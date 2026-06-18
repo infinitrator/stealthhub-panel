@@ -312,7 +312,34 @@ Current MVP is not production-ready and should not be exposed publicly without a
 
 ## License
 
-MIT
+StealthHub Panel is licensed under the **GNU Affero General Public License v3.0 or later**.
+
+SPDX identifier:
+
+```text
+AGPL-3.0-or-later
+```
+
+You may use, study, copy, modify, and redistribute this project, including for commercial purposes, but any distributed or network-accessible modified version must remain available under AGPL-compatible terms.
+
+Because StealthHub Panel is a network server application, AGPL is important: if you modify the panel and let users interact with that modified version over a network, you must provide those users access to the corresponding source code of your modified version.
+
+In simple terms:
+
+* you may use the project;
+* you may modify it;
+* you may fork it;
+* you may use it commercially;
+* you must keep copyright and license notices;
+* you must publish the source code of modified versions when distributing them or providing network access to them;
+* you cannot turn a modified version into a closed-source hosted service.
+
+See:
+
+* [`LICENSE`](./LICENSE) — full legal license text;
+* [`LICENSE.ru.md`](./LICENSE.ru.md) — Russian explanation;
+* [`NOTICE`](./NOTICE) — attribution notice.
+
 
 ---
 

@@ -8,7 +8,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 authors = ["Fedor Korneev"]
 repository = "https://github.com/infinitrator/stealthhub-panel"
 
