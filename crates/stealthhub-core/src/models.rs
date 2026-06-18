@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::storage::UserRecord;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PanelSettings {
     pub panel_name: String,
@@ -8,7 +10,7 @@ pub struct PanelSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DemoUser {
+pub struct SubscriptionUser {
     pub username: String,
     pub uuid: String,
     pub subscription_token: String,
@@ -33,6 +35,16 @@ pub enum ProxyKind {
     Tuic,
 }
 
+impl From<UserRecord> for SubscriptionUser {
+    fn from(value: UserRecord) -> Self {
+        Self {
+            username: value.username,
+            uuid: value.uuid,
+            subscription_token: value.subscription_token,
+        }
+    }
+}
+
 pub fn demo_settings() -> PanelSettings {
     PanelSettings {
         panel_name: "StealthHub Panel".to_string(),
@@ -41,8 +53,8 @@ pub fn demo_settings() -> PanelSettings {
     }
 }
 
-pub fn demo_user() -> DemoUser {
-    DemoUser {
+pub fn demo_user() -> SubscriptionUser {
+    SubscriptionUser {
         username: "demo".to_string(),
         uuid: "11111111-1111-4111-8111-111111111111".to_string(),
         subscription_token: "demo".to_string(),

@@ -1,9 +1,12 @@
 use anyhow::Result;
 use serde_json::json;
 
-use crate::models::{DemoUser, PanelSettings};
+use crate::models::{PanelSettings, SubscriptionUser};
 
-pub fn generate_demo_mihomo_yaml(settings: &PanelSettings, user: &DemoUser) -> Result<String> {
+pub fn generate_demo_mihomo_yaml(
+    settings: &PanelSettings,
+    user: &SubscriptionUser,
+) -> Result<String> {
     let node = &settings.node_domain;
 
     // На этом этапе это демонстрационный config contract.

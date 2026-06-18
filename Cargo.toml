@@ -25,4 +25,5 @@ tower-http = { version = "0.6", features = ["trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
 clap = { version = "4", features = ["derive"] }
