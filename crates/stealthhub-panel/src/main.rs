@@ -13,7 +13,8 @@ use stealthhub_core::{
     models::{demo_settings, SubscriptionUser},
     rules::{banking_direct_yaml, direct_local_yaml, proxy_ai_yaml, streaming_yaml},
     storage::{
-        create_user, ensure_demo_user, get_user_by_token, init_db, list_users, open_pool, NewUser,
+        create_user, delete_user, ensure_demo_user, get_user_by_id, get_user_by_token, init_db,
+        list_users, open_pool, reset_user_subscription_token, set_user_enabled, NewUser,
     },
 };
 use tower_http::trace::TraceLayer;
@@ -26,7 +27,8 @@ struct AppState {
 #[derive(Debug, Deserialize)]
 struct CreateUserForm {
     username: String,
-    traffic_limit_gb: Option<i64>,
+    #[serde(default)]
+    traffic_limit_gb: String,
 }
 
 #[tokio::main]
@@ -50,6 +52,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
         .route("/admin/users/create", post(create_user_action))
+        .route("/admin/users/:id/toggle", post(toggle_user_action))
+        .route(
+            "/admin/users/:id/reset-token",
+            post(reset_user_token_action),
+        )
+        .route("/admin/users/:id/delete", post(delete_user_action))
         .route("/health", get(health))
         .route("/sub/:token/mihomo.yaml", get(mihomo_subscription))
         .route("/rules/:name", get(rule_provider))
@@ -275,6 +283,7 @@ async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
                                     th { "UUID" }
                                     th { "Subscription" }
                                     th { "Traffic" }
+                                    th { "Actions" }
                                 }
                             }
                             tbody {
@@ -309,6 +318,25 @@ async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
                                                 },
                                             }
                                         }
+                                        td {
+                                            @if user.enabled {
+                                                form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
+                                                    button type="submit" { "Disable" }
+                                                }
+                                            } @else {
+                                                form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
+                                                    button type="submit" { "Enable" }
+                                                }
+                                            }
+
+                                            form method="post" action=(format!("/admin/users/{}/reset-token", user.id)) class="inline-form" {
+                                                button type="submit" { "Reset token" }
+                                            }
+
+                                            form method="post" action=(format!("/admin/users/{}/delete", user.id)) class="inline-form" onsubmit="return confirm('Delete this user?');" {
+                                                button type="submit" class="danger" { "Delete" }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -331,10 +359,29 @@ async fn create_user_action(
         return (StatusCode::BAD_REQUEST, "username is empty").into_response();
     }
 
-    let traffic_limit_bytes = form
-        .traffic_limit_gb
-        .filter(|value| *value > 0)
-        .map(|gb| gb * 1024 * 1024 * 1024);
+    let traffic_limit_bytes = match form.traffic_limit_gb.trim() {
+        "" | "0" => None,
+        value => {
+            let gb = match value.parse::<i64>() {
+                Ok(value) if value > 0 => value,
+                Ok(_) => {
+                    return (StatusCode::BAD_REQUEST, "traffic limit must be positive")
+                        .into_response()
+                }
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "traffic limit must be a number")
+                        .into_response()
+                }
+            };
+
+            match gb.checked_mul(1024 * 1024 * 1024) {
+                Some(bytes) => Some(bytes),
+                None => {
+                    return (StatusCode::BAD_REQUEST, "traffic limit is too large").into_response()
+                }
+            }
+        }
+    };
 
     let input = NewUser {
         username,
@@ -347,6 +394,54 @@ async fn create_user_action(
         Err(err) => (
             StatusCode::BAD_REQUEST,
             format!("failed to create user: {err}"),
+        )
+            .into_response(),
+    }
+}
+async fn toggle_user_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let user = match get_user_by_id(&state.pool, id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return (StatusCode::NOT_FOUND, format!("failed to find user: {err}")).into_response();
+        }
+    };
+
+    match set_user_enabled(&state.pool, id, !user.enabled).await {
+        Ok(_) => Redirect::to("/admin/users").into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            format!("failed to toggle user: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn reset_user_token_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match reset_user_subscription_token(&state.pool, id).await {
+        Ok(_) => Redirect::to("/admin/users").into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            format!("failed to reset token: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_user_action(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match delete_user(&state.pool, id).await {
+        Ok(_) => Redirect::to("/admin/users").into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            format!("failed to delete user: {err}"),
         )
             .into_response(),
     }
@@ -478,6 +573,16 @@ fn layout(title: &str, body: Markup) -> Markup {
                         color: #9ff0c0;
                     }
                     .badge.off {
+                        background: #3a1414;
+                        color: #ffb0b0;
+                    }
+                    .inline-form {
+                        display: inline-block;
+                        margin: 0 6px 6px 0;
+                    }
+
+                    button.danger {
+                        border-color: #7f1d1d;
                         background: #3a1414;
                         color: #ffb0b0;
                     }

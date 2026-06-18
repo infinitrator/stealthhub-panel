@@ -76,11 +76,18 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_demo_user(pool: &SqlitePool) -> Result<()> {
-    let exists: Option<(i64,)> =
-        sqlx::query_as("SELECT id FROM users WHERE subscription_token = ?")
-            .bind("demo")
-            .fetch_optional(pool)
-            .await?;
+    let exists: Option<(i64,)> = sqlx::query_as(
+        r#"
+        SELECT id
+        FROM users
+        WHERE username = ? OR uuid = ?
+        LIMIT 1
+        "#,
+    )
+    .bind("demo")
+    .bind("11111111-1111-4111-8111-111111111111")
+    .fetch_optional(pool)
+    .await?;
 
     if exists.is_some() {
         return Ok(());
@@ -196,4 +203,81 @@ pub async fn get_user_by_token(pool: &SqlitePool, token: &str) -> Result<UserRec
     .await?;
 
     Ok(user)
+}
+pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
+    let user = sqlx::query_as::<_, UserRecord>(
+        r#"
+        SELECT
+            id,
+            username,
+            uuid,
+            subscription_token,
+            enabled,
+            traffic_limit_bytes,
+            traffic_used_bytes,
+            expires_at,
+            created_at,
+            updated_at
+        FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(user)
+}
+
+pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Result<()> {
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET enabled = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(enabled)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result<String> {
+    let now = Utc::now();
+    let new_token = Uuid::new_v4().simple().to_string();
+
+    sqlx::query(
+        r#"
+        UPDATE users
+        SET subscription_token = ?, updated_at = ?
+        WHERE id = ?
+        "#,
+    )
+    .bind(&new_token)
+    .bind(now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(new_token)
+}
+
+pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM users
+        WHERE id = ?
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
