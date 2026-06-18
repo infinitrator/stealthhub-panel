@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/stealthhub-core",
+  "crates/stealthhub-panel",
+  "crates/stealthhub-cli"
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["Fedor Korneev"]
+repository = "https://github.com/YOUR_GITHUB_USERNAME/stealthhub-panel"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.7"
+chrono = { version = "0.4", features = ["serde"] }
+maud = { version = "0.26", features = ["axum"] }
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["trace", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }

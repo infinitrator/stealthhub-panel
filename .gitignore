@@ -1,0 +1,14 @@
+/target
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+.DS_Store
+.idea
+.vscode/*.log
+.zed
+dist
+secrets
+*.pem
+*.key
