@@ -10,7 +10,7 @@ members = [
 edition = "2021"
 license = "MIT"
 authors = ["Fedor Korneev"]
-repository = "https://github.com/YOUR_GITHUB_USERNAME/stealthhub-panel"
+repository = "https://github.com/infinitrator/stealthhub-panel"
 
 [workspace.dependencies]
 anyhow = "1"
