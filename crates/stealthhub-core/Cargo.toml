@@ -11,3 +11,6 @@ serde_json.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 sqlx.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

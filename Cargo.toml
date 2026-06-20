@@ -14,12 +14,17 @@ repository = "https://github.com/infinitrator/stealthhub-panel"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.5"
 axum = "0.7"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
+cookie = "0.18"
 maud = { version = "0.26", features = ["axum"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["trace", "fs"] }
 tracing = "0.1"

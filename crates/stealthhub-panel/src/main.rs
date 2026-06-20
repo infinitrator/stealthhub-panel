@@ -1,3 +1,7 @@
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     extract::{Form, Path, State},
     http::{header, HeaderMap, StatusCode},
@@ -5,23 +9,36 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use chrono::{Duration, Utc};
+use cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use maud::{html, Markup, PreEscaped, DOCTYPE};
+use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use stealthhub_core::{
     mihomo::generate_demo_mihomo_yaml,
     models::{demo_settings, SubscriptionUser},
     rules::{banking_direct_yaml, direct_local_yaml, proxy_ai_yaml, streaming_yaml},
     storage::{
-        create_user, delete_user, ensure_demo_user, get_user_by_id, get_user_by_token, init_db,
-        list_users, open_pool, reset_user_subscription_token, set_user_enabled, NewUser,
+        admin_count, create_admin, create_admin_session, create_user, delete_admin_session,
+        delete_expired_admin_sessions, delete_user, ensure_demo_user, get_admin_by_id,
+        get_admin_by_username, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
+        list_users, open_pool, reset_user_subscription_token, set_user_enabled,
+        touch_admin_session, AdminRecord, NewUser,
     },
 };
 use tower_http::trace::TraceLayer;
 
+const ADMIN_SESSION_COOKIE: &str = "stealthhub_admin_session";
+const ADMIN_SESSION_TTL_DAYS: i64 = 7;
+const MIN_ADMIN_PASSWORD_LEN: usize = 12;
+
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
+    cookie_secure: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +46,19 @@ struct CreateUserForm {
     username: String,
     #[serde(default)]
     traffic_limit_gb: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupAdminForm {
+    username: String,
+    password: String,
+    password_confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
 }
 
 #[tokio::main]
@@ -40,15 +70,28 @@ async fn main() -> anyhow::Result<()> {
     let bind = std::env::var("STEALTHHUB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let db_url = std::env::var("STEALTHHUB_DB")
         .unwrap_or_else(|_| "sqlite://./stealthhub.sqlite?mode=rwc".to_string());
+    let cookie_secure = std::env::var("STEALTHHUB_COOKIE_SECURE")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
 
     let pool = open_pool(&db_url).await?;
     init_db(&pool).await?;
     ensure_demo_user(&pool).await?;
+    delete_expired_admin_sessions(&pool).await?;
 
-    let state = AppState { pool };
+    let state = AppState {
+        pool,
+        cookie_secure,
+    };
 
     let app = Router::new()
         .route("/", get(index))
+        .route(
+            "/admin/setup",
+            get(setup_admin_page).post(setup_admin_action),
+        )
+        .route("/admin/login", get(login_page).post(login_action))
+        .route("/admin/logout", post(logout_action))
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
         .route("/admin/users/create", post(create_user_action))
@@ -165,16 +208,230 @@ async fn index() -> impl IntoResponse {
     )
 }
 
-async fn admin_dashboard() -> impl IntoResponse {
+async fn setup_admin_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Ok(Some(_)) = current_admin(&state, &headers).await {
+        return Redirect::to("/admin").into_response();
+    }
+
+    match admin_count(&state.pool).await {
+        Ok(0) => Html(
+            layout(
+                "Initial admin setup",
+                html! {
+                    h1 { "Initial admin setup" }
+                    div class="notice" {
+                        "Create the first local administrator account. This page disappears after setup."
+                    }
+                    section {
+                        h2 { "Admin account" }
+                        form method="post" action="/admin/setup" class="form" {
+                            label {
+                                span { "Username" }
+                                input type="text" name="username" minlength="3" maxlength="64" required autocomplete="username";
+                            }
+                            label {
+                                span { "Password" }
+                                input type="password" name="password" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
+                            }
+                            label {
+                                span { "Confirm password" }
+                                input type="password" name="password_confirm" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
+                            }
+                            button type="submit" { "Create admin" }
+                        }
+                    }
+                },
+            )
+            .into_string(),
+        )
+        .into_response(),
+        Ok(_) => Redirect::to("/admin/login").into_response(),
+        Err(err) => html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup unavailable",
+            format!("Failed to inspect admin setup state: {err}"),
+            "/",
+            "Back to Home",
+        ),
+    }
+}
+
+async fn setup_admin_action(
+    State(state): State<AppState>,
+    Form(form): Form<SetupAdminForm>,
+) -> Response {
+    match admin_count(&state.pool).await {
+        Ok(0) => {}
+        Ok(_) => return Redirect::to("/admin/login").into_response(),
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Setup failed",
+                format!("Failed to inspect admin setup state: {err}"),
+                "/admin/setup",
+                "Back to Setup",
+            );
+        }
+    }
+
+    let username = form.username.trim();
+    if username.len() < 3 || username.len() > 64 {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Setup failed",
+            "Username must be 3-64 characters long",
+            "/admin/setup",
+            "Back to Setup",
+        );
+    }
+
+    if form.password.len() < MIN_ADMIN_PASSWORD_LEN {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Setup failed",
+            format!("Password must be at least {MIN_ADMIN_PASSWORD_LEN} characters long"),
+            "/admin/setup",
+            "Back to Setup",
+        );
+    }
+
+    if form.password != form.password_confirm {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Setup failed",
+            "Password confirmation does not match",
+            "/admin/setup",
+            "Back to Setup",
+        );
+    }
+
+    let password_hash = match hash_password(&form.password) {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Setup failed",
+                format!("Failed to hash password: {err}"),
+                "/admin/setup",
+                "Back to Setup",
+            );
+        }
+    };
+
+    let admin = match create_admin(&state.pool, username, &password_hash).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Setup failed",
+                format!("Failed to create admin: {err}"),
+                "/admin/setup",
+                "Back to Setup",
+            );
+        }
+    };
+
+    create_session_redirect(&state, admin.id, "/admin").await
+}
+
+async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Ok(0) = admin_count(&state.pool).await {
+        return Redirect::to("/admin/setup").into_response();
+    }
+
+    if let Ok(Some(_)) = current_admin(&state, &headers).await {
+        return Redirect::to("/admin").into_response();
+    }
+
+    Html(
+        layout(
+            "Admin login",
+            html! {
+                h1 { "Admin login" }
+                section {
+                    h2 { "Sign in" }
+                    form method="post" action="/admin/login" class="form" {
+                        label {
+                            span { "Username" }
+                            input type="text" name="username" required autocomplete="username";
+                        }
+                        label {
+                            span { "Password" }
+                            input type="password" name="password" required autocomplete="current-password";
+                        }
+                        button type="submit" { "Login" }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+    if let Ok(0) = admin_count(&state.pool).await {
+        return Redirect::to("/admin/setup").into_response();
+    }
+
+    let admin = match get_admin_by_username(&state.pool, &form.username).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return login_failed_response();
+        }
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Login failed",
+                format!("Failed to load admin: {err}"),
+                "/admin/login",
+                "Back to Login",
+            );
+        }
+    };
+
+    match verify_password(&form.password, &admin.password_hash) {
+        Ok(true) => create_session_redirect(&state, admin.id, "/admin").await,
+        Ok(false) => login_failed_response(),
+        Err(err) => html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Login failed",
+            format!("Stored password hash is invalid: {err}"),
+            "/admin/login",
+            "Back to Login",
+        ),
+    }
+}
+
+async fn logout_action(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(token) = session_token_from_headers(&headers) {
+        let token_hash = hash_session_token(&token);
+        if let Err(err) = delete_admin_session(&state.pool, &token_hash).await {
+            tracing::warn!("failed to delete admin session: {err}");
+        }
+    }
+
+    let mut response = Redirect::to("/admin/login").into_response();
+    append_session_cookie(&mut response, expired_session_cookie(&state));
+    response
+}
+
+async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
     Html(
         layout(
             "Dashboard",
             html! {
+                (admin_bar(&admin))
                 h1 { "Dashboard" }
 
                 div class="notice" {
                     strong { "v0.1:" }
-                    " SQLite users + real subscription tokens. Следующий этап — auth, edit/delete users, systemd и real protocol configs."
+                    " SQLite users + protected admin GUI. Следующий этап — real protocol configs, systemd и safe apply."
                 }
 
                 div class="grid" {
@@ -220,9 +477,15 @@ async fn admin_dashboard() -> impl IntoResponse {
         )
         .into_string(),
     )
+    .into_response()
 }
 
-async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
+async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let admin = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
     let users = match list_users(&state.pool).await {
         Ok(value) => value,
         Err(err) => {
@@ -237,7 +500,8 @@ async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
                     },
                 )
                 .into_string(),
-            );
+            )
+            .into_response();
         }
     };
 
@@ -245,10 +509,11 @@ async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
         layout(
             "Users",
             html! {
+                (admin_bar(&admin))
                 h1 { "Users" }
 
                 div class="notice" {
-                    "Пока это базовый users MVP: создание пользователя, токен подписки и UUID. Edit/delete добавим следующим шагом."
+                    "Пока это базовый users MVP: создание пользователя, токен подписки, enable/disable, reset token и delete."
                 }
 
                 section {
@@ -347,16 +612,22 @@ async fn users_page(State(state): State<AppState>) -> impl IntoResponse {
         )
         .into_string(),
     )
+    .into_response()
 }
 
 async fn create_user_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Form(form): Form<CreateUserForm>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+
     let username = form.username.trim().to_string();
 
     if username.is_empty() {
-        return (StatusCode::BAD_REQUEST, "username is empty").into_response();
+        return html_error_response(StatusCode::BAD_REQUEST, "Bad request", "Username is empty");
     }
 
     let traffic_limit_bytes = match form.traffic_limit_gb.trim() {
@@ -365,19 +636,29 @@ async fn create_user_action(
             let gb = match value.parse::<i64>() {
                 Ok(value) if value > 0 => value,
                 Ok(_) => {
-                    return (StatusCode::BAD_REQUEST, "traffic limit must be positive")
-                        .into_response()
+                    return html_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Bad request",
+                        "Traffic limit must be positive",
+                    );
                 }
                 Err(_) => {
-                    return (StatusCode::BAD_REQUEST, "traffic limit must be a number")
-                        .into_response()
+                    return html_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Bad request",
+                        "Traffic limit must be a number",
+                    );
                 }
             };
 
             match gb.checked_mul(1024 * 1024 * 1024) {
                 Some(bytes) => Some(bytes),
                 None => {
-                    return (StatusCode::BAD_REQUEST, "traffic limit is too large").into_response()
+                    return html_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Bad request",
+                        "Traffic limit is too large",
+                    );
                 }
             }
         }
@@ -391,60 +672,275 @@ async fn create_user_action(
 
     match create_user(&state.pool, input).await {
         Ok(_) => Redirect::to("/admin/users").into_response(),
-        Err(err) => (
+        Err(err) => html_error_response(
             StatusCode::BAD_REQUEST,
-            format!("failed to create user: {err}"),
-        )
-            .into_response(),
+            "Create user failed",
+            format!("Failed to create user: {err}"),
+        ),
     }
 }
 async fn toggle_user_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+
     let user = match get_user_by_id(&state.pool, id).await {
         Ok(value) => value,
         Err(err) => {
-            return (StatusCode::NOT_FOUND, format!("failed to find user: {err}")).into_response();
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "User not found",
+                format!("Failed to find user: {err}"),
+            );
         }
     };
 
     match set_user_enabled(&state.pool, id, !user.enabled).await {
         Ok(_) => Redirect::to("/admin/users").into_response(),
-        Err(err) => (
+        Err(err) => html_error_response(
             StatusCode::BAD_REQUEST,
-            format!("failed to toggle user: {err}"),
-        )
-            .into_response(),
+            "Toggle user failed",
+            format!("Failed to toggle user: {err}"),
+        ),
     }
 }
 
 async fn reset_user_token_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+
     match reset_user_subscription_token(&state.pool, id).await {
         Ok(_) => Redirect::to("/admin/users").into_response(),
-        Err(err) => (
+        Err(err) => html_error_response(
             StatusCode::BAD_REQUEST,
-            format!("failed to reset token: {err}"),
-        )
-            .into_response(),
+            "Reset token failed",
+            format!("Failed to reset token: {err}"),
+        ),
     }
 }
 
 async fn delete_user_action(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers).await {
+        return response;
+    }
+
     match delete_user(&state.pool, id).await {
         Ok(_) => Redirect::to("/admin/users").into_response(),
-        Err(err) => (
+        Err(err) => html_error_response(
             StatusCode::BAD_REQUEST,
-            format!("failed to delete user: {err}"),
-        )
-            .into_response(),
+            "Delete user failed",
+            format!("Failed to delete user: {err}"),
+        ),
     }
+}
+
+async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AdminRecord, Response> {
+    match current_admin(state, headers).await {
+        Ok(Some(admin)) => Ok(admin),
+        Ok(None) => match admin_count(&state.pool).await {
+            Ok(0) => Err(Redirect::to("/admin/setup").into_response()),
+            Ok(_) => Err(Redirect::to("/admin/login").into_response()),
+            Err(err) => Err(html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Auth failed",
+                format!("Failed to inspect admin setup state: {err}"),
+                "/",
+                "Back to Home",
+            )),
+        },
+        Err(err) => Err(html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Auth failed",
+            format!("Failed to validate admin session: {err}"),
+            "/admin/login",
+            "Back to Login",
+        )),
+    }
+}
+
+async fn current_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> anyhow::Result<Option<AdminRecord>> {
+    let Some(token) = session_token_from_headers(headers) else {
+        return Ok(None);
+    };
+
+    let token_hash = hash_session_token(&token);
+    let Some(session) = get_valid_admin_session(&state.pool, &token_hash).await? else {
+        return Ok(None);
+    };
+
+    let admin = get_admin_by_id(&state.pool, session.admin_id).await?;
+    if admin.is_some() {
+        touch_admin_session(&state.pool, &token_hash).await?;
+    } else {
+        delete_admin_session(&state.pool, &token_hash).await?;
+    }
+
+    Ok(admin)
+}
+
+async fn create_session_redirect(state: &AppState, admin_id: i64, location: &str) -> Response {
+    let token = generate_session_token();
+    let token_hash = hash_session_token(&token);
+    let expires_at = Utc::now() + Duration::days(ADMIN_SESSION_TTL_DAYS);
+
+    match create_admin_session(&state.pool, admin_id, &token_hash, expires_at).await {
+        Ok(()) => {
+            let mut response = Redirect::to(location).into_response();
+            append_session_cookie(&mut response, active_session_cookie(state, token));
+            response
+        }
+        Err(err) => html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Session failed",
+            format!("Failed to create admin session: {err}"),
+            "/admin/login",
+            "Back to Login",
+        ),
+    }
+}
+
+fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|err| anyhow::anyhow!("argon2 password hash failed: {err}"))?;
+
+    Ok(password_hash.to_string())
+}
+
+fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> {
+    let parsed_hash = PasswordHash::new(password_hash)
+        .map_err(|err| anyhow::anyhow!("stored password hash is invalid: {err}"))?;
+
+    match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
+        Ok(()) => Ok(true),
+        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(err) => Err(anyhow::anyhow!(
+            "argon2 password verification failed: {err}"
+        )),
+    }
+}
+
+fn generate_session_token() -> String {
+    let mut token = [0_u8; 32];
+    OsRng.fill_bytes(&mut token);
+    URL_SAFE_NO_PAD.encode(token)
+}
+
+fn hash_session_token(token: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
+
+    cookie_header.split(';').find_map(|value| {
+        let cookie = Cookie::parse(value.trim().to_string()).ok()?;
+        (cookie.name() == ADMIN_SESSION_COOKIE).then(|| cookie.value().to_string())
+    })
+}
+
+fn active_session_cookie(state: &AppState, token: String) -> Cookie<'static> {
+    Cookie::build((ADMIN_SESSION_COOKIE, token))
+        .path("/")
+        .http_only(true)
+        .secure(state.cookie_secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::days(ADMIN_SESSION_TTL_DAYS))
+        .build()
+}
+
+fn expired_session_cookie(state: &AppState) -> Cookie<'static> {
+    Cookie::build((ADMIN_SESSION_COOKIE, ""))
+        .path("/")
+        .http_only(true)
+        .secure(state.cookie_secure)
+        .same_site(SameSite::Lax)
+        .max_age(CookieDuration::seconds(0))
+        .build()
+}
+
+fn append_session_cookie(response: &mut Response, cookie: Cookie<'static>) {
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        cookie
+            .to_string()
+            .parse()
+            .expect("session cookie header must be valid"),
+    );
+}
+
+fn login_failed_response() -> Response {
+    html_error_response_with_back(
+        StatusCode::UNAUTHORIZED,
+        "Login failed",
+        "Username or password is incorrect",
+        "/admin/login",
+        "Back to Login",
+    )
+}
+
+fn admin_bar(admin: &AdminRecord) -> Markup {
+    html! {
+        div class="admin-bar" {
+            span { "Signed in as " strong { (admin.username) } }
+            form method="post" action="/admin/logout" class="inline-form" {
+                button type="submit" { "Logout" }
+            }
+        }
+    }
+}
+
+fn html_error_response(
+    status: StatusCode,
+    title: &'static str,
+    message: impl Into<String>,
+) -> Response {
+    html_error_response_with_back(status, title, message, "/admin/users", "Back to Users")
+}
+
+fn html_error_response_with_back(
+    status: StatusCode,
+    title: &'static str,
+    message: impl Into<String>,
+    back_href: &'static str,
+    back_label: &'static str,
+) -> Response {
+    let message = message.into();
+
+    (
+        status,
+        Html(
+            layout(
+                title,
+                html! {
+                    h1 { (title) }
+                    div class="notice error" {
+                        (message)
+                    }
+                    a class="button" href=(back_href) { (back_label) }
+                },
+            )
+            .into_string(),
+        ),
+    )
+        .into_response()
 }
 
 fn format_bytes(value: i64) -> String {
@@ -579,6 +1075,17 @@ fn layout(title: &str, body: Markup) -> Markup {
                     .inline-form {
                         display: inline-block;
                         margin: 0 6px 6px 0;
+                    }
+                    .admin-bar {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
+                        margin-bottom: 20px;
+                        padding: 12px 14px;
+                        border: 1px solid #223042;
+                        border-radius: 10px;
+                        background: #101820;
                     }
 
                     button.danger {

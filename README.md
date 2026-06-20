@@ -5,7 +5,7 @@
 The project is designed around one practical goal: keep the server simple, predictable, and controllable from a web GUI without relying on heavy multi-service panels.
 
 > Status: early development / MVP.
-> Current focus: users, token-based subscriptions, Mihomo YAML generation, and a clean Rust foundation.
+> Current focus: protected admin GUI, users, token-based subscriptions, Mihomo YAML generation, and a clean Rust foundation.
 
 ---
 
@@ -76,10 +76,22 @@ Implemented:
 * `stealthhub-cli` CLI skeleton;
 * SQLite storage;
 * user table;
+* admin table;
+* server-side admin sessions;
+* initial admin setup page;
+* admin login/logout;
+* Argon2id password hashing;
+* key/value settings storage foundation;
+* local secret-value storage foundation;
+* protocol profile model for Xray/sing-box/Hysteria/TUIC-oriented configs;
 * token-based Mihomo subscription endpoint;
 * demo user initialization;
 * basic web GUI;
-* basic user lifecycle actions in progress;
+* user creation;
+* user enable/disable;
+* subscription token reset;
+* user delete;
+* simple HTML error pages for admin actions;
 * rule-provider endpoints;
 * health endpoint.
 
@@ -87,8 +99,17 @@ Current routes:
 
 ```text
 GET  /
+GET  /admin/setup
+POST /admin/setup
+GET  /admin/login
+POST /admin/login
+POST /admin/logout
 GET  /admin
 GET  /admin/users
+POST /admin/users/create
+POST /admin/users/{id}/toggle
+POST /admin/users/{id}/reset-token
+POST /admin/users/{id}/delete
 GET  /health
 GET  /sub/{token}/mihomo.yaml
 GET  /rules/{name}
@@ -148,6 +169,12 @@ STEALTHHUB_DB='sqlite://./stealthhub.sqlite?mode=rwc' \
 cargo run -p stealthhub-panel
 ```
 
+For production behind HTTPS, enable the `Secure` flag on the admin session cookie:
+
+```bash
+STEALTHHUB_COOKIE_SECURE=true
+```
+
 Open:
 
 ```text
@@ -156,6 +183,8 @@ http://127.0.0.1:8080/admin
 http://127.0.0.1:8080/admin/users
 http://127.0.0.1:8080/health
 ```
+
+On the first run, open `/admin` or `/admin/setup` and create the first admin account. After that, `/admin` and `/admin/users` require login. Public subscription and rule-provider endpoints stay public so Mihomo-compatible clients can fetch configs.
 
 Generate demo Mihomo YAML from CLI:
 
@@ -226,23 +255,26 @@ Planned GUI features:
 
 ### v0.2 — User lifecycle
 
-* enable / disable users;
-* reset subscription token;
-* delete users;
-* better form validation;
-* safer error pages.
+* enable / disable users; ✅
+* reset subscription token; ✅
+* delete users; ✅
+* better form validation; ✅
+* safer error pages. ✅
 
 ### v0.3 — Admin authentication
 
-* login page;
-* password hashing;
-* secure session cookies;
-* logout;
-* initial admin setup;
+* login page; ✅
+* password hashing; ✅
+* session cookies; ✅
+* logout; ✅
+* initial admin setup; ✅
 * optional 2FA later.
 
 ### v0.4 — Real protocol settings
 
+* settings storage foundation; ✅
+* secret-value storage foundation; ✅
+* protocol profile model; ✅
 * GUI protocol settings;
 * Mihomo config builder;
 * generated config validation;
@@ -284,16 +316,30 @@ StealthHub Panel is intended to run on a private server and should be protected 
 
 Planned security features:
 
-* admin login;
-* password hashing;
-* secure session cookies;
+* admin login; ✅
+* password hashing; ✅
+* server-side session storage; ✅
+* secure session cookies when `STEALTHHUB_COOKIE_SECURE=true`;
 * optional IP allowlist;
 * backup and restore;
 * config validation before apply;
 * atomic config updates;
 * rollback on failed service restart.
 
-Current MVP is not production-ready and should not be exposed publicly without additional protection.
+Current MVP has basic admin authentication, but it is still not production-ready. Do not expose it publicly without HTTPS, a strong admin password, firewall or reverse-proxy restrictions, and careful operational hardening.
+
+Suggested commit message for the current auth/lifecycle milestone:
+
+```text
+add admin authentication
+```
+
+If committing manually:
+
+```bash
+git add Cargo.toml Cargo.lock README.md crates/stealthhub-core/Cargo.toml crates/stealthhub-core/src/models.rs crates/stealthhub-core/src/storage.rs crates/stealthhub-panel/Cargo.toml crates/stealthhub-panel/src/main.rs
+git commit -m "add admin authentication"
+```
 
 ---
 
