@@ -290,7 +290,7 @@ fn select_group<'a>(preferred: &[&'a str], fallback: &[&'a str]) -> Vec<&'a str>
     if names.is_empty() {
         names.extend_from_slice(fallback);
     }
-    if !names.iter().any(|value| *value == "DIRECT") {
+    if !names.contains(&"DIRECT") {
         names.push("DIRECT");
     }
     names

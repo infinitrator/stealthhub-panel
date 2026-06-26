@@ -1,0 +1,27 @@
+[Unit]
+Description=StealthHub Panel
+Documentation=https://github.com/infinitrator/stealthhub-panel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=stealthhub
+Group=stealthhub
+EnvironmentFile=/etc/stealthhub-panel/stealthhub-panel.env
+WorkingDirectory=/var/lib/stealthhub-panel
+ExecStart=/usr/local/bin/stealthhub-panel
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/stealthhub-panel
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

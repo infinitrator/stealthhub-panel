@@ -97,6 +97,9 @@ Implemented:
 * user delete;
 * simple HTML error pages for admin actions;
 * protocol overview page;
+* system overview page;
+* readiness endpoint with SQLite check;
+* bare-metal systemd deployment templates;
 * rule-provider endpoints;
 * health endpoint.
 
@@ -112,11 +115,13 @@ POST /admin/logout
 GET  /admin
 GET  /admin/users
 GET  /admin/protocols
+GET  /admin/system
 POST /admin/users/create
 POST /admin/users/{id}/toggle
 POST /admin/users/{id}/reset-token
 POST /admin/users/{id}/delete
 GET  /health
+GET  /ready
 GET  /sub/{token}/mihomo.yaml
 GET  /rules/{name}
 ```
@@ -164,6 +169,7 @@ Run checks:
 ```bash
 cargo fmt
 cargo check --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
@@ -187,7 +193,10 @@ Open:
 http://127.0.0.1:8080
 http://127.0.0.1:8080/admin
 http://127.0.0.1:8080/admin/users
+http://127.0.0.1:8080/admin/protocols
+http://127.0.0.1:8080/admin/system
 http://127.0.0.1:8080/health
+http://127.0.0.1:8080/ready
 ```
 
 On the first run, open `/admin` or `/admin/setup` and create the first admin account. After that, `/admin` and `/admin/users` require login. Public subscription and rule-provider endpoints stay public so Mihomo-compatible clients can fetch configs.
@@ -196,6 +205,51 @@ Generate demo Mihomo YAML from CLI:
 
 ```bash
 cargo run -p stealthhub-cli -- generate-mihomo
+```
+
+---
+
+## Deployment target
+
+The current deployment target is **bare metal + systemd**, not Docker.
+
+That is intentional for the single-node control-panel model: StealthHub Panel will need to inspect and control host services, write proxy-core configs, read logs, validate ports, and later apply rollback-safe changes. Running the panel as a normal Linux service keeps those system boundaries explicit and avoids coupling production deploys to a local development machine.
+
+Repository deployment templates:
+
+```text
+deploy/stealthhub-panel.env.example
+deploy/stealthhub-panel.service
+deploy/nginx-stealthhub-panel.conf.example
+```
+
+Expected server layout:
+
+```text
+/usr/local/bin/stealthhub-panel
+/etc/stealthhub-panel/stealthhub-panel.env
+/var/lib/stealthhub-panel/stealthhub.sqlite
+```
+
+Minimal server install outline:
+
+```bash
+sudo useradd --system --home /var/lib/stealthhub-panel --shell /usr/sbin/nologin stealthhub
+sudo install -d -o stealthhub -g stealthhub -m 0750 /var/lib/stealthhub-panel
+sudo install -d -o root -g root -m 0755 /etc/stealthhub-panel
+sudo install -m 0640 deploy/stealthhub-panel.env.example /etc/stealthhub-panel/stealthhub-panel.env
+sudo install -m 0755 target/release/stealthhub-panel /usr/local/bin/stealthhub-panel
+sudo install -m 0644 deploy/stealthhub-panel.service /etc/systemd/system/stealthhub-panel.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now stealthhub-panel
+```
+
+For production, put Nginx/Caddy in front of the panel, keep `STEALTHHUB_BIND=127.0.0.1:8080`, set `STEALTHHUB_COOKIE_SECURE=true`, and check:
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
+systemctl status stealthhub-panel
 ```
 
 ---
@@ -290,6 +344,10 @@ Planned GUI features:
 
 ### v0.5 — System control
 
+* bare-metal deployment target; ✅
+* system overview page; ✅
+* readiness endpoint; ✅
+* systemd service template; ✅
 * service status;
 * systemd restart/reload;
 * logs viewer;

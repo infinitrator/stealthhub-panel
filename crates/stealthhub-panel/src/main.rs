@@ -41,6 +41,7 @@ const ADMIN_SESSION_TTL_DAYS: i64 = 7;
 const MIN_ADMIN_PASSWORD_LEN: usize = 12;
 const LOGIN_FAILURE_DELAY_MS: u64 = 500;
 const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNAjjkqaKvQ$cCpCPgJOl06K2/RHtedp/MTm/4u+0n4JeNlYF00eQj4";
+const DEPLOYMENT_MODE: &str = "bare-metal systemd";
 
 #[derive(Clone)]
 struct AppState {
@@ -124,6 +125,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
         .route("/admin/protocols", get(protocols_page))
+        .route("/admin/system", get(system_page))
         .route("/admin/users/create", post(create_user_action))
         .route("/admin/users/:id/toggle", post(toggle_user_action))
         .route(
@@ -135,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
             get(delete_user_page).post(delete_user_action),
         )
         .route("/health", get(health))
+        .route("/ready", get(readiness))
         .route("/sub/:token/mihomo.yaml", get(mihomo_subscription))
         .route("/rules/:name", get(rule_provider))
         .with_state(state)
@@ -151,6 +154,25 @@ async fn main() -> anyhow::Result<()> {
 
 async fn health() -> impl IntoResponse {
     "ok\n"
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+    {
+        Ok(1) => (StatusCode::OK, "ready\n").into_response(),
+        Ok(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database readiness probe returned an unexpected value\n",
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("database is not ready: {err}\n"),
+        )
+            .into_response(),
+    }
 }
 
 async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<String>) -> Response {
@@ -527,6 +549,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                     }
 
                     section {
+                        h2 { "System" }
+                        p { "Bare-metal deploy target, health checks, env contract and service layout." }
+                        a class="button" href="/admin/system" { "Open System" }
+                    }
+
+                    section {
                         h2 { "Routing" }
                         ul {
                             li { "BANKING / RU / LOCAL → DIRECT" }
@@ -556,6 +584,98 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                             li { "backup/restore" }
                             li { "git pull + build + restart" }
                         }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let db_ready = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&state.pool)
+        .await
+        .is_ok();
+
+    Html(
+        layout(
+            "System",
+            html! {
+                (admin_bar(&auth))
+                h1 { "System" }
+
+                div class="notice" {
+                    "Deployment target is intentionally small: one release binary, SQLite under /var/lib, env under /etc, systemd as supervisor, and a reverse proxy for HTTPS."
+                }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Deploy mode" }
+                        strong { (DEPLOYMENT_MODE) }
+                    }
+                    div class="metric" {
+                        span { "Version" }
+                        strong { (env!("CARGO_PKG_VERSION")) }
+                    }
+                    div class="metric" {
+                        span { "Database" }
+                        strong {
+                            @if db_ready {
+                                "ready"
+                            } @else {
+                                "not ready"
+                            }
+                        }
+                    }
+                    div class="metric" {
+                        span { "Cookie Secure" }
+                        strong {
+                            @if state.cookie_secure {
+                                "enabled"
+                            } @else {
+                                "disabled"
+                            }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Runtime contract" }
+                    dl class="details" {
+                        dt { "Binary" }
+                        dd { code { "/usr/local/bin/stealthhub-panel" } }
+                        dt { "Environment" }
+                        dd { code { "/etc/stealthhub-panel/stealthhub-panel.env" } }
+                        dt { "Database" }
+                        dd { code { "/var/lib/stealthhub-panel/stealthhub.sqlite" } }
+                        dt { "Service" }
+                        dd { code { "stealthhub-panel.service" } }
+                    }
+                }
+
+                section {
+                    h2 { "Health checks" }
+                    ul {
+                        li { code { "/health" } " returns process liveness." }
+                        li { code { "/ready" } " checks SQLite connectivity." }
+                    }
+                }
+
+                section {
+                    h2 { "Next server controls" }
+                    ul {
+                        li { "service status and restart for the panel itself;" }
+                        li { "journal log viewer;" }
+                        li { "Xray/sing-box/Hysteria/TUIC service status;" }
+                        li { "config validation before apply;" }
+                        li { "atomic config write and rollback." }
                     }
                 }
             },
@@ -1754,6 +1874,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                     a href="/admin" { "Dashboard" }
                     a href="/admin/users" { "Users" }
                     a href="/admin/protocols" { "Protocols" }
+                    a href="/admin/system" { "System" }
                     a href="/health" { "Health" }
                 }
                 (body)
