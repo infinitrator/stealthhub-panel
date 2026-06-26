@@ -1,10 +1,14 @@
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{sqlite::SqlitePoolOptions, FromRow, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    FromRow, SqlitePool,
+};
+use std::{str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
-use crate::models::{ProtocolConfig, ProxyKind, ProxyRole};
+use crate::models::{PanelSettings, ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole};
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct UserRecord {
@@ -87,9 +91,13 @@ pub struct NewProtocolProfile {
 }
 
 pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .foreign_keys(true)
+        .busy_timeout(StdDuration::from_secs(10));
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(database_url)
+        .connect_with(options)
         .await?;
 
     Ok(pool)
@@ -246,6 +254,14 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
+    upsert_setting_if_missing(pool, "panel_name", "StealthHub Panel").await?;
+    upsert_setting_if_missing(pool, "subscription_domain", "atlas.stealthhub.cc").await?;
+    upsert_setting_if_missing(pool, "node_domain", "iberia.stealthhub.cc").await?;
+
+    Ok(())
+}
+
 pub async fn ensure_demo_user(pool: &SqlitePool) -> Result<()> {
     let exists: Option<(i64,)> = sqlx::query_as(
         r#"
@@ -289,6 +305,91 @@ pub async fn ensure_demo_user(pool: &SqlitePool) -> Result<()> {
     .bind(now)
     .execute(pool)
     .await?;
+
+    Ok(())
+}
+
+pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM protocol_profiles")
+        .fetch_one(pool)
+        .await?;
+
+    if count > 0 {
+        return Ok(());
+    }
+
+    let defaults = vec![
+        NewProtocolProfile {
+            name: "VLESS-XHTTP-SAFE".to_string(),
+            kind: ProxyKind::VlessRealityXhttp,
+            role: ProxyRole::AutoSafe,
+            enabled: true,
+            server: "iberia.stealthhub.cc".to_string(),
+            port: 8443,
+            config: ProtocolConfig::VlessRealityXhttp {
+                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                server_name: "www.microsoft.com".to_string(),
+                path: "/api/v1".to_string(),
+                public_key_secret: "xray.reality.public_key".to_string(),
+                short_id_secret: "xray.reality.short_id".to_string(),
+            },
+        },
+        NewProtocolProfile {
+            name: "SS2022-SHADOWTLS-FALLBACK".to_string(),
+            kind: ProxyKind::Shadowsocks2022ShadowTls,
+            role: ProxyRole::Compatibility,
+            enabled: true,
+            server: "iberia.stealthhub.cc".to_string(),
+            port: 9443,
+            config: ProtocolConfig::Shadowsocks2022ShadowTls {
+                server_name: "www.apple.com".to_string(),
+                password_secret: "shadowsocks.2022.password".to_string(),
+                shadow_tls_password_secret: "shadowtls.password".to_string(),
+            },
+        },
+        NewProtocolProfile {
+            name: "ANYTLS-EXPERIMENTAL".to_string(),
+            kind: ProxyKind::AnyTls,
+            role: ProxyRole::Compatibility,
+            enabled: false,
+            server: "iberia.stealthhub.cc".to_string(),
+            port: 10443,
+            config: ProtocolConfig::AnyTls {
+                password_secret: "anytls.password".to_string(),
+                sni: "www.apple.com".to_string(),
+            },
+        },
+        NewProtocolProfile {
+            name: "HYSTERIA2-SPEED".to_string(),
+            kind: ProxyKind::Hysteria2,
+            role: ProxyRole::Speed,
+            enabled: false,
+            server: "iberia.stealthhub.cc".to_string(),
+            port: 443,
+            config: ProtocolConfig::Hysteria2 {
+                password_secret: "hysteria2.password".to_string(),
+                sni: "www.bing.com".to_string(),
+                obfs_password_secret: Some("hysteria2.obfs_password".to_string()),
+            },
+        },
+        NewProtocolProfile {
+            name: "TUIC-SPEED".to_string(),
+            kind: ProxyKind::Tuic,
+            role: ProxyRole::Speed,
+            enabled: false,
+            server: "iberia.stealthhub.cc".to_string(),
+            port: 11443,
+            config: ProtocolConfig::Tuic {
+                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                password_secret: "tuic.password".to_string(),
+                sni: "www.github.com".to_string(),
+            },
+        },
+    ];
+
+    for profile in defaults {
+        create_protocol_profile(pool, profile).await?;
+    }
 
     Ok(())
 }
@@ -501,6 +602,25 @@ pub async fn upsert_setting(pool: &SqlitePool, key: &str, value: &str) -> Result
     Ok(())
 }
 
+async fn upsert_setting_if_missing(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    let now = Utc::now();
+
+    sqlx::query(
+        r#"
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO NOTHING
+        "#,
+    )
+    .bind(key.trim())
+    .bind(value)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<SettingRecord>> {
     let setting = sqlx::query_as::<_, SettingRecord>(
         r#"
@@ -673,6 +793,49 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
     .await?;
 
     Ok(profiles)
+}
+
+pub fn decode_protocol_profile(record: ProtocolProfileRecord) -> Result<ProtocolProfile> {
+    let kind: ProxyKind = serde_json::from_value(serde_json::Value::String(record.kind))?;
+    let role: ProxyRole = serde_json::from_value(serde_json::Value::String(record.role))?;
+    let config: ProtocolConfig = serde_json::from_str(&record.config_json)?;
+    let port = u16::try_from(record.port).map_err(|_| anyhow::anyhow!("invalid protocol port"))?;
+
+    Ok(ProtocolProfile {
+        name: record.name,
+        kind,
+        role,
+        server: record.server,
+        port,
+        enabled: record.enabled,
+        config,
+    })
+}
+
+pub async fn list_protocol_profiles_decoded(pool: &SqlitePool) -> Result<Vec<ProtocolProfile>> {
+    list_protocol_profiles(pool)
+        .await?
+        .into_iter()
+        .map(decode_protocol_profile)
+        .collect()
+}
+
+pub async fn load_panel_settings(pool: &SqlitePool) -> Result<PanelSettings> {
+    let mut settings = PanelSettings::default();
+
+    if let Some(value) = get_setting(pool, "panel_name").await? {
+        settings.panel_name = value.value;
+    }
+
+    if let Some(value) = get_setting(pool, "subscription_domain").await? {
+        settings.subscription_domain = value.value;
+    }
+
+    if let Some(value) = get_setting(pool, "node_domain").await? {
+        settings.node_domain = value.value;
+    }
+
+    Ok(settings)
 }
 
 fn storage_string<T>(value: &T) -> Result<String>
@@ -974,6 +1137,35 @@ mod tests {
 
         let session = get_valid_admin_session(&pool, token_hash).await?;
         assert!(session.is_none());
+
+        close_and_remove(pool, &path).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn admin_sessions_are_removed_with_admin() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+
+        let admin = create_admin(&pool, "admin", "argon2-hash-placeholder").await?;
+        create_admin_session(
+            &pool,
+            admin.id,
+            "session-token-hash",
+            Utc::now() + chrono::Duration::days(1),
+        )
+        .await?;
+
+        sqlx::query("DELETE FROM admins WHERE id = ?")
+            .bind(admin.id)
+            .execute(&pool)
+            .await?;
+
+        let (session_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM admin_sessions")
+            .fetch_one(&pool)
+            .await?;
+
+        assert_eq!(session_count, 0);
 
         close_and_remove(pool, &path).await;
 

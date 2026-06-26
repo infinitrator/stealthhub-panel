@@ -101,6 +101,54 @@ pub enum UserUuidSource {
     StaticSecret,
 }
 
+impl Default for PanelSettings {
+    fn default() -> Self {
+        demo_settings()
+    }
+}
+
+impl ProtocolProfile {
+    pub fn required_secret_names(&self) -> Vec<&str> {
+        match &self.config {
+            ProtocolConfig::VlessRealityXhttp {
+                public_key_secret,
+                short_id_secret,
+                ..
+            }
+            | ProtocolConfig::VlessRealityTcp {
+                public_key_secret,
+                short_id_secret,
+                ..
+            } => vec![public_key_secret.as_str(), short_id_secret.as_str()],
+            ProtocolConfig::Shadowsocks2022ShadowTls {
+                password_secret,
+                shadow_tls_password_secret,
+                ..
+            } => vec![
+                password_secret.as_str(),
+                shadow_tls_password_secret.as_str(),
+            ],
+            ProtocolConfig::Hysteria2 {
+                password_secret,
+                obfs_password_secret,
+                ..
+            } => {
+                let mut names = vec![password_secret.as_str()];
+                if let Some(secret) = obfs_password_secret.as_deref() {
+                    names.push(secret);
+                }
+                names
+            }
+            ProtocolConfig::AnyTls {
+                password_secret, ..
+            }
+            | ProtocolConfig::Tuic {
+                password_secret, ..
+            } => vec![password_secret.as_str()],
+        }
+    }
+}
+
 impl From<UserRecord> for SubscriptionUser {
     fn from(value: UserRecord) -> Self {
         Self {

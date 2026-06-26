@@ -81,9 +81,13 @@ Implemented:
 * initial admin setup page;
 * admin login/logout;
 * Argon2id password hashing;
+* CSRF protection for authenticated admin forms;
+* security headers for web responses;
 * key/value settings storage foundation;
 * local secret-value storage foundation;
 * protocol profile model for Xray/sing-box/Hysteria/TUIC-oriented configs;
+* default protocol-profile seeding;
+* DB-backed Mihomo YAML generation from settings + profiles + secret references;
 * token-based Mihomo subscription endpoint;
 * demo user initialization;
 * basic web GUI;
@@ -92,6 +96,7 @@ Implemented:
 * subscription token reset;
 * user delete;
 * simple HTML error pages for admin actions;
+* protocol overview page;
 * rule-provider endpoints;
 * health endpoint.
 
@@ -106,6 +111,7 @@ POST /admin/login
 POST /admin/logout
 GET  /admin
 GET  /admin/users
+GET  /admin/protocols
 POST /admin/users/create
 POST /admin/users/{id}/toggle
 POST /admin/users/{id}/reset-token
@@ -275,8 +281,10 @@ Planned GUI features:
 * settings storage foundation; ✅
 * secret-value storage foundation; ✅
 * protocol profile model; ✅
+* default protocol profile seeding; ✅
+* protocol overview page; ✅
+* Mihomo config builder from DB-backed profiles; ✅
 * GUI protocol settings;
-* Mihomo config builder;
 * generated config validation;
 * separate profiles for safe, speed, fallback, and balance modes.
 
@@ -319,14 +327,26 @@ Planned security features:
 * admin login; ✅
 * password hashing; ✅
 * server-side session storage; ✅
+* CSRF protection for admin actions; ✅
+* basic security headers; ✅
 * secure session cookies when `STEALTHHUB_COOKIE_SECURE=true`;
 * optional IP allowlist;
+* login rate limiting;
+* 2FA / passkeys;
 * backup and restore;
 * config validation before apply;
 * atomic config updates;
 * rollback on failed service restart.
 
 Current MVP has basic admin authentication, but it is still not production-ready. Do not expose it publicly without HTTPS, a strong admin password, firewall or reverse-proxy restrictions, and careful operational hardening.
+
+Current limitations:
+
+* no 2FA/passkey support yet;
+* no login rate limiting yet;
+* no IP allowlist yet;
+* local secret values are stored in SQLite plaintext for now, so protect the database file and host permissions;
+* destructive actions use CSRF protection but do not yet have dedicated confirmation pages.
 
 Suggested commit message for the current auth/lifecycle milestone:
 

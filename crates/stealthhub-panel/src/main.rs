@@ -3,8 +3,10 @@ use argon2::{
     Argon2,
 };
 use axum::{
+    body::Body,
     extract::{Form, Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
@@ -17,16 +19,19 @@ use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use stealthhub_core::{
-    mihomo::generate_demo_mihomo_yaml,
-    models::{demo_settings, SubscriptionUser},
+    mihomo::generate_mihomo_yaml,
+    models::{ProtocolProfile, ProxyKind, ProxyRole, SubscriptionUser},
     rules::{banking_direct_yaml, direct_local_yaml, proxy_ai_yaml, streaming_yaml},
     storage::{
         admin_count, create_admin, create_admin_session, create_user, delete_admin_session,
-        delete_expired_admin_sessions, delete_user, ensure_demo_user, get_admin_by_id,
-        get_admin_by_username, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
-        list_users, open_pool, reset_user_subscription_token, set_user_enabled,
-        touch_admin_session, AdminRecord, NewUser,
+        delete_expired_admin_sessions, delete_user, ensure_default_protocol_profiles,
+        ensure_default_settings, ensure_demo_user, get_admin_by_id, get_admin_by_username,
+        get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
+        list_protocol_profiles_decoded, list_secret_names, list_users, load_panel_settings,
+        open_pool, reset_user_subscription_token, set_user_enabled, touch_admin_session,
+        AdminRecord, NewUser,
     },
 };
 use tower_http::trace::TraceLayer;
@@ -34,6 +39,8 @@ use tower_http::trace::TraceLayer;
 const ADMIN_SESSION_COOKIE: &str = "stealthhub_admin_session";
 const ADMIN_SESSION_TTL_DAYS: i64 = 7;
 const MIN_ADMIN_PASSWORD_LEN: usize = 12;
+const LOGIN_FAILURE_DELAY_MS: u64 = 500;
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNAjjkqaKvQ$cCpCPgJOl06K2/RHtedp/MTm/4u+0n4JeNlYF00eQj4";
 
 #[derive(Clone)]
 struct AppState {
@@ -46,6 +53,14 @@ struct CreateUserForm {
     username: String,
     #[serde(default)]
     traffic_limit_gb: String,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CsrfForm {
+    #[serde(default)]
+    csrf_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +76,12 @@ struct LoginForm {
     password: String,
 }
 
+#[derive(Debug, Clone)]
+struct AuthenticatedAdmin {
+    admin: AdminRecord,
+    csrf_token: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -74,9 +95,17 @@ async fn main() -> anyhow::Result<()> {
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
+    if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
+        tracing::warn!(
+            "admin session cookie Secure flag is disabled; set STEALTHHUB_COOKIE_SECURE=true behind HTTPS"
+        );
+    }
+
     let pool = open_pool(&db_url).await?;
     init_db(&pool).await?;
+    ensure_default_settings(&pool).await?;
     ensure_demo_user(&pool).await?;
+    ensure_default_protocol_profiles(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
 
     let state = AppState {
@@ -94,17 +123,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/logout", post(logout_action))
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
+        .route("/admin/protocols", get(protocols_page))
         .route("/admin/users/create", post(create_user_action))
         .route("/admin/users/:id/toggle", post(toggle_user_action))
         .route(
             "/admin/users/:id/reset-token",
-            post(reset_user_token_action),
+            get(reset_user_token_page).post(reset_user_token_action),
         )
-        .route("/admin/users/:id/delete", post(delete_user_action))
+        .route(
+            "/admin/users/:id/delete",
+            get(delete_user_page).post(delete_user_action),
+        )
         .route("/health", get(health))
         .route("/sub/:token/mihomo.yaml", get(mihomo_subscription))
         .route("/rules/:name", get(rule_provider))
         .with_state(state)
+        .layer(middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http());
 
     tracing::info!("StealthHub Panel listening on http://{}", bind);
@@ -132,8 +166,20 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
     }
 
     let subscription_user: SubscriptionUser = user.into();
+    let settings = match load_panel_settings(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+    let secrets = match load_secret_values_map(&state.pool, &profiles).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
 
-    let yaml = match generate_demo_mihomo_yaml(&demo_settings(), &subscription_user) {
+    let yaml = match generate_mihomo_yaml(&settings, &subscription_user, &profiles, &secrets) {
         Ok(value) => value,
         Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     };
@@ -377,7 +423,8 @@ async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>
     let admin = match get_admin_by_username(&state.pool, &form.username).await {
         Ok(Some(value)) => value,
         Ok(None) => {
-            return login_failed_response();
+            let _ = verify_password(&form.password, DUMMY_PASSWORD_HASH);
+            return login_failed_response().await;
         }
         Err(err) => {
             return html_error_response_with_back(
@@ -392,7 +439,7 @@ async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>
 
     match verify_password(&form.password, &admin.password_hash) {
         Ok(true) => create_session_redirect(&state, admin.id, "/admin").await,
-        Ok(false) => login_failed_response(),
+        Ok(false) => login_failed_response().await,
         Err(err) => html_error_response_with_back(
             StatusCode::BAD_REQUEST,
             "Login failed",
@@ -403,7 +450,20 @@ async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>
     }
 }
 
-async fn logout_action(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn logout_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
     if let Some(token) = session_token_from_headers(&headers) {
         let token_hash = hash_session_token(&token);
         if let Err(err) = delete_admin_session(&state.pool, &token_hash).await {
@@ -417,7 +477,7 @@ async fn logout_action(State(state): State<AppState>, headers: HeaderMap) -> Res
 }
 
 async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -426,8 +486,27 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         layout(
             "Dashboard",
             html! {
-                (admin_bar(&admin))
+                (admin_bar(&auth))
                 h1 { "Dashboard" }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Admin" }
+                        strong { "protected" }
+                    }
+                    div class="metric" {
+                        span { "Storage" }
+                        strong { "SQLite" }
+                    }
+                    div class="metric" {
+                        span { "Client" }
+                        strong { "Mihomo YAML" }
+                    }
+                    div class="metric" {
+                        span { "Mode" }
+                        strong { "single-node" }
+                    }
+                }
 
                 div class="notice" {
                     strong { "v0.1:" }
@@ -439,6 +518,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                         h2 { "Users" }
                         p { "Создание пользователей и token-based подписок." }
                         a class="button" href="/admin/users" { "Open Users" }
+                    }
+
+                    section {
+                        h2 { "Protocols" }
+                        p { "Профили, secrets и сборка реального Mihomo YAML из SQLite." }
+                        a class="button" href="/admin/protocols" { "Open Protocols" }
                     }
 
                     section {
@@ -480,8 +565,168 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
     .into_response()
 }
 
+async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let settings = match load_panel_settings(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Protocols unavailable",
+                format!("Failed to load panel settings: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Protocols unavailable",
+                format!("Failed to load protocol profiles: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+
+    let secret_names = match list_secret_names(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Protocols unavailable",
+                format!("Failed to load secret names: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+
+    Html(
+        layout(
+            "Protocols",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Protocols" }
+
+                div class="notice" {
+                    "Эта страница уже показывает, из каких профилей и secret names будет собираться подписка `mihomo.yaml`. Следующий шаг после нее — формы редактирования и safe apply на сервер."
+                }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Profiles" }
+                        strong { (profiles.len()) }
+                    }
+                    div class="metric" {
+                        span { "Enabled" }
+                        strong { (profiles.iter().filter(|profile| profile.enabled).count()) }
+                    }
+                    div class="metric" {
+                        span { "Secrets" }
+                        strong { (secret_names.len()) }
+                    }
+                    div class="metric" {
+                        span { "Subscription host" }
+                        strong { (&settings.subscription_domain) }
+                    }
+                }
+
+                section {
+                    h2 { "Panel settings" }
+                    dl class="details" {
+                        dt { "Panel name" }
+                        dd { code { (&settings.panel_name) } }
+                        dt { "Subscription domain" }
+                        dd { code { (&settings.subscription_domain) } }
+                        dt { "Node domain" }
+                        dd { code { (&settings.node_domain) } }
+                    }
+                }
+
+                section {
+                    h2 { "Protocol profiles" }
+                    @if profiles.is_empty() {
+                        p { "No protocol profiles configured yet." }
+                    } @else {
+                        div class="table-wrap" {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Name" }
+                                        th { "Kind" }
+                                        th { "Role" }
+                                        th { "Enabled" }
+                                        th { "Endpoint" }
+                                        th { "Secrets" }
+                                    }
+                                }
+                                tbody {
+                                    @for profile in profiles {
+                                        tr {
+                                            td { code { (&profile.name) } }
+                                            td { (proxy_kind_label(&profile.kind)) }
+                                            td { (proxy_role_label(&profile.role)) }
+                                            td {
+                                                @if profile.enabled {
+                                                    span class="badge ok" { "on" }
+                                                } @else {
+                                                    span class="badge off" { "off" }
+                                                }
+                                            }
+                                            td { code { (format!("{}:{}", profile.server, profile.port)) } }
+                                            td {
+                                                @let missing = missing_secret_names(&profile, &secret_names);
+                                                @if profile.required_secret_names().is_empty() {
+                                                    span class="badge ok" { "none" }
+                                                } @else if missing.is_empty() {
+                                                    span class="badge ok" { "ready" }
+                                                    br;
+                                                    @for secret in profile.required_secret_names() {
+                                                        code { (secret) }
+                                                        " "
+                                                    }
+                                                } @else {
+                                                    span class="badge off" { "missing" }
+                                                    br;
+                                                    @for secret in missing {
+                                                        code { (secret) }
+                                                        " "
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Current public outputs" }
+                    ul {
+                        li { code { "/sub/{token}/mihomo.yaml" } " now uses DB-backed settings and profiles." }
+                        li { code { "/rules/banking-direct.yaml" } ", " code { "/rules/direct-local.yaml" } ", " code { "/rules/proxy-ai.yaml" } ", " code { "/rules/streaming.yaml" } " remain static built-ins for now." }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
 async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let admin = match require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -509,7 +754,7 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         layout(
             "Users",
             html! {
-                (admin_bar(&admin))
+                (admin_bar(&auth))
                 h1 { "Users" }
 
                 div class="notice" {
@@ -519,6 +764,7 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 section {
                     h2 { "Create user" }
                     form method="post" action="/admin/users/create" class="form" {
+                        (csrf_field(&auth.csrf_token))
                         label {
                             span { "Username" }
                             input type="text" name="username" placeholder="fedor-phone" required;
@@ -539,67 +785,66 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                     @if users.is_empty() {
                         p { "No users yet." }
                     } @else {
-                        table {
-                            thead {
-                                tr {
-                                    th { "ID" }
-                                    th { "Username" }
-                                    th { "Enabled" }
-                                    th { "UUID" }
-                                    th { "Subscription" }
-                                    th { "Traffic" }
-                                    th { "Actions" }
-                                }
-                            }
-                            tbody {
-                                @for user in users {
+                        div class="table-wrap" {
+                            table {
+                                thead {
                                     tr {
-                                        td { (user.id) }
-                                        td { (user.username) }
-                                        td {
-                                            @if user.enabled {
-                                                span class="badge ok" { "on" }
-                                            } @else {
-                                                span class="badge off" { "off" }
-                                            }
-                                        }
-                                        td {
-                                            code { (user.uuid) }
-                                        }
-                                        td {
-                                            code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) }
-                                            br;
-                                            a href=(format!("/sub/{}/mihomo.yaml", user.subscription_token)) { "download" }
-                                        }
-                                        td {
-                                            (format_bytes(user.traffic_used_bytes))
-                                            " / "
-                                            @match user.traffic_limit_bytes {
-                                                Some(limit) => {
-                                                    (format_bytes(limit))
-                                                },
-                                                None => {
-                                                    "unlimited"
-                                                },
-                                            }
-                                        }
-                                        td {
-                                            @if user.enabled {
-                                                form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
-                                                    button type="submit" { "Disable" }
-                                                }
-                                            } @else {
-                                                form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
-                                                    button type="submit" { "Enable" }
+                                        th { "ID" }
+                                        th { "Username" }
+                                        th { "Enabled" }
+                                        th { "UUID" }
+                                        th { "Subscription" }
+                                        th { "Traffic" }
+                                        th { "Actions" }
+                                    }
+                                }
+                                tbody {
+                                    @for user in users {
+                                        tr {
+                                            td { (user.id) }
+                                            td { (user.username) }
+                                            td {
+                                                @if user.enabled {
+                                                    span class="badge ok" { "on" }
+                                                } @else {
+                                                    span class="badge off" { "off" }
                                                 }
                                             }
-
-                                            form method="post" action=(format!("/admin/users/{}/reset-token", user.id)) class="inline-form" {
-                                                button type="submit" { "Reset token" }
+                                            td {
+                                                code { (user.uuid) }
                                             }
+                                            td {
+                                                code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) }
+                                                br;
+                                                a href=(format!("/sub/{}/mihomo.yaml", user.subscription_token)) { "download" }
+                                            }
+                                            td {
+                                                (format_bytes(user.traffic_used_bytes))
+                                                " / "
+                                                @match user.traffic_limit_bytes {
+                                                    Some(limit) => {
+                                                        (format_bytes(limit))
+                                                    },
+                                                    None => {
+                                                        "unlimited"
+                                                    },
+                                                }
+                                            }
+                                            td {
+                                                @if user.enabled {
+                                                    form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
+                                                        (csrf_field(&auth.csrf_token))
+                                                        button type="submit" { "Disable" }
+                                                    }
+                                                } @else {
+                                                    form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
+                                                        (csrf_field(&auth.csrf_token))
+                                                        button type="submit" { "Enable" }
+                                                    }
+                                                }
 
-                                            form method="post" action=(format!("/admin/users/{}/delete", user.id)) class="inline-form" onsubmit="return confirm('Delete this user?');" {
-                                                button type="submit" class="danger" { "Delete" }
+                                                a class="button compact" href=(format!("/admin/users/{}/reset-token", user.id)) { "Reset token" }
+                                                a class="button compact danger" href=(format!("/admin/users/{}/delete", user.id)) { "Delete" }
                                             }
                                         }
                                     }
@@ -620,7 +865,12 @@ async fn create_user_action(
     headers: HeaderMap,
     Form(form): Form<CreateUserForm>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
         return response;
     }
 
@@ -683,8 +933,14 @@ async fn toggle_user_action(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
         return response;
     }
 
@@ -709,12 +965,80 @@ async fn toggle_user_action(
     }
 }
 
-async fn reset_user_token_action(
+async fn reset_user_token_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let user = match get_user_by_id(&state.pool, id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "User not found",
+                format!("Failed to find user: {err}"),
+            );
+        }
+    };
+
+    Html(
+        layout(
+            "Reset token",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Reset token" }
+
+                section class="confirm-panel" {
+                    h2 { "Confirm subscription token reset" }
+                    p {
+                        "Old subscription URL for "
+                        strong { (user.username) }
+                        " will stop working immediately. The user will need the new URL."
+                    }
+                    dl class="details" {
+                        dt { "Current subscription" }
+                        dd { code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) } }
+                        dt { "Status" }
+                        dd {
+                            @if user.enabled {
+                                span class="badge ok" { "on" }
+                            } @else {
+                                span class="badge off" { "off" }
+                            }
+                        }
+                    }
+                    div class="actions" {
+                        form method="post" action=(format!("/admin/users/{}/reset-token", user.id)) class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            button type="submit" class="danger" { "Reset token" }
+                        }
+                        a class="button secondary" href="/admin/users" { "Cancel" }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn reset_user_token_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
         return response;
     }
 
@@ -728,12 +1052,87 @@ async fn reset_user_token_action(
     }
 }
 
-async fn delete_user_action(
+async fn delete_user_page(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    if let Err(response) = require_admin(&state, &headers).await {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let user = match get_user_by_id(&state.pool, id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "User not found",
+                format!("Failed to find user: {err}"),
+            );
+        }
+    };
+
+    Html(
+        layout(
+            "Delete user",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Delete user" }
+
+                section class="confirm-panel danger-zone" {
+                    h2 { "Confirm user deletion" }
+                    p {
+                        "This removes "
+                        strong { (user.username) }
+                        " from the panel and invalidates the subscription token. Proxy server config cleanup will be handled by the future safe-apply flow."
+                    }
+                    dl class="details" {
+                        dt { "UUID" }
+                        dd { code { (user.uuid) } }
+                        dt { "Subscription" }
+                        dd { code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) } }
+                        dt { "Traffic" }
+                        dd {
+                            (format_bytes(user.traffic_used_bytes))
+                            " / "
+                            @match user.traffic_limit_bytes {
+                                Some(limit) => {
+                                    (format_bytes(limit))
+                                },
+                                None => {
+                                    "unlimited"
+                                },
+                            }
+                        }
+                    }
+                    div class="actions" {
+                        form method="post" action=(format!("/admin/users/{}/delete", user.id)) class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            button type="submit" class="danger" { "Delete user" }
+                        }
+                        a class="button secondary" href="/admin/users" { "Cancel" }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn delete_user_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
         return response;
     }
 
@@ -747,7 +1146,10 @@ async fn delete_user_action(
     }
 }
 
-async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AdminRecord, Response> {
+async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedAdmin, Response> {
     match current_admin(state, headers).await {
         Ok(Some(admin)) => Ok(admin),
         Ok(None) => match admin_count(&state.pool).await {
@@ -774,7 +1176,7 @@ async fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<AdminRec
 async fn current_admin(
     state: &AppState,
     headers: &HeaderMap,
-) -> anyhow::Result<Option<AdminRecord>> {
+) -> anyhow::Result<Option<AuthenticatedAdmin>> {
     let Some(token) = session_token_from_headers(headers) else {
         return Ok(None);
     };
@@ -791,7 +1193,10 @@ async fn current_admin(
         delete_admin_session(&state.pool, &token_hash).await?;
     }
 
-    Ok(admin)
+    Ok(admin.map(|admin| AuthenticatedAdmin {
+        admin,
+        csrf_token: csrf_token_for_session_token(&token),
+    }))
 }
 
 async fn create_session_redirect(state: &AppState, admin_id: i64, location: &str) -> Response {
@@ -847,6 +1252,13 @@ fn hash_session_token(token: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
 }
 
+fn csrf_token_for_session_token(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"stealthhub-admin-csrf-v1:");
+    hasher.update(token.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
 fn session_token_from_headers(headers: &HeaderMap) -> Option<String> {
     let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
 
@@ -886,7 +1298,9 @@ fn append_session_cookie(response: &mut Response, cookie: Cookie<'static>) {
     );
 }
 
-fn login_failed_response() -> Response {
+async fn login_failed_response() -> Response {
+    tokio::time::sleep(std::time::Duration::from_millis(LOGIN_FAILURE_DELAY_MS)).await;
+
     html_error_response_with_back(
         StatusCode::UNAUTHORIZED,
         "Login failed",
@@ -896,15 +1310,119 @@ fn login_failed_response() -> Response {
     )
 }
 
-fn admin_bar(admin: &AdminRecord) -> Markup {
+fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Response> {
+    if csrf_token == auth.csrf_token {
+        return None;
+    }
+
+    Some(html_error_response_with_back(
+        StatusCode::FORBIDDEN,
+        "Request blocked",
+        "Security token is missing or invalid. Please reload the page and try again.",
+        "/admin/users",
+        "Back to Users",
+    ))
+}
+
+fn csrf_field(token: &str) -> Markup {
+    html! {
+        input type="hidden" name="csrf_token" value=(token);
+    }
+}
+
+async fn load_secret_values_map(
+    pool: &SqlitePool,
+    profiles: &[ProtocolProfile],
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut secrets = HashMap::new();
+
+    for secret_name in profiles
+        .iter()
+        .flat_map(ProtocolProfile::required_secret_names)
+    {
+        if secrets.contains_key(secret_name) {
+            continue;
+        }
+
+        if let Some(secret) = get_secret(pool, secret_name).await? {
+            secrets.insert(secret_name.to_string(), secret.value);
+        }
+    }
+
+    Ok(secrets)
+}
+
+fn missing_secret_names(profile: &ProtocolProfile, present_secret_names: &[String]) -> Vec<String> {
+    profile
+        .required_secret_names()
+        .into_iter()
+        .filter(|name| !present_secret_names.iter().any(|present| present == name))
+        .map(str::to_string)
+        .collect()
+}
+
+fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
+    match kind {
+        ProxyKind::VlessRealityXhttp => "VLESS + REALITY + XHTTP",
+        ProxyKind::VlessRealityTcp => "VLESS + REALITY + TCP",
+        ProxyKind::Shadowsocks2022ShadowTls => "SS2022 + ShadowTLS",
+        ProxyKind::Hysteria2 => "Hysteria2",
+        ProxyKind::AnyTls => "AnyTLS",
+        ProxyKind::Tuic => "TUIC",
+    }
+}
+
+fn proxy_role_label(role: &ProxyRole) -> &'static str {
+    match role {
+        ProxyRole::AutoSafe => "AUTO-SAFE",
+        ProxyRole::Speed => "SPEED",
+        ProxyRole::Compatibility => "COMPAT",
+        ProxyRole::RuAccess => "RU-ACCESS",
+        ProxyRole::Manual => "MANUAL",
+    }
+}
+
+fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
     html! {
         div class="admin-bar" {
-            span { "Signed in as " strong { (admin.username) } }
+            span { "Signed in as " strong { (auth.admin.username) } }
             form method="post" action="/admin/logout" class="inline-form" {
+                (csrf_field(&auth.csrf_token))
                 button type="submit" { "Logout" }
             }
         }
     }
+}
+
+async fn security_headers(request: Request<Body>, next: Next) -> Response {
+    let is_admin_path = request.uri().path().starts_with("/admin");
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+
+    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        "Permissions-Policy",
+        "camera=(), microphone=(), geolocation=(), payment=()"
+            .parse()
+            .unwrap(),
+    );
+
+    if is_admin_path {
+        headers.insert(
+            header::CACHE_CONTROL,
+            "no-store, max-age=0".parse().unwrap(),
+        );
+    }
+
+    response
 }
 
 fn html_error_response(
@@ -965,63 +1483,124 @@ fn layout(title: &str, body: Markup) -> Markup {
                     :root {
                         color-scheme: dark;
                         font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                        background: #0b0f14;
+                        background: #090d12;
                         color: #e5edf5;
+                        --bg: #090d12;
+                        --panel: #111821;
+                        --panel-soft: #0f151d;
+                        --border: #253244;
+                        --border-strong: #3a5270;
+                        --text: #e5edf5;
+                        --muted: #9fb0c3;
+                        --accent: #5aa7ff;
+                        --ok-bg: #0d3125;
+                        --ok-text: #9be7bf;
+                        --danger-bg: #351515;
+                        --danger-text: #ffb3b3;
                     }
+                    * { box-sizing: border-box; }
                     body {
                         max-width: 1200px;
                         margin: 0 auto;
-                        padding: 32px 18px;
+                        padding: 24px 18px 40px;
+                        background: var(--bg);
+                        color: var(--text);
                     }
-                    a { color: inherit; }
-                    h1 { font-size: 32px; margin-bottom: 8px; }
-                    h2 { margin-top: 0; }
+                    a {
+                        color: inherit;
+                        text-underline-offset: 3px;
+                    }
+                    h1 {
+                        font-size: 30px;
+                        line-height: 1.15;
+                        margin: 0 0 10px;
+                    }
+                    h2 {
+                        margin: 0 0 12px;
+                        font-size: 18px;
+                    }
+                    p { color: var(--muted); }
                     code {
                         display: inline-block;
-                        padding: 6px 8px;
-                        border-radius: 8px;
-                        background: #101820;
+                        padding: 4px 7px;
+                        border-radius: 6px;
+                        background: #0c121a;
+                        border: 1px solid #1e2a39;
                         color: #b8d7ff;
                         word-break: break-all;
+                    }
+                    .top-nav {
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 8px;
+                        margin-bottom: 22px;
+                        padding: 10px 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        background: #0d141d;
+                    }
+                    .top-nav a {
+                        padding: 6px 8px;
+                        border-radius: 6px;
+                        color: var(--muted);
+                        text-decoration: none;
+                    }
+                    .top-nav a:hover {
+                        color: var(--text);
+                        background: #172235;
                     }
                     .cards, .grid {
                         display: grid;
                         grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-                        gap: 14px;
-                        margin-top: 24px;
+                        gap: 12px;
+                        margin-top: 18px;
                     }
                     .card, section, .notice {
-                        background: #111821;
-                        border: 1px solid #223042;
-                        border-radius: 14px;
-                        padding: 18px;
+                        background: var(--panel);
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        padding: 16px;
                         text-decoration: none;
                     }
                     .card:hover, .button:hover, button:hover {
-                        border-color: #4c85ff;
+                        border-color: var(--accent);
                     }
                     .notice {
-                        margin: 20px 0;
-                        background: #161c24;
+                        margin: 16px 0;
+                        background: var(--panel-soft);
+                        color: var(--muted);
                     }
                     .error {
                         border-color: #ef4444;
+                        color: var(--danger-text);
                     }
                     li { margin: 6px 0; }
                     .button, button {
                         display: inline-block;
-                        padding: 10px 14px;
-                        border-radius: 10px;
-                        border: 1px solid #31507a;
+                        min-height: 36px;
+                        padding: 8px 12px;
+                        border-radius: 6px;
+                        border: 1px solid var(--border-strong);
                         background: #172235;
-                        color: #e5edf5;
+                        color: var(--text);
                         text-decoration: none;
                         cursor: pointer;
-                        font-weight: 700;
+                        font-weight: 650;
+                    }
+                    .button.compact {
+                        min-height: 32px;
+                        padding: 6px 10px;
+                        margin: 0 6px 6px 0;
+                    }
+                    .button.secondary {
+                        border-color: var(--border);
+                        background: #0d141d;
+                        color: var(--muted);
                     }
                     .form {
                         display: grid;
-                        gap: 14px;
+                        gap: 12px;
                         max-width: 520px;
                     }
                     label {
@@ -1029,33 +1608,48 @@ fn layout(title: &str, body: Markup) -> Markup {
                         gap: 6px;
                     }
                     label span {
-                        color: #b7c3d2;
+                        color: var(--muted);
                         font-size: 14px;
                     }
                     input {
-                        padding: 12px;
-                        border-radius: 10px;
-                        border: 1px solid #26374c;
+                        width: 100%;
+                        min-height: 40px;
+                        padding: 10px 11px;
+                        border-radius: 6px;
+                        border: 1px solid var(--border);
                         background: #0c121a;
-                        color: #e5edf5;
+                        color: var(--text);
                         font-size: 16px;
+                    }
+                    input:focus {
+                        outline: 2px solid rgba(90, 167, 255, 0.35);
+                        border-color: var(--accent);
+                    }
+                    .table-wrap {
+                        overflow-x: auto;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
                     }
                     table {
                         width: 100%;
                         border-collapse: collapse;
-                        overflow: hidden;
+                        min-width: 860px;
                     }
                     th, td {
                         text-align: left;
-                        border-bottom: 1px solid #223042;
-                        padding: 12px 8px;
+                        border-bottom: 1px solid var(--border);
+                        padding: 11px 10px;
                         vertical-align: top;
                     }
+                    tbody tr:hover {
+                        background: rgba(90, 167, 255, 0.04);
+                    }
                     th {
-                        color: #b7c3d2;
+                        color: var(--muted);
                         font-size: 13px;
                         text-transform: uppercase;
-                        letter-spacing: 0.06em;
+                        letter-spacing: 0.04em;
+                        background: #0f151d;
                     }
                     .badge {
                         display: inline-block;
@@ -1065,12 +1659,12 @@ fn layout(title: &str, body: Markup) -> Markup {
                         font-size: 12px;
                     }
                     .badge.ok {
-                        background: #0f3a2a;
-                        color: #9ff0c0;
+                        background: var(--ok-bg);
+                        color: var(--ok-text);
                     }
                     .badge.off {
-                        background: #3a1414;
-                        color: #ffb0b0;
+                        background: var(--danger-bg);
+                        color: var(--danger-text);
                     }
                     .inline-form {
                         display: inline-block;
@@ -1083,31 +1677,105 @@ fn layout(title: &str, body: Markup) -> Markup {
                         gap: 12px;
                         margin-bottom: 20px;
                         padding: 12px 14px;
-                        border: 1px solid #223042;
-                        border-radius: 10px;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
                         background: #101820;
                     }
-
-                    button.danger {
+                    .status-strip {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                        gap: 10px;
+                        margin: 18px 0;
+                    }
+                    .metric {
+                        padding: 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        background: #0d141d;
+                    }
+                    .metric span {
+                        display: block;
+                        color: var(--muted);
+                        font-size: 12px;
+                        text-transform: uppercase;
+                        letter-spacing: 0.04em;
+                    }
+                    .metric strong {
+                        display: block;
+                        margin-top: 4px;
+                    }
+                    .actions {
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        gap: 8px;
+                        margin-top: 16px;
+                    }
+                    .details {
+                        display: grid;
+                        grid-template-columns: max-content minmax(0, 1fr);
+                        gap: 8px 14px;
+                        margin: 16px 0 0;
+                    }
+                    .details dt {
+                        color: var(--muted);
+                        font-size: 13px;
+                    }
+                    .details dd {
+                        min-width: 0;
+                        margin: 0;
+                    }
+                    .danger-zone {
                         border-color: #7f1d1d;
-                        background: #3a1414;
-                        color: #ffb0b0;
+                    }
+
+                    .button.danger, button.danger {
+                        border-color: #7f1d1d;
+                        background: var(--danger-bg);
+                        color: var(--danger-text);
+                    }
+                    @media (max-width: 640px) {
+                        body { padding: 16px 12px 32px; }
+                        h1 { font-size: 26px; }
+                        .admin-bar {
+                            align-items: flex-start;
+                            flex-direction: column;
+                        }
+                        .details {
+                            grid-template-columns: 1fr;
+                        }
                     }
                     "#))
                 }
             }
             body {
-                nav style="margin-bottom: 20px;" {
+                nav class="top-nav" {
                     a href="/" { "Home" }
-                    " · "
                     a href="/admin" { "Dashboard" }
-                    " · "
                     a href="/admin/users" { "Users" }
-                    " · "
+                    a href="/admin/protocols" { "Protocols" }
                     a href="/health" { "Health" }
                 }
                 (body)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csrf_token_is_derived_from_session_token() {
+        let session_token = "session-token";
+        let csrf_token = csrf_token_for_session_token(session_token);
+
+        assert_eq!(csrf_token, csrf_token_for_session_token(session_token));
+        assert_ne!(csrf_token, session_token);
+        assert_ne!(
+            csrf_token,
+            csrf_token_for_session_token("other-session-token")
+        );
     }
 }
