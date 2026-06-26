@@ -81,6 +81,7 @@ Implemented:
 * initial admin setup page;
 * admin login/logout;
 * Argon2id password hashing;
+* in-memory login rate limiting;
 * CSRF protection for authenticated admin forms;
 * security headers for web responses;
 * key/value settings storage foundation;
@@ -89,7 +90,7 @@ Implemented:
 * default protocol-profile seeding;
 * DB-backed Mihomo YAML generation from settings + profiles + secret references;
 * token-based Mihomo subscription endpoint;
-* demo user initialization;
+* optional demo user initialization for local development;
 * basic web GUI;
 * user creation;
 * user enable/disable;
@@ -178,6 +179,7 @@ Run locally:
 ```bash
 STEALTHHUB_BIND=127.0.0.1:8080 \
 STEALTHHUB_DB='sqlite://./stealthhub.sqlite?mode=rwc' \
+STEALTHHUB_ENABLE_DEMO_USER=true \
 cargo run -p stealthhub-panel
 ```
 
@@ -200,6 +202,8 @@ http://127.0.0.1:8080/ready
 ```
 
 On the first run, open `/admin` or `/admin/setup` and create the first admin account. After that, `/admin` and `/admin/users` require login. Public subscription and rule-provider endpoints stay public so Mihomo-compatible clients can fetch configs.
+
+The local demo subscription at `/sub/demo/mihomo.yaml` is created only when `STEALTHHUB_ENABLE_DEMO_USER=true`. Keep it disabled on production servers.
 
 Generate demo Mihomo YAML from CLI:
 
@@ -309,7 +313,7 @@ Planned GUI features:
 
 * SQLite users;
 * token-based subscriptions;
-* demo user;
+* optional demo user;
 * basic users page;
 * create user form.
 
@@ -389,7 +393,7 @@ Planned security features:
 * basic security headers; ✅
 * secure session cookies when `STEALTHHUB_COOKIE_SECURE=true`;
 * optional IP allowlist;
-* login rate limiting;
+* login rate limiting; ✅
 * 2FA / passkeys;
 * backup and restore;
 * config validation before apply;
@@ -401,7 +405,7 @@ Current MVP has basic admin authentication, but it is still not production-ready
 Current limitations:
 
 * no 2FA/passkey support yet;
-* no login rate limiting yet;
+* login rate limiting is in-memory and resets on panel restart;
 * no IP allowlist yet;
 * local secret values are stored in SQLite plaintext for now, so protect the database file and host permissions;
 * destructive actions use CSRF protection but do not yet have dedicated confirmation pages.

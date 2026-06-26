@@ -4,6 +4,7 @@ use argon2::{
 };
 use axum::{
     body::Body,
+    extract::connect_info::ConnectInfo,
     extract::{Form, Path, State},
     http::{header, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
@@ -19,7 +20,12 @@ use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
+};
 use stealthhub_core::{
     mihomo::generate_mihomo_yaml,
     models::{ProtocolProfile, ProxyKind, ProxyRole, SubscriptionUser},
@@ -42,11 +48,25 @@ const MIN_ADMIN_PASSWORD_LEN: usize = 12;
 const LOGIN_FAILURE_DELAY_MS: u64 = 500;
 const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNAjjkqaKvQ$cCpCPgJOl06K2/RHtedp/MTm/4u+0n4JeNlYF00eQj4";
 const DEPLOYMENT_MODE: &str = "bare-metal systemd";
+const LOGIN_RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
+const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
 
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
     cookie_secure: bool,
+    login_limiter: Arc<LoginRateLimiter>,
+}
+
+#[derive(Debug, Default)]
+struct LoginRateLimiter {
+    attempts: Mutex<HashMap<String, LoginAttempt>>,
+}
+
+#[derive(Debug, Clone)]
+struct LoginAttempt {
+    failures: u32,
+    window_started_at: Instant,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +115,9 @@ async fn main() -> anyhow::Result<()> {
     let cookie_secure = std::env::var("STEALTHHUB_COOKIE_SECURE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    let enable_demo_user = std::env::var("STEALTHHUB_ENABLE_DEMO_USER")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
 
     if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
         tracing::warn!(
@@ -105,13 +128,16 @@ async fn main() -> anyhow::Result<()> {
     let pool = open_pool(&db_url).await?;
     init_db(&pool).await?;
     ensure_default_settings(&pool).await?;
-    ensure_demo_user(&pool).await?;
+    if enable_demo_user {
+        ensure_demo_user(&pool).await?;
+    }
     ensure_default_protocol_profiles(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
 
     let state = AppState {
         pool,
         cookie_secure,
+        login_limiter: Arc::new(LoginRateLimiter::default()),
     };
 
     let app = Router::new()
@@ -147,7 +173,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("StealthHub Panel listening on http://{}", bind);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }
@@ -437,15 +467,26 @@ async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
     .into_response()
 }
 
-async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+async fn login_action(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     if let Ok(0) = admin_count(&state.pool).await {
         return Redirect::to("/admin/setup").into_response();
+    }
+
+    let rate_limit_keys = login_rate_limit_keys(&headers, peer_addr, &form.username);
+    if let Some(retry_after) = state.login_limiter.retry_after(&rate_limit_keys) {
+        return rate_limited_response(retry_after);
     }
 
     let admin = match get_admin_by_username(&state.pool, &form.username).await {
         Ok(Some(value)) => value,
         Ok(None) => {
             let _ = verify_password(&form.password, DUMMY_PASSWORD_HASH);
+            state.login_limiter.record_failure(&rate_limit_keys);
             return login_failed_response().await;
         }
         Err(err) => {
@@ -460,8 +501,14 @@ async fn login_action(State(state): State<AppState>, Form(form): Form<LoginForm>
     };
 
     match verify_password(&form.password, &admin.password_hash) {
-        Ok(true) => create_session_redirect(&state, admin.id, "/admin").await,
-        Ok(false) => login_failed_response().await,
+        Ok(true) => {
+            state.login_limiter.record_success(&rate_limit_keys);
+            create_session_redirect(&state, admin.id, "/admin").await
+        }
+        Ok(false) => {
+            state.login_limiter.record_failure(&rate_limit_keys);
+            login_failed_response().await
+        }
         Err(err) => html_error_response_with_back(
             StatusCode::BAD_REQUEST,
             "Login failed",
@@ -1430,6 +1477,123 @@ async fn login_failed_response() -> Response {
     )
 }
 
+fn rate_limited_response(retry_after: StdDuration) -> Response {
+    let retry_after_secs = retry_after.as_secs().max(1).to_string();
+    let mut response = html_error_response_with_back(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Login temporarily blocked",
+        "Too many failed login attempts. Please wait and try again.",
+        "/admin/login",
+        "Back to Login",
+    );
+
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        retry_after_secs
+            .parse()
+            .expect("retry-after seconds must be a valid header"),
+    );
+
+    response
+}
+
+fn login_rate_limit_keys(
+    headers: &HeaderMap,
+    peer_addr: SocketAddr,
+    username: &str,
+) -> Vec<String> {
+    let username = username.trim().to_ascii_lowercase();
+    let username = if username.is_empty() {
+        "<empty>".to_string()
+    } else {
+        username
+    };
+
+    vec![
+        format!("username:{username}"),
+        format!("source:{}", login_source_hint(headers, peer_addr)),
+    ]
+}
+
+fn login_source_hint(headers: &HeaderMap, peer_addr: SocketAddr) -> String {
+    if peer_addr.ip().is_loopback() {
+        if let Some(forwarded) = trusted_forwarded_source(headers) {
+            return forwarded;
+        }
+    }
+
+    peer_addr.ip().to_string()
+}
+
+fn trusted_forwarded_source(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+impl LoginRateLimiter {
+    fn retry_after(&self, keys: &[String]) -> Option<StdDuration> {
+        let now = Instant::now();
+        let mut attempts = self
+            .attempts
+            .lock()
+            .expect("login limiter mutex should not be poisoned");
+
+        keys.iter()
+            .filter_map(|key| {
+                let attempt = attempts.get_mut(key)?;
+                if now.duration_since(attempt.window_started_at) >= LOGIN_RATE_LIMIT_WINDOW {
+                    attempts.remove(key);
+                    return None;
+                }
+
+                (attempt.failures >= LOGIN_RATE_LIMIT_MAX_FAILURES).then(|| {
+                    LOGIN_RATE_LIMIT_WINDOW
+                        .saturating_sub(now.duration_since(attempt.window_started_at))
+                })
+            })
+            .max()
+    }
+
+    fn record_failure(&self, keys: &[String]) {
+        let now = Instant::now();
+        let mut attempts = self
+            .attempts
+            .lock()
+            .expect("login limiter mutex should not be poisoned");
+
+        for key in keys {
+            let attempt = attempts.entry(key.clone()).or_insert(LoginAttempt {
+                failures: 0,
+                window_started_at: now,
+            });
+
+            if now.duration_since(attempt.window_started_at) >= LOGIN_RATE_LIMIT_WINDOW {
+                attempt.failures = 0;
+                attempt.window_started_at = now;
+            }
+
+            attempt.failures = attempt.failures.saturating_add(1);
+        }
+    }
+
+    fn record_success(&self, keys: &[String]) {
+        let mut attempts = self
+            .attempts
+            .lock()
+            .expect("login limiter mutex should not be poisoned");
+
+        for key in keys {
+            attempts.remove(key);
+        }
+    }
+}
+
 fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Response> {
     if csrf_token == auth.csrf_token {
         return None;
@@ -1897,6 +2061,55 @@ mod tests {
         assert_ne!(
             csrf_token,
             csrf_token_for_session_token("other-session-token")
+        );
+    }
+
+    #[test]
+    fn login_rate_limiter_blocks_after_failures_and_clears_on_success() {
+        let limiter = LoginRateLimiter::default();
+        let keys = vec!["username:admin".to_string()];
+
+        for _ in 0..LOGIN_RATE_LIMIT_MAX_FAILURES {
+            assert!(limiter.retry_after(&keys).is_none());
+            limiter.record_failure(&keys);
+        }
+
+        assert!(limiter.retry_after(&keys).is_some());
+        limiter.record_success(&keys);
+        assert!(limiter.retry_after(&keys).is_none());
+    }
+
+    #[test]
+    fn login_rate_limit_keys_normalize_username_and_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            " 203.0.113.10, 10.0.0.1".parse().unwrap(),
+        );
+
+        let peer_addr = "127.0.0.1:42300".parse().unwrap();
+
+        assert_eq!(
+            login_rate_limit_keys(&headers, peer_addr, " Admin "),
+            vec![
+                "username:admin".to_string(),
+                "source:203.0.113.10".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn login_rate_limit_keys_ignore_forwarded_source_from_non_loopback_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.10".parse().unwrap());
+        let peer_addr = "198.51.100.20:42300".parse().unwrap();
+
+        assert_eq!(
+            login_rate_limit_keys(&headers, peer_addr, "admin"),
+            vec![
+                "username:admin".to_string(),
+                "source:198.51.100.20".to_string()
+            ]
         );
     }
 }
