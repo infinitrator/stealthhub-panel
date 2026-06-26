@@ -1,0 +1,26 @@
+[Unit]
+Description=StealthHub TUIC Core
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=stealthhub
+Group=stealthhub
+ExecStart=/opt/stealthhub/cores/tuic/current/tuic-server -c /etc/stealthhub-cores/tuic/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/stealthhub-cores/tuic
+ReadOnlyPaths=/opt/stealthhub/cores/tuic
+ReadWritePaths=/var/log/stealthhub-cores
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

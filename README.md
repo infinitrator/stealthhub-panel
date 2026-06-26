@@ -99,6 +99,9 @@ Implemented:
 * simple HTML error pages for admin actions;
 * protocol overview page;
 * system overview page;
+* proxy cores overview page;
+* proxy core systemd templates;
+* proxy core config placeholders;
 * readiness endpoint with SQLite check;
 * bare-metal systemd deployment templates;
 * rule-provider endpoints;
@@ -117,6 +120,7 @@ GET  /admin
 GET  /admin/users
 GET  /admin/protocols
 GET  /admin/system
+GET  /admin/cores
 POST /admin/users/create
 POST /admin/users/{id}/toggle
 POST /admin/users/{id}/reset-token
@@ -225,6 +229,7 @@ Repository deployment templates:
 deploy/stealthhub-panel.env.example
 deploy/stealthhub-panel.service
 deploy/nginx-stealthhub-panel.conf.example
+deploy/cores/
 ```
 
 Expected server layout:
@@ -255,6 +260,53 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
 systemctl status stealthhub-panel
 ```
+
+---
+
+## Proxy cores
+
+The panel is designed to control external proxy cores instead of embedding protocol implementations.
+
+Initial runtime stack:
+
+| Core     | Role                                             | Service                         |
+| -------- | ------------------------------------------------ | ------------------------------- |
+| Xray     | VLESS + REALITY + XHTTP/TCP primary profile      | `stealthhub-xray.service`       |
+| sing-box | SS2022 + ShadowTLS, AnyTLS compatibility profile | `stealthhub-sing-box.service`   |
+| Hysteria | Hysteria2 speed fallback                         | `stealthhub-hysteria.service`   |
+| TUIC     | optional TUIC speed fallback                     | `stealthhub-tuic.service`       |
+
+Repository templates:
+
+```text
+deploy/cores/README.md
+deploy/cores/core-update-manifest.example.toml
+deploy/cores/systemd/*.service
+deploy/cores/configs/*
+```
+
+Expected runtime layout:
+
+```text
+/opt/stealthhub/cores/{core}/{version}
+/opt/stealthhub/cores/{core}/current
+/etc/stealthhub-cores/{core}/config.*
+/var/lib/stealthhub-panel/core-updates/{core}/{version}
+```
+
+Safe update policy:
+
+```text
+download to staging
+verify SHA256
+validate binary and config
+switch current symlink atomically
+restart one service
+check health and journal
+roll back symlink if the service fails
+```
+
+Do not overwrite active core binaries in place. Do not let the panel download and execute a release without checksum verification and config validation.
 
 ---
 
@@ -350,6 +402,8 @@ Planned GUI features:
 
 * bare-metal deployment target; ✅
 * system overview page; ✅
+* proxy cores overview page; ✅
+* proxy core service templates; ✅
 * readiness endpoint; ✅
 * systemd service template; ✅
 * service status;

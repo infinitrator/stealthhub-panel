@@ -50,6 +50,55 @@ const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNA
 const DEPLOYMENT_MODE: &str = "bare-metal systemd";
 const LOGIN_RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
 const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
+const CORE_RUNTIMES: &[CoreRuntime] = &[
+    CoreRuntime {
+        name: "Xray",
+        role: "VLESS REALITY XHTTP/TCP",
+        service: "stealthhub-xray.service",
+        binary_path: "/opt/stealthhub/cores/xray/current/xray",
+        config_path: "/etc/stealthhub-cores/xray/config.json",
+        update_channel: "XTLS/Xray-core GitHub releases",
+        priority: "primary",
+    },
+    CoreRuntime {
+        name: "sing-box",
+        role: "SS2022 ShadowTLS, AnyTLS, compatibility",
+        service: "stealthhub-sing-box.service",
+        binary_path: "/opt/stealthhub/cores/sing-box/current/sing-box",
+        config_path: "/etc/stealthhub-cores/sing-box/config.json",
+        update_channel: "SagerNet/sing-box GitHub releases",
+        priority: "compat",
+    },
+    CoreRuntime {
+        name: "Hysteria",
+        role: "Hysteria2 speed fallback",
+        service: "stealthhub-hysteria.service",
+        binary_path: "/opt/stealthhub/cores/hysteria/current/hysteria",
+        config_path: "/etc/stealthhub-cores/hysteria/config.yaml",
+        update_channel: "apernet/hysteria GitHub releases",
+        priority: "speed",
+    },
+    CoreRuntime {
+        name: "TUIC",
+        role: "TUIC QUIC speed fallback",
+        service: "stealthhub-tuic.service",
+        binary_path: "/opt/stealthhub/cores/tuic/current/tuic-server",
+        config_path: "/etc/stealthhub-cores/tuic/config.json",
+        update_channel: "tuic-protocol/tuic GitHub releases",
+        priority: "optional",
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct CoreRuntime {
+    name: &'static str,
+    role: &'static str,
+    service: &'static str,
+    binary_path: &'static str,
+    config_path: &'static str,
+    update_channel: &'static str,
+    priority: &'static str,
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -152,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/users", get(users_page))
         .route("/admin/protocols", get(protocols_page))
         .route("/admin/system", get(system_page))
+        .route("/admin/cores", get(cores_page))
         .route("/admin/users/create", post(create_user_action))
         .route("/admin/users/:id/toggle", post(toggle_user_action))
         .route(
@@ -602,6 +652,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                     }
 
                     section {
+                        h2 { "Cores" }
+                        p { "Xray, sing-box, Hysteria and TUIC runtime contract." }
+                        a class="button" href="/admin/cores" { "Open Cores" }
+                    }
+
+                    section {
                         h2 { "Routing" }
                         ul {
                             li { "BANKING / RU / LOCAL → DIRECT" }
@@ -631,6 +687,105 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                             li { "backup/restore" }
                             li { "git pull + build + restart" }
                         }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    Html(
+        layout(
+            "Cores",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Cores" }
+
+                div class="notice" {
+                    "Proxy cores are managed as host systemd services. StealthHub Panel owns users, subscriptions, configs and safe apply; each core keeps its own binary, config file and rollback target."
+                }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Mode" }
+                        strong { "external binaries" }
+                    }
+                    div class="metric" {
+                        span { "Supervisor" }
+                        strong { "systemd" }
+                    }
+                    div class="metric" {
+                        span { "Configured cores" }
+                        strong { (CORE_RUNTIMES.len()) }
+                    }
+                    div class="metric" {
+                        span { "Update policy" }
+                        strong { "staged rollback" }
+                    }
+                }
+
+                section {
+                    h2 { "Runtime registry" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Core" }
+                                    th { "Priority" }
+                                    th { "Role" }
+                                    th { "Service" }
+                                    th { "Binary" }
+                                    th { "Config" }
+                                    th { "Updates" }
+                                }
+                            }
+                            tbody {
+                                @for core in CORE_RUNTIMES {
+                                    tr {
+                                        td { strong { (core.name) } }
+                                        td { span class=(format!("badge {}", core_priority_class(core.priority))) { (core.priority) } }
+                                        td { (core.role) }
+                                        td { code { (core.service) } }
+                                        td { code { (core.binary_path) } }
+                                        td { code { (core.config_path) } }
+                                        td { (core.update_channel) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Safe update flow" }
+                    ol {
+                        li { "Download release archive into a staging directory under " code { "/var/lib/stealthhub-panel/core-updates" } "." }
+                        li { "Verify SHA256 checksum from the release metadata before touching the active symlink." }
+                        li { "Run binary self-check and config validation with the staged binary." }
+                        li { "Switch " code { "current" } " symlink atomically only after validation passes." }
+                        li { "Restart exactly one service, check readiness, and roll back symlink if the service fails." }
+                    }
+                }
+
+                section {
+                    h2 { "Local install contract" }
+                    dl class="details" {
+                        dt { "Core root" }
+                        dd { code { "/opt/stealthhub/cores/{core}/{version}" } }
+                        dt { "Active binary" }
+                        dd { code { "/opt/stealthhub/cores/{core}/current" } }
+                        dt { "Configs" }
+                        dd { code { "/etc/stealthhub-cores/{core}" } }
+                        dt { "Service templates" }
+                        dd { code { "deploy/cores/systemd/*.service" } }
                     }
                 }
             },
@@ -1666,6 +1821,13 @@ fn proxy_role_label(role: &ProxyRole) -> &'static str {
     }
 }
 
+fn core_priority_class(priority: &str) -> &'static str {
+    match priority {
+        "primary" | "compat" => "ok",
+        _ => "off",
+    }
+}
+
 fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
     html! {
         div class="admin-bar" {
@@ -2039,6 +2201,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                     a href="/admin/users" { "Users" }
                     a href="/admin/protocols" { "Protocols" }
                     a href="/admin/system" { "System" }
+                    a href="/admin/cores" { "Cores" }
                     a href="/health" { "Health" }
                 }
                 (body)

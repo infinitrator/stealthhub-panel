@@ -1,0 +1,8 @@
+{
+  "server": "[::]:11443",
+  "users": {},
+  "certificate": "/etc/stealthhub-cores/tls/fullchain.pem",
+  "private_key": "/etc/stealthhub-cores/tls/privkey.pem",
+  "congestion_control": "bbr",
+  "alpn": ["h3"]
+}
