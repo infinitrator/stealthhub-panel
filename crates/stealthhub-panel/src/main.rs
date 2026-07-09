@@ -38,7 +38,7 @@ use stealthhub_core::{
         get_valid_admin_session, init_db, list_protocol_profiles_decoded, list_secret_names,
         list_users, load_panel_settings, load_routing_rule_sets, open_pool,
         reset_user_subscription_token, set_user_enabled, touch_admin_session,
-        update_protocol_profile, update_routing_rule_set, AdminRecord, NewUser,
+        update_protocol_profile, update_routing_rule_set, upsert_setting, AdminRecord, NewUser,
         UpdateProtocolProfile, UpdateRoutingRuleSet,
     },
 };
@@ -179,6 +179,15 @@ struct RoutingRuleSetForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct PanelSettingsForm {
+    #[serde(default)]
+    csrf_token: String,
+    panel_name: String,
+    subscription_domain: String,
+    node_domain: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SetupAdminForm {
     username: String,
     password: String,
@@ -245,6 +254,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/logout", post(logout_action))
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
+        .route(
+            "/admin/settings",
+            get(settings_page).post(update_settings_action),
+        )
         .route("/admin/protocols", get(protocols_page))
         .route(
             "/admin/protocols/:name/update",
@@ -708,6 +721,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                     }
 
                     section {
+                        h2 { "Settings" }
+                        p { "Panel name, subscription host, node host." }
+                        a class="button" href="/admin/settings" { "Open Settings" }
+                    }
+
+                    section {
                         h2 { "Protocols" }
                         p { "Enabled profiles, endpoint, SNI, transport path, secret names." }
                         a class="button" href="/admin/protocols" { "Open Protocols" }
@@ -736,6 +755,164 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         .into_string(),
     )
     .into_response()
+}
+
+async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let settings = match load_panel_settings(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Settings unavailable",
+                format!("Failed to load panel settings: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+
+    Html(
+        layout(
+            "Settings",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Settings" }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Panel name" }
+                        strong { (&settings.panel_name) }
+                    }
+                    div class="metric" {
+                        span { "Subscription host" }
+                        strong { (&settings.subscription_domain) }
+                    }
+                    div class="metric" {
+                        span { "Node host" }
+                        strong { (&settings.node_domain) }
+                    }
+                    div class="metric" {
+                        span { "Config source" }
+                        strong { "SQLite settings" }
+                    }
+                }
+
+                section {
+                    h2 { "Global parameters" }
+                    form method="post" action="/admin/settings" class="config-form" {
+                        (csrf_field(&auth.csrf_token))
+                        label {
+                            span { "Panel name" }
+                            input type="text" name="panel_name" value=(&settings.panel_name) minlength="2" maxlength="80" required;
+                            small { "Displayed in generated metadata and admin screens." }
+                        }
+                        label {
+                            span { "Subscription host" }
+                            input type="text" name="subscription_domain" value=(&settings.subscription_domain) required;
+                            small { "Public HTTPS host used by clients to fetch subscription and rule providers." }
+                        }
+                        label {
+                            span { "Node host" }
+                            input type="text" name="node_domain" value=(&settings.node_domain) required;
+                            small { "Public host that Mihomo clients use to connect to proxy profiles." }
+                        }
+                        div class="full-span" {
+                            button type="submit" { "Save Settings" }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Generated client endpoints" }
+                    dl class="details" {
+                        dt { "Subscription template" }
+                        dd { code { (format!("https://{}/sub/{{token}}/mihomo.yaml", settings.subscription_domain)) } }
+                        dt { "Rule provider template" }
+                        dd { code { (format!("https://{}/rules/{{name}}", settings.subscription_domain)) } }
+                        dt { "Proxy endpoint host" }
+                        dd { code { (&settings.node_domain) } }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn update_settings_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PanelSettingsForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let panel_name = form.panel_name.trim();
+    if panel_name.len() < 2 || panel_name.len() > 80 {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Invalid settings",
+            "Panel name must be between 2 and 80 characters.",
+            "/admin/settings",
+            "Back to Settings",
+        );
+    }
+
+    let subscription_domain = match normalize_public_host(&form.subscription_domain) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Invalid subscription host",
+                message,
+                "/admin/settings",
+                "Back to Settings",
+            );
+        }
+    };
+
+    let node_domain = match normalize_public_host(&form.node_domain) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Invalid node host",
+                message,
+                "/admin/settings",
+                "Back to Settings",
+            );
+        }
+    };
+
+    for (key, value) in [
+        ("panel_name", panel_name.to_string()),
+        ("subscription_domain", subscription_domain),
+        ("node_domain", node_domain),
+    ] {
+        if let Err(err) = upsert_setting(&state.pool, key, &value).await {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Settings not saved",
+                format!("Failed to save {key}: {err}"),
+                "/admin/settings",
+                "Back to Settings",
+            );
+        }
+    }
+
+    Redirect::to("/admin/settings").into_response()
 }
 
 async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -831,6 +1008,38 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                         dd { code { "/etc/stealthhub-cores/{core}" } }
                         dt { "Service templates" }
                         dd { code { "deploy/cores/systemd/*.service" } }
+                    }
+                }
+
+                section {
+                    h2 { "Safe core import" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Step" }
+                                    th { "Command / contract" }
+                                }
+                            }
+                            tbody {
+                                tr {
+                                    td { "Download or import" }
+                                    td { code { "sudo deploy/cores/install-core.sh --core xray --version 26.3.27 --url <release-archive-url> --sha256 <sha256> --binary xray --restart stealthhub-xray.service" } }
+                                }
+                                tr {
+                                    td { "Staging" }
+                                    td { code { "/var/lib/stealthhub-panel/core-updates/{core}/{version}" } }
+                                }
+                                tr {
+                                    td { "Activation" }
+                                    td { code { "/opt/stealthhub/cores/{core}/current -> /opt/stealthhub/cores/{core}/{version}" } }
+                                }
+                                tr {
+                                    td { "Validation" }
+                                    td { code { "sha256sum -c, binary --version, optional systemctl restart/status" } }
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -1072,6 +1281,20 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                         dd { code { "/var/lib/stealthhub-panel/stealthhub.sqlite" } }
                         dt { "Service" }
                         dd { code { "stealthhub-panel.service" } }
+                    }
+                }
+
+                section {
+                    h2 { "VPS install path" }
+                    dl class="details" {
+                        dt { "Build" }
+                        dd { code { "cargo build --release -p stealthhub-panel" } }
+                        dt { "Install" }
+                        dd { code { "sudo bash deploy/install.sh" } }
+                        dt { "Reverse proxy" }
+                        dd { code { "deploy/nginx-stealthhub-panel.conf.example" } }
+                        dt { "Core updates" }
+                        dd { code { "sudo deploy/cores/install-core.sh --core <name> --version <version> --url <url> --sha256 <sha256> --binary <binary>" } }
                     }
                 }
 
@@ -1385,6 +1608,30 @@ fn required_field(value: &str, label: &str) -> anyhow::Result<String> {
 fn optional_field(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_public_host(value: &str) -> Result<String, &'static str> {
+    let value = value.trim().trim_end_matches('.');
+    if value.is_empty() {
+        return Err("Host must not be empty.");
+    }
+
+    if value.contains("://") || value.contains('/') || value.contains('\\') {
+        return Err("Use host only, without scheme, path, or trailing slash.");
+    }
+
+    if value.len() > 253 {
+        return Err("Host is too long.");
+    }
+
+    let valid = value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':'));
+    if !valid || value.split('.').any(|part| part.is_empty()) {
+        return Err("Host contains unsupported characters.");
+    }
+
+    Ok(value.to_ascii_lowercase())
 }
 
 fn checkbox_enabled(value: &str) -> bool {
@@ -2979,6 +3226,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                             a href="/" { "Home" }
                             a href="/admin" { "Dashboard" }
                             a href="/admin/users" { "Users" }
+                            a href="/admin/settings" { "Settings" }
                             a href="/admin/protocols" { "Protocols" }
                             a href="/admin/routing" { "Routing" }
                             a href="/admin/cores" { "Cores" }

@@ -2,8 +2,8 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-    FromRow, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
+    Row, SqlitePool,
 };
 use std::{str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
@@ -18,7 +18,7 @@ use crate::{
 
 pub type DbPool = SqlitePool;
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub id: i64,
     pub username: String,
@@ -39,7 +39,7 @@ pub struct NewUser {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminRecord {
     pub id: i64,
     pub username: String,
@@ -48,7 +48,7 @@ pub struct AdminRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSessionRecord {
     pub id: i64,
     pub admin_id: i64,
@@ -58,14 +58,14 @@ pub struct AdminSessionRecord {
     pub last_seen_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingRecord {
     pub key: String,
     pub value: String,
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretRecord {
     pub name: String,
     pub value: String,
@@ -73,7 +73,7 @@ pub struct SecretRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProtocolProfileRecord {
     pub id: i64,
     pub name: String,
@@ -113,6 +113,86 @@ pub struct UpdateRoutingRuleSet {
     pub enabled: bool,
     pub target: String,
     pub payload: String,
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for UserRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            uuid: row.try_get("uuid")?,
+            subscription_token: row.try_get("subscription_token")?,
+            enabled: row.try_get("enabled")?,
+            traffic_limit_bytes: row.try_get("traffic_limit_bytes")?,
+            traffic_used_bytes: row.try_get("traffic_used_bytes")?,
+            expires_at: row.try_get("expires_at")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for AdminRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            username: row.try_get("username")?,
+            password_hash: row.try_get("password_hash")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for AdminSessionRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            admin_id: row.try_get("admin_id")?,
+            token_hash: row.try_get("token_hash")?,
+            expires_at: row.try_get("expires_at")?,
+            created_at: row.try_get("created_at")?,
+            last_seen_at: row.try_get("last_seen_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for SettingRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            key: row.try_get("key")?,
+            value: row.try_get("value")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for SecretRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            name: row.try_get("name")?,
+            value: row.try_get("value")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ProtocolProfileRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            kind: row.try_get("kind")?,
+            role: row.try_get("role")?,
+            enabled: row.try_get("enabled")?,
+            server: row.try_get("server")?,
+            port: row.try_get("port")?,
+            config_json: row.try_get("config_json")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
 }
 
 pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {

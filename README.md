@@ -4,8 +4,8 @@
 
 The project is designed around one practical goal: keep the server simple, predictable, and controllable from a web GUI without relying on heavy multi-service panels.
 
-> Status: early development / MVP.
-> Current focus: protected admin GUI, users, token-based subscriptions, Mihomo YAML generation, and a clean Rust foundation.
+> Status: release-candidate field build.
+> Current focus: protected admin GUI, users, protocol settings, routing, Mihomo subscriptions, proxy-core deployment, and VPS systemd installs.
 
 ---
 
@@ -85,6 +85,7 @@ Implemented:
 * CSRF protection for authenticated admin forms;
 * security headers for web responses;
 * key/value settings storage foundation;
+* global settings editor;
 * local secret-value storage foundation;
 * protocol profile model for Xray/sing-box/Hysteria/TUIC-oriented configs;
 * default protocol-profile seeding;
@@ -106,8 +107,10 @@ Implemented:
 * local proxy-core install detection under `.runtime/cores`;
 * proxy core systemd templates;
 * proxy core config placeholders;
+* safe proxy-core install/update script;
 * readiness endpoint with SQLite check;
 * bare-metal systemd deployment templates;
+* bare-metal install script;
 * rule-provider endpoints;
 * health endpoint.
 
@@ -122,6 +125,8 @@ POST /admin/login
 POST /admin/logout
 GET  /admin
 GET  /admin/users
+GET  /admin/settings
+POST /admin/settings
 GET  /admin/protocols
 POST /admin/protocols/{name}/update
 GET  /admin/routing
@@ -251,6 +256,7 @@ Repository deployment templates:
 ```text
 deploy/stealthhub-panel.env.example
 deploy/stealthhub-panel.service
+deploy/install.sh
 deploy/nginx-stealthhub-panel.conf.example
 deploy/cores/
 ```
@@ -263,17 +269,11 @@ Expected server layout:
 /var/lib/stealthhub-panel/stealthhub.sqlite
 ```
 
-Minimal server install outline:
+Minimal server install:
 
 ```bash
-sudo useradd --system --home /var/lib/stealthhub-panel --shell /usr/sbin/nologin stealthhub
-sudo install -d -o stealthhub -g stealthhub -m 0750 /var/lib/stealthhub-panel
-sudo install -d -o root -g root -m 0755 /etc/stealthhub-panel
-sudo install -m 0640 deploy/stealthhub-panel.env.example /etc/stealthhub-panel/stealthhub-panel.env
-sudo install -m 0755 target/release/stealthhub-panel /usr/local/bin/stealthhub-panel
-sudo install -m 0644 deploy/stealthhub-panel.service /etc/systemd/system/stealthhub-panel.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now stealthhub-panel
+cargo build --release -p stealthhub-panel
+sudo bash deploy/install.sh
 ```
 
 For production, put Nginx/Caddy in front of the panel, keep `STEALTHHUB_BIND=127.0.0.1:8080`, set `STEALTHHUB_COOKIE_SECURE=true`, and check:
@@ -283,6 +283,8 @@ curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
 systemctl status stealthhub-panel
 ```
+
+Full VPS instructions: [docs/VPS_INSTALL.md](docs/VPS_INSTALL.md).
 
 ---
 
@@ -303,6 +305,7 @@ Repository templates:
 
 ```text
 deploy/cores/README.md
+deploy/cores/install-core.sh
 deploy/cores/core-update-manifest.example.toml
 deploy/cores/systemd/*.service
 deploy/cores/configs/*
@@ -341,6 +344,18 @@ roll back symlink if the service fails
 ```
 
 Do not overwrite active core binaries in place. Do not let the panel download and execute a release without checksum verification and config validation.
+
+Core install example:
+
+```bash
+sudo deploy/cores/install-core.sh \
+  --core xray \
+  --version 26.3.27 \
+  --url 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip' \
+  --sha256 '<sha256-from-release>' \
+  --binary xray \
+  --restart stealthhub-xray.service
+```
 
 ---
 

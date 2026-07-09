@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build panel
+        run: cargo build --release -p stealthhub-panel
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stealthhub-panel-linux-x86_64
+          cp target/release/stealthhub-panel dist/stealthhub-panel-linux-x86_64/
+          cp -R deploy docs README.md LICENSE LICENSE.ru.md dist/stealthhub-panel-linux-x86_64/
+          tar -C dist -czf stealthhub-panel-linux-x86_64.tar.gz stealthhub-panel-linux-x86_64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stealthhub-panel-linux-x86_64
+          path: stealthhub-panel-linux-x86_64.tar.gz

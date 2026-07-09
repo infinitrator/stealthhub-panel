@@ -35,3 +35,31 @@ The panel should generate and validate configs, then let systemd supervise each 
 8. Roll back the symlink and restart if validation or health checks fail.
 
 Do not overwrite active binaries in place.
+
+## Install Script
+
+Use `deploy/cores/install-core.sh` for checksum-verified installs and updates.
+
+```bash
+sudo deploy/cores/install-core.sh \
+  --core xray \
+  --version 26.3.27 \
+  --url 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip' \
+  --sha256 '<sha256-from-release>' \
+  --binary xray \
+  --restart stealthhub-xray.service
+```
+
+You can also import a pre-downloaded archive:
+
+```bash
+sudo deploy/cores/install-core.sh \
+  --core sing-box \
+  --version 1.13.14 \
+  --archive ./sing-box.tar.gz \
+  --sha256 '<sha256>' \
+  --binary sing-box
+```
+
+The script refuses to switch `current` if checksum verification fails or the
+staged binary does not answer `--version`.

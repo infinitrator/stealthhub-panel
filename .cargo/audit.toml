@@ -1,0 +1,8 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 is reported for rsa 0.9.x. The package is present only
+    # through sqlx optional backend metadata in Cargo.lock; StealthHub enables
+    # SQLite only, and `cargo tree --target all -i rsa` reports no active path.
+    # The advisory has no fixed upstream release at the moment.
+    "RUSTSEC-2023-0071",
+]
