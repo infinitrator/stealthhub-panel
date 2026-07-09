@@ -160,3 +160,40 @@ pub fn routing_rule_payload_yaml(payload: &str) -> Result<String> {
 
     Ok(yaml)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classical_payload_validation_trims_comments_and_rejects_nested_sets() {
+        let rules = validate_classical_rule_payload(
+            r#"
+            # comment
+            DOMAIN-SUFFIX,example.com
+            IP-CIDR,10.0.0.0/8,no-resolve
+            "#,
+        )
+        .expect("payload should be valid");
+
+        assert_eq!(
+            rules,
+            vec![
+                "DOMAIN-SUFFIX,example.com".to_string(),
+                "IP-CIDR,10.0.0.0/8,no-resolve".to_string()
+            ]
+        );
+
+        let err = validate_classical_rule_payload("RULE-SET,other,DIRECT").unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot reference another rule set"));
+    }
+
+    #[test]
+    fn routing_rule_payload_yaml_outputs_mihomo_payload_document() {
+        let yaml = routing_rule_payload_yaml("DOMAIN-SUFFIX,example.com").unwrap();
+
+        assert_eq!(yaml, "payload:\n  - DOMAIN-SUFFIX,example.com\n");
+    }
+}

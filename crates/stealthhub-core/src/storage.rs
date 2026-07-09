@@ -1405,4 +1405,116 @@ mod tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn protocol_profiles_update_config_and_enabled_state() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+
+        create_protocol_profile(
+            &pool,
+            NewProtocolProfile {
+                name: "VLESS-XHTTP-SAFE".to_string(),
+                kind: ProxyKind::VlessRealityXhttp,
+                role: ProxyRole::AutoSafe,
+                enabled: true,
+                server: "old.example.test".to_string(),
+                port: 8443,
+                config: ProtocolConfig::VlessRealityXhttp {
+                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                    server_name: "www.microsoft.com".to_string(),
+                    path: "/api/v1".to_string(),
+                    public_key_secret: "xray.reality.public_key".to_string(),
+                    short_id_secret: "xray.reality.short_id".to_string(),
+                },
+            },
+        )
+        .await?;
+
+        let updated = update_protocol_profile(
+            &pool,
+            UpdateProtocolProfile {
+                name: "VLESS-XHTTP-SAFE".to_string(),
+                enabled: false,
+                server: "new.example.test".to_string(),
+                port: 9443,
+                config: ProtocolConfig::VlessRealityXhttp {
+                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                    server_name: "www.apple.com".to_string(),
+                    path: "/edge".to_string(),
+                    public_key_secret: "xray.reality.public_key".to_string(),
+                    short_id_secret: "xray.reality.short_id".to_string(),
+                },
+            },
+        )
+        .await?;
+
+        assert!(!updated.enabled);
+        assert_eq!(updated.server, "new.example.test");
+        assert_eq!(updated.port, 9443);
+        assert!(updated.config_json.contains("/edge"));
+
+        close_and_remove(pool, &path).await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn routing_rule_sets_round_trip_and_validate_input() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+
+        ensure_default_routing_rule_sets(&pool).await?;
+        let rule_sets = load_routing_rule_sets(&pool).await?;
+        assert_eq!(rule_sets.len(), 4);
+        assert!(rule_sets.iter().all(|rule_set| rule_set.enabled));
+
+        update_routing_rule_set(
+            &pool,
+            UpdateRoutingRuleSet {
+                slug: "proxy-ai".to_string(),
+                enabled: true,
+                target: "AUTO-SAFE".to_string(),
+                payload: "DOMAIN-SUFFIX,openai.com\nDOMAIN-SUFFIX,perplexity.ai".to_string(),
+            },
+        )
+        .await?;
+
+        let rule_sets = load_routing_rule_sets(&pool).await?;
+        let proxy_ai = rule_sets
+            .iter()
+            .find(|rule_set| rule_set.slug == "proxy-ai")
+            .expect("proxy-ai rule set should exist");
+        assert!(proxy_ai.payload.contains("perplexity.ai"));
+
+        let err = update_routing_rule_set(
+            &pool,
+            UpdateRoutingRuleSet {
+                slug: "proxy-ai".to_string(),
+                enabled: true,
+                target: "AUTO-SAFE".to_string(),
+                payload: "RULE-SET,other,DIRECT".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot reference another rule set"));
+
+        let err = update_routing_rule_set(
+            &pool,
+            UpdateRoutingRuleSet {
+                slug: "proxy-ai".to_string(),
+                enabled: true,
+                target: "INVALID".to_string(),
+                payload: "DOMAIN-SUFFIX,openai.com".to_string(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("unsupported routing target"));
+
+        close_and_remove(pool, &path).await;
+
+        Ok(())
+    }
 }

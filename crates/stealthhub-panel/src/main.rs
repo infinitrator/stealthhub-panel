@@ -2262,8 +2262,8 @@ fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Re
         StatusCode::FORBIDDEN,
         "Request blocked",
         "Security token is missing or invalid. Please reload the page and try again.",
-        "/admin/users",
-        "Back to Users",
+        "/admin",
+        "Back to Dashboard",
     ))
 }
 
