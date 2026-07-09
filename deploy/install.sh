@@ -8,6 +8,7 @@ CONFIG_DIR="${STEALTHHUB_CONFIG_DIR:-/etc/stealthhub-panel}"
 STATE_DIR="${STEALTHHUB_STATE_DIR:-/var/lib/stealthhub-panel}"
 CORE_DIR="${STEALTHHUB_CORE_DIR:-/opt/stealthhub/cores}"
 CORE_CONFIG_DIR="${STEALTHHUB_CORE_CONFIG_DIR:-/etc/stealthhub-cores}"
+CORE_LOG_DIR="${STEALTHHUB_CORE_LOG_DIR:-/var/log/stealthhub-cores}"
 SERVICE_FILE="${STEALTHHUB_SERVICE_FILE:-/etc/systemd/system/stealthhub-panel.service}"
 ENV_FILE="${CONFIG_DIR}/stealthhub-panel.env"
 
@@ -83,6 +84,7 @@ install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g root -m 0755 "$CORE_CONFIG_DIR"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 
@@ -93,6 +95,30 @@ else
 fi
 
 install -m 0644 "${ROOT_DIR}/deploy/stealthhub-panel.service" "$SERVICE_FILE"
+
+for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
+    install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
+done
+
+install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/xray"
+install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/sing-box"
+install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/hysteria"
+install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/tuic"
+install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
+
+if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
+    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
+fi
+if [[ ! -f "$CORE_CONFIG_DIR/sing-box/config.json" ]]; then
+    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/sing-box.config.example.json" "$CORE_CONFIG_DIR/sing-box/config.json"
+fi
+if [[ ! -f "$CORE_CONFIG_DIR/hysteria/config.yaml" ]]; then
+    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/hysteria.config.example.yaml" "$CORE_CONFIG_DIR/hysteria/config.yaml"
+fi
+if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
+    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
+fi
+
 systemctl daemon-reload
 systemctl enable --now stealthhub-panel.service
 
@@ -100,3 +126,4 @@ echo "StealthHub Panel installed."
 echo "Status: systemctl status stealthhub-panel.service"
 echo "Health: curl http://127.0.0.1:8080/health"
 echo "Config: $ENV_FILE"
+echo "Core services are installed but not enabled until core binaries and final configs are ready."

@@ -24,7 +24,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/stealthhub-panel-linux-x86_64
           cp target/release/stealthhub-panel dist/stealthhub-panel-linux-x86_64/
-          cp -R deploy docs README.md LICENSE LICENSE.ru.md dist/stealthhub-panel-linux-x86_64/
+          cp -R deploy README.md LICENSE LICENSE.ru.md dist/stealthhub-panel-linux-x86_64/
           tar -C dist -czf stealthhub-panel-linux-x86_64.tar.gz stealthhub-panel-linux-x86_64
 
       - name: Upload artifact

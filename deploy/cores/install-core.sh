@@ -89,6 +89,36 @@ if [[ -z "$VERSION" || -z "$SHA256" || -z "$BINARY" ]]; then
     exit 2
 fi
 
+if [[ ! "$VERSION" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+    echo "Invalid version. Use only letters, digits, dot, underscore, plus, and dash." >&2
+    exit 2
+fi
+
+if [[ ! "$BINARY" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+    echo "Invalid binary name. Use only letters, digits, dot, underscore, plus, and dash." >&2
+    exit 2
+fi
+
+if [[ ! "$SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    echo "Invalid SHA256. Expected 64 hexadecimal characters." >&2
+    exit 2
+fi
+
+expected_service() {
+    case "$CORE" in
+        xray) echo "stealthhub-xray.service" ;;
+        sing-box) echo "stealthhub-sing-box.service" ;;
+        hysteria) echo "stealthhub-hysteria.service" ;;
+        tuic) echo "stealthhub-tuic.service" ;;
+    esac
+}
+
+if [[ -n "$RESTART_SERVICE" && "$RESTART_SERVICE" != "$(expected_service)" ]]; then
+    echo "Refusing to restart unrelated service: $RESTART_SERVICE" >&2
+    echo "Expected for $CORE: $(expected_service)" >&2
+    exit 2
+fi
+
 if [[ -n "$URL" && -n "$ARCHIVE" ]]; then
     echo "Use either --url or --archive, not both" >&2
     exit 2
@@ -152,9 +182,9 @@ case "$ARCHIVE_PATH" in
         ;;
 esac
 
-FOUND_BINARY="$(find "$EXTRACT_DIR" -type f -name "$BINARY" -perm -u+x | head -n 1)"
+FOUND_BINARY="$(find "$EXTRACT_DIR" -type f -name "$BINARY" -perm -u+x -print -quit)"
 if [[ -z "$FOUND_BINARY" ]]; then
-    FOUND_BINARY="$(find "$EXTRACT_DIR" -type f -name "$BINARY" | head -n 1)"
+    FOUND_BINARY="$(find "$EXTRACT_DIR" -type f -name "$BINARY" -print -quit)"
 fi
 
 if [[ -z "$FOUND_BINARY" ]]; then
