@@ -4,6 +4,7 @@ use serde_json::json;
 use crate::models::{
     PanelSettings, ProtocolConfig, ProtocolProfile, ProxyRole, SubscriptionUser, UserUuidSource,
 };
+use crate::rules::{default_routing_rule_sets, RoutingRuleSet};
 
 fn secret_or_placeholder<'a>(
     secrets: &'a std::collections::HashMap<String, String>,
@@ -27,6 +28,7 @@ pub fn generate_mihomo_yaml(
     user: &SubscriptionUser,
     profiles: &[ProtocolProfile],
     secrets: &std::collections::HashMap<String, String>,
+    routing_rule_sets: &[RoutingRuleSet],
 ) -> Result<String> {
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
     if enabled_profiles.is_empty() {
@@ -168,6 +170,7 @@ pub fn generate_mihomo_yaml(
     );
     let speed_names = names_for_roles(&enabled_profiles, &[ProxyRole::Speed], &proxy_names);
     let ru_access_names = names_for_roles(&enabled_profiles, &[ProxyRole::RuAccess], &proxy_names);
+    let active_rule_sets = active_routing_rule_sets(routing_rule_sets);
 
     let doc = json!({
         "mixed-port": 7890,
@@ -176,40 +179,7 @@ pub fn generate_mihomo_yaml(
         "log-level": "info",
         "ipv6": false,
         "external-controller": "127.0.0.1:9090",
-        "rule-providers": {
-            "banking-direct": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/banking-direct.yaml",
-                "url": format!("https://{}/rules/banking-direct.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "direct-local": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/direct-local.yaml",
-                "url": format!("https://{}/rules/direct-local.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "proxy-ai": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/proxy-ai.yaml",
-                "url": format!("https://{}/rules/proxy-ai.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "streaming": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/streaming.yaml",
-                "url": format!("https://{}/rules/streaming.yaml", settings.subscription_domain),
-                "interval": 3600
-            }
-        },
+        "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
         "proxy-groups": [
             {
@@ -251,17 +221,7 @@ pub fn generate_mihomo_yaml(
                 "proxies": select_group(&ru_access_names, &auto_safe_names)
             }
         ],
-        "rules": [
-            "RULE-SET,banking-direct,DIRECT",
-            "RULE-SET,direct-local,DIRECT",
-            "RULE-SET,proxy-ai,AUTO-SAFE",
-            "RULE-SET,streaming,SPEED",
-            "GEOIP,RU,DIRECT",
-            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-            "MATCH,MANUAL"
-        ]
+        "rules": routing_rules(&active_rule_sets)
     });
 
     Ok(serde_yaml::to_string(&doc)?)
@@ -308,6 +268,8 @@ pub fn generate_demo_mihomo_yaml(
     user: &SubscriptionUser,
 ) -> Result<String> {
     let node = &settings.node_domain;
+    let rule_sets = default_routing_rule_sets();
+    let active_rule_sets = active_routing_rule_sets(&rule_sets);
 
     // На этом этапе это демонстрационный config contract.
     // Реальные secrets, public-key, short-id, passwords будут браться из SQLite/secret store.
@@ -320,40 +282,7 @@ pub fn generate_demo_mihomo_yaml(
 
         "external-controller": "127.0.0.1:9090",
 
-        "rule-providers": {
-            "banking-direct": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/banking-direct.yaml",
-                "url": format!("https://{}/rules/banking-direct.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "direct-local": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/direct-local.yaml",
-                "url": format!("https://{}/rules/direct-local.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "proxy-ai": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/proxy-ai.yaml",
-                "url": format!("https://{}/rules/proxy-ai.yaml", settings.subscription_domain),
-                "interval": 3600
-            },
-            "streaming": {
-                "type": "http",
-                "behavior": "classical",
-                "format": "yaml",
-                "path": "./rules/streaming.yaml",
-                "url": format!("https://{}/rules/streaming.yaml", settings.subscription_domain),
-                "interval": 3600
-            }
-        },
+        "rule-providers": rule_provider_map(settings, &active_rule_sets),
 
         "proxies": [
             {
@@ -487,20 +416,61 @@ pub fn generate_demo_mihomo_yaml(
             }
         ],
 
-        "rules": [
-            "RULE-SET,banking-direct,DIRECT",
-            "RULE-SET,direct-local,DIRECT",
-            "RULE-SET,proxy-ai,AUTO-SAFE",
-            "RULE-SET,streaming,SPEED",
-            "GEOIP,RU,DIRECT",
-            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
-            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-            "MATCH,MANUAL"
-        ]
+        "rules": routing_rules(&active_rule_sets)
     });
 
     Ok(serde_yaml::to_string(&doc)?)
+}
+
+fn active_routing_rule_sets(rule_sets: &[RoutingRuleSet]) -> Vec<RoutingRuleSet> {
+    let active: Vec<_> = rule_sets
+        .iter()
+        .filter(|rule_set| rule_set.enabled)
+        .cloned()
+        .collect();
+
+    if active.is_empty() {
+        default_routing_rule_sets()
+    } else {
+        active
+    }
+}
+
+fn rule_provider_map(
+    settings: &PanelSettings,
+    rule_sets: &[RoutingRuleSet],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut providers = serde_json::Map::new();
+
+    for rule_set in rule_sets {
+        providers.insert(
+            rule_set.slug.clone(),
+            json!({
+                "type": "http",
+                "behavior": "classical",
+                "format": "yaml",
+                "path": format!("./rules/{}.yaml", rule_set.slug),
+                "url": format!("https://{}/rules/{}.yaml", settings.subscription_domain, rule_set.slug),
+                "interval": 3600
+            }),
+        );
+    }
+
+    providers
+}
+
+fn routing_rules(rule_sets: &[RoutingRuleSet]) -> Vec<String> {
+    let mut rules: Vec<_> = rule_sets
+        .iter()
+        .map(|rule_set| format!("RULE-SET,{},{}", rule_set.slug, rule_set.target))
+        .collect();
+
+    rules.push("GEOIP,RU,DIRECT".to_string());
+    rules.push("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve".to_string());
+    rules.push("IP-CIDR,172.16.0.0/12,DIRECT,no-resolve".to_string());
+    rules.push("IP-CIDR,192.168.0.0/16,DIRECT,no-resolve".to_string());
+    rules.push("MATCH,MANUAL".to_string());
+    rules
 }
 
 #[cfg(test)]
@@ -534,11 +504,13 @@ mod tests {
             "public-key-value".to_string(),
         );
 
-        let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets).unwrap();
+        let rules = crate::rules::default_routing_rule_sets();
+        let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &rules).unwrap();
 
         assert!(yaml.contains("node.example.test"));
         assert!(yaml.contains("public-key-value"));
         assert!(yaml.contains("xray.reality.short_id"));
         assert!(yaml.contains("AUTO-SAFE"));
+        assert!(yaml.contains("RULE-SET,proxy-ai,AUTO-SAFE"));
     }
 }

@@ -73,7 +73,7 @@ Implemented:
 * Rust workspace structure;
 * `stealthhub-core` crate;
 * `stealthhub-panel` web server;
-* `stealthhub-cli` CLI skeleton;
+* `stealthhub-cli` helper commands;
 * SQLite storage;
 * user table;
 * admin table;
@@ -88,7 +88,10 @@ Implemented:
 * local secret-value storage foundation;
 * protocol profile model for Xray/sing-box/Hysteria/TUIC-oriented configs;
 * default protocol-profile seeding;
+* protocol profile parameter editor;
 * DB-backed Mihomo YAML generation from settings + profiles + secret references;
+* DB-backed routing rule-set storage;
+* routing rule-set editor for Mihomo `RULE-SET` imports;
 * token-based Mihomo subscription endpoint;
 * optional demo user initialization for local development;
 * basic web GUI;
@@ -100,6 +103,7 @@ Implemented:
 * protocol overview page;
 * system overview page;
 * proxy cores overview page;
+* local proxy-core install detection under `.runtime/cores`;
 * proxy core systemd templates;
 * proxy core config placeholders;
 * readiness endpoint with SQLite check;
@@ -119,6 +123,9 @@ POST /admin/logout
 GET  /admin
 GET  /admin/users
 GET  /admin/protocols
+POST /admin/protocols/{name}/update
+GET  /admin/routing
+POST /admin/routing
 GET  /admin/system
 GET  /admin/cores
 POST /admin/users/create
@@ -200,6 +207,7 @@ http://127.0.0.1:8080
 http://127.0.0.1:8080/admin
 http://127.0.0.1:8080/admin/users
 http://127.0.0.1:8080/admin/protocols
+http://127.0.0.1:8080/admin/routing
 http://127.0.0.1:8080/admin/system
 http://127.0.0.1:8080/health
 http://127.0.0.1:8080/ready
@@ -213,6 +221,21 @@ Generate demo Mihomo YAML from CLI:
 
 ```bash
 cargo run -p stealthhub-cli -- generate-mihomo
+```
+
+Create a local test user in the default development database:
+
+```bash
+cargo run -p stealthhub-cli -- create-user --username test-local --traffic-limit-gb 10
+cargo run -p stealthhub-cli -- list-users
+```
+
+Then run the panel against the same database and open the printed subscription path:
+
+```bash
+STEALTHHUB_BIND=127.0.0.1:8080 \
+STEALTHHUB_DB='sqlite://./stealthhub.local.sqlite?mode=rwc' \
+cargo run -p stealthhub-panel
 ```
 
 ---
@@ -294,6 +317,17 @@ Expected runtime layout:
 /var/lib/stealthhub-panel/core-updates/{core}/{version}
 ```
 
+Local development uses the same versioned layout under `.runtime/cores`:
+
+```text
+.runtime/cores/xray/current/xray
+.runtime/cores/sing-box/current/sing-box
+.runtime/cores/hysteria/current/hysteria
+.runtime/cores/tuic/current/tuic-server
+```
+
+The `.runtime` directory is intentionally ignored by Git. Download releases there, verify SHA256 before execution, and keep production installs under `/opt/stealthhub/cores`.
+
 Safe update policy:
 
 ```text
@@ -334,7 +368,7 @@ The generated config contains:
 * fallback group;
 * load-balance group.
 
-The goal is to make this endpoint directly usable by Clash Mi and other Mihomo-compatible clients.
+The endpoint is generated as Mihomo-compatible YAML.
 
 ---
 
@@ -349,13 +383,12 @@ The panel can serve rule-provider files for Mihomo:
 /rules/streaming.yaml
 ```
 
-Planned GUI features:
+Current GUI support:
 
-* edit rule sets from the panel;
+* edit built-in rule sets from the panel;
 * enable/disable rule sets;
-* import external rule sets;
-* sync rules from GitHub/raw URLs;
-* validate rule-provider syntax before applying.
+* choose the generated `RULE-SET` target group;
+* validate classical rule payload before saving.
 
 ---
 
@@ -463,19 +496,6 @@ Current limitations:
 * no IP allowlist yet;
 * local secret values are stored in SQLite plaintext for now, so protect the database file and host permissions;
 * destructive actions use CSRF protection but do not yet have dedicated confirmation pages.
-
-Suggested commit message for the current auth/lifecycle milestone:
-
-```text
-add admin authentication
-```
-
-If committing manually:
-
-```bash
-git add Cargo.toml Cargo.lock README.md crates/stealthhub-core/Cargo.toml crates/stealthhub-core/src/models.rs crates/stealthhub-core/src/storage.rs crates/stealthhub-panel/Cargo.toml crates/stealthhub-panel/src/main.rs
-git commit -m "add admin authentication"
-```
 
 ---
 

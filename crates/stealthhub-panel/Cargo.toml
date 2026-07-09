@@ -20,3 +20,4 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 sqlx.workspace = true
 stealthhub-core = { path = "../stealthhub-core" }
+subtle.workspace = true

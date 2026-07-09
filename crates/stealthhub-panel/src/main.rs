@@ -28,18 +28,21 @@ use std::{
 };
 use stealthhub_core::{
     mihomo::generate_mihomo_yaml,
-    models::{ProtocolProfile, ProxyKind, ProxyRole, SubscriptionUser},
-    rules::{banking_direct_yaml, direct_local_yaml, proxy_ai_yaml, streaming_yaml},
+    models::{ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole, SubscriptionUser},
+    rules::{routing_rule_payload_yaml, ROUTING_TARGETS},
     storage::{
         admin_count, create_admin, create_admin_session, create_user, delete_admin_session,
         delete_expired_admin_sessions, delete_user, ensure_default_protocol_profiles,
-        ensure_default_settings, ensure_demo_user, get_admin_by_id, get_admin_by_username,
-        get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
-        list_protocol_profiles_decoded, list_secret_names, list_users, load_panel_settings,
-        open_pool, reset_user_subscription_token, set_user_enabled, touch_admin_session,
-        AdminRecord, NewUser,
+        ensure_default_routing_rule_sets, ensure_default_settings, ensure_demo_user,
+        get_admin_by_id, get_admin_by_username, get_secret, get_user_by_id, get_user_by_token,
+        get_valid_admin_session, init_db, list_protocol_profiles_decoded, list_secret_names,
+        list_users, load_panel_settings, load_routing_rule_sets, open_pool,
+        reset_user_subscription_token, set_user_enabled, touch_admin_session,
+        update_protocol_profile, update_routing_rule_set, AdminRecord, NewUser,
+        UpdateProtocolProfile, UpdateRoutingRuleSet,
     },
 };
+use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
 const ADMIN_SESSION_COOKIE: &str = "stealthhub_admin_session";
@@ -56,6 +59,7 @@ const CORE_RUNTIMES: &[CoreRuntime] = &[
         role: "VLESS REALITY XHTTP/TCP",
         service: "stealthhub-xray.service",
         binary_path: "/opt/stealthhub/cores/xray/current/xray",
+        local_binary_path: ".runtime/cores/xray/current/xray",
         config_path: "/etc/stealthhub-cores/xray/config.json",
         update_channel: "XTLS/Xray-core GitHub releases",
         priority: "primary",
@@ -65,6 +69,7 @@ const CORE_RUNTIMES: &[CoreRuntime] = &[
         role: "SS2022 ShadowTLS, AnyTLS, compatibility",
         service: "stealthhub-sing-box.service",
         binary_path: "/opt/stealthhub/cores/sing-box/current/sing-box",
+        local_binary_path: ".runtime/cores/sing-box/current/sing-box",
         config_path: "/etc/stealthhub-cores/sing-box/config.json",
         update_channel: "SagerNet/sing-box GitHub releases",
         priority: "compat",
@@ -74,6 +79,7 @@ const CORE_RUNTIMES: &[CoreRuntime] = &[
         role: "Hysteria2 speed fallback",
         service: "stealthhub-hysteria.service",
         binary_path: "/opt/stealthhub/cores/hysteria/current/hysteria",
+        local_binary_path: ".runtime/cores/hysteria/current/hysteria",
         config_path: "/etc/stealthhub-cores/hysteria/config.yaml",
         update_channel: "apernet/hysteria GitHub releases",
         priority: "speed",
@@ -83,6 +89,7 @@ const CORE_RUNTIMES: &[CoreRuntime] = &[
         role: "TUIC QUIC speed fallback",
         service: "stealthhub-tuic.service",
         binary_path: "/opt/stealthhub/cores/tuic/current/tuic-server",
+        local_binary_path: ".runtime/cores/tuic/current/tuic-server",
         config_path: "/etc/stealthhub-cores/tuic/config.json",
         update_channel: "tuic-protocol/tuic GitHub releases",
         priority: "optional",
@@ -95,6 +102,7 @@ struct CoreRuntime {
     role: &'static str,
     service: &'static str,
     binary_path: &'static str,
+    local_binary_path: &'static str,
     config_path: &'static str,
     update_channel: &'static str,
     priority: &'static str,
@@ -131,6 +139,43 @@ struct CreateUserForm {
 struct CsrfForm {
     #[serde(default)]
     csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProtocolProfileForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    enabled: String,
+    server: String,
+    port: u16,
+    #[serde(default)]
+    server_name: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    sni: String,
+    #[serde(default)]
+    public_key_secret: String,
+    #[serde(default)]
+    short_id_secret: String,
+    #[serde(default)]
+    password_secret: String,
+    #[serde(default)]
+    shadow_tls_password_secret: String,
+    #[serde(default)]
+    obfs_password_secret: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingRuleSetForm {
+    #[serde(default)]
+    csrf_token: String,
+    slug: String,
+    #[serde(default)]
+    enabled: String,
+    target: String,
+    payload: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
         ensure_demo_user(&pool).await?;
     }
     ensure_default_protocol_profiles(&pool).await?;
+    ensure_default_routing_rule_sets(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
 
     let state = AppState {
@@ -200,6 +246,14 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin", get(admin_dashboard))
         .route("/admin/users", get(users_page))
         .route("/admin/protocols", get(protocols_page))
+        .route(
+            "/admin/protocols/:name/update",
+            post(update_protocol_action),
+        )
+        .route(
+            "/admin/routing",
+            get(routing_page).post(update_routing_rule_action),
+        )
         .route("/admin/system", get(system_page))
         .route("/admin/cores", get(cores_page))
         .route("/admin/users/create", post(create_user_action))
@@ -280,8 +334,18 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         Ok(value) => value,
         Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     };
+    let routing_rule_sets = match load_routing_rule_sets(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
 
-    let yaml = match generate_mihomo_yaml(&settings, &subscription_user, &profiles, &secrets) {
+    let yaml = match generate_mihomo_yaml(
+        &settings,
+        &subscription_user,
+        &profiles,
+        &secrets,
+        &routing_rule_sets,
+    ) {
         Ok(value) => value,
         Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     };
@@ -303,13 +367,23 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
     (headers, yaml).into_response()
 }
 
-async fn rule_provider(Path(name): Path<String>) -> Response {
-    let body = match name.as_str() {
-        "banking-direct.yaml" => banking_direct_yaml(),
-        "direct-local.yaml" => direct_local_yaml(),
-        "proxy-ai.yaml" => proxy_ai_yaml(),
-        "streaming.yaml" => streaming_yaml(),
-        _ => return (StatusCode::NOT_FOUND, "rule not found\n").into_response(),
+async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let slug = name.trim_end_matches(".yaml");
+    let rule_sets = match load_routing_rule_sets(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+
+    let Some(rule_set) = rule_sets
+        .into_iter()
+        .find(|rule_set| rule_set.slug == slug && rule_set.enabled)
+    else {
+        return (StatusCode::NOT_FOUND, "rule not found\n").into_response();
+    };
+
+    let body = match routing_rule_payload_yaml(&rule_set.payload) {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
     };
 
     let mut headers = HeaderMap::new();
@@ -331,23 +405,22 @@ async fn index() -> impl IntoResponse {
             "StealthHub Panel",
             html! {
                 h1 { "StealthHub Panel" }
-                p { "Fast single-node Rust control panel for Clash Mi / mihomo.yaml." }
                 div class="cards" {
                     a class="card" href="/admin" {
-                        h2 { "Admin GUI" }
-                        p { "Dashboard, users, protocols, system settings." }
+                        h2 { "Dashboard" }
+                        p { "Admin session, storage, subscription status." }
                     }
                     a class="card" href="/admin/users" {
                         h2 { "Users" }
-                        p { "Создание пользователей и подписок." }
+                        p { "UUID, subscription token, traffic limit." }
                     }
-                    a class="card" href="/sub/demo/mihomo.yaml" {
-                        h2 { "Demo mihomo.yaml" }
-                        p { "Проверить отдачу подписки для Clash Mi." }
+                    a class="card" href="/admin/protocols" {
+                        h2 { "Protocols" }
+                        p { "Proxy profile parameters for Mihomo YAML." }
                     }
-                    a class="card" href="/health" {
-                        h2 { "Health" }
-                        p { "Проверка живости панели." }
+                    a class="card" href="/admin/routing" {
+                        h2 { "Routing" }
+                        p { "Rule providers imported by the subscription." }
                     }
                 }
             },
@@ -627,66 +700,35 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                     }
                 }
 
-                div class="notice" {
-                    strong { "v0.1:" }
-                    " SQLite users + protected admin GUI. Следующий этап — real protocol configs, systemd и safe apply."
-                }
-
                 div class="grid" {
                     section {
                         h2 { "Users" }
-                        p { "Создание пользователей и token-based подписок." }
+                        p { "UUID, subscription token, enable flag, traffic limit." }
                         a class="button" href="/admin/users" { "Open Users" }
                     }
 
                     section {
                         h2 { "Protocols" }
-                        p { "Профили, secrets и сборка реального Mihomo YAML из SQLite." }
+                        p { "Enabled profiles, endpoint, SNI, transport path, secret names." }
                         a class="button" href="/admin/protocols" { "Open Protocols" }
                     }
 
                     section {
+                        h2 { "Routing" }
+                        p { "Mihomo rule providers, RULE-SET targets, classical payload." }
+                        a class="button" href="/admin/routing" { "Open Routing" }
+                    }
+
+                    section {
                         h2 { "System" }
-                        p { "Bare-metal deploy target, health checks, env contract and service layout." }
+                        p { "Bind address, SQLite readiness, cookie mode, service paths." }
                         a class="button" href="/admin/system" { "Open System" }
                     }
 
                     section {
                         h2 { "Cores" }
-                        p { "Xray, sing-box, Hysteria and TUIC runtime contract." }
+                        p { "Binary paths, service names, config paths, local runtime state." }
                         a class="button" href="/admin/cores" { "Open Cores" }
-                    }
-
-                    section {
-                        h2 { "Routing" }
-                        ul {
-                            li { "BANKING / RU / LOCAL → DIRECT" }
-                            li { "AI / GitHub → AUTO-SAFE" }
-                            li { "Streaming → SPEED" }
-                            li { "Final → MANUAL" }
-                        }
-                    }
-
-                    section {
-                        h2 { "Protocol plan" }
-                        ul {
-                            li { "VLESS + REALITY + XHTTP" }
-                            li { "SS2022 + ShadowTLS v3" }
-                            li { "AnyTLS" }
-                            li { "Hysteria2 speed fallback" }
-                            li { "TUIC speed fallback" }
-                        }
-                    }
-
-                    section {
-                        h2 { "System control roadmap" }
-                        ul {
-                            li { "systemd status/restart" }
-                            li { "journal logs" }
-                            li { "firewall ports" }
-                            li { "backup/restore" }
-                            li { "git pull + build + restart" }
-                        }
                     }
                 }
             },
@@ -701,6 +743,10 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(value) => value,
         Err(response) => return response,
     };
+    let installed_local_cores = CORE_RUNTIMES
+        .iter()
+        .filter(|core| std::path::Path::new(core.local_binary_path).is_file())
+        .count();
 
     Html(
         layout(
@@ -709,14 +755,10 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 (admin_bar(&auth))
                 h1 { "Cores" }
 
-                div class="notice" {
-                    "Proxy cores are managed as host systemd services. StealthHub Panel owns users, subscriptions, configs and safe apply; each core keeps its own binary, config file and rollback target."
-                }
-
                 div class="status-strip" {
                     div class="metric" {
-                        span { "Mode" }
-                        strong { "external binaries" }
+                        span { "Local binaries" }
+                        strong { (installed_local_cores) "/" (CORE_RUNTIMES.len()) }
                     }
                     div class="metric" {
                         span { "Supervisor" }
@@ -742,6 +784,7 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                                     th { "Priority" }
                                     th { "Role" }
                                     th { "Service" }
+                                    th { "Local" }
                                     th { "Binary" }
                                     th { "Config" }
                                     th { "Updates" }
@@ -754,6 +797,17 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                                         td { span class=(format!("badge {}", core_priority_class(core.priority))) { (core.priority) } }
                                         td { (core.role) }
                                         td { code { (core.service) } }
+                                        td {
+                                            @if std::path::Path::new(core.local_binary_path).is_file() {
+                                                span class="badge ok" { "installed" }
+                                                " "
+                                                code { (core.local_binary_path) }
+                                            } @else {
+                                                span class="badge off" { "missing" }
+                                                " "
+                                                code { (core.local_binary_path) }
+                                            }
+                                        }
                                         td { code { (core.binary_path) } }
                                         td { code { (core.config_path) } }
                                         td { (core.update_channel) }
@@ -765,19 +819,10 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 }
 
                 section {
-                    h2 { "Safe update flow" }
-                    ol {
-                        li { "Download release archive into a staging directory under " code { "/var/lib/stealthhub-panel/core-updates" } "." }
-                        li { "Verify SHA256 checksum from the release metadata before touching the active symlink." }
-                        li { "Run binary self-check and config validation with the staged binary." }
-                        li { "Switch " code { "current" } " symlink atomically only after validation passes." }
-                        li { "Restart exactly one service, check readiness, and roll back symlink if the service fails." }
-                    }
-                }
-
-                section {
                     h2 { "Local install contract" }
                     dl class="details" {
+                        dt { "Local dev root" }
+                        dd { code { ".runtime/cores/{core}/{version}" } }
                         dt { "Core root" }
                         dd { code { "/opt/stealthhub/cores/{core}/{version}" } }
                         dt { "Active binary" }
@@ -793,6 +838,178 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         .into_string(),
     )
     .into_response()
+}
+
+async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    let rule_sets = match load_routing_rule_sets(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Routing unavailable",
+                format!("Failed to load routing rules: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+
+    Html(
+        layout(
+            "Routing",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Routing" }
+
+                div class="status-strip" {
+                    div class="metric" {
+                        span { "Rule sets" }
+                        strong { (rule_sets.len()) }
+                    }
+                    div class="metric" {
+                        span { "Enabled" }
+                        strong { (rule_sets.iter().filter(|rule_set| rule_set.enabled).count()) }
+                    }
+                    div class="metric" {
+                        span { "Provider type" }
+                        strong { "http / classical / yaml" }
+                    }
+                    div class="metric" {
+                        span { "Import" }
+                        strong { "RULE-SET" }
+                    }
+                }
+
+                section {
+                    h2 { "Mihomo rule sets" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Name" }
+                                    th { "Target" }
+                                    th { "Provider URL" }
+                                    th { "Rules" }
+                                    th { "State" }
+                                }
+                            }
+                            tbody {
+                                @for rule_set in &rule_sets {
+                                    tr {
+                                        td { strong { (&rule_set.title) } br; code { (&rule_set.slug) } }
+                                        td { code { (&rule_set.target) } }
+                                        td { code { (format!("/rules/{}.yaml", rule_set.slug)) } }
+                                        td { (rule_set.payload.lines().filter(|line| !line.trim().is_empty()).count()) }
+                                        td {
+                                            @if rule_set.enabled {
+                                                span class="badge ok" { "enabled" }
+                                            } @else {
+                                                span class="badge off" { "disabled" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Rule parameters" }
+                    div class="config-list" {
+                        @for rule_set in &rule_sets {
+                            (routing_rule_editor(rule_set, &auth))
+                        }
+                    }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn update_routing_rule_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RoutingRuleSetForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let input = UpdateRoutingRuleSet {
+        slug: form.slug,
+        enabled: checkbox_enabled(&form.enabled),
+        target: form.target,
+        payload: form.payload,
+    };
+
+    match update_routing_rule_set(&state.pool, input).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(err) => html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Routing update failed",
+            format!("Failed to update rule set: {err}"),
+        ),
+    }
+}
+
+fn routing_rule_editor(
+    rule_set: &stealthhub_core::rules::RoutingRuleSet,
+    auth: &AuthenticatedAdmin,
+) -> Markup {
+    html! {
+        section class="config-row" {
+            div class="config-row-head" {
+                h3 { (&rule_set.title) }
+                div class="config-row-meta" {
+                    span class=(format!("badge {}", if rule_set.enabled { "ok" } else { "off" })) {
+                        @if rule_set.enabled { "enabled" } @else { "disabled" }
+                    }
+                    span class="badge neutral" { (&rule_set.target) }
+                    code { (format!("/rules/{}.yaml", rule_set.slug)) }
+                }
+            }
+            form method="post" action="/admin/routing" class="config-form wide" {
+                (csrf_field(&auth.csrf_token))
+                input type="hidden" name="slug" value=(&rule_set.slug);
+                label class="switch-field" {
+                    input type="checkbox" name="enabled" checked[rule_set.enabled];
+                    span class="switch-ui" {}
+                    span {
+                        strong { "Enabled" }
+                        small { "Include this rule provider and RULE-SET line in generated Mihomo YAML." }
+                    }
+                }
+                label {
+                    span { "Target group" }
+                    select name="target" {
+                        @for target in ROUTING_TARGETS {
+                            option value=(target) selected[*target == rule_set.target] { (target) }
+                        }
+                    }
+                    small { (&rule_set.effect) }
+                }
+                label class="full-span" {
+                    span { "Classical payload" }
+                    textarea name="payload" rows="10" spellcheck="false" { (&rule_set.payload) }
+                    small { "One Mihomo classical rule per line, for example DOMAIN-SUFFIX,example.com or IP-CIDR,10.0.0.0/8,no-resolve." }
+                }
+                button type="submit" { "Save rule set" }
+            }
+        }
+    }
 }
 
 async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -812,10 +1029,6 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
             html! {
                 (admin_bar(&auth))
                 h1 { "System" }
-
-                div class="notice" {
-                    "Deployment target is intentionally small: one release binary, SQLite under /var/lib, env under /etc, systemd as supervisor, and a reverse proxy for HTTPS."
-                }
 
                 div class="status-strip" {
                     div class="metric" {
@@ -870,16 +1083,6 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                     }
                 }
 
-                section {
-                    h2 { "Next server controls" }
-                    ul {
-                        li { "service status and restart for the panel itself;" }
-                        li { "journal log viewer;" }
-                        li { "Xray/sing-box/Hysteria/TUIC service status;" }
-                        li { "config validation before apply;" }
-                        li { "atomic config write and rollback." }
-                    }
-                }
             },
         )
         .into_string(),
@@ -939,10 +1142,6 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 (admin_bar(&auth))
                 h1 { "Protocols" }
 
-                div class="notice" {
-                    "Эта страница уже показывает, из каких профилей и secret names будет собираться подписка `mihomo.yaml`. Следующий шаг после нее — формы редактирования и safe apply на сервер."
-                }
-
                 div class="status-strip" {
                     div class="metric" {
                         span { "Profiles" }
@@ -963,10 +1162,8 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 }
 
                 section {
-                    h2 { "Panel settings" }
+                    h2 { "Mihomo subscription endpoint" }
                     dl class="details" {
-                        dt { "Panel name" }
-                        dd { code { (&settings.panel_name) } }
                         dt { "Subscription domain" }
                         dd { code { (&settings.subscription_domain) } }
                         dt { "Node domain" }
@@ -992,7 +1189,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                                     }
                                 }
                                 tbody {
-                                    @for profile in profiles {
+                                    @for profile in &profiles {
                                         tr {
                                             td { code { (&profile.name) } }
                                             td { (proxy_kind_label(&profile.kind)) }
@@ -1006,7 +1203,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                                             }
                                             td { code { (format!("{}:{}", profile.server, profile.port)) } }
                                             td {
-                                                @let missing = missing_secret_names(&profile, &secret_names);
+                                                @let missing = missing_secret_names(profile, &secret_names);
                                                 @if profile.required_secret_names().is_empty() {
                                                     span class="badge ok" { "none" }
                                                 } @else if missing.is_empty() {
@@ -1034,10 +1231,16 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 }
 
                 section {
-                    h2 { "Current public outputs" }
-                    ul {
-                        li { code { "/sub/{token}/mihomo.yaml" } " now uses DB-backed settings and profiles." }
-                        li { code { "/rules/banking-direct.yaml" } ", " code { "/rules/direct-local.yaml" } ", " code { "/rules/proxy-ai.yaml" } ", " code { "/rules/streaming.yaml" } " remain static built-ins for now." }
+                    h2 { "Profile parameters" }
+                    datalist id="secret-names" {
+                        @for secret in &secret_names {
+                            option value=(secret) {}
+                        }
+                    }
+                    div class="config-list" {
+                        @for profile in &profiles {
+                            (protocol_profile_editor(profile, &auth, &secret_names))
+                        }
                     }
                 }
             },
@@ -1045,6 +1248,307 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         .into_string(),
     )
     .into_response()
+}
+
+async fn update_protocol_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<ProtocolProfileForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Protocol update failed",
+                format!("Failed to load protocol profiles: {err}"),
+            )
+        }
+    };
+    let Some(existing) = profiles.into_iter().find(|profile| profile.name == name) else {
+        return html_error_response(
+            StatusCode::NOT_FOUND,
+            "Protocol update failed",
+            "Profile not found",
+        );
+    };
+
+    let config = match protocol_config_from_form(&existing, &form) {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Protocol update failed",
+                err.to_string(),
+            )
+        }
+    };
+
+    let input = UpdateProtocolProfile {
+        name: existing.name,
+        enabled: checkbox_enabled(&form.enabled),
+        server: form.server.trim().to_string(),
+        port: form.port,
+        config,
+    };
+
+    match update_protocol_profile(&state.pool, input).await {
+        Ok(_) => Redirect::to("/admin/protocols").into_response(),
+        Err(err) => html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Protocol update failed",
+            format!("Failed to update profile: {err}"),
+        ),
+    }
+}
+
+fn protocol_config_from_form(
+    existing: &ProtocolProfile,
+    form: &ProtocolProfileForm,
+) -> anyhow::Result<ProtocolConfig> {
+    if form.server.trim().is_empty() {
+        return Err(anyhow::anyhow!("Server address is required"));
+    }
+
+    match &existing.config {
+        ProtocolConfig::VlessRealityXhttp { uuid_source, .. } => {
+            Ok(ProtocolConfig::VlessRealityXhttp {
+                uuid_source: uuid_source.clone(),
+                server_name: required_field(&form.server_name, "TLS server name")?,
+                path: required_field(&form.path, "XHTTP path")?,
+                public_key_secret: required_field(
+                    &form.public_key_secret,
+                    "REALITY public key secret",
+                )?,
+                short_id_secret: required_field(&form.short_id_secret, "REALITY short ID secret")?,
+            })
+        }
+        ProtocolConfig::VlessRealityTcp { uuid_source, .. } => {
+            Ok(ProtocolConfig::VlessRealityTcp {
+                uuid_source: uuid_source.clone(),
+                server_name: required_field(&form.server_name, "TLS server name")?,
+                public_key_secret: required_field(
+                    &form.public_key_secret,
+                    "REALITY public key secret",
+                )?,
+                short_id_secret: required_field(&form.short_id_secret, "REALITY short ID secret")?,
+            })
+        }
+        ProtocolConfig::Shadowsocks2022ShadowTls { .. } => {
+            Ok(ProtocolConfig::Shadowsocks2022ShadowTls {
+                server_name: required_field(&form.server_name, "ShadowTLS server name")?,
+                password_secret: required_field(
+                    &form.password_secret,
+                    "Shadowsocks password secret",
+                )?,
+                shadow_tls_password_secret: required_field(
+                    &form.shadow_tls_password_secret,
+                    "ShadowTLS password secret",
+                )?,
+            })
+        }
+        ProtocolConfig::Hysteria2 { .. } => Ok(ProtocolConfig::Hysteria2 {
+            password_secret: required_field(&form.password_secret, "Hysteria2 password secret")?,
+            sni: required_field(&form.sni, "TLS SNI")?,
+            obfs_password_secret: optional_field(&form.obfs_password_secret),
+        }),
+        ProtocolConfig::AnyTls { .. } => Ok(ProtocolConfig::AnyTls {
+            password_secret: required_field(&form.password_secret, "AnyTLS password secret")?,
+            sni: required_field(&form.sni, "TLS SNI")?,
+        }),
+        ProtocolConfig::Tuic { uuid_source, .. } => Ok(ProtocolConfig::Tuic {
+            uuid_source: uuid_source.clone(),
+            password_secret: required_field(&form.password_secret, "TUIC password secret")?,
+            sni: required_field(&form.sni, "TLS SNI")?,
+        }),
+    }
+}
+
+fn required_field(value: &str, label: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow::anyhow!("{label} is required"));
+    }
+    Ok(value.to_string())
+}
+
+fn optional_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn checkbox_enabled(value: &str) -> bool {
+    matches!(value, "1" | "true" | "yes" | "on")
+}
+
+fn protocol_profile_editor(
+    profile: &ProtocolProfile,
+    auth: &AuthenticatedAdmin,
+    secret_names: &[String],
+) -> Markup {
+    html! {
+        section class="config-row" {
+            div class="config-row-head" {
+                h3 { (&profile.name) }
+                div class="config-row-meta" {
+                    span class=(format!("badge {}", if profile.enabled { "ok" } else { "off" })) {
+                        @if profile.enabled { "enabled" } @else { "disabled" }
+                    }
+                    span class="badge neutral" { (proxy_kind_label(&profile.kind)) }
+                    span class="badge neutral" { (proxy_role_label(&profile.role)) }
+                }
+            }
+            form method="post" action=(format!("/admin/protocols/{}/update", profile.name)) class="config-form" {
+                (csrf_field(&auth.csrf_token))
+                label class="switch-field" {
+                    input type="checkbox" name="enabled" checked[profile.enabled];
+                    span class="switch-ui" {}
+                    span {
+                        strong { "Enabled" }
+                        small { "Include this proxy in generated Mihomo subscriptions." }
+                    }
+                }
+                label {
+                    span { "Server address" }
+                    input type="text" name="server" value=(&profile.server) required;
+                    small { "Hostname or IP used by the Mihomo proxy object." }
+                }
+                label {
+                    span { "Server port" }
+                    input type="number" name="port" min="1" max="65535" value=(profile.port) required;
+                    small { "Remote port used by the client." }
+                }
+                (protocol_specific_fields(profile, secret_names))
+                button type="submit" { "Save profile" }
+            }
+        }
+    }
+}
+
+fn protocol_specific_fields(profile: &ProtocolProfile, secret_names: &[String]) -> Markup {
+    match &profile.config {
+        ProtocolConfig::VlessRealityXhttp {
+            server_name,
+            path,
+            public_key_secret,
+            short_id_secret,
+            ..
+        } => html! {
+            (text_input("server_name", "TLS server name", server_name, "SNI and XHTTP Host value used by Mihomo."))
+            (text_input("path", "XHTTP path", path, "HTTP path sent by the xhttp transport."))
+            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
+            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
+        },
+        ProtocolConfig::VlessRealityTcp {
+            server_name,
+            public_key_secret,
+            short_id_secret,
+            ..
+        } => html! {
+            (text_input("server_name", "TLS server name", server_name, "SNI value for REALITY verification."))
+            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
+            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
+        },
+        ProtocolConfig::Shadowsocks2022ShadowTls {
+            server_name,
+            password_secret,
+            shadow_tls_password_secret,
+        } => html! {
+            (text_input("server_name", "ShadowTLS server name", server_name, "TLS host presented by ShadowTLS v3."))
+            (secret_input("password_secret", "Shadowsocks password secret", password_secret, secret_names))
+            (secret_input(
+                "shadow_tls_password_secret",
+                "ShadowTLS password secret",
+                shadow_tls_password_secret,
+                secret_names
+            ))
+        },
+        ProtocolConfig::Hysteria2 {
+            password_secret,
+            sni,
+            obfs_password_secret,
+        } => html! {
+            (text_input("sni", "TLS SNI", sni, "Server name used by the TLS handshake."))
+            (secret_input("password_secret", "Hysteria2 password secret", password_secret, secret_names))
+            (optional_secret_input(
+                "obfs_password_secret",
+                "Salamander obfs secret",
+                obfs_password_secret.as_deref().unwrap_or(""),
+                secret_names
+            ))
+        },
+        ProtocolConfig::AnyTls {
+            password_secret,
+            sni,
+        } => html! {
+            (text_input("sni", "TLS SNI", sni, "Server name used by AnyTLS."))
+            (secret_input("password_secret", "AnyTLS password secret", password_secret, secret_names))
+        },
+        ProtocolConfig::Tuic {
+            password_secret,
+            sni,
+            ..
+        } => html! {
+            (text_input("sni", "TLS SNI", sni, "Server name used by TUIC."))
+            (secret_input("password_secret", "TUIC password secret", password_secret, secret_names))
+        },
+    }
+}
+
+fn text_input(name: &str, label: &str, value: &str, help: &str) -> Markup {
+    html! {
+        label {
+            span { (label) }
+            input type="text" name=(name) value=(value) required;
+            small { (help) }
+        }
+    }
+}
+
+fn secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
+    html! {
+        label {
+            span { (label) }
+            input type="text" name=(name) value=(value) list="secret-names" required;
+            small {
+                "SQLite secret name. "
+                @if secret_names.iter().any(|secret| secret == value) {
+                    span class="inline-ok" { "present" }
+                } @else {
+                    span class="inline-warn" { "missing" }
+                }
+            }
+        }
+    }
+}
+
+fn optional_secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
+    html! {
+        label {
+            span { (label) }
+            input type="text" name=(name) value=(value) list="secret-names";
+            small {
+                "Optional SQLite secret name."
+                @if !value.is_empty() && secret_names.iter().any(|secret| secret == value) {
+                    " "
+                    span class="inline-ok" { "present" }
+                } @else if !value.is_empty() {
+                    " "
+                    span class="inline-warn" { "missing" }
+                }
+            }
+        }
+    }
 }
 
 async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1078,10 +1582,6 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
             html! {
                 (admin_bar(&auth))
                 h1 { "Users" }
-
-                div class="notice" {
-                    "Пока это базовый users MVP: создание пользователя, токен подписки, enable/disable, reset token и delete."
-                }
 
                 section {
                     h2 { "Create user" }
@@ -1407,7 +1907,7 @@ async fn delete_user_page(
                     p {
                         "This removes "
                         strong { (user.username) }
-                        " from the panel and invalidates the subscription token. Proxy server config cleanup will be handled by the future safe-apply flow."
+                        " from the users table and invalidates the subscription token."
                     }
                     dl class="details" {
                         dt { "UUID" }
@@ -1750,7 +2250,11 @@ impl LoginRateLimiter {
 }
 
 fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Response> {
-    if csrf_token == auth.csrf_token {
+    if csrf_token
+        .as_bytes()
+        .ct_eq(auth.csrf_token.as_bytes())
+        .into()
+    {
         return None;
     }
 
@@ -1927,121 +2431,218 @@ fn layout(title: &str, body: Markup) -> Markup {
                 style {
                     (PreEscaped(r#"
                     :root {
-                        color-scheme: dark;
-                        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                        background: #090d12;
-                        color: #e5edf5;
-                        --bg: #090d12;
-                        --panel: #111821;
-                        --panel-soft: #0f151d;
-                        --border: #253244;
-                        --border-strong: #3a5270;
-                        --text: #e5edf5;
-                        --muted: #9fb0c3;
-                        --accent: #5aa7ff;
-                        --ok-bg: #0d3125;
-                        --ok-text: #9be7bf;
-                        --danger-bg: #351515;
-                        --danger-text: #ffb3b3;
+                        color-scheme: light;
+                        font-family: "Aptos", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+                        background: #e7edf2;
+                        color: #202a33;
+                        --bg: #e7edf2;
+                        --chrome: #0a4964;
+                        --chrome-dark: #07344a;
+                        --chrome-soft: #d9e8ef;
+                        --panel: #ffffff;
+                        --panel-soft: #f5f8fa;
+                        --panel-strong: #eef4f7;
+                        --border: #c6d2db;
+                        --border-strong: #88a4b5;
+                        --text: #202a33;
+                        --muted: #627483;
+                        --accent: #087da1;
+                        --accent-dark: #075f7b;
+                        --ok-bg: #e2f4e8;
+                        --ok-text: #17653a;
+                        --warn-bg: #fff3d5;
+                        --warn-text: #875600;
+                        --danger-bg: #fbe4e4;
+                        --danger-text: #9f1c1c;
                     }
                     * { box-sizing: border-box; }
                     body {
-                        max-width: 1200px;
-                        margin: 0 auto;
-                        padding: 24px 18px 40px;
+                        margin: 0;
+                        min-height: 100vh;
                         background: var(--bg);
                         color: var(--text);
+                    }
+                    .app-chrome {
+                        min-height: 100vh;
+                        display: grid;
+                        grid-template-rows: auto 1fr;
+                    }
+                    .masthead {
+                        min-height: 46px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 18px;
+                        padding: 8px 22px;
+                        background: linear-gradient(180deg, var(--chrome) 0%, var(--chrome-dark) 100%);
+                        border-bottom: 1px solid #062f42;
+                        color: #f6fbfd;
+                        box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset;
+                    }
+                    .masthead-title {
+                        display: flex;
+                        align-items: center;
+                        gap: 10px;
+                        font-weight: 750;
+                        letter-spacing: 0.01em;
+                    }
+                    .brand-mark {
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 4px;
+                        background:
+                            linear-gradient(90deg, transparent 0 18%, rgba(255,255,255,0.9) 18% 24%, transparent 24% 38%, rgba(255,255,255,0.9) 38% 44%, transparent 44% 58%, rgba(255,255,255,0.9) 58% 64%, transparent 64%),
+                            #16a0c3;
+                        border: 1px solid rgba(255,255,255,0.55);
+                    }
+                    .masthead-meta {
+                        color: #cde7f1;
+                        font-size: 12px;
+                        text-transform: uppercase;
+                        letter-spacing: 0.08em;
+                    }
+                    .layout-shell {
+                        display: grid;
+                        grid-template-columns: 232px minmax(0, 1fr);
+                        min-height: 0;
+                    }
+                    .content {
+                        width: 100%;
+                        max-width: 1280px;
+                        padding: 22px 26px 42px;
                     }
                     a {
                         color: inherit;
                         text-underline-offset: 3px;
                     }
                     h1 {
-                        font-size: 30px;
-                        line-height: 1.15;
-                        margin: 0 0 10px;
+                        font-size: 26px;
+                        line-height: 1.2;
+                        margin: 0 0 12px;
+                        color: #152633;
                     }
                     h2 {
                         margin: 0 0 12px;
-                        font-size: 18px;
+                        font-size: 16px;
+                        color: #1b3342;
                     }
-                    p { color: var(--muted); }
+                    p { color: var(--muted); line-height: 1.55; }
                     code {
                         display: inline-block;
-                        padding: 4px 7px;
-                        border-radius: 6px;
-                        background: #0c121a;
-                        border: 1px solid #1e2a39;
-                        color: #b8d7ff;
+                        padding: 3px 6px;
+                        border-radius: 3px;
+                        background: #edf3f6;
+                        border: 1px solid #c9d7df;
+                        color: #17495e;
                         word-break: break-all;
                     }
                     .top-nav {
-                        display: flex;
-                        flex-wrap: wrap;
-                        align-items: center;
-                        gap: 8px;
-                        margin-bottom: 22px;
-                        padding: 10px 12px;
-                        border: 1px solid var(--border);
-                        border-radius: 8px;
-                        background: #0d141d;
+                        min-height: 100%;
+                        padding: 16px 10px;
+                        border-right: 1px solid var(--border);
+                        background: linear-gradient(180deg, #f8fbfc 0%, #edf3f6 100%);
                     }
                     .top-nav a {
-                        padding: 6px 8px;
-                        border-radius: 6px;
-                        color: var(--muted);
+                        display: block;
+                        margin-bottom: 4px;
+                        padding: 9px 10px;
+                        border: 1px solid transparent;
+                        border-radius: 3px;
+                        color: #273a46;
                         text-decoration: none;
+                        font-size: 14px;
+                        font-weight: 650;
                     }
                     .top-nav a:hover {
                         color: var(--text);
-                        background: #172235;
+                        border-color: #b5c8d3;
+                        background: #ffffff;
+                    }
+                    .nav-section {
+                        margin: 10px 8px 8px;
+                        color: #6b7d89;
+                        font-size: 11px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                        letter-spacing: 0.08em;
                     }
                     .cards, .grid {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-                        gap: 12px;
-                        margin-top: 18px;
+                        display: flex;
+                        flex-direction: column;
+                        gap: 7px;
+                        margin-top: 16px;
                     }
                     .card, section, .notice {
                         background: var(--panel);
                         border: 1px solid var(--border);
-                        border-radius: 8px;
-                        padding: 16px;
+                        border-radius: 4px;
+                        padding: 13px 14px;
                         text-decoration: none;
+                        box-shadow: 0 1px 2px rgba(31, 55, 70, 0.06);
+                    }
+                    section {
+                        margin-top: 12px;
+                    }
+                    .cards .card, .grid section {
+                        min-height: 52px;
+                        display: grid;
+                        grid-template-columns: 220px minmax(0, 1fr) auto;
+                        align-items: center;
+                        gap: 12px;
+                        margin-top: 0;
+                        padding: 10px 12px;
+                    }
+                    .cards .card h2, .grid section h2 {
+                        margin: 0;
+                    }
+                    .cards .card p, .grid section p {
+                        margin: 0;
+                    }
+                    .grid section ul {
+                        grid-column: 2 / -1;
+                        columns: 2;
+                        margin: 0;
+                        padding-left: 18px;
+                    }
+                    .grid section .button {
+                        justify-self: end;
                     }
                     .card:hover, .button:hover, button:hover {
                         border-color: var(--accent);
                     }
                     .notice {
-                        margin: 16px 0;
+                        margin: 14px 0;
                         background: var(--panel-soft);
                         color: var(--muted);
+                        border-left: 4px solid var(--accent);
                     }
                     .error {
-                        border-color: #ef4444;
+                        border-color: #c64d4d;
                         color: var(--danger-text);
+                        background: #fff6f6;
                     }
                     li { margin: 6px 0; }
                     .button, button {
                         display: inline-block;
-                        min-height: 36px;
-                        padding: 8px 12px;
-                        border-radius: 6px;
+                        min-height: 34px;
+                        padding: 7px 12px;
+                        border-radius: 3px;
                         border: 1px solid var(--border-strong);
-                        background: #172235;
-                        color: var(--text);
+                        background: linear-gradient(180deg, #ffffff 0%, #e7eef2 100%);
+                        color: #173244;
                         text-decoration: none;
                         cursor: pointer;
                         font-weight: 650;
+                        box-shadow: 0 1px 0 rgba(255,255,255,0.9) inset;
                     }
                     .button.compact {
-                        min-height: 32px;
+                        min-height: 30px;
                         padding: 6px 10px;
                         margin: 0 6px 6px 0;
                     }
                     .button.secondary {
                         border-color: var(--border);
-                        background: #0d141d;
+                        background: #f7fafb;
                         color: var(--muted);
                     }
                     .form {
@@ -2057,24 +2658,36 @@ fn layout(title: &str, body: Markup) -> Markup {
                         color: var(--muted);
                         font-size: 14px;
                     }
-                    input {
+                    input, select, textarea {
                         width: 100%;
-                        min-height: 40px;
-                        padding: 10px 11px;
-                        border-radius: 6px;
+                        min-height: 38px;
+                        padding: 9px 10px;
+                        border-radius: 3px;
                         border: 1px solid var(--border);
-                        background: #0c121a;
+                        background: #ffffff;
                         color: var(--text);
-                        font-size: 16px;
+                        font-size: 15px;
                     }
-                    input:focus {
-                        outline: 2px solid rgba(90, 167, 255, 0.35);
+                    textarea {
+                        min-height: 180px;
+                        resize: vertical;
+                        font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+                        line-height: 1.45;
+                    }
+                    input:focus, select:focus, textarea:focus {
+                        outline: 2px solid rgba(8, 125, 161, 0.22);
                         border-color: var(--accent);
+                    }
+                    small {
+                        color: var(--muted);
+                        font-size: 12px;
+                        line-height: 1.35;
                     }
                     .table-wrap {
                         overflow-x: auto;
                         border: 1px solid var(--border);
-                        border-radius: 8px;
+                        border-radius: 4px;
+                        background: #ffffff;
                     }
                     table {
                         width: 100%;
@@ -2084,33 +2697,50 @@ fn layout(title: &str, body: Markup) -> Markup {
                     th, td {
                         text-align: left;
                         border-bottom: 1px solid var(--border);
-                        padding: 11px 10px;
+                        padding: 9px 10px;
                         vertical-align: top;
+                        font-size: 14px;
                     }
                     tbody tr:hover {
-                        background: rgba(90, 167, 255, 0.04);
+                        background: #f3f8fa;
                     }
                     th {
-                        color: var(--muted);
-                        font-size: 13px;
+                        color: #425563;
+                        font-size: 12px;
                         text-transform: uppercase;
-                        letter-spacing: 0.04em;
-                        background: #0f151d;
+                        letter-spacing: 0.05em;
+                        background: linear-gradient(180deg, #f5f8fa 0%, #e7eef2 100%);
                     }
                     .badge {
                         display: inline-block;
-                        padding: 4px 8px;
-                        border-radius: 999px;
+                        padding: 3px 8px;
+                        border-radius: 3px;
                         font-weight: 700;
                         font-size: 12px;
+                        border: 1px solid transparent;
                     }
                     .badge.ok {
                         background: var(--ok-bg);
                         color: var(--ok-text);
+                        border-color: #a8d9bb;
                     }
                     .badge.off {
                         background: var(--danger-bg);
                         color: var(--danger-text);
+                        border-color: #e4b0b0;
+                    }
+                    .badge.neutral {
+                        background: #edf3f6;
+                        color: #315063;
+                        border-color: #c9d7df;
+                    }
+                    .inline-ok {
+                        color: var(--ok-text);
+                        font-weight: 700;
+                    }
+                    .inline-warn {
+                        color: var(--danger-text);
+                        font-weight: 700;
                     }
                     .inline-form {
                         display: inline-block;
@@ -2121,23 +2751,28 @@ fn layout(title: &str, body: Markup) -> Markup {
                         align-items: center;
                         justify-content: space-between;
                         gap: 12px;
-                        margin-bottom: 20px;
-                        padding: 12px 14px;
+                        margin-bottom: 16px;
+                        padding: 10px 12px;
                         border: 1px solid var(--border);
-                        border-radius: 8px;
-                        background: #101820;
+                        border-radius: 4px;
+                        background: var(--panel-strong);
                     }
                     .status-strip {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-                        gap: 10px;
-                        margin: 18px 0;
+                        display: flex;
+                        flex-direction: column;
+                        gap: 6px;
+                        margin: 16px 0;
                     }
                     .metric {
-                        padding: 12px;
+                        min-height: 42px;
+                        display: grid;
+                        grid-template-columns: 180px minmax(0, 1fr);
+                        align-items: center;
+                        gap: 12px;
+                        padding: 8px 12px;
                         border: 1px solid var(--border);
-                        border-radius: 8px;
-                        background: #0d141d;
+                        border-radius: 4px;
+                        background: linear-gradient(180deg, #ffffff 0%, #f5f8fa 100%);
                     }
                     .metric span {
                         display: block;
@@ -2148,7 +2783,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                     }
                     .metric strong {
                         display: block;
-                        margin-top: 4px;
+                        margin-top: 0;
                     }
                     .actions {
                         display: flex;
@@ -2156,6 +2791,88 @@ fn layout(title: &str, body: Markup) -> Markup {
                         align-items: center;
                         gap: 8px;
                         margin-top: 16px;
+                    }
+                    .config-list {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 10px;
+                    }
+                    .config-row {
+                        padding: 0;
+                    }
+                    .config-row-head {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
+                        padding: 10px 12px;
+                        border-bottom: 1px solid var(--border);
+                        background: var(--panel-strong);
+                    }
+                    .config-row h3 {
+                        margin: 0;
+                        font-size: 15px;
+                    }
+                    .config-row-meta {
+                        display: flex;
+                        flex-wrap: wrap;
+                        align-items: center;
+                        justify-content: flex-end;
+                        gap: 6px;
+                    }
+                    .config-form {
+                        display: grid;
+                        grid-template-columns: repeat(2, minmax(0, 1fr));
+                        gap: 12px;
+                        padding: 12px;
+                    }
+                    .config-form.wide {
+                        grid-template-columns: minmax(220px, 0.35fr) minmax(0, 0.65fr);
+                    }
+                    .config-form button {
+                        justify-self: start;
+                    }
+                    .full-span {
+                        grid-column: 1 / -1;
+                    }
+                    .switch-field {
+                        display: grid;
+                        grid-template-columns: 42px minmax(0, 1fr);
+                        align-items: center;
+                        gap: 10px;
+                    }
+                    .switch-field input {
+                        position: absolute;
+                        opacity: 0;
+                        width: 1px;
+                        height: 1px;
+                    }
+                    .switch-ui {
+                        width: 38px;
+                        height: 20px;
+                        position: relative;
+                        border-radius: 999px;
+                        border: 1px solid #9fb2bf;
+                        background: #d5dde3;
+                    }
+                    .switch-ui::after {
+                        content: "";
+                        position: absolute;
+                        top: 2px;
+                        left: 2px;
+                        width: 14px;
+                        height: 14px;
+                        border-radius: 50%;
+                        background: #ffffff;
+                        border: 1px solid #9fb2bf;
+                        transition: transform 120ms ease;
+                    }
+                    .switch-field input:checked + .switch-ui {
+                        background: #0d8faf;
+                        border-color: #087da1;
+                    }
+                    .switch-field input:checked + .switch-ui::after {
+                        transform: translateX(18px);
                     }
                     .details {
                         display: grid;
@@ -2172,17 +2889,70 @@ fn layout(title: &str, body: Markup) -> Markup {
                         margin: 0;
                     }
                     .danger-zone {
-                        border-color: #7f1d1d;
+                        border-color: #d88f8f;
                     }
 
                     .button.danger, button.danger {
-                        border-color: #7f1d1d;
+                        border-color: #c64d4d;
                         background: var(--danger-bg);
                         color: var(--danger-text);
                     }
-                    @media (max-width: 640px) {
-                        body { padding: 16px 12px 32px; }
-                        h1 { font-size: 26px; }
+                    @media (max-width: 760px) {
+                        .masthead {
+                            align-items: flex-start;
+                            flex-direction: column;
+                            gap: 4px;
+                            padding: 10px 14px;
+                        }
+                        .layout-shell {
+                            display: block;
+                        }
+                        .top-nav {
+                            min-height: auto;
+                            display: flex;
+                            flex-wrap: wrap;
+                            gap: 6px;
+                            padding: 10px;
+                            border-right: 0;
+                            border-bottom: 1px solid var(--border);
+                        }
+                        .top-nav a {
+                            margin-bottom: 0;
+                            padding: 7px 9px;
+                        }
+                        .nav-section {
+                            width: 100%;
+                            margin: 6px 4px 0;
+                        }
+                        .content {
+                            padding: 16px 12px 32px;
+                        }
+                        .cards .card, .grid section, .metric {
+                            grid-template-columns: 1fr;
+                            align-items: start;
+                            gap: 6px;
+                        }
+                        .config-row-head {
+                            align-items: flex-start;
+                            flex-direction: column;
+                        }
+                        .config-row-meta {
+                            justify-content: flex-start;
+                        }
+                        .config-form, .config-form.wide {
+                            grid-template-columns: 1fr;
+                        }
+                        .full-span {
+                            grid-column: auto;
+                        }
+                        .grid section ul {
+                            grid-column: auto;
+                            columns: 1;
+                        }
+                        .grid section .button {
+                            justify-self: start;
+                        }
+                        h1 { font-size: 24px; }
                         .admin-bar {
                             align-items: flex-start;
                             flex-direction: column;
@@ -2195,16 +2965,32 @@ fn layout(title: &str, body: Markup) -> Markup {
                 }
             }
             body {
-                nav class="top-nav" {
-                    a href="/" { "Home" }
-                    a href="/admin" { "Dashboard" }
-                    a href="/admin/users" { "Users" }
-                    a href="/admin/protocols" { "Protocols" }
-                    a href="/admin/system" { "System" }
-                    a href="/admin/cores" { "Cores" }
-                    a href="/health" { "Health" }
+                div class="app-chrome" {
+                    header class="masthead" {
+                        div class="masthead-title" {
+                            span class="brand-mark" aria-hidden="true" {}
+                            span { "StealthHub Panel" }
+                        }
+                        div class="masthead-meta" { "admin console" }
+                    }
+                    div class="layout-shell" {
+                        nav class="top-nav" aria-label="Main navigation" {
+                            div class="nav-section" { "Operate" }
+                            a href="/" { "Home" }
+                            a href="/admin" { "Dashboard" }
+                            a href="/admin/users" { "Users" }
+                            a href="/admin/protocols" { "Protocols" }
+                            a href="/admin/routing" { "Routing" }
+                            a href="/admin/cores" { "Cores" }
+                            div class="nav-section" { "Maintenance" }
+                            a href="/admin/system" { "System" }
+                            a href="/health" { "Health" }
+                        }
+                        main class="content" {
+                            (body)
+                        }
+                    }
                 }
-                (body)
             }
         }
     }

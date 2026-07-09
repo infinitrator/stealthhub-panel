@@ -8,7 +8,15 @@ use sqlx::{
 use std::{str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
-use crate::models::{PanelSettings, ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole};
+use crate::{
+    models::{PanelSettings, ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole},
+    rules::{
+        default_routing_rule_set, default_routing_rule_sets, is_valid_routing_target,
+        validate_classical_rule_payload, RoutingRuleSet,
+    },
+};
+
+pub type DbPool = SqlitePool;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct UserRecord {
@@ -88,6 +96,23 @@ pub struct NewProtocolProfile {
     pub server: String,
     pub port: u16,
     pub config: ProtocolConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateProtocolProfile {
+    pub name: String,
+    pub enabled: bool,
+    pub server: String,
+    pub port: u16,
+    pub config: ProtocolConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateRoutingRuleSet {
+    pub slug: String,
+    pub enabled: bool,
+    pub target: String,
+    pub payload: String,
 }
 
 pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
@@ -258,6 +283,31 @@ pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
     upsert_setting_if_missing(pool, "panel_name", "StealthHub Panel").await?;
     upsert_setting_if_missing(pool, "subscription_domain", "atlas.stealthhub.cc").await?;
     upsert_setting_if_missing(pool, "node_domain", "iberia.stealthhub.cc").await?;
+
+    Ok(())
+}
+
+pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
+    for rule_set in default_routing_rule_sets() {
+        upsert_setting_if_missing(
+            pool,
+            &routing_setting_key(&rule_set.slug, "enabled"),
+            bool_setting(rule_set.enabled),
+        )
+        .await?;
+        upsert_setting_if_missing(
+            pool,
+            &routing_setting_key(&rule_set.slug, "target"),
+            &rule_set.target,
+        )
+        .await?;
+        upsert_setting_if_missing(
+            pool,
+            &routing_setting_key(&rule_set.slug, "payload"),
+            &rule_set.payload,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -820,6 +870,89 @@ pub async fn list_protocol_profiles_decoded(pool: &SqlitePool) -> Result<Vec<Pro
         .collect()
 }
 
+pub async fn update_protocol_profile(
+    pool: &SqlitePool,
+    input: UpdateProtocolProfile,
+) -> Result<ProtocolProfileRecord> {
+    let existing = get_protocol_profile_by_name(pool, &input.name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("protocol profile not found"))?;
+    let now = Utc::now();
+    let config_json = serde_json::to_string(&input.config)?;
+
+    sqlx::query(
+        r#"
+        UPDATE protocol_profiles
+        SET enabled = ?, server = ?, port = ?, config_json = ?, updated_at = ?
+        WHERE name = ?
+        "#,
+    )
+    .bind(input.enabled)
+    .bind(input.server.trim())
+    .bind(i64::from(input.port))
+    .bind(config_json)
+    .bind(now)
+    .bind(existing.name.as_str())
+    .execute(pool)
+    .await?;
+
+    get_protocol_profile_by_name(pool, &existing.name)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("protocol profile was not updated"))
+}
+
+pub async fn load_routing_rule_sets(pool: &SqlitePool) -> Result<Vec<RoutingRuleSet>> {
+    let mut result = Vec::new();
+
+    for mut rule_set in default_routing_rule_sets() {
+        if let Some(enabled) =
+            get_setting(pool, &routing_setting_key(&rule_set.slug, "enabled")).await?
+        {
+            rule_set.enabled = parse_bool_setting(&enabled.value);
+        }
+        if let Some(target) =
+            get_setting(pool, &routing_setting_key(&rule_set.slug, "target")).await?
+        {
+            rule_set.target = target.value;
+        }
+        if let Some(payload) =
+            get_setting(pool, &routing_setting_key(&rule_set.slug, "payload")).await?
+        {
+            rule_set.payload = payload.value;
+        }
+
+        result.push(rule_set);
+    }
+
+    Ok(result)
+}
+
+pub async fn update_routing_rule_set(pool: &SqlitePool, input: UpdateRoutingRuleSet) -> Result<()> {
+    let slug = input.slug.trim();
+    if default_routing_rule_set(slug).is_none() {
+        return Err(anyhow::anyhow!("unknown rule set"));
+    }
+
+    let target = input.target.trim();
+    if !is_valid_routing_target(target) {
+        return Err(anyhow::anyhow!("unsupported routing target"));
+    }
+
+    let rules = validate_classical_rule_payload(&input.payload)?;
+    let payload = rules.join("\n");
+
+    upsert_setting(
+        pool,
+        &routing_setting_key(slug, "enabled"),
+        bool_setting(input.enabled),
+    )
+    .await?;
+    upsert_setting(pool, &routing_setting_key(slug, "target"), target).await?;
+    upsert_setting(pool, &routing_setting_key(slug, "payload"), &payload).await?;
+
+    Ok(())
+}
+
 pub async fn load_panel_settings(pool: &SqlitePool) -> Result<PanelSettings> {
     let mut settings = PanelSettings::default();
 
@@ -836,6 +969,22 @@ pub async fn load_panel_settings(pool: &SqlitePool) -> Result<PanelSettings> {
     }
 
     Ok(settings)
+}
+
+fn routing_setting_key(slug: &str, field: &str) -> String {
+    format!("routing.ruleset.{}.{}", slug.trim(), field)
+}
+
+fn bool_setting(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+fn parse_bool_setting(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "yes" | "on")
 }
 
 fn storage_string<T>(value: &T) -> Result<String>
