@@ -25,7 +25,7 @@ use std::{
     fs,
     net::{IpAddr, SocketAddr},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration as StdDuration, Instant},
 };
 use stealthhub_core::{
@@ -58,6 +58,7 @@ const DEPLOYMENT_MODE: &str = "bare-metal systemd";
 const LOGIN_RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
 const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
 const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 2048;
+static APP_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
         slug: "panel",
@@ -174,6 +175,60 @@ enum SystemActionKind {
     ReloadFirewall,
 }
 
+const CONSOLE_COMMANDS: &[ConsoleCommand] = &[
+    ConsoleCommand {
+        slug: "panel-status",
+        name: "Panel service status",
+        description: "Read systemd state for the Infiproxy panel service.",
+        program: "systemctl",
+        args: &["--no-pager", "--full", "status", "infiproxy.service"],
+    },
+    ConsoleCommand {
+        slug: "panel-logs",
+        name: "Panel logs",
+        description: "Read the last 80 journal lines for the panel service.",
+        program: "journalctl",
+        args: &["-u", "infiproxy.service", "-n", "80", "--no-pager"],
+    },
+    ConsoleCommand {
+        slug: "disk-usage",
+        name: "Disk usage",
+        description: "Show filesystem capacity for the root volume.",
+        program: "df",
+        args: &["-h", "/"],
+    },
+    ConsoleCommand {
+        slug: "memory",
+        name: "Memory snapshot",
+        description: "Show kernel memory accounting from /proc/meminfo.",
+        program: "head",
+        args: &["-n", "12", "/proc/meminfo"],
+    },
+    ConsoleCommand {
+        slug: "nginx-test",
+        name: "Nginx config test",
+        description: "Validate Nginx configuration without reloading it.",
+        program: "nginx",
+        args: &["-t"],
+    },
+    ConsoleCommand {
+        slug: "ssh-test",
+        name: "SSH config test",
+        description: "Validate sshd configuration without reloading it.",
+        program: "sshd",
+        args: &["-t"],
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ConsoleCommand {
+    slug: &'static str,
+    name: &'static str,
+    description: &'static str,
+    program: &'static str,
+    args: &'static [&'static str],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CoreRuntime {
     name: &'static str,
@@ -266,6 +321,20 @@ struct SystemActionForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct ConsoleCommandForm {
+    #[serde(default)]
+    csrf_token: String,
+    command: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct UninstallPreviewForm {
+    #[serde(default)]
+    csrf_token: String,
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct PanelSettingsForm {
     #[serde(default)]
     csrf_token: String,
@@ -295,6 +364,7 @@ struct AuthenticatedAdmin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = APP_STARTED_AT.set(Instant::now());
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,stealthhub_panel=info,tower_http=warn"));
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
@@ -357,7 +427,13 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/system", get(system_page))
         .route("/admin/system/action", post(system_action))
+        .route("/admin/system/console", post(system_console_action))
+        .route(
+            "/admin/system/uninstall-preview",
+            post(uninstall_preview_action),
+        )
         .route("/admin/cores", get(cores_page))
+        .route("/admin/credits", get(credits_page))
         .route("/admin/users/create", post(create_user_action))
         .route("/admin/users/{id}/toggle", post(toggle_user_action))
         .route(
@@ -1608,6 +1684,107 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 }
 
                 section {
+                    h2 { "Virtual console" }
+                    div class="notice" {
+                        "This is an operator console, not a raw shell. Commands are allowlisted, arguments are fixed in code, and output is capped."
+                    }
+                    form method="post" action="/admin/system/console" class="config-form wide" {
+                        (csrf_field(&auth.csrf_token))
+                        label {
+                            span { "Command" }
+                            select name="command" {
+                                @for command in CONSOLE_COMMANDS {
+                                    option value=(command.slug) { (command.name) }
+                                }
+                            }
+                        }
+                        label class="full-span" {
+                            span { "Available operations" }
+                            textarea readonly rows="6" {
+                                @for command in CONSOLE_COMMANDS {
+                                    (command.slug) " - " (command.description) "\n"
+                                }
+                            }
+                        }
+                        button type="submit" { "Run selected command" }
+                    }
+                }
+
+                section {
+                    h2 { "Configuration workspace" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Config" }
+                                    th { "Path" }
+                                    th { "Validation" }
+                                    th { "Reload" }
+                                }
+                            }
+                            tbody {
+                                tr {
+                                    td { "Panel environment" }
+                                    td { code { "/etc/infiproxy/infiproxy.env" } }
+                                    td { code { "systemctl show infiproxy.service" } }
+                                    td { code { "systemctl restart infiproxy.service" } }
+                                }
+                                tr {
+                                    td { "Nginx reverse proxy" }
+                                    td { code { "/etc/nginx/sites-available/infiproxy.conf" } }
+                                    td { code { "nginx -t" } }
+                                    td { code { "systemctl reload nginx.service" } }
+                                }
+                                tr {
+                                    td { "SSH daemon" }
+                                    td { code { "/etc/ssh/sshd_config" } }
+                                    td { code { "sshd -t" } }
+                                    td { code { "systemctl reload ssh.service" } }
+                                }
+                                tr {
+                                    td { "Proxy cores" }
+                                    td { code { "/etc/infiproxy-cores/{xray,sing-box,hysteria,tuic}" } }
+                                    td { code { "<core> check / --version" } }
+                                    td { code { "systemctl restart infiproxy-<core>.service" } }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                section {
+                    h2 { "Bare server bootstrap" }
+                    div class="runbook" {
+                        ol {
+                            li { "Install panel with " code { "deploy/bootstrap.sh" } " and bind it to localhost behind HTTPS." }
+                            li { "Create admin, set subscription domain, node domain and cookie secure mode." }
+                            li { "Install verified proxy cores into " code { "/opt/infiproxy/cores/{core}/{version}" } "." }
+                            li { "Activate " code { "current" } " symlinks and enable only the core services you use." }
+                            li { "Edit core configs under " code { "/etc/infiproxy-cores" } " and validate before reload." }
+                        }
+                    }
+                }
+
+                section class="danger-zone" {
+                    h2 { "Uninstall planner" }
+                    div class="notice error" {
+                        "Destructive uninstall is intentionally preview-only from the web UI. Review the generated plan and run it from SSH/root when you really want to remove files."
+                    }
+                    div class="actions" {
+                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            input type="hidden" name="mode" value="panel";
+                            button type="submit" class="danger" { "Preview panel-only removal" }
+                        }
+                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            input type="hidden" name="mode" value="full";
+                            button type="submit" class="danger" { "Preview full footprint removal" }
+                        }
+                    }
+                }
+
+                section {
                     h2 { "Health checks" }
                     ul {
                         li { code { "/health" } " returns process liveness." }
@@ -1696,6 +1873,207 @@ async fn system_action(
                         }
                     }
                     a class="button" href="/admin/system" { "Back to System" }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn system_console_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ConsoleCommandForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let Some(command) = CONSOLE_COMMANDS
+        .iter()
+        .find(|command| command.slug == form.command)
+    else {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Console command failed",
+            "Unknown console command",
+            "/admin/system",
+            "Back to System",
+        );
+    };
+
+    let step = run_command(command.program, command.args);
+
+    Html(
+        layout(
+            "Console",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Virtual console" }
+
+                section {
+                    h2 { (command.name) }
+                    p { (command.description) }
+                    div class="config-row" {
+                        div class="config-row-head" {
+                            h3 { code { (&step.command) } }
+                            @if step.success {
+                                span class="badge ok" { "ok" }
+                            } @else {
+                                span class="badge off" { "failed" }
+                            }
+                        }
+                        div class="command-output" {
+                            @if !step.stdout.is_empty() {
+                                strong { "stdout" }
+                                pre { (&step.stdout) }
+                            }
+                            @if !step.stderr.is_empty() {
+                                strong { "stderr" }
+                                pre { (&step.stderr) }
+                            }
+                            @if step.stdout.is_empty() && step.stderr.is_empty() {
+                                small { "No output." }
+                            }
+                        }
+                    }
+                    a class="button" href="/admin/system" { "Back to System" }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn uninstall_preview_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UninstallPreviewForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let Some(plan) = uninstall_plan(&form.mode) else {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Uninstall preview failed",
+            "Unknown uninstall mode",
+            "/admin/system",
+            "Back to System",
+        );
+    };
+
+    Html(
+        layout(
+            "Uninstall preview",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Uninstall preview" }
+
+                section class="danger-zone" {
+                    h2 { (plan.title) }
+                    div class="notice error" {
+                        (plan.warning)
+                    }
+                    div class="command-output" {
+                        strong { "review-only shell runbook" }
+                        pre { (plan.commands.join("\n")) }
+                    }
+                    a class="button" href="/admin/system" { "Back to System" }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn credits_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    Html(
+        layout(
+            "Credits",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Credits" }
+
+                section class="product-card" {
+                    div class="product-logo" {
+                        (brand_mark())
+                    }
+                    div {
+                        span class="eyebrow" { "commercial-grade control plane" }
+                        h2 { (APP_NAME) }
+                        p { "Rust, SQLite, systemd and Mihomo-compatible subscriptions with a conservative server-first UI." }
+                    }
+                }
+
+                section {
+                    h2 { "Project" }
+                    dl class="details" {
+                        dt { "Repository" }
+                        dd { a href="https://github.com/infinitrator/stealthhub-panel" rel="noreferrer" { "github.com/infinitrator/stealthhub-panel" } }
+                        dt { "License" }
+                        dd { code { "AGPL-3.0-or-later" } }
+                        dt { "Runtime" }
+                        dd { code { "Rust + Axum + SQLx + SQLite" } }
+                        dt { "Brand" }
+                        dd { "Infiproxy" }
+                    }
+                }
+
+                section {
+                    h2 { "GitHub stars" }
+                    div class="notice" {
+                        "Live stars are intentionally not fetched by the panel yet: keeping the control plane offline-capable avoids an extra HTTPS client dependency and background network calls."
+                    }
+                    dl class="details" {
+                        dt { "Recommended API" }
+                        dd { code { "GET https://api.github.com/repos/infinitrator/stealthhub-panel" } }
+                        dt { "Field" }
+                        dd { code { "stargazers_count" } }
+                        dt { "Production approach" }
+                        dd { "Fetch with ETag, cache for 6-24 hours in SQLite, render the cached value in this tab." }
+                    }
+                    a class="button" href="https://github.com/infinitrator/stealthhub-panel" rel="noreferrer" { "Open GitHub" }
+                }
+
+                section {
+                    h2 { "Acknowledgements" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Area" }
+                                    th { "Technology" }
+                                    th { "Role" }
+                                }
+                            }
+                            tbody {
+                                tr { td { "Web" } td { "Axum / Maud" } td { "Server-rendered admin interface" } }
+                                tr { td { "Storage" } td { "SQLite / SQLx" } td { "Single-node durable state" } }
+                                tr { td { "Subscriptions" } td { "Mihomo YAML" } td { "Client import format" } }
+                                tr { td { "Deployment" } td { "systemd" } td { "Bare-metal VPS runtime" } }
+                            }
+                        }
+                    }
                 }
             },
         )
@@ -3018,6 +3396,17 @@ fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
     }
 }
 
+fn brand_mark() -> Markup {
+    html! {
+        span class="brand-mark" aria-hidden="true" {
+            span class="brand-core" {}
+            span class="brand-node n1" {}
+            span class="brand-node n2" {}
+            span class="brand-node n3" {}
+        }
+    }
+}
+
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let is_admin_path = request.uri().path().starts_with("/admin");
     let mut response = next.run(request).await;
@@ -3135,6 +3524,28 @@ fn health_dashboard(
                     }
 
                     section {
+                        h2 { "Runtime statistics" }
+                        div class="status-strip compact-status" {
+                            div class="metric" {
+                                span { "Version" }
+                                strong { (env!("CARGO_PKG_VERSION")) }
+                            }
+                            div class="metric" {
+                                span { "Uptime" }
+                                strong { (app_uptime_label()) }
+                            }
+                            div class="metric" {
+                                span { "Deployment" }
+                                strong { (DEPLOYMENT_MODE) }
+                            }
+                            div class="metric" {
+                                span { "Probe mode" }
+                                strong { "html + plain text" }
+                            }
+                        }
+                    }
+
+                    section {
                         h2 { "Probe contract" }
                         dl class="details" {
                             dt { "Browser" }
@@ -3182,6 +3593,13 @@ fn health_badge_class(state: &str) -> &'static str {
     }
 }
 
+fn app_uptime_label() -> String {
+    APP_STARTED_AT
+        .get()
+        .map(|started_at| format_duration(started_at.elapsed().as_secs()))
+        .unwrap_or_else(|| "starting".to_string())
+}
+
 #[derive(Debug, Clone)]
 struct HostSnapshot {
     os_name: String,
@@ -3219,6 +3637,53 @@ struct CommandStep {
     success: bool,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Clone)]
+struct UninstallPlan {
+    title: &'static str,
+    warning: &'static str,
+    commands: Vec<&'static str>,
+}
+
+fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
+    match mode {
+        "panel" => Some(UninstallPlan {
+            title: "Panel-only removal",
+            warning: "Removes only the Infiproxy panel service, binary and panel state. Proxy cores and third-party services are left intact.",
+            commands: vec![
+                "# Review paths before running as root.",
+                "systemctl disable --now infiproxy.service || true",
+                "rm -f /etc/systemd/system/infiproxy.service",
+                "systemctl daemon-reload",
+                "rm -f /usr/local/bin/infiproxy",
+                "rm -rf /etc/infiproxy",
+                "rm -rf /var/lib/infiproxy",
+                "userdel infiproxy 2>/dev/null || true",
+                "groupdel infiproxy 2>/dev/null || true",
+            ],
+        }),
+        "full" => Some(UninstallPlan {
+            title: "Full footprint removal",
+            warning: "Removes panel-managed services, panel state, core binaries/configs/logs and the source checkout. It does not remove system packages such as nginx, git or Rust.",
+            commands: vec![
+                "# Review paths before running as root.",
+                "systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service || true",
+                "rm -f /etc/systemd/system/infiproxy.service",
+                "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service",
+                "systemctl daemon-reload",
+                "rm -f /usr/local/bin/infiproxy",
+                "rm -rf /etc/infiproxy /var/lib/infiproxy",
+                "rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores",
+                "rm -rf /opt/infiproxy/source",
+                "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
+                "nginx -t && systemctl reload nginx.service || true",
+                "userdel infiproxy 2>/dev/null || true",
+                "groupdel infiproxy 2>/dev/null || true",
+            ],
+        }),
+        _ => None,
+    }
 }
 
 fn host_snapshot() -> HostSnapshot {
@@ -3708,13 +4173,57 @@ fn layout(title: &str, body: Markup) -> Markup {
                         letter-spacing: 0.01em;
                     }
                     .brand-mark {
+                        position: relative;
                         width: 22px;
                         height: 22px;
+                        display: inline-block;
                         border-radius: 4px;
-                        background:
-                            linear-gradient(90deg, transparent 0 18%, rgba(255,255,255,0.9) 18% 24%, transparent 24% 38%, rgba(255,255,255,0.9) 38% 44%, transparent 44% 58%, rgba(255,255,255,0.9) 58% 64%, transparent 64%),
-                            #5f8f3f;
+                        background: linear-gradient(135deg, #6f9d4e 0%, #365f24 100%);
                         border: 1px solid rgba(255,255,255,0.55);
+                        box-shadow: 0 1px 0 rgba(255,255,255,0.25) inset;
+                    }
+                    .brand-mark::before, .brand-mark::after {
+                        content: "";
+                        position: absolute;
+                        height: 2px;
+                        background: rgba(255,255,255,0.82);
+                        transform-origin: left center;
+                    }
+                    .brand-mark::before {
+                        width: 12px;
+                        left: 6px;
+                        top: 7px;
+                        transform: rotate(28deg);
+                    }
+                    .brand-mark::after {
+                        width: 12px;
+                        left: 6px;
+                        top: 14px;
+                        transform: rotate(-28deg);
+                    }
+                    .brand-core {
+                        position: absolute;
+                        left: 7px;
+                        top: 7px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 2px;
+                        background: #f8fff2;
+                        border: 1px solid rgba(31,55,28,0.35);
+                        z-index: 2;
+                    }
+                    .brand-node {
+                        position: absolute;
+                        width: 5px;
+                        height: 5px;
+                        border-radius: 50%;
+                        background: #f8fff2;
+                        border: 1px solid rgba(31,55,28,0.35);
+                        z-index: 3;
+                    }
+                    .brand-node.n1 { left: 3px; top: 3px; }
+                    .brand-node.n2 { right: 3px; top: 3px; }
+                    .brand-node.n3 { right: 3px; bottom: 3px; }
                     }
                     .masthead-meta {
                         color: #dce7d6;
@@ -4167,6 +4676,46 @@ fn layout(title: &str, body: Markup) -> Markup {
                         font-size: 12px;
                         white-space: pre-wrap;
                     }
+                    .product-card {
+                        display: grid;
+                        grid-template-columns: 74px minmax(0, 1fr);
+                        align-items: center;
+                        gap: 16px;
+                        background:
+                            linear-gradient(135deg, rgba(79,127,53,0.1) 0%, rgba(255,255,255,0) 46%),
+                            #ffffff;
+                    }
+                    .product-logo {
+                        width: 64px;
+                        height: 64px;
+                        display: grid;
+                        place-items: center;
+                        border: 1px solid var(--border);
+                        border-radius: 8px;
+                        background: linear-gradient(180deg, #f8faf6 0%, #e8efe4 100%);
+                    }
+                    .product-logo .brand-mark {
+                        width: 42px;
+                        height: 42px;
+                        border-radius: 8px;
+                    }
+                    .product-logo .brand-core {
+                        left: 14px;
+                        top: 14px;
+                        width: 14px;
+                        height: 14px;
+                    }
+                    .product-logo .brand-node {
+                        width: 8px;
+                        height: 8px;
+                    }
+                    .product-logo .brand-node.n1 { left: 7px; top: 7px; }
+                    .product-logo .brand-node.n2 { right: 7px; top: 7px; }
+                    .product-logo .brand-node.n3 { right: 7px; bottom: 7px; }
+                    .runbook ol {
+                        margin: 0;
+                        padding-left: 22px;
+                    }
                     .config-list {
                         display: flex;
                         flex-direction: column;
@@ -4313,6 +4862,9 @@ fn layout(title: &str, body: Markup) -> Markup {
                         .health-grid {
                             grid-template-columns: 1fr;
                         }
+                        .product-card {
+                            grid-template-columns: 1fr;
+                        }
                         .sys-grid {
                             grid-template-columns: 1fr;
                         }
@@ -4352,7 +4904,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                 div class="app-chrome" {
                     header class="masthead" {
                         div class="masthead-title" {
-                            span class="brand-mark" aria-hidden="true" {}
+                            (brand_mark())
                             span { (APP_NAME) }
                         }
                         div class="masthead-meta" { "server console" }
@@ -4370,6 +4922,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                             div class="nav-section" { "Maintenance" }
                             a href="/admin/system" { "System" }
                             a href="/health" { "Health" }
+                            a href="/admin/credits" { "Credits" }
                         }
                         main class="content" {
                             (body)
@@ -4546,5 +5099,33 @@ mod tests {
             "text/html,application/xhtml+xml".parse().unwrap(),
         );
         assert!(wants_html(&headers));
+    }
+
+    #[test]
+    fn console_commands_are_allowlisted_without_shell() {
+        assert!(CONSOLE_COMMANDS
+            .iter()
+            .all(|command| command.program != "sh"));
+        assert!(CONSOLE_COMMANDS
+            .iter()
+            .all(|command| command.program != "bash"));
+        assert!(CONSOLE_COMMANDS
+            .iter()
+            .all(|command| !command.args.iter().any(|arg| arg.contains(';'))));
+    }
+
+    #[test]
+    fn uninstall_plans_are_preview_runbooks() {
+        let panel = uninstall_plan("panel").expect("panel plan exists");
+        let full = uninstall_plan("full").expect("full plan exists");
+
+        assert!(panel.title.contains("Panel-only"));
+        assert!(full.title.contains("Full"));
+        assert!(uninstall_plan("unknown").is_none());
+    }
+
+    #[test]
+    fn app_uptime_has_safe_fallback() {
+        assert!(!app_uptime_label().is_empty());
     }
 }
