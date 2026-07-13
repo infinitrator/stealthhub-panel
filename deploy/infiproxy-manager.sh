@@ -51,12 +51,23 @@ pause() {
   read -r -p "${muted}Press Enter to continue...${reset}" _
 }
 
+invalid_choice() {
+  echo "${danger}Unknown menu item.${reset}"
+  pause
+}
+
+read_menu_choice() {
+  choice=""
+  read -r -p "> " choice || return 1
+}
+
 header() {
   clear 2>/dev/null || true
   echo "${green}${bold}+--------------------------------------------+${reset}"
-  echo "${green}${bold}| ${APP} manager                             |${reset}"
+  printf '%s| %-42s |%s\n' "${green}${bold}" "${APP} manager" "${reset}"
   echo "${green}${bold}+--------------------------------------------+${reset}"
   echo "${muted}systemd / bare-metal / KISS control surface${reset}"
+  echo "${muted}env: ${ENV_FILE}${reset}"
   echo
 }
 
@@ -177,12 +188,20 @@ unit_state() {
 
 service_status() {
   header
+  echo "${bold}Services${reset}"
   printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
   printf "%-34s %-12s %-12s\n" "----" "------" "-------"
   unit_state "$PANEL_SERVICE"
   for service in "${CORE_SERVICES[@]}"; do
     unit_state "$service"
   done
+  echo
+  echo "${bold}Local checks${reset}"
+  echo "  curl http://127.0.0.1:8080/health"
+  echo "  curl http://127.0.0.1:8080/ready"
+  echo
+  echo "${bold}Next step${reset}"
+  echo "  Use HTTPS / Cloudflare setup to publish a protected URL."
   pause
 }
 
@@ -194,7 +213,7 @@ restart_menu() {
   echo "4) Restart all enabled core services"
   echo "5) Reboot server"
   echo "0) Back"
-  read -r -p "> " choice
+  read_menu_choice || return
   case "$choice" in
     1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" ;;
     2)
@@ -227,6 +246,7 @@ restart_menu() {
       [[ "$confirm" == "REBOOT" ]] && run_cmd systemctl reboot
       ;;
     0) return ;;
+    *) invalid_choice; return ;;
   esac
   pause
 }
@@ -274,12 +294,13 @@ install_or_repair() {
   echo "2) Install/repair with nginx template"
   echo "3) Force env template rewrite"
   echo "0) Back"
-  read -r -p "> " choice
+  read_menu_choice || return
   case "$choice" in
     1) bash "${SOURCE_DIR}/deploy/install.sh" --build ;;
     2) bash "${SOURCE_DIR}/deploy/install.sh" --build --with-nginx ;;
     3) bash "${SOURCE_DIR}/deploy/install.sh" --build --force-env ;;
     0) return ;;
+    *) invalid_choice; return ;;
   esac
   pause
 }
@@ -297,14 +318,14 @@ core_helper() {
   echo "3) hysteria"
   echo "4) tuic"
   echo "0) Back"
-  read -r -p "> " choice
+  read_menu_choice || return
   case "$choice" in
     1) core="xray"; binary="xray"; service="infiproxy-xray.service" ;;
     2) core="sing-box"; binary="sing-box"; service="infiproxy-sing-box.service" ;;
     3) core="hysteria"; binary="hysteria"; service="infiproxy-hysteria.service" ;;
     4) core="tuic"; binary="tuic-server"; service="infiproxy-tuic.service" ;;
     0) return ;;
-    *) return ;;
+    *) invalid_choice; return ;;
   esac
   read -r -p "Version: " version
   read -r -p "Release archive URL: " url
@@ -421,7 +442,7 @@ https_setup_menu() {
   echo "4) Write nginx HTTPS config"
   echo "5) Full guided setup"
   echo "0) Back"
-  read -r -p "> " choice
+  read_menu_choice || return
   case "$choice" in
     1)
       install_https_deps
@@ -475,6 +496,7 @@ https_setup_menu() {
       echo "${green}${bold}Secure panel URL: https://${domain}/admin/setup${reset}"
       ;;
     0) return ;;
+    *) invalid_choice; return ;;
   esac
   pause
 }
@@ -547,13 +569,13 @@ run_uninstall() {
     echo "2) Full Infiproxy footprint removal"
     echo "3) Factory footprint cleanup"
     echo "0) Back"
-    read -r -p "> " choice
+    read_menu_choice || return
     case "$choice" in
       1) mode="panel" ;;
       2) mode="full" ;;
       3) mode="factory" ;;
       0) return ;;
-      *) return ;;
+      *) invalid_choice; return ;;
     esac
   fi
   header
@@ -578,7 +600,7 @@ main_menu() {
     echo "8) Panel logs"
     echo "${danger}9) Uninstall / cleanup${reset}"
     echo "0) Exit"
-    read -r -p "> " choice
+    read_menu_choice || exit 0
     case "$choice" in
       1) service_status ;;
       2) restart_menu ;;
@@ -590,6 +612,7 @@ main_menu() {
       8) logs_menu ;;
       9) run_uninstall ;;
       0) exit 0 ;;
+      *) invalid_choice ;;
     esac
   done
 }

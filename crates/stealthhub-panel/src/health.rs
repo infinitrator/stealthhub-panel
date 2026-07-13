@@ -10,8 +10,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use maud::{html, Markup};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
 
 use crate::{
     ops::{

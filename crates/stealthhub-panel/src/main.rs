@@ -22,8 +22,7 @@ use argon2::{
 };
 use axum::{
     body::Body,
-    extract::connect_info::ConnectInfo,
-    extract::{Form, Path, State},
+    extract::{connect_info::ConnectInfo, Form, Path, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
