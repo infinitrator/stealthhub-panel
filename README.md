@@ -81,6 +81,7 @@ curl http://127.0.0.1:8080/ready
 ```env
 INFIPROXY_BIND=127.0.0.1:8080
 INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
+INFIPROXY_DB_MAX_CONNECTIONS=2
 INFIPROXY_COOKIE_SECURE=true
 INFIPROXY_ENABLE_DEMO_USER=false
 ```

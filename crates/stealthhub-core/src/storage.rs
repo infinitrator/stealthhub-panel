@@ -199,9 +199,15 @@ pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
     let options = SqliteConnectOptions::from_str(database_url)?
         .foreign_keys(true)
         .busy_timeout(StdDuration::from_secs(10));
+    let max_connections = std::env::var("INFIPROXY_DB_MAX_CONNECTIONS")
+        .ok()
+        .or_else(|| std::env::var("STEALTHHUB_DB_MAX_CONNECTIONS").ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(2);
 
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(max_connections)
         .connect_with(options)
         .await?;
 

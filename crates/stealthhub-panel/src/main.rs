@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::connect_info::ConnectInfo,
     extract::{Form, Path, State},
-    http::{header, HeaderMap, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -44,6 +44,7 @@ use stealthhub_core::{
 };
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
+use tracing_subscriber::EnvFilter;
 
 const APP_NAME: &str = "Infiproxy";
 const ADMIN_SESSION_COOKIE: &str = "infiproxy_admin_session";
@@ -54,6 +55,7 @@ const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNA
 const DEPLOYMENT_MODE: &str = "bare-metal systemd";
 const LOGIN_RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
 const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
+const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 2048;
 const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
         name: "Panel service",
@@ -254,9 +256,9 @@ struct AuthenticatedAdmin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter("stealthhub_panel=debug,tower_http=debug,info")
-        .init();
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,stealthhub_panel=info,tower_http=warn"));
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let bind = env_value("INFIPROXY_BIND", "STEALTHHUB_BIND")
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
@@ -419,15 +421,15 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        "application/yaml; charset=utf-8".parse().unwrap(),
+        HeaderValue::from_static("application/yaml; charset=utf-8"),
     );
     headers.insert(
         header::CACHE_CONTROL,
-        "no-cache, no-store, must-revalidate".parse().unwrap(),
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
     headers.insert(
         "Subscription-Userinfo",
-        "upload=0; download=0; total=0; expire=0".parse().unwrap(),
+        HeaderValue::from_static("upload=0; download=0; total=0; expire=0"),
     );
 
     (headers, yaml).into_response()
@@ -455,11 +457,11 @@ async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) 
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
-        "application/yaml; charset=utf-8".parse().unwrap(),
+        HeaderValue::from_static("application/yaml; charset=utf-8"),
     );
     headers.insert(
         header::CACHE_CONTROL,
-        "public, max-age=300".parse().unwrap(),
+        HeaderValue::from_static("public, max-age=300"),
     );
 
     (headers, body).into_response()
@@ -2441,13 +2443,9 @@ fn expired_session_cookie(state: &AppState) -> Cookie<'static> {
 }
 
 fn append_session_cookie(response: &mut Response, cookie: Cookie<'static>) {
-    response.headers_mut().append(
-        header::SET_COOKIE,
-        cookie
-            .to_string()
-            .parse()
-            .expect("session cookie header must be valid"),
-    );
+    if let Ok(value) = HeaderValue::from_str(&cookie.to_string()) {
+        response.headers_mut().append(header::SET_COOKIE, value);
+    }
 }
 
 async fn login_failed_response() -> Response {
@@ -2472,12 +2470,9 @@ fn rate_limited_response(retry_after: StdDuration) -> Response {
         "Back to Login",
     );
 
-    response.headers_mut().insert(
-        header::RETRY_AFTER,
-        retry_after_secs
-            .parse()
-            .expect("retry-after seconds must be a valid header"),
-    );
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
 
     response
 }
@@ -2487,7 +2482,12 @@ fn login_rate_limit_keys(
     peer_addr: SocketAddr,
     username: &str,
 ) -> Vec<String> {
-    let username = username.trim().to_ascii_lowercase();
+    let username: String = username
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .take(128)
+        .collect();
     let username = if username.is_empty() {
         "<empty>".to_string()
     } else {
@@ -2527,7 +2527,8 @@ impl LoginRateLimiter {
         let mut attempts = self
             .attempts
             .lock()
-            .expect("login limiter mutex should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_login_attempts(&mut attempts, now);
 
         keys.iter()
             .filter_map(|key| {
@@ -2550,9 +2551,14 @@ impl LoginRateLimiter {
         let mut attempts = self
             .attempts
             .lock()
-            .expect("login limiter mutex should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_login_attempts(&mut attempts, now);
 
         for key in keys {
+            if !attempts.contains_key(key) && attempts.len() >= LOGIN_RATE_LIMIT_MAX_KEYS {
+                continue;
+            }
+
             let attempt = attempts.entry(key.clone()).or_insert(LoginAttempt {
                 failures: 0,
                 window_started_at: now,
@@ -2571,12 +2577,18 @@ impl LoginRateLimiter {
         let mut attempts = self
             .attempts
             .lock()
-            .expect("login limiter mutex should not be poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         for key in keys {
             attempts.remove(key);
         }
     }
+}
+
+fn prune_login_attempts(attempts: &mut HashMap<String, LoginAttempt>, now: Instant) {
+    attempts.retain(|_, attempt| {
+        now.duration_since(attempt.window_started_at) < LOGIN_RATE_LIMIT_WINDOW
+    });
 }
 
 fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Response> {
@@ -2679,26 +2691,30 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
 
-    headers.insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+        ),
     );
     headers.insert(
         "Permissions-Policy",
-        "camera=(), microphone=(), geolocation=(), payment=()"
-            .parse()
-            .unwrap(),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=(), payment=()"),
     );
 
     if is_admin_path {
         headers.insert(
             header::CACHE_CONTROL,
-            "no-store, max-age=0".parse().unwrap(),
+            HeaderValue::from_static("no-store, max-age=0"),
         );
     }
 

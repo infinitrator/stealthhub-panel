@@ -25,8 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.7", features = ["trace", "fs"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
