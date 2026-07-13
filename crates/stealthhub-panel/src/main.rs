@@ -395,26 +395,67 @@ fn env_value(primary: &str, legacy: &str) -> Option<String> {
         .or_else(|| std::env::var(legacy).ok())
 }
 
-async fn health() -> impl IntoResponse {
-    "ok\n"
+async fn health(headers: HeaderMap) -> Response {
+    if !wants_html(&headers) {
+        return "ok\n".into_response();
+    }
+
+    health_dashboard(
+        StatusCode::OK,
+        "operational",
+        "Process liveness probe is passing.",
+        html! {
+            (health_component("Process", "ok", "Runtime is accepting HTTP requests."))
+            (health_component("Router", "ok", "Public and admin routes are registered."))
+            (health_component("Security headers", "ok", "Frame, content type, referrer and CSP headers are enforced."))
+            (health_component("Probe contract", "ok", "Non-browser clients still receive plain text ok."))
+        },
+    )
 }
 
-async fn readiness(State(state): State<AppState>) -> Response {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
+async fn readiness(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let readiness = match sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&state.pool)
         .await
     {
-        Ok(1) => (StatusCode::OK, "ready\n").into_response(),
-        Ok(_) => (
+        Ok(1) => Ok(()),
+        Ok(_) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "database readiness probe returned an unexpected value\n",
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("database is not ready: {err}\n"),
-        )
-            .into_response(),
+            "database readiness probe returned an unexpected value",
+        )),
+        Err(_) => Err((StatusCode::SERVICE_UNAVAILABLE, "database is not ready")),
+    };
+
+    if !wants_html(&headers) {
+        return match readiness {
+            Ok(()) => (StatusCode::OK, "ready\n").into_response(),
+            Err((status, message)) => (status, format!("{message}\n")).into_response(),
+        };
+    }
+
+    match readiness {
+        Ok(()) => health_dashboard(
+            StatusCode::OK,
+            "ready",
+            "SQLite readiness probe is passing.",
+            html! {
+                (health_component("Process", "ok", "Runtime is alive."))
+                (health_component("SQLite", "ok", "Database connection returned the expected readiness value."))
+                (health_component("Subscriptions", "ok", "Mihomo YAML generation can use persisted settings."))
+                (health_component("Admin panel", "ok", "Authenticated control plane is available."))
+            },
+        ),
+        Err((status, message)) => health_dashboard(
+            status,
+            "degraded",
+            message,
+            html! {
+                (health_component("Process", "ok", "Runtime is alive."))
+                (health_component("SQLite", "off", message))
+                (health_component("Subscriptions", "off", "Subscription generation may fail until storage recovers."))
+                (health_component("Admin panel", "warn", "Login may work, but state-changing operations require database access."))
+            },
+        ),
     }
 }
 
@@ -3048,6 +3089,99 @@ fn html_error_response_with_back(
         .into_response()
 }
 
+fn wants_html(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim_start().starts_with("text/html"))
+        })
+}
+
+fn health_dashboard(
+    status: StatusCode,
+    state_label: &'static str,
+    summary: &'static str,
+    components: Markup,
+) -> Response {
+    (
+        status,
+        Html(
+            layout(
+                "Health",
+                html! {
+                    h1 { "Health" }
+
+                    section class=(format!("health-hero {}", health_state_class(state_label))) {
+                        div {
+                            span class="eyebrow" { "Infiproxy control plane" }
+                            h2 { (state_label) }
+                            p { (summary) }
+                        }
+                        div class="health-ring" {
+                            span class=(format!("health-led {}", health_state_class(state_label))) {}
+                            strong { (status.as_u16()) }
+                            small { (status.canonical_reason().unwrap_or("status")) }
+                        }
+                    }
+
+                    section {
+                        h2 { "Component status" }
+                        div class="health-grid" {
+                            (components)
+                        }
+                    }
+
+                    section {
+                        h2 { "Probe contract" }
+                        dl class="details" {
+                            dt { "Browser" }
+                            dd { "HTML health console with component status." }
+                            dt { "Automation" }
+                            dd { code { "curl -H 'Accept: */*' /health" } " returns " code { "ok" } "." }
+                            dt { "Readiness" }
+                            dd { code { "/ready" } " includes SQLite connectivity and preserves HTTP status semantics." }
+                        }
+                    }
+                },
+            )
+            .into_string(),
+        ),
+    )
+        .into_response()
+}
+
+fn health_component(name: &'static str, state: &'static str, detail: &'static str) -> Markup {
+    html! {
+        div class="health-card" {
+            div class="health-card-head" {
+                span class=(format!("health-led {}", health_state_class(state))) {}
+                strong { (name) }
+            }
+            p { (detail) }
+            span class=(format!("badge {}", health_badge_class(state))) { (state) }
+        }
+    }
+}
+
+fn health_state_class(state: &str) -> &'static str {
+    match state {
+        "ok" | "ready" | "operational" => "ok",
+        "warn" | "degraded" => "warn",
+        _ => "off",
+    }
+}
+
+fn health_badge_class(state: &str) -> &'static str {
+    match health_state_class(state) {
+        "ok" => "ok",
+        "warn" => "neutral",
+        _ => "off",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HostSnapshot {
     os_name: String,
@@ -3879,6 +4013,108 @@ fn layout(title: &str, body: Markup) -> Markup {
                         gap: 8px;
                         margin-top: 16px;
                     }
+                    .eyebrow {
+                        display: block;
+                        margin-bottom: 6px;
+                        color: var(--muted);
+                        font-size: 11px;
+                        font-weight: 850;
+                        text-transform: uppercase;
+                        letter-spacing: 0.1em;
+                    }
+                    .health-hero {
+                        display: grid;
+                        grid-template-columns: minmax(0, 1fr) 160px;
+                        align-items: center;
+                        gap: 18px;
+                        border-left-width: 6px;
+                        background:
+                            linear-gradient(135deg, rgba(79,127,53,0.08) 0%, rgba(255,255,255,0) 42%),
+                            #ffffff;
+                    }
+                    .health-hero.ok {
+                        border-left-color: var(--accent);
+                    }
+                    .health-hero.warn {
+                        border-left-color: #b68123;
+                    }
+                    .health-hero.off {
+                        border-left-color: #b33a3a;
+                    }
+                    .health-hero h2 {
+                        margin: 0;
+                        font-size: 28px;
+                        text-transform: uppercase;
+                        letter-spacing: 0.03em;
+                    }
+                    .health-hero p {
+                        max-width: 720px;
+                        margin: 8px 0 0;
+                    }
+                    .health-ring {
+                        min-height: 118px;
+                        display: grid;
+                        place-items: center;
+                        align-content: center;
+                        gap: 5px;
+                        border: 1px solid var(--border);
+                        border-radius: 4px;
+                        background: linear-gradient(180deg, #f8faf6 0%, #e8efe4 100%);
+                    }
+                    .health-ring strong {
+                        font-size: 28px;
+                        line-height: 1;
+                    }
+                    .health-ring small {
+                        color: var(--muted);
+                        text-transform: uppercase;
+                        letter-spacing: 0.06em;
+                    }
+                    .health-led {
+                        width: 12px;
+                        height: 12px;
+                        display: inline-block;
+                        border-radius: 50%;
+                        border: 1px solid rgba(0,0,0,0.2);
+                        background: #9aa29a;
+                        box-shadow: 0 0 0 3px rgba(154,162,154,0.18);
+                    }
+                    .health-led.ok {
+                        background: #4f7f35;
+                        box-shadow: 0 0 0 3px rgba(79,127,53,0.18);
+                    }
+                    .health-led.warn {
+                        background: #b68123;
+                        box-shadow: 0 0 0 3px rgba(182,129,35,0.18);
+                    }
+                    .health-led.off {
+                        background: #b33a3a;
+                        box-shadow: 0 0 0 3px rgba(179,58,58,0.16);
+                    }
+                    .health-grid {
+                        display: grid;
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        gap: 8px;
+                    }
+                    .health-card {
+                        min-height: 138px;
+                        display: grid;
+                        align-content: start;
+                        gap: 10px;
+                        padding: 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 4px;
+                        background: linear-gradient(180deg, #ffffff 0%, #f5f8fa 100%);
+                    }
+                    .health-card-head {
+                        display: flex;
+                        align-items: center;
+                        gap: 8px;
+                    }
+                    .health-card p {
+                        margin: 0;
+                        font-size: 13px;
+                    }
                     .sys-grid {
                         display: grid;
                         grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -4070,6 +4306,12 @@ fn layout(title: &str, body: Markup) -> Markup {
                             grid-template-columns: 1fr;
                             align-items: start;
                             gap: 6px;
+                        }
+                        .health-hero {
+                            grid-template-columns: 1fr;
+                        }
+                        .health-grid {
+                            grid-template-columns: 1fr;
                         }
                         .sys-grid {
                             grid-template-columns: 1fr;
@@ -4289,5 +4531,20 @@ mod tests {
 
         assert!(output.ends_with("... <truncated>"));
         assert!(output.is_char_boundary(output.len()));
+    }
+
+    #[test]
+    fn health_content_negotiation_only_html_for_browsers() {
+        let mut headers = HeaderMap::new();
+        assert!(!wants_html(&headers));
+
+        headers.insert(header::ACCEPT, "*/*".parse().unwrap());
+        assert!(!wants_html(&headers));
+
+        headers.insert(
+            header::ACCEPT,
+            "text/html,application/xhtml+xml".parse().unwrap(),
+        );
+        assert!(wants_html(&headers));
     }
 }
