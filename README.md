@@ -20,6 +20,12 @@ Fedora/RHEL-like серверы с `dnf` также поддержаны bootstr
 curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash
 ```
 
+Проверить план установки без изменений на сервере:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --check
+```
+
 Установка конкретной ветки, тега или коммита:
 
 ```bash
@@ -40,6 +46,12 @@ curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/
 curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --with-nginx
 ```
 
+Принудительно пересоздать env-файл при обновлении:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --force-env
+```
+
 Bootstrap делает весь базовый серверный цикл:
 
 - ставит системные зависимости для сборки;
@@ -52,6 +64,7 @@ Bootstrap делает весь базовый серверный цикл:
 - устанавливает `infiproxy.service`;
 - устанавливает systemd-шаблоны для proxy-ядер;
 - раскладывает стартовые config-файлы ядер;
+- при `--with-nginx` устанавливает шаблон сайта в `/etc/nginx/sites-available/infiproxy.conf`;
 - запускает только саму панель.
 
 После установки проверить сервис:
@@ -97,6 +110,18 @@ sudo systemctl restart infiproxy.service
 
 ```text
 https://<your-domain>/admin/setup
+```
+
+Если HTTPS ещё не настроен, открой панель через SSH-туннель:
+
+```bash
+ssh -L 8080:127.0.0.1:8080 root@<server>
+```
+
+После этого локально открой:
+
+```text
+http://127.0.0.1:8080/admin/setup
 ```
 
 Для HTTPS поставь Nginx или Caddy перед панелью. Готовый пример Nginx лежит в:

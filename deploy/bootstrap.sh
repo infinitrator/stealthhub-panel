@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 027
 
 REPO_URL="${STEALTHHUB_REPO:-https://github.com/infinitrator/stealthhub-panel.git}"
 REF="${STEALTHHUB_REF:-main}"
 SRC_DIR="${INFIPROXY_SRC_DIR:-${STEALTHHUB_SRC_DIR:-/opt/infiproxy/source}}"
 WITH_NGINX=0
 FORCE_ENV=0
+CHECK_ONLY=0
 
 usage() {
     cat <<'USAGE'
@@ -17,20 +19,34 @@ Options:
   --src-dir <path>   Source checkout directory. Default: /opt/infiproxy/source
   --with-nginx       Install nginx package together with build dependencies.
   --force-env        Replace /etc/infiproxy/infiproxy.env.
+  --check            Validate source/dependencies and print install plan.
 USAGE
+}
+
+require_value() {
+    local flag="$1"
+    local value="${2:-}"
+    if [[ -z "$value" || "$value" == --* ]]; then
+        echo "Missing value for $flag" >&2
+        usage >&2
+        exit 2
+    fi
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --repo)
+            require_value "$1" "${2:-}"
             REPO_URL="${2:-}"
             shift 2
             ;;
         --ref)
+            require_value "$1" "${2:-}"
             REF="${2:-}"
             shift 2
             ;;
         --src-dir)
+            require_value "$1" "${2:-}"
             SRC_DIR="${2:-}"
             shift 2
             ;;
@@ -40,6 +56,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --force-env)
             FORCE_ENV=1
+            shift
+            ;;
+        --check)
+            CHECK_ONLY=1
             shift
             ;;
         -h|--help)
@@ -59,12 +79,36 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
+echo "Infiproxy bootstrap:"
+echo "  repo:      $REPO_URL"
+echo "  ref:       $REF"
+echo "  source:    $SRC_DIR"
+echo "  nginx:     $WITH_NGINX"
+echo "  force env: $FORCE_ENV"
+
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "Missing command after dependency install: $1" >&2
         exit 1
     fi
 }
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo "Preflight:"
+    for cmd in git cargo systemctl; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "  $cmd: found"
+        else
+            echo "  $cmd: missing"
+        fi
+    done
+    if [[ -x "${SRC_DIR}/deploy/install.sh" ]]; then
+        bash "${SRC_DIR}/deploy/install.sh" --check
+    else
+        echo "  install plan: source checkout not found at ${SRC_DIR}"
+    fi
+    exit 0
+fi
 
 install_deps() {
     if command -v apt-get >/dev/null 2>&1; then
@@ -156,6 +200,9 @@ install_args=()
 if [[ "$FORCE_ENV" -eq 1 ]]; then
     install_args+=(--force-env)
 fi
+if [[ "$WITH_NGINX" -eq 1 ]]; then
+    install_args+=(--with-nginx)
+fi
 
 bash "${SRC_DIR}/deploy/install.sh" "${install_args[@]}"
 
@@ -172,6 +219,7 @@ Local health checks:
 
 First admin setup:
   Open https://<your-domain>/admin/setup after configuring HTTPS reverse proxy.
+  Or use an SSH tunnel first: ssh -L 8080:127.0.0.1:8080 root@<server>
 
 Source:
   ${SRC_DIR}
