@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$(id -u)" -ne 0 ]]; then
+if [[ "$(id -u)" -ne 0 && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Run as root: curl -fsSL <bootstrap-url> | sudo bash" >&2
     exit 1
 fi
@@ -212,6 +212,7 @@ Infiproxy is installed.
 
 Service:
   systemctl status infiproxy.service
+  sudo infiproxy-manager
 
 Local health checks:
   curl http://127.0.0.1:8080/health

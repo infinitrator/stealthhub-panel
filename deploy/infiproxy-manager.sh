@@ -4,6 +4,7 @@ set -Eeuo pipefail
 APP="Infiproxy"
 ENV_FILE="${INFIPROXY_ENV_FILE:-/etc/infiproxy/infiproxy.env}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
+APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 PANEL_SERVICE="infiproxy.service"
 CORE_SERVICES=(
   "infiproxy-xray.service"
@@ -19,6 +20,15 @@ danger=$'\033[38;5;167m'
 reset=$'\033[0m'
 bold=$'\033[1m'
 
+if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
+  green=""
+  soft=""
+  muted=""
+  danger=""
+  reset=""
+  bold=""
+fi
+
 need_root() {
   if [[ "${EUID}" -ne 0 ]]; then
     echo "${danger}Run as root: sudo infiproxy-manager${reset}" >&2
@@ -28,11 +38,12 @@ need_root() {
 
 pause() {
   echo
+  [[ -t 0 ]] || return 0
   read -r -p "${muted}Press Enter to continue...${reset}" _
 }
 
 header() {
-  clear
+  clear 2>/dev/null || true
   echo "${green}${bold}+--------------------------------------------+${reset}"
   echo "${green}${bold}| ${APP} manager                             |${reset}"
   echo "${green}${bold}+--------------------------------------------+${reset}"
@@ -45,12 +56,38 @@ run_cmd() {
   "$@"
 }
 
+pick_editor() {
+  if [[ -n "${EDITOR:-}" ]]; then
+    echo "$EDITOR"
+  elif command -v nano >/dev/null 2>&1; then
+    echo "nano"
+  else
+    echo "vi"
+  fi
+}
+
+secure_env_file() {
+  install -d -m 0770 -o root -g "$APP_GROUP" "$(dirname "$ENV_FILE")"
+  touch "$ENV_FILE"
+  chown root:"$APP_GROUP" "$ENV_FILE" 2>/dev/null || true
+  chmod 0660 "$ENV_FILE" 2>/dev/null || true
+}
+
+unit_state() {
+  local unit="$1"
+  local active enabled
+  active="$(systemctl is-active "$unit" 2>/dev/null || true)"
+  enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+  printf "%-34s %-12s %-12s\n" "$unit" "${active:-unknown}" "${enabled:-unknown}"
+}
+
 service_status() {
   header
-  run_cmd systemctl --no-pager --full status "$PANEL_SERVICE" || true
+  printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
+  printf "%-34s %-12s %-12s\n" "----" "------" "-------"
+  unit_state "$PANEL_SERVICE"
   for service in "${CORE_SERVICES[@]}"; do
-    echo
-    run_cmd systemctl --no-pager --full status "$service" || true
+    unit_state "$service"
   done
   pause
 }
@@ -66,8 +103,22 @@ restart_menu() {
   read -r -p "> " choice
   case "$choice" in
     1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" ;;
-    2) need_root; run_cmd nginx -t && run_cmd systemctl reload nginx.service ;;
-    3) need_root; run_cmd sshd -t && (run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service) ;;
+    2)
+      need_root
+      if command -v nginx >/dev/null 2>&1; then
+        run_cmd nginx -t && run_cmd systemctl reload nginx.service
+      else
+        echo "${danger}nginx is not installed.${reset}"
+      fi
+      ;;
+    3)
+      need_root
+      if command -v sshd >/dev/null 2>&1; then
+        run_cmd sshd -t && (run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service)
+      else
+        echo "${danger}sshd is not installed.${reset}"
+      fi
+      ;;
     4)
       need_root
       for service in "${CORE_SERVICES[@]}"; do
@@ -89,9 +140,9 @@ restart_menu() {
 edit_env() {
   need_root
   header
-  install -d -m 0755 "$(dirname "$ENV_FILE")"
-  touch "$ENV_FILE"
-  "${EDITOR:-nano}" "$ENV_FILE"
+  secure_env_file
+  "$(pick_editor)" "$ENV_FILE"
+  secure_env_file
   run_cmd systemctl restart "$PANEL_SERVICE"
   pause
 }
@@ -99,8 +150,7 @@ edit_env() {
 toggle_danger_shell() {
   need_root
   header
-  install -d -m 0755 "$(dirname "$ENV_FILE")"
-  touch "$ENV_FILE"
+  secure_env_file
   if grep -q '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE"; then
     current="$(grep '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
     if [[ "$current" == "true" ]]; then
@@ -111,6 +161,7 @@ toggle_danger_shell() {
   else
     echo "INFIPROXY_ENABLE_DANGER_SHELL=true" >>"$ENV_FILE"
   fi
+  secure_env_file
   run_cmd systemctl restart "$PANEL_SERVICE"
   grep '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE" || true
   pause
@@ -147,9 +198,35 @@ core_helper() {
     pause
     return
   fi
-  echo "This helper opens the verified core installer. Prepare URL, version and sha256 first."
-  echo "Example:"
-  echo "  sudo ${SOURCE_DIR}/deploy/cores/install-core.sh --core xray --version <ver> --url <url> --sha256 <sha256> --binary xray --restart infiproxy-xray.service"
+  echo "1) xray"
+  echo "2) sing-box"
+  echo "3) hysteria"
+  echo "4) tuic"
+  echo "0) Back"
+  read -r -p "> " choice
+  case "$choice" in
+    1) core="xray"; binary="xray"; service="infiproxy-xray.service" ;;
+    2) core="sing-box"; binary="sing-box"; service="infiproxy-sing-box.service" ;;
+    3) core="hysteria"; binary="hysteria"; service="infiproxy-hysteria.service" ;;
+    4) core="tuic"; binary="tuic-server"; service="infiproxy-tuic.service" ;;
+    0) return ;;
+    *) return ;;
+  esac
+  read -r -p "Version: " version
+  read -r -p "Release archive URL: " url
+  read -r -p "SHA256: " sha256
+  if [[ -z "$version" || -z "$url" || -z "$sha256" ]]; then
+    echo "${danger}Version, URL and SHA256 are required.${reset}"
+    pause
+    return
+  fi
+  bash "${SOURCE_DIR}/deploy/cores/install-core.sh" \
+    --core "$core" \
+    --version "$version" \
+    --url "$url" \
+    --sha256 "$sha256" \
+    --binary "$binary" \
+    --restart "$service"
   pause
 }
 
@@ -210,6 +287,11 @@ EOF
 run_uninstall() {
   need_root
   local mode="${1:-}"
+  if [[ -n "$mode" && "$mode" != "panel" && "$mode" != "full" && "$mode" != "factory" ]]; then
+    echo "${danger}Unknown uninstall mode: $mode${reset}" >&2
+    echo "Use: panel, full, or factory" >&2
+    exit 2
+  fi
   if [[ -z "$mode" ]]; then
     header
     echo "1) Panel-only removal"

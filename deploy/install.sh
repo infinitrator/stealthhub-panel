@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$(id -u)" -ne 0 ]]; then
+if [[ "$(id -u)" -ne 0 && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Run as root: sudo bash deploy/install.sh" >&2
     exit 1
 fi
@@ -80,9 +80,28 @@ need_cmd() {
     fi
 }
 
-need_cmd systemctl
-need_cmd getent
-need_cmd install
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo "Preflight commands:"
+    for cmd in getent groupadd id install systemctl useradd; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "  $cmd: found"
+        else
+            echo "  $cmd: missing"
+        fi
+    done
+else
+    need_cmd getent
+    need_cmd groupadd
+    need_cmd id
+    need_cmd install
+    need_cmd systemctl
+    need_cmd useradd
+fi
+
+if [[ ! -f "${ROOT_DIR}/deploy/infiproxy-manager.sh" ]]; then
+    echo "Manager script not found: ${ROOT_DIR}/deploy/infiproxy-manager.sh" >&2
+    exit 1
+fi
 
 if [[ "$BUILD" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
@@ -110,6 +129,7 @@ Infiproxy install plan:
   core logs:     $CORE_LOG_DIR
   service:       $SERVICE_FILE
   nginx:         $WITH_NGINX
+  web config:    /etc/infiproxy and /etc/infiproxy-cores are group-writable by $APP_GROUP
 EOF
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -125,12 +145,12 @@ if ! id -u "$APP_USER" >/dev/null 2>&1; then
     useradd --system --home "$STATE_DIR" --shell /usr/sbin/nologin --gid "$APP_GROUP" "$APP_USER"
 fi
 
-install -d -o root -g root -m 0755 "$CONFIG_DIR"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
-install -d -o root -g root -m 0755 "$CORE_CONFIG_DIR"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
@@ -140,10 +160,12 @@ if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
     if [[ -f "$ENV_FILE" ]]; then
         cp -a "$ENV_FILE" "${ENV_FILE}.bak.$(date +%Y%m%d%H%M%S)"
     fi
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/infiproxy.env.example" "$ENV_FILE"
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/infiproxy.env.example" "$ENV_FILE"
 else
     echo "Keeping existing env file: $ENV_FILE"
 fi
+chown root:"$APP_GROUP" "$ENV_FILE"
+chmod 0660 "$ENV_FILE"
 
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy.service" "$SERVICE_FILE"
 
@@ -151,24 +173,33 @@ for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
     install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
 done
 
-install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/xray"
-install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/sing-box"
-install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/hysteria"
-install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/tuic"
-install -d -o root -g "$APP_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/xray"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/sing-box"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/hysteria"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tuic"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tls"
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/sing-box/config.json" ]]; then
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/sing-box.config.example.json" "$CORE_CONFIG_DIR/sing-box/config.json"
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/sing-box.config.example.json" "$CORE_CONFIG_DIR/sing-box/config.json"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/hysteria/config.yaml" ]]; then
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/hysteria.config.example.yaml" "$CORE_CONFIG_DIR/hysteria/config.yaml"
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/hysteria.config.example.yaml" "$CORE_CONFIG_DIR/hysteria/config.yaml"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
 fi
+for config in \
+    "$CORE_CONFIG_DIR/xray/config.json" \
+    "$CORE_CONFIG_DIR/sing-box/config.json" \
+    "$CORE_CONFIG_DIR/hysteria/config.yaml" \
+    "$CORE_CONFIG_DIR/tuic/config.json"
+do
+    chown root:"$APP_GROUP" "$config"
+    chmod 0660 "$config"
+done
 
 if [[ "$WITH_NGINX" -eq 1 ]]; then
     if command -v nginx >/dev/null 2>&1; then
