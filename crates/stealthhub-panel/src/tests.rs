@@ -4,6 +4,7 @@ use super::*;
 use crate::{health, ip};
 use axum::http::{header, HeaderMap};
 use chrono::{Duration, Utc};
+use std::collections::HashSet;
 use stealthhub_core::storage::UserRecord;
 
 fn test_user() -> UserRecord {
@@ -220,4 +221,25 @@ fn brand_mark_uses_gateway_glyph() {
     assert!(rendered.contains("brand-mark"));
     assert!(rendered.contains("brand-glyph"));
     assert!(!rendered.contains("brand-node"));
+}
+
+#[test]
+fn config_editor_targets_are_allowlisted_and_unique() {
+    let mut slugs = HashSet::new();
+
+    for spec in CONFIG_FILES {
+        assert!(slugs.insert(spec.slug));
+        assert!(spec.path.starts_with("/etc/"));
+        assert!(spec.max_bytes <= 256 * 1024);
+    }
+
+    assert!(CONFIG_FILES.len() >= CORE_RUNTIMES.len());
+}
+
+#[test]
+fn config_editor_rejects_unknown_targets() {
+    let report = write_config_file("../etc/passwd", "nope");
+
+    assert!(!report.success);
+    assert_eq!(report.message, "unknown config target");
 }

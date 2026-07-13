@@ -639,6 +639,14 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                     .config-form button {
                         justify-self: start;
                     }
+                    .code-editor {
+                        min-height: 320px;
+                        resize: vertical;
+                        font-family: "SFMono-Regular", "Cascadia Mono", "Liberation Mono", monospace;
+                        line-height: 1.45;
+                        white-space: pre;
+                        overflow: auto;
+                    }
                     .full-span {
                         grid-column: 1 / -1;
                     }
@@ -805,6 +813,7 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                             a href="/admin/ip" { "IP Check" }
                             div class="nav-section" { "Maintenance" }
                             a href="/admin/system" { "System" }
+                            a href="/admin/configs" { "Configs" }
                             a href="/health" { "Health" }
                             a href="/admin/credits" { "Credits" }
                         }

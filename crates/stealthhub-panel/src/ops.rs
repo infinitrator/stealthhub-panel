@@ -1,5 +1,10 @@
 use maud::{html, Markup};
-use std::{fs, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
@@ -174,6 +179,59 @@ pub(crate) const CONSOLE_COMMANDS: &[ConsoleCommand] = &[
         program: "ss",
         args: &["-tulpn"],
     },
+    ConsoleCommand {
+        slug: "failed-units",
+        name: "Failed systemd units",
+        description: "Show failed units that can explain degraded server state.",
+        program: "systemctl",
+        args: &["--failed", "--no-pager"],
+    },
+    ConsoleCommand {
+        slug: "unit-inventory",
+        name: "Service inventory",
+        description: "List active systemd services without opening a raw shell.",
+        program: "systemctl",
+        args: &[
+            "list-units",
+            "--type=service",
+            "--state=running",
+            "--no-pager",
+        ],
+    },
+    ConsoleCommand {
+        slug: "network-addresses",
+        name: "Network addresses",
+        description: "Show interface addresses for routing and binding checks.",
+        program: "ip",
+        args: &["addr", "show"],
+    },
+    ConsoleCommand {
+        slug: "dns-status",
+        name: "DNS resolver status",
+        description: "Read resolver state when systemd-resolved is available.",
+        program: "resolvectl",
+        args: &["status"],
+    },
+    ConsoleCommand {
+        slug: "time-status",
+        name: "Time sync status",
+        description: "Show clock and NTP state for TLS and certificate debugging.",
+        program: "timedatectl",
+        args: &["status"],
+    },
+    ConsoleCommand {
+        slug: "infiproxy-footprint",
+        name: "Infiproxy disk footprint",
+        description: "Show storage used by panel state, source checkout and core runtimes.",
+        program: "du",
+        args: &[
+            "-sh",
+            "/var/lib/infiproxy",
+            "/opt/infiproxy",
+            "/etc/infiproxy",
+            "/etc/infiproxy-cores",
+        ],
+    },
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -183,6 +241,267 @@ pub(crate) struct ConsoleCommand {
     pub(crate) description: &'static str,
     pub(crate) program: &'static str,
     pub(crate) args: &'static [&'static str],
+}
+
+pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
+    ConfigFileSpec {
+        slug: "panel-env",
+        name: "Panel environment",
+        category: "panel",
+        path: "/etc/infiproxy/infiproxy.env",
+        syntax: "dotenv",
+        description: "Bind address, database URL, cookie security and runtime flags.",
+        validate_hint: "Restart panel after saving; invalid env values can stop startup.",
+        reload_hint: "systemctl restart infiproxy.service",
+        max_bytes: 16 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "nginx-site",
+        name: "Nginx reverse proxy",
+        category: "edge",
+        path: "/etc/nginx/sites-available/infiproxy.conf",
+        syntax: "nginx",
+        description: "HTTPS edge, localhost proxying and public exposure rules.",
+        validate_hint: "nginx -t",
+        reload_hint: "systemctl reload nginx.service",
+        max_bytes: 64 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "ssh-daemon",
+        name: "SSH daemon",
+        category: "host",
+        path: "/etc/ssh/sshd_config",
+        syntax: "sshd_config",
+        description: "Administrative SSH access. Validate before reload to avoid lockout.",
+        validate_hint: "sshd -t",
+        reload_hint: "systemctl reload ssh.service",
+        max_bytes: 64 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "xray-core",
+        name: "Xray core",
+        category: "proxy-core",
+        path: "/etc/infiproxy-cores/xray/config.json",
+        syntax: "json",
+        description: "Xray inbound/outbound runtime configuration.",
+        validate_hint: "xray -test -config <file>",
+        reload_hint: "systemctl restart infiproxy-xray.service",
+        max_bytes: 256 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "sing-box-core",
+        name: "sing-box core",
+        category: "proxy-core",
+        path: "/etc/infiproxy-cores/sing-box/config.json",
+        syntax: "json",
+        description: "sing-box runtime configuration for compatibility transports.",
+        validate_hint: "sing-box check -c <file>",
+        reload_hint: "systemctl restart infiproxy-sing-box.service",
+        max_bytes: 256 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "hysteria-core",
+        name: "Hysteria core",
+        category: "proxy-core",
+        path: "/etc/infiproxy-cores/hysteria/config.yaml",
+        syntax: "yaml",
+        description: "Hysteria2 server runtime configuration.",
+        validate_hint: "hysteria server -c <file> --check",
+        reload_hint: "systemctl restart infiproxy-hysteria.service",
+        max_bytes: 128 * 1024,
+    },
+    ConfigFileSpec {
+        slug: "tuic-core",
+        name: "TUIC core",
+        category: "proxy-core",
+        path: "/etc/infiproxy-cores/tuic/config.json",
+        syntax: "json",
+        description: "TUIC server runtime configuration.",
+        validate_hint: "tuic-server -c <file> check",
+        reload_hint: "systemctl restart infiproxy-tuic.service",
+        max_bytes: 128 * 1024,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConfigFileSpec {
+    pub(crate) slug: &'static str,
+    pub(crate) name: &'static str,
+    pub(crate) category: &'static str,
+    pub(crate) path: &'static str,
+    pub(crate) syntax: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) validate_hint: &'static str,
+    pub(crate) reload_hint: &'static str,
+    pub(crate) max_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigFileSnapshot {
+    pub(crate) spec: ConfigFileSpec,
+    pub(crate) exists: bool,
+    pub(crate) bytes: u64,
+    pub(crate) content: String,
+    pub(crate) status: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigWriteReport {
+    pub(crate) spec: ConfigFileSpec,
+    pub(crate) success: bool,
+    pub(crate) message: String,
+    pub(crate) backup_path: Option<String>,
+}
+
+pub(crate) fn config_file_by_slug(slug: &str) -> Option<ConfigFileSpec> {
+    CONFIG_FILES.iter().copied().find(|spec| spec.slug == slug)
+}
+
+pub(crate) fn read_config_file(slug: &str) -> ConfigFileSnapshot {
+    let Some(spec) = config_file_by_slug(slug) else {
+        return ConfigFileSnapshot {
+            spec: CONFIG_FILES[0],
+            exists: false,
+            bytes: 0,
+            content: String::new(),
+            status: "unknown config target".to_string(),
+        };
+    };
+
+    read_config_spec(spec)
+}
+
+pub(crate) fn read_config_spec(spec: ConfigFileSpec) -> ConfigFileSnapshot {
+    let path = Path::new(spec.path);
+    let Ok(metadata) = fs::metadata(path) else {
+        return ConfigFileSnapshot {
+            spec,
+            exists: false,
+            bytes: 0,
+            content: String::new(),
+            status: "file does not exist yet".to_string(),
+        };
+    };
+
+    if !metadata.is_file() {
+        return ConfigFileSnapshot {
+            spec,
+            exists: true,
+            bytes: metadata.len(),
+            content: String::new(),
+            status: "path is not a regular file".to_string(),
+        };
+    }
+
+    if metadata.len() > spec.max_bytes as u64 {
+        return ConfigFileSnapshot {
+            spec,
+            exists: true,
+            bytes: metadata.len(),
+            content: String::new(),
+            status: format!(
+                "file is larger than the {} byte editor limit",
+                spec.max_bytes
+            ),
+        };
+    }
+
+    match fs::read_to_string(path) {
+        Ok(content) => ConfigFileSnapshot {
+            spec,
+            exists: true,
+            bytes: metadata.len(),
+            content,
+            status: "ready".to_string(),
+        },
+        Err(err) => ConfigFileSnapshot {
+            spec,
+            exists: true,
+            bytes: metadata.len(),
+            content: String::new(),
+            status: format!("read failed: {err}"),
+        },
+    }
+}
+
+pub(crate) fn write_config_file(slug: &str, content: &str) -> ConfigWriteReport {
+    let Some(spec) = config_file_by_slug(slug) else {
+        return ConfigWriteReport {
+            spec: CONFIG_FILES[0],
+            success: false,
+            message: "unknown config target".to_string(),
+            backup_path: None,
+        };
+    };
+
+    if content.len() > spec.max_bytes {
+        return ConfigWriteReport {
+            spec,
+            success: false,
+            message: format!(
+                "content is larger than the {} byte editor limit",
+                spec.max_bytes
+            ),
+            backup_path: None,
+        };
+    }
+
+    if content.contains('\0') {
+        return ConfigWriteReport {
+            spec,
+            success: false,
+            message: "content contains NUL bytes".to_string(),
+            backup_path: None,
+        };
+    }
+
+    let path = Path::new(spec.path);
+    let backup_path = if path.exists() {
+        match backup_config_file(path) {
+            Ok(value) => Some(value),
+            Err(err) => {
+                return ConfigWriteReport {
+                    spec,
+                    success: false,
+                    message: format!("backup failed: {err}"),
+                    backup_path: None,
+                };
+            }
+        }
+    } else {
+        None
+    };
+
+    match fs::write(path, content) {
+        Ok(()) => ConfigWriteReport {
+            spec,
+            success: true,
+            message: "saved".to_string(),
+            backup_path,
+        },
+        Err(err) => ConfigWriteReport {
+            spec,
+            success: false,
+            message: format!("write failed: {err}"),
+            backup_path,
+        },
+    }
+}
+
+fn backup_config_file(path: &Path) -> std::io::Result<String> {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!(
+        "{}.infiproxy-bak-{suffix}",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("bak")
+    ));
+
+    fs::copy(path, &backup)?;
+    Ok(backup.display().to_string())
 }
 
 pub(crate) const IP_REPUTATION_SOURCES: &[IpReputationSource] = &[

@@ -7,7 +7,14 @@ use maud::{html, Markup};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use crate::{ops::format_duration, ui::layout, AppState, DEPLOYMENT_MODE};
+use crate::{
+    ops::{
+        format_duration, host_snapshot, meter_bar, service_state, service_state_badge,
+        SYSTEM_TARGETS,
+    },
+    ui::layout,
+    AppState, DEPLOYMENT_MODE,
+};
 
 static APP_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
@@ -96,6 +103,8 @@ fn health_dashboard(
     summary: &'static str,
     components: Markup,
 ) -> Response {
+    let host = host_snapshot();
+
     (
         status,
         Html(
@@ -142,6 +151,57 @@ fn health_dashboard(
                             div class="metric" {
                                 span { "Probe mode" }
                                 strong { "html + plain text" }
+                            }
+                        }
+                    }
+
+                    section {
+                        h2 { "Host sensors" }
+                        div class="sys-grid" {
+                            div class="sys-card" {
+                                span { "OS" }
+                                strong { (&host.os_name) }
+                                small { "Kernel " (&host.kernel) }
+                            }
+                            div class="sys-card" {
+                                span { "Load" }
+                                strong { (&host.load_average) }
+                                small { "Uptime " (&host.uptime) }
+                            }
+                            div class="sys-card" {
+                                span { "Memory" }
+                                strong { (&host.memory_label) }
+                                (meter_bar(host.memory_used_percent))
+                            }
+                            div class="sys-card" {
+                                span { "Root disk" }
+                                strong { (&host.disk_label) }
+                                (meter_bar(host.disk_used_percent))
+                            }
+                        }
+                    }
+
+                    section {
+                        h2 { "Service sensors" }
+                        div class="table-wrap" {
+                            table {
+                                thead {
+                                    tr {
+                                        th { "Target" }
+                                        th { "State" }
+                                        th { "Config" }
+                                    }
+                                }
+                                tbody {
+                                    @for target in SYSTEM_TARGETS {
+                                        @let state = service_state(target.units);
+                                        tr {
+                                            td { strong { (target.name) } }
+                                            td { (service_state_badge(&state)) }
+                                            td { code { (target.config) } }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
