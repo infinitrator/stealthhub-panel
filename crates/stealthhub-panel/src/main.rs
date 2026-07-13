@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -2517,8 +2517,8 @@ fn trusted_forwarded_source(headers: &HeaderMap) -> Option<String> {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(',').next())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .and_then(|value| value.parse::<IpAddr>().ok())
+        .map(|ip| ip.to_string())
 }
 
 impl LoginRateLimiter {
@@ -3406,6 +3406,18 @@ mod tests {
                 "username:admin".to_string(),
                 "source:198.51.100.20".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn login_rate_limit_keys_ignore_invalid_forwarded_source() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        let peer_addr = "127.0.0.1:42300".parse().unwrap();
+
+        assert_eq!(
+            login_rate_limit_keys(&headers, peer_addr, "admin"),
+            vec!["username:admin".to_string(), "source:127.0.0.1".to_string()]
         );
     }
 }
