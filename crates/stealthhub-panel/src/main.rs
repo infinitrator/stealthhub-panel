@@ -1,3 +1,10 @@
+//! Axum web control plane for Infiproxy.
+//!
+//! The binary wires routes, authentication, CSRF protection, settings, users,
+//! protocol editors, routing editors and owner-only danger operations. Heavy
+//! host helpers and UI layout live in sibling modules to keep this file focused
+//! on request/response flow.
+
 mod health;
 mod ip;
 mod ops;

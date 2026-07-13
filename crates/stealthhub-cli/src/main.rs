@@ -1,3 +1,9 @@
+//! Command-line maintenance utilities for local Infiproxy development.
+//!
+//! The CLI intentionally stays small: it initializes SQLite state, creates test
+//! users, lists users and prints sample Mihomo YAML without starting the web
+//! control plane.
+
 use clap::{Parser, Subcommand};
 use stealthhub_core::{
     mihomo::generate_demo_mihomo_yaml,

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Idempotent bare-metal installer for the Infiproxy panel.
+#
+# This script installs the release binary, systemd units, web-editable config
+# directories, starting core configs and the SSH manager without enabling proxy
+# core services before their verified binaries are installed.
 set -euo pipefail
 umask 027
 
@@ -220,6 +225,7 @@ systemctl enable --now infiproxy.service
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
 echo "Manager: sudo infiproxy-manager"
+echo "HTTPS:  sudo infiproxy-manager  # choose HTTPS / Cloudflare setup"
 echo "Health: curl http://127.0.0.1:8080/health"
 echo "Ready:  curl http://127.0.0.1:8080/ready"
 echo "Config: $ENV_FILE"

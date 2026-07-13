@@ -1,3 +1,9 @@
+//! SQLite persistence layer for Infiproxy.
+//!
+//! This module owns schema creation, migrations-by-idempotent-DDL and CRUD
+//! helpers for users, admins, sessions, settings, secrets, protocol profiles and
+//! routing rule sets. Callers receive typed records instead of raw SQL rows.
+
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -1,3 +1,9 @@
+//! Health and readiness endpoints.
+//!
+//! Browser clients receive a compact HTML operations dashboard, while automation
+//! keeps the stable plain-text `/health` and `/ready` contracts expected by load
+//! balancers, uptime checks and shell probes.
+
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},

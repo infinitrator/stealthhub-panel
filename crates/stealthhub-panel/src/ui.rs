@@ -1,3 +1,8 @@
+//! Server-rendered UI shell for the Infiproxy panel.
+//!
+//! The layout is intentionally static CSS and Maud markup: no client-side build
+//! pipeline, no JavaScript dependency and fast rendering on small VPS machines.
+
 use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 pub(crate) const APP_NAME: &str = "Infiproxy";

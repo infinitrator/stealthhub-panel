@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# One-command Infiproxy bootstrapper for fresh VPS hosts.
+#
+# Installs OS build dependencies, ensures Rust is available, syncs the source
+# checkout and delegates the idempotent filesystem/systemd setup to install.sh.
 set -euo pipefail
 umask 027
 
@@ -213,6 +217,10 @@ Infiproxy is installed.
 Service:
   systemctl status infiproxy.service
   sudo infiproxy-manager
+
+HTTPS:
+  sudo infiproxy-manager
+  Choose "HTTPS / Cloudflare setup" and follow the guided DNS + certificate flow.
 
 Local health checks:
   curl http://127.0.0.1:8080/health

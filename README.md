@@ -122,6 +122,18 @@ sudo infiproxy-manager
 перезапустить сервисы, посмотреть логи, открыть helper установки ядер и выполнить
 root-level удаление: `panel`, `full` или `factory`.
 
+HTTPS и Cloudflare:
+
+```bash
+sudo infiproxy-manager
+```
+
+Выбери `HTTPS / Cloudflare setup`. Мастер умеет поставить `nginx`, `certbot`,
+`python3-certbot-dns-cloudflare`, создать или обновить Cloudflare `A` record,
+выпустить Let's Encrypt сертификат через DNS-01 и записать nginx HTTPS config.
+Нужен Cloudflare API token с правами `Zone:Read` и `DNS:Edit` для нужной зоны.
+Токен сохраняется в `/etc/letsencrypt/cloudflare.ini` с правами `0600`.
+
 Первый вход:
 
 ```text

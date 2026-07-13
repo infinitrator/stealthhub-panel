@@ -1,3 +1,8 @@
+//! Typed domain models used by the panel, CLI and Mihomo generator.
+//!
+//! These structs describe panel settings, subscription users and supported proxy
+//! profile variants. They intentionally avoid database or HTTP concerns.
+
 use serde::{Deserialize, Serialize};
 
 use crate::storage::UserRecord;

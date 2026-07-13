@@ -1,3 +1,9 @@
+//! Routing rule-set definitions and validation.
+//!
+//! Rule payloads are stored in classical Mihomo provider format. This module
+//! keeps defaults and validation close together so invalid routing payloads are
+//! rejected before they reach generated subscriptions.
+
 use anyhow::{bail, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

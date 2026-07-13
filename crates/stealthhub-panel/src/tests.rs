@@ -1,3 +1,8 @@
+//! Unit tests for panel security boundaries and formatting helpers.
+//!
+//! Tests live outside `main.rs` so route handlers remain readable while private
+//! module items can still be exercised through Rust's sibling test module rules.
+
 #![cfg(test)]
 
 use super::*;

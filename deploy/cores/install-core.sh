@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Verified proxy-core installer.
+#
+# Downloads or reads a release archive, verifies SHA256, installs it into a
+# versioned core directory and atomically updates the `current` symlink. Optional
+# service restart is restricted to the expected Infiproxy core unit.
 set -euo pipefail
 
 CORE_ROOT="${INFIPROXY_CORE_ROOT:-${STEALTHHUB_CORE_ROOT:-/opt/infiproxy/cores}}"

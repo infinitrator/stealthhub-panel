@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Minimal SSH control surface for Infiproxy VPS installs.
+#
+# The manager intentionally stays dependency-light: plain Bash, systemd, curl,
+# certbot and Python for tiny JSON parsing. Destructive actions require root and
+# explicit confirmation; Cloudflare tokens are never echoed back to the terminal.
 set -Eeuo pipefail
 
 APP="Infiproxy"
@@ -6,6 +11,10 @@ ENV_FILE="${INFIPROXY_ENV_FILE:-/etc/infiproxy/infiproxy.env}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 PANEL_SERVICE="infiproxy.service"
+NGINX_SITE="${INFIPROXY_NGINX_SITE:-/etc/nginx/sites-available/infiproxy.conf}"
+NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
+CLOUDFLARE_CREDENTIALS="${INFIPROXY_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
+CF_API="https://api.cloudflare.com/client/v4"
 CORE_SERVICES=(
   "infiproxy-xray.service"
   "infiproxy-sing-box.service"
@@ -54,6 +63,91 @@ header() {
 run_cmd() {
   echo "${soft}$ $*${reset}"
   "$@"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_cmd() {
+  if ! have_cmd "$1"; then
+    echo "${danger}Missing command: $1${reset}" >&2
+    return 1
+  fi
+}
+
+valid_domain() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+public_ip() {
+  curl -fsSL --max-time 10 https://api.ipify.org
+}
+
+json_first_id() {
+  python3 -c 'import json,sys; data=json.load(sys.stdin); result=data.get("result") or []; print(result[0].get("id","") if result else "")'
+}
+
+cloudflare_get() {
+  local token="$1"
+  local url="$2"
+  shift 2
+  curl -fsS \
+    --config <(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$token") \
+    --get "$@" "$url"
+}
+
+cloudflare_zone_id() {
+  local token="$1"
+  local zone="$2"
+  cloudflare_get "$token" "${CF_API}/zones" --data-urlencode "name=${zone}" | json_first_id
+}
+
+cloudflare_record_id() {
+  local token="$1"
+  local zone_id="$2"
+  local record="$3"
+  cloudflare_get "$token" "${CF_API}/zones/${zone_id}/dns_records" \
+    --data-urlencode "type=A" \
+    --data-urlencode "name=${record}" | json_first_id
+}
+
+cloudflare_write_a_record() {
+  local token="$1"
+  local zone="$2"
+  local record="$3"
+  local ip="$4"
+  local proxied="${5:-false}"
+
+  require_cmd curl || return 1
+  require_cmd python3 || return 1
+  [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
+  valid_domain "$zone" || { echo "${danger}Invalid zone: $zone${reset}" >&2; return 1; }
+  valid_domain "$record" || { echo "${danger}Invalid record: $record${reset}" >&2; return 1; }
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "${danger}Invalid IPv4: $ip${reset}" >&2; return 1; }
+
+  local zone_id record_id payload method url
+  zone_id="$(cloudflare_zone_id "$token" "$zone")"
+  if [[ -z "$zone_id" ]]; then
+    echo "${danger}Cloudflare zone not found: $zone${reset}" >&2
+    return 1
+  fi
+
+  record_id="$(cloudflare_record_id "$token" "$zone_id" "$record")"
+  payload="{\"type\":\"A\",\"name\":\"${record}\",\"content\":\"${ip}\",\"ttl\":1,\"proxied\":${proxied}}"
+  if [[ -n "$record_id" ]]; then
+    method="PUT"
+    url="${CF_API}/zones/${zone_id}/dns_records/${record_id}"
+  else
+    method="POST"
+    url="${CF_API}/zones/${zone_id}/dns_records"
+  fi
+
+  curl -fsS -X "$method" \
+    --config <(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$token") \
+    --data "$payload" \
+    "$url" >/dev/null
+  echo "${green}Cloudflare A record ready: ${record} -> ${ip}${reset}"
 }
 
 pick_editor() {
@@ -230,6 +324,161 @@ core_helper() {
   pause
 }
 
+install_https_deps() {
+  need_root
+  header
+  if have_cmd apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd apt-get update
+    run_cmd apt-get install -y ca-certificates certbot curl nginx python3 python3-certbot-dns-cloudflare
+  elif have_cmd dnf; then
+    run_cmd dnf install -y ca-certificates certbot curl nginx python3 python3-certbot-dns-cloudflare
+  else
+    echo "${danger}Unsupported package manager. Install nginx, certbot, python3 and certbot-dns-cloudflare manually.${reset}" >&2
+    return 1
+  fi
+  run_cmd systemctl enable --now nginx.service
+}
+
+save_cloudflare_credentials() {
+  local token="$1"
+  [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
+  install -d -m 0700 -o root -g root "$(dirname "$CLOUDFLARE_CREDENTIALS")"
+  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CLOUDFLARE_CREDENTIALS"
+  chown root:root "$CLOUDFLARE_CREDENTIALS"
+  chmod 0600 "$CLOUDFLARE_CREDENTIALS"
+}
+
+issue_cloudflare_certificate() {
+  local domain="$1"
+  local email="$2"
+
+  need_root
+  require_cmd certbot || return 1
+  valid_domain "$domain" || { echo "${danger}Invalid domain: $domain${reset}" >&2; return 1; }
+  [[ "$email" == *@*.* ]] || { echo "${danger}Invalid email: $email${reset}" >&2; return 1; }
+  [[ -f "$CLOUDFLARE_CREDENTIALS" ]] || { echo "${danger}Missing Cloudflare credentials: $CLOUDFLARE_CREDENTIALS${reset}" >&2; return 1; }
+
+  run_cmd certbot certonly \
+    --dns-cloudflare \
+    --dns-cloudflare-credentials "$CLOUDFLARE_CREDENTIALS" \
+    --dns-cloudflare-propagation-seconds 60 \
+    --cert-name "$domain" \
+    -d "$domain" \
+    --non-interactive \
+    --agree-tos \
+    -m "$email"
+}
+
+write_nginx_https_config() {
+  local domain="$1"
+
+  need_root
+  valid_domain "$domain" || { echo "${danger}Invalid domain: $domain${reset}" >&2; return 1; }
+  install -d -m 0755 "$(dirname "$NGINX_SITE")"
+  cat >"$NGINX_SITE" <<EOF
+server {
+    listen 443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+
+server {
+    listen 80;
+    server_name ${domain};
+    return 301 https://\$host\$request_uri;
+}
+EOF
+  install -d -m 0755 "$(dirname "$NGINX_ENABLED")"
+  if [[ ! -e "$NGINX_ENABLED" ]]; then
+    ln -s "$NGINX_SITE" "$NGINX_ENABLED"
+  fi
+  run_cmd nginx -t
+  run_cmd systemctl reload nginx.service
+}
+
+https_setup_menu() {
+  need_root
+  header
+  echo "1) Install HTTPS dependencies"
+  echo "2) Upsert Cloudflare A record"
+  echo "3) Issue certificate with Cloudflare DNS-01"
+  echo "4) Write nginx HTTPS config"
+  echo "5) Full guided setup"
+  echo "0) Back"
+  read -r -p "> " choice
+  case "$choice" in
+    1)
+      install_https_deps
+      ;;
+    2)
+      read -r -p "Cloudflare zone (example.com): " zone
+      read -r -p "Panel hostname (panel.example.com): " domain
+      read -r -p "IPv4 [auto]: " ip
+      if [[ -z "$ip" ]]; then
+        ip="$(public_ip)"
+      fi
+      read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
+      read -r -s -p "Cloudflare API token: " token
+      echo
+      proxied=false
+      [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
+      cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied"
+      ;;
+    3)
+      read -r -p "Panel hostname: " domain
+      read -r -p "Let's Encrypt email: " email
+      read -r -s -p "Cloudflare API token (stored in ${CLOUDFLARE_CREDENTIALS}): " token
+      echo
+      save_cloudflare_credentials "$token"
+      issue_cloudflare_certificate "$domain" "$email"
+      ;;
+    4)
+      read -r -p "Panel hostname: " domain
+      write_nginx_https_config "$domain"
+      echo "${green}Secure panel URL: https://${domain}/admin/setup${reset}"
+      ;;
+    5)
+      read -r -p "Cloudflare zone (example.com): " zone
+      read -r -p "Panel hostname (panel.example.com): " domain
+      read -r -p "Let's Encrypt email: " email
+      read -r -p "IPv4 [auto]: " ip
+      if [[ -z "$ip" ]]; then
+        ip="$(public_ip)"
+      fi
+      read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
+      read -r -s -p "Cloudflare API token: " token
+      echo
+      proxied=false
+      [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
+      install_https_deps
+      cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied"
+      save_cloudflare_credentials "$token"
+      issue_cloudflare_certificate "$domain" "$email"
+      write_nginx_https_config "$domain"
+      echo
+      echo "${green}${bold}Secure panel URL: https://${domain}/admin/setup${reset}"
+      ;;
+    0) return ;;
+  esac
+  pause
+}
+
 logs_menu() {
   header
   run_cmd journalctl -u "$PANEL_SERVICE" -n 120 --no-pager || true
@@ -323,10 +572,11 @@ main_menu() {
     echo "2) Restart / reload services"
     echo "3) Edit panel environment"
     echo "4) Toggle web danger shell"
-    echo "5) Install / repair panel"
-    echo "6) Core installer helper"
-    echo "7) Panel logs"
-    echo "${danger}8) Uninstall / cleanup${reset}"
+    echo "5) HTTPS / Cloudflare setup"
+    echo "6) Install / repair panel"
+    echo "7) Core installer helper"
+    echo "8) Panel logs"
+    echo "${danger}9) Uninstall / cleanup${reset}"
     echo "0) Exit"
     read -r -p "> " choice
     case "$choice" in
@@ -334,10 +584,11 @@ main_menu() {
       2) restart_menu ;;
       3) edit_env ;;
       4) toggle_danger_shell ;;
-      5) install_or_repair ;;
-      6) core_helper ;;
-      7) logs_menu ;;
-      8) run_uninstall ;;
+      5) https_setup_menu ;;
+      6) install_or_repair ;;
+      7) core_helper ;;
+      8) logs_menu ;;
+      9) run_uninstall ;;
       0) exit 0 ;;
     esac
   done

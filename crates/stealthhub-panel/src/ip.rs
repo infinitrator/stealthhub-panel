@@ -1,3 +1,9 @@
+//! IP reputation and diagnostics page.
+//!
+//! The panel does not call third-party reputation providers automatically. It
+//! classifies the submitted IP locally and renders operator links to external
+//! databases so checks stay explicit, cache-free and API-key-free by default.
+
 use axum::{
     extract::{Query, State},
     http::HeaderMap,

@@ -1,3 +1,9 @@
+//! Mihomo subscription YAML generation.
+//!
+//! The functions in this module convert persisted panel settings, protocol
+//! profiles, secrets and routing rule sets into client-importable Mihomo config.
+//! Inputs are explicit so generation can be tested without a database.
+
 use anyhow::Result;
 use serde_json::json;
 

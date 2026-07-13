@@ -1,3 +1,9 @@
+//! Host operations used by the web panel.
+//!
+//! This module centralizes service metadata, config-file allowlists, bounded
+//! command execution, uninstall runbooks and host metrics. Keeping these helpers
+//! outside route handlers makes dangerous behavior easier to audit.
+
 use maud::{html, Markup};
 use std::{
     fs,
