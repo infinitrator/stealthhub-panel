@@ -161,9 +161,9 @@ impl From<UserRecord> for SubscriptionUser {
 
 pub fn demo_settings() -> PanelSettings {
     PanelSettings {
-        panel_name: "StealthHub Panel".to_string(),
-        subscription_domain: "atlas.stealthhub.cc".to_string(),
-        node_domain: "iberia.stealthhub.cc".to_string(),
+        panel_name: "Infiproxy".to_string(),
+        subscription_domain: "sub.infiproxy.local".to_string(),
+        node_domain: "node.infiproxy.local".to_string(),
     }
 }
 

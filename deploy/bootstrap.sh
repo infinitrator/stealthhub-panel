@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO_URL="${STEALTHHUB_REPO:-https://github.com/infinitrator/stealthhub-panel.git}"
 REF="${STEALTHHUB_REF:-main}"
-SRC_DIR="${STEALTHHUB_SRC_DIR:-/opt/stealthhub-panel/source}"
+SRC_DIR="${INFIPROXY_SRC_DIR:-${STEALTHHUB_SRC_DIR:-/opt/infiproxy/source}}"
 WITH_NGINX=0
 FORCE_ENV=0
 
@@ -14,9 +14,9 @@ Usage: curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-pane
 Options:
   --repo <url>       Git repository URL. Default: https://github.com/infinitrator/stealthhub-panel.git
   --ref <ref>        Git branch, tag, or commit to install. Default: main
-  --src-dir <path>   Source checkout directory. Default: /opt/stealthhub-panel/source
+  --src-dir <path>   Source checkout directory. Default: /opt/infiproxy/source
   --with-nginx       Install nginx package together with build dependencies.
-  --force-env        Replace /etc/stealthhub-panel/stealthhub-panel.env.
+  --force-env        Replace /etc/infiproxy/infiproxy.env.
 USAGE
 }
 
@@ -161,10 +161,10 @@ bash "${SRC_DIR}/deploy/install.sh" "${install_args[@]}"
 
 cat <<EOF
 
-StealthHub Panel is installed.
+Infiproxy is installed.
 
 Service:
-  systemctl status stealthhub-panel.service
+  systemctl status infiproxy.service
 
 Local health checks:
   curl http://127.0.0.1:8080/health

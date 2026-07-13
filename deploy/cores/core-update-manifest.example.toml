@@ -1,27 +1,27 @@
 [xray]
 repo = "XTLS/Xray-core"
 binary = "xray"
-service = "stealthhub-xray.service"
-active = "/opt/stealthhub/cores/xray/current"
-config = "/etc/stealthhub-cores/xray/config.json"
+service = "infiproxy-xray.service"
+active = "/opt/infiproxy/cores/xray/current"
+config = "/etc/infiproxy-cores/xray/config.json"
 
 [sing_box]
 repo = "SagerNet/sing-box"
 binary = "sing-box"
-service = "stealthhub-sing-box.service"
-active = "/opt/stealthhub/cores/sing-box/current"
-config = "/etc/stealthhub-cores/sing-box/config.json"
+service = "infiproxy-sing-box.service"
+active = "/opt/infiproxy/cores/sing-box/current"
+config = "/etc/infiproxy-cores/sing-box/config.json"
 
 [hysteria]
 repo = "apernet/hysteria"
 binary = "hysteria"
-service = "stealthhub-hysteria.service"
-active = "/opt/stealthhub/cores/hysteria/current"
-config = "/etc/stealthhub-cores/hysteria/config.yaml"
+service = "infiproxy-hysteria.service"
+active = "/opt/infiproxy/cores/hysteria/current"
+config = "/etc/infiproxy-cores/hysteria/config.yaml"
 
 [tuic]
 repo = "tuic-protocol/tuic"
 binary = "tuic-server"
-service = "stealthhub-tuic.service"
-active = "/opt/stealthhub/cores/tuic/current"
-config = "/etc/stealthhub-cores/tuic/config.json"
+service = "infiproxy-tuic.service"
+active = "/opt/infiproxy/cores/tuic/current"
+config = "/etc/infiproxy-cores/tuic/config.json"

@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_USER="${STEALTHHUB_USER:-stealthhub}"
-APP_GROUP="${STEALTHHUB_GROUP:-$APP_USER}"
-INSTALL_BIN="${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/stealthhub-panel}"
-CONFIG_DIR="${STEALTHHUB_CONFIG_DIR:-/etc/stealthhub-panel}"
-STATE_DIR="${STEALTHHUB_STATE_DIR:-/var/lib/stealthhub-panel}"
-CORE_DIR="${STEALTHHUB_CORE_DIR:-/opt/stealthhub/cores}"
-CORE_CONFIG_DIR="${STEALTHHUB_CORE_CONFIG_DIR:-/etc/stealthhub-cores}"
-CORE_LOG_DIR="${STEALTHHUB_CORE_LOG_DIR:-/var/log/stealthhub-cores}"
-SERVICE_FILE="${STEALTHHUB_SERVICE_FILE:-/etc/systemd/system/stealthhub-panel.service}"
-ENV_FILE="${CONFIG_DIR}/stealthhub-panel.env"
+APP_USER="${INFIPROXY_USER:-${STEALTHHUB_USER:-infiproxy}}"
+APP_GROUP="${INFIPROXY_GROUP:-${STEALTHHUB_GROUP:-$APP_USER}}"
+INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
+CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
+STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
+CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
+CORE_CONFIG_DIR="${INFIPROXY_CORE_CONFIG_DIR:-${STEALTHHUB_CORE_CONFIG_DIR:-/etc/infiproxy-cores}}"
+CORE_LOG_DIR="${INFIPROXY_CORE_LOG_DIR:-${STEALTHHUB_CORE_LOG_DIR:-/var/log/infiproxy-cores}}"
+SERVICE_FILE="${INFIPROXY_SERVICE_FILE:-${STEALTHHUB_SERVICE_FILE:-/etc/systemd/system/infiproxy.service}}"
+ENV_FILE="${CONFIG_DIR}/infiproxy.env"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
@@ -19,11 +19,11 @@ usage() {
     cat <<'USAGE'
 Usage: sudo bash deploy/install.sh [--build] [--force-env]
 
-Installs StealthHub Panel for bare-metal systemd deployment.
+Installs Infiproxy for bare-metal systemd deployment.
 
 Options:
   --build       Build target/release/stealthhub-panel before installing.
-  --force-env   Overwrite /etc/stealthhub-panel/stealthhub-panel.env.
+  --force-env   Overwrite /etc/infiproxy/infiproxy.env.
 USAGE
 }
 
@@ -89,12 +89,12 @@ install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
-    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/stealthhub-panel.env.example" "$ENV_FILE"
+    install -m 0640 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/infiproxy.env.example" "$ENV_FILE"
 else
     echo "Keeping existing env file: $ENV_FILE"
 fi
 
-install -m 0644 "${ROOT_DIR}/deploy/stealthhub-panel.service" "$SERVICE_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy.service" "$SERVICE_FILE"
 
 for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
     install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
@@ -120,10 +120,10 @@ if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now stealthhub-panel.service
+systemctl enable --now infiproxy.service
 
-echo "StealthHub Panel installed."
-echo "Status: systemctl status stealthhub-panel.service"
+echo "Infiproxy installed."
+echo "Status: systemctl status infiproxy.service"
 echo "Health: curl http://127.0.0.1:8080/health"
 echo "Config: $ENV_FILE"
 echo "Core services are installed but not enabled until core binaries and final configs are ready."

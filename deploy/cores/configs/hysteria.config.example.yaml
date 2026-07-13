@@ -1,8 +1,8 @@
 listen: :443
 
 tls:
-  cert: /etc/stealthhub-cores/tls/fullchain.pem
-  key: /etc/stealthhub-cores/tls/privkey.pem
+  cert: /etc/infiproxy-cores/tls/fullchain.pem
+  key: /etc/infiproxy-cores/tls/privkey.pem
 
 auth:
   type: password

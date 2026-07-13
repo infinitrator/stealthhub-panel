@@ -22,13 +22,13 @@ jobs:
       - name: Package
         run: |
           set -euo pipefail
-          mkdir -p dist/stealthhub-panel-linux-x86_64
-          cp target/release/stealthhub-panel dist/stealthhub-panel-linux-x86_64/
-          cp -R deploy README.md LICENSE LICENSE.ru.md dist/stealthhub-panel-linux-x86_64/
-          tar -C dist -czf stealthhub-panel-linux-x86_64.tar.gz stealthhub-panel-linux-x86_64
+          mkdir -p dist/infiproxy-linux-x86_64
+          cp target/release/stealthhub-panel dist/infiproxy-linux-x86_64/infiproxy
+          cp -R deploy README.md LICENSE LICENSE.ru.md dist/infiproxy-linux-x86_64/
+          tar -C dist -czf infiproxy-linux-x86_64.tar.gz infiproxy-linux-x86_64
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: stealthhub-panel-linux-x86_64
-          path: stealthhub-panel-linux-x86_64.tar.gz
+          name: infiproxy-linux-x86_64
+          path: infiproxy-linux-x86_64.tar.gz

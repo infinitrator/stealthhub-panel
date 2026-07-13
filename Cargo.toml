@@ -15,7 +15,7 @@ repository = "https://github.com/infinitrator/stealthhub-panel"
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
-axum = "0.7"
+axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 cookie = "0.18"
@@ -26,10 +26,10 @@ serde_yaml = "0.9"
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
 clap = { version = "4", features = ["derive"] }
 subtle = "2"

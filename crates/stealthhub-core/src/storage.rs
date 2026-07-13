@@ -360,9 +360,9 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
-    upsert_setting_if_missing(pool, "panel_name", "StealthHub Panel").await?;
-    upsert_setting_if_missing(pool, "subscription_domain", "atlas.stealthhub.cc").await?;
-    upsert_setting_if_missing(pool, "node_domain", "iberia.stealthhub.cc").await?;
+    upsert_setting_if_missing(pool, "panel_name", "Infiproxy").await?;
+    upsert_setting_if_missing(pool, "subscription_domain", "sub.infiproxy.local").await?;
+    upsert_setting_if_missing(pool, "node_domain", "node.infiproxy.local").await?;
 
     Ok(())
 }
@@ -454,7 +454,7 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             kind: ProxyKind::VlessRealityXhttp,
             role: ProxyRole::AutoSafe,
             enabled: true,
-            server: "iberia.stealthhub.cc".to_string(),
+            server: "node.infiproxy.local".to_string(),
             port: 8443,
             config: ProtocolConfig::VlessRealityXhttp {
                 uuid_source: crate::models::UserUuidSource::SubscriptionUser,
@@ -469,7 +469,7 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             kind: ProxyKind::Shadowsocks2022ShadowTls,
             role: ProxyRole::Compatibility,
             enabled: true,
-            server: "iberia.stealthhub.cc".to_string(),
+            server: "node.infiproxy.local".to_string(),
             port: 9443,
             config: ProtocolConfig::Shadowsocks2022ShadowTls {
                 server_name: "www.apple.com".to_string(),
@@ -482,7 +482,7 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             kind: ProxyKind::AnyTls,
             role: ProxyRole::Compatibility,
             enabled: false,
-            server: "iberia.stealthhub.cc".to_string(),
+            server: "node.infiproxy.local".to_string(),
             port: 10443,
             config: ProtocolConfig::AnyTls {
                 password_secret: "anytls.password".to_string(),
@@ -494,7 +494,7 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             kind: ProxyKind::Hysteria2,
             role: ProxyRole::Speed,
             enabled: false,
-            server: "iberia.stealthhub.cc".to_string(),
+            server: "node.infiproxy.local".to_string(),
             port: 443,
             config: ProtocolConfig::Hysteria2 {
                 password_secret: "hysteria2.password".to_string(),
@@ -507,7 +507,7 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             kind: ProxyKind::Tuic,
             role: ProxyRole::Speed,
             enabled: false,
-            server: "iberia.stealthhub.cc".to_string(),
+            server: "node.infiproxy.local".to_string(),
             port: 11443,
             config: ProtocolConfig::Tuic {
                 uuid_source: crate::models::UserUuidSource::SubscriptionUser,
@@ -1256,10 +1256,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     async fn test_pool() -> Result<(SqlitePool, PathBuf)> {
-        let path = std::env::temp_dir().join(format!(
-            "stealthhub-panel-test-{}.sqlite",
-            Uuid::new_v4().simple()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("infiproxy-test-{}.sqlite", Uuid::new_v4().simple()));
         let database_url = format!("sqlite://{}?mode=rwc", path.display());
         let pool = open_pool(&database_url).await?;
 

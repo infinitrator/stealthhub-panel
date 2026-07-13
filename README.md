@@ -1,6 +1,6 @@
-# StealthHub Panel
+# Infiproxy
 
-StealthHub Panel — односерверная Rust-панель для управления пользователями,
+Infiproxy — односерверная Rust-панель для управления пользователями,
 Mihomo/Clash-compatible подписками, правилами маршрутизации, профилями
 протоколов и системными proxy-ядрами.
 
@@ -44,12 +44,12 @@ Bootstrap делает весь базовый серверный цикл:
 
 - ставит системные зависимости для сборки;
 - ставит Rust stable через `rustup`, если `cargo` не найден;
-- клонирует или обновляет исходники в `/opt/stealthhub-panel/source`;
+- клонирует или обновляет исходники в `/opt/infiproxy/source`;
 - собирает release-бинарник;
-- устанавливает панель в `/usr/local/bin/stealthhub-panel`;
-- создает системного пользователя `stealthhub`;
+- устанавливает панель в `/usr/local/bin/infiproxy`;
+- создает системного пользователя `infiproxy`;
 - создает SQLite базу и runtime-каталоги;
-- устанавливает `stealthhub-panel.service`;
+- устанавливает `infiproxy.service`;
 - устанавливает systemd-шаблоны для proxy-ядер;
 - раскладывает стартовые config-файлы ядер;
 - запускает только саму панель.
@@ -57,7 +57,7 @@ Bootstrap делает весь базовый серверный цикл:
 После установки проверить сервис:
 
 ```bash
-systemctl status stealthhub-panel.service
+systemctl status infiproxy.service
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
 ```
@@ -65,31 +65,31 @@ curl http://127.0.0.1:8080/ready
 Пути на сервере:
 
 ```text
-/opt/stealthhub-panel/source
-/usr/local/bin/stealthhub-panel
-/etc/stealthhub-panel/stealthhub-panel.env
-/var/lib/stealthhub-panel/stealthhub.sqlite
-/etc/systemd/system/stealthhub-panel.service
-/etc/systemd/system/stealthhub-*.service
-/opt/stealthhub/cores
-/etc/stealthhub-cores
-/var/log/stealthhub-cores
+/opt/infiproxy/source
+/usr/local/bin/infiproxy
+/etc/infiproxy/infiproxy.env
+/var/lib/infiproxy/infiproxy.sqlite
+/etc/systemd/system/infiproxy.service
+/etc/systemd/system/infiproxy-*.service
+/opt/infiproxy/cores
+/etc/infiproxy-cores
+/var/log/infiproxy-cores
 ```
 
 Панель по умолчанию слушает только localhost:
 
 ```env
-STEALTHHUB_BIND=127.0.0.1:8080
-STEALTHHUB_DB=sqlite:///var/lib/stealthhub-panel/stealthhub.sqlite?mode=rwc
-STEALTHHUB_COOKIE_SECURE=true
-STEALTHHUB_ENABLE_DEMO_USER=false
+INFIPROXY_BIND=127.0.0.1:8080
+INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
+INFIPROXY_COOKIE_SECURE=true
+INFIPROXY_ENABLE_DEMO_USER=false
 ```
 
 Настройки окружения:
 
 ```bash
-sudo nano /etc/stealthhub-panel/stealthhub-panel.env
-sudo systemctl restart stealthhub-panel.service
+sudo nano /etc/infiproxy/infiproxy.env
+sudo systemctl restart infiproxy.service
 ```
 
 Первый вход:
@@ -101,7 +101,7 @@ https://<your-domain>/admin/setup
 Для HTTPS поставь Nginx или Caddy перед панелью. Готовый пример Nginx лежит в:
 
 ```text
-deploy/nginx-stealthhub-panel.conf.example
+deploy/nginx-infiproxy.conf.example
 ```
 
 ## Обновление Панели
@@ -115,15 +115,15 @@ curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/
 Или обновить из уже установленного checkout:
 
 ```bash
-cd /opt/stealthhub-panel/source
+cd /opt/infiproxy/source
 sudo bash deploy/bootstrap.sh
 ```
 
-Файл `/etc/stealthhub-panel/stealthhub-panel.env` не перезаписывается. Если
+Файл `/etc/infiproxy/infiproxy.env` не перезаписывается. Если
 нужно принудительно вернуть env к шаблону:
 
 ```bash
-sudo bash /opt/stealthhub-panel/source/deploy/bootstrap.sh --force-env
+sudo bash /opt/infiproxy/source/deploy/bootstrap.sh --force-env
 ```
 
 ## Установка Ядер
@@ -135,25 +135,25 @@ sudo bash /opt/stealthhub-panel/source/deploy/bootstrap.sh --force-env
 Поддержанные каталоги:
 
 ```text
-/opt/stealthhub/cores/xray/current/xray
-/opt/stealthhub/cores/sing-box/current/sing-box
-/opt/stealthhub/cores/hysteria/current/hysteria
-/opt/stealthhub/cores/tuic/current/tuic-server
+/opt/infiproxy/cores/xray/current/xray
+/opt/infiproxy/cores/sing-box/current/sing-box
+/opt/infiproxy/cores/hysteria/current/hysteria
+/opt/infiproxy/cores/tuic/current/tuic-server
 ```
 
 Systemd-сервисы:
 
 ```text
-stealthhub-xray.service
-stealthhub-sing-box.service
-stealthhub-hysteria.service
-stealthhub-tuic.service
+infiproxy-xray.service
+infiproxy-sing-box.service
+infiproxy-hysteria.service
+infiproxy-tuic.service
 ```
 
 Установить или обновить ядро через проверенный архив:
 
 ```bash
-sudo /opt/stealthhub-panel/source/deploy/cores/install-core.sh \
+sudo /opt/infiproxy/source/deploy/cores/install-core.sh \
   --core xray \
   --version 26.3.27 \
   --url 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip' \
@@ -161,10 +161,23 @@ sudo /opt/stealthhub-panel/source/deploy/cores/install-core.sh \
   --binary xray
 ```
 
+Актуальные версии по официальным GitHub Releases на 2026-07-13:
+
+```text
+Xray stable:     v26.3.27
+sing-box stable: v1.13.14
+Hysteria stable: app/v2.10.0
+TUIC stable:     tuic-server-1.0.0
+```
+
+Для Xray upstream также публикует более свежую prerelease-ветку. Для основной
+установки оставлен stable release; prerelease лучше проверять на тестовом
+пользователе перед переключением production.
+
 Импортировать заранее скачанный архив:
 
 ```bash
-sudo /opt/stealthhub-panel/source/deploy/cores/install-core.sh \
+sudo /opt/infiproxy/source/deploy/cores/install-core.sh \
   --core sing-box \
   --version 1.13.14 \
   --archive ./sing-box.tar.gz \
@@ -175,8 +188,8 @@ sudo /opt/stealthhub-panel/source/deploy/cores/install-core.sh \
 После настройки конфига ядра:
 
 ```bash
-sudo systemctl enable --now stealthhub-xray.service
-sudo systemctl status stealthhub-xray.service
+sudo systemctl enable --now infiproxy-xray.service
+sudo systemctl status infiproxy-xray.service
 ```
 
 Логика установки ядра:
@@ -186,7 +199,7 @@ download/import archive
 verify SHA256
 extract to staging
 run binary --version
-install into /opt/stealthhub/cores/{core}/{version}
+install into /opt/infiproxy/cores/{core}/{version}
 atomically switch current symlink
 restart service only when --restart is passed
 ```
@@ -197,9 +210,9 @@ restart service only when --restart is passed
 ## Локальный Запуск
 
 ```bash
-STEALTHHUB_BIND=127.0.0.1:8080 \
-STEALTHHUB_DB='sqlite://./stealthhub.local.sqlite?mode=rwc' \
-STEALTHHUB_ENABLE_DEMO_USER=true \
+INFIPROXY_BIND=127.0.0.1:8080 \
+INFIPROXY_DB='sqlite://./infiproxy.local.sqlite?mode=rwc' \
+INFIPROXY_ENABLE_DEMO_USER=true \
 cargo run -p stealthhub-panel
 ```
 
@@ -268,7 +281,7 @@ GET  /rules/{name}
 ## Структура
 
 ```text
-stealthhub-panel/
+infiproxy/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── crates/
@@ -278,16 +291,16 @@ stealthhub-panel/
 ├── deploy/
 │   ├── bootstrap.sh
 │   ├── install.sh
-│   ├── nginx-stealthhub-panel.conf.example
-│   ├── stealthhub-panel.env.example
-│   ├── stealthhub-panel.service
+│   ├── nginx-infiproxy.conf.example
+│   ├── infiproxy.env.example
+│   ├── infiproxy.service
 │   └── cores/
 └── .github/
 ```
 
 ## License
 
-StealthHub Panel is licensed under the **GNU Affero General Public License v3.0 or later**.
+Infiproxy is licensed under the **GNU Affero General Public License v3.0 or later**.
 
 ```text
 AGPL-3.0-or-later

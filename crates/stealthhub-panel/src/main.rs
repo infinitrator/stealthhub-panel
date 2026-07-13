@@ -45,7 +45,8 @@ use stealthhub_core::{
 use subtle::ConstantTimeEq;
 use tower_http::trace::TraceLayer;
 
-const ADMIN_SESSION_COOKIE: &str = "stealthhub_admin_session";
+const APP_NAME: &str = "Infiproxy";
+const ADMIN_SESSION_COOKIE: &str = "infiproxy_admin_session";
 const ADMIN_SESSION_TTL_DAYS: i64 = 7;
 const MIN_ADMIN_PASSWORD_LEN: usize = 12;
 const LOGIN_FAILURE_DELAY_MS: u64 = 500;
@@ -53,48 +54,93 @@ const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$gTSHLOLVD71RNA
 const DEPLOYMENT_MODE: &str = "bare-metal systemd";
 const LOGIN_RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(15 * 60);
 const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
+const SYSTEM_TARGETS: &[SystemTarget] = &[
+    SystemTarget {
+        name: "Panel service",
+        kind: "systemd",
+        unit: "infiproxy.service",
+        config: "/etc/infiproxy/infiproxy.env",
+        check: "systemctl status infiproxy.service",
+        reload: "systemctl restart infiproxy.service",
+    },
+    SystemTarget {
+        name: "SSH daemon",
+        kind: "host",
+        unit: "ssh.service / sshd.service",
+        config: "/etc/ssh/sshd_config",
+        check: "sshd -t && systemctl status ssh || systemctl status sshd",
+        reload: "sshd -t && systemctl reload ssh || systemctl reload sshd",
+    },
+    SystemTarget {
+        name: "Nginx reverse proxy",
+        kind: "host",
+        unit: "nginx.service",
+        config: "/etc/nginx/sites-available/infiproxy.conf",
+        check: "nginx -t && systemctl status nginx.service",
+        reload: "nginx -t && systemctl reload nginx.service",
+    },
+    SystemTarget {
+        name: "Firewall",
+        kind: "host",
+        unit: "ufw / nftables",
+        config: "/etc/ufw / /etc/nftables.conf",
+        check: "ufw status verbose || nft list ruleset",
+        reload: "ufw reload || systemctl reload nftables.service",
+    },
+];
 const CORE_RUNTIMES: &[CoreRuntime] = &[
     CoreRuntime {
         name: "Xray",
         role: "VLESS REALITY XHTTP/TCP",
-        service: "stealthhub-xray.service",
-        binary_path: "/opt/stealthhub/cores/xray/current/xray",
+        service: "infiproxy-xray.service",
+        binary_path: "/opt/infiproxy/cores/xray/current/xray",
         local_binary_path: ".runtime/cores/xray/current/xray",
-        config_path: "/etc/stealthhub-cores/xray/config.json",
-        update_channel: "XTLS/Xray-core GitHub releases",
+        config_path: "/etc/infiproxy-cores/xray/config.json",
+        update_channel:
+            "XTLS/Xray-core latest stable v26.3.27; upstream has newer prerelease stream",
         priority: "primary",
     },
     CoreRuntime {
         name: "sing-box",
         role: "SS2022 ShadowTLS, AnyTLS, compatibility",
-        service: "stealthhub-sing-box.service",
-        binary_path: "/opt/stealthhub/cores/sing-box/current/sing-box",
+        service: "infiproxy-sing-box.service",
+        binary_path: "/opt/infiproxy/cores/sing-box/current/sing-box",
         local_binary_path: ".runtime/cores/sing-box/current/sing-box",
-        config_path: "/etc/stealthhub-cores/sing-box/config.json",
-        update_channel: "SagerNet/sing-box GitHub releases",
+        config_path: "/etc/infiproxy-cores/sing-box/config.json",
+        update_channel: "SagerNet/sing-box latest stable v1.13.14",
         priority: "compat",
     },
     CoreRuntime {
         name: "Hysteria",
         role: "Hysteria2 speed fallback",
-        service: "stealthhub-hysteria.service",
-        binary_path: "/opt/stealthhub/cores/hysteria/current/hysteria",
+        service: "infiproxy-hysteria.service",
+        binary_path: "/opt/infiproxy/cores/hysteria/current/hysteria",
         local_binary_path: ".runtime/cores/hysteria/current/hysteria",
-        config_path: "/etc/stealthhub-cores/hysteria/config.yaml",
-        update_channel: "apernet/hysteria GitHub releases",
+        config_path: "/etc/infiproxy-cores/hysteria/config.yaml",
+        update_channel: "apernet/hysteria latest stable app/v2.10.0",
         priority: "speed",
     },
     CoreRuntime {
         name: "TUIC",
         role: "TUIC QUIC speed fallback",
-        service: "stealthhub-tuic.service",
-        binary_path: "/opt/stealthhub/cores/tuic/current/tuic-server",
+        service: "infiproxy-tuic.service",
+        binary_path: "/opt/infiproxy/cores/tuic/current/tuic-server",
         local_binary_path: ".runtime/cores/tuic/current/tuic-server",
-        config_path: "/etc/stealthhub-cores/tuic/config.json",
-        update_channel: "tuic-protocol/tuic GitHub releases",
+        config_path: "/etc/infiproxy-cores/tuic/config.json",
+        update_channel: "tuic-protocol/tuic latest stable tuic-server-1.0.0",
         priority: "optional",
     },
 ];
+
+#[derive(Debug, Clone, Copy)]
+struct SystemTarget {
+    name: &'static str,
+    kind: &'static str,
+    unit: &'static str,
+    config: &'static str,
+    check: &'static str,
+    reload: &'static str,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct CoreRuntime {
@@ -212,19 +258,20 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("stealthhub_panel=debug,tower_http=debug,info")
         .init();
 
-    let bind = std::env::var("STEALTHHUB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let db_url = std::env::var("STEALTHHUB_DB")
-        .unwrap_or_else(|_| "sqlite://./stealthhub.sqlite?mode=rwc".to_string());
-    let cookie_secure = std::env::var("STEALTHHUB_COOKIE_SECURE")
+    let bind = env_value("INFIPROXY_BIND", "STEALTHHUB_BIND")
+        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let db_url = env_value("INFIPROXY_DB", "STEALTHHUB_DB")
+        .unwrap_or_else(|| "sqlite://./infiproxy.sqlite?mode=rwc".to_string());
+    let cookie_secure = env_value("INFIPROXY_COOKIE_SECURE", "STEALTHHUB_COOKIE_SECURE")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let enable_demo_user = std::env::var("STEALTHHUB_ENABLE_DEMO_USER")
+    let enable_demo_user = env_value("INFIPROXY_ENABLE_DEMO_USER", "STEALTHHUB_ENABLE_DEMO_USER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
 
     if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
         tracing::warn!(
-            "admin session cookie Secure flag is disabled; set STEALTHHUB_COOKIE_SECURE=true behind HTTPS"
+            "admin session cookie Secure flag is disabled; set INFIPROXY_COOKIE_SECURE=true behind HTTPS"
         );
     }
 
@@ -260,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/protocols", get(protocols_page))
         .route(
-            "/admin/protocols/:name/update",
+            "/admin/protocols/{name}/update",
             post(update_protocol_action),
         )
         .route(
@@ -270,24 +317,24 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/system", get(system_page))
         .route("/admin/cores", get(cores_page))
         .route("/admin/users/create", post(create_user_action))
-        .route("/admin/users/:id/toggle", post(toggle_user_action))
+        .route("/admin/users/{id}/toggle", post(toggle_user_action))
         .route(
-            "/admin/users/:id/reset-token",
+            "/admin/users/{id}/reset-token",
             get(reset_user_token_page).post(reset_user_token_action),
         )
         .route(
-            "/admin/users/:id/delete",
+            "/admin/users/{id}/delete",
             get(delete_user_page).post(delete_user_action),
         )
         .route("/health", get(health))
         .route("/ready", get(readiness))
-        .route("/sub/:token/mihomo.yaml", get(mihomo_subscription))
-        .route("/rules/:name", get(rule_provider))
+        .route("/sub/{token}/mihomo.yaml", get(mihomo_subscription))
+        .route("/rules/{name}", get(rule_provider))
         .with_state(state)
         .layer(middleware::from_fn(security_headers))
         .layer(TraceLayer::new_for_http());
 
-    tracing::info!("StealthHub Panel listening on http://{}", bind);
+    tracing::info!("{APP_NAME} listening on http://{}", bind);
 
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(
@@ -297,6 +344,12 @@ async fn main() -> anyhow::Result<()> {
     .await?;
 
     Ok(())
+}
+
+fn env_value(primary: &str, legacy: &str) -> Option<String> {
+    std::env::var(primary)
+        .ok()
+        .or_else(|| std::env::var(legacy).ok())
 }
 
 async fn health() -> impl IntoResponse {
@@ -415,9 +468,9 @@ async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) 
 async fn index() -> impl IntoResponse {
     Html(
         layout(
-            "StealthHub Panel",
+            APP_NAME,
             html! {
-                h1 { "StealthHub Panel" }
+                h1 { (APP_NAME) }
                 div class="cards" {
                     a class="card" href="/admin" {
                         h2 { "Dashboard" }
@@ -1001,11 +1054,11 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                         dt { "Local dev root" }
                         dd { code { ".runtime/cores/{core}/{version}" } }
                         dt { "Core root" }
-                        dd { code { "/opt/stealthhub/cores/{core}/{version}" } }
+                        dd { code { "/opt/infiproxy/cores/{core}/{version}" } }
                         dt { "Active binary" }
-                        dd { code { "/opt/stealthhub/cores/{core}/current" } }
+                        dd { code { "/opt/infiproxy/cores/{core}/current" } }
                         dt { "Configs" }
-                        dd { code { "/etc/stealthhub-cores/{core}" } }
+                        dd { code { "/etc/infiproxy-cores/{core}" } }
                         dt { "Service templates" }
                         dd { code { "deploy/cores/systemd/*.service" } }
                     }
@@ -1024,15 +1077,15 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                             tbody {
                                 tr {
                                     td { "Download or import" }
-                                    td { code { "sudo deploy/cores/install-core.sh --core xray --version 26.3.27 --url <release-archive-url> --sha256 <sha256> --binary xray --restart stealthhub-xray.service" } }
+                                    td { code { "sudo deploy/cores/install-core.sh --core xray --version 26.3.27 --url <release-archive-url> --sha256 <sha256> --binary xray --restart infiproxy-xray.service" } }
                                 }
                                 tr {
                                     td { "Staging" }
-                                    td { code { "/var/lib/stealthhub-panel/core-updates/{core}/{version}" } }
+                                    td { code { "/var/lib/infiproxy/core-updates/{core}/{version}" } }
                                 }
                                 tr {
                                     td { "Activation" }
-                                    td { code { "/opt/stealthhub/cores/{core}/current -> /opt/stealthhub/cores/{core}/{version}" } }
+                                    td { code { "/opt/infiproxy/cores/{core}/current -> /opt/infiproxy/cores/{core}/{version}" } }
                                 }
                                 tr {
                                     td { "Validation" }
@@ -1274,13 +1327,13 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                     h2 { "Runtime contract" }
                     dl class="details" {
                         dt { "Binary" }
-                        dd { code { "/usr/local/bin/stealthhub-panel" } }
+                        dd { code { "/usr/local/bin/infiproxy" } }
                         dt { "Environment" }
-                        dd { code { "/etc/stealthhub-panel/stealthhub-panel.env" } }
+                        dd { code { "/etc/infiproxy/infiproxy.env" } }
                         dt { "Database" }
-                        dd { code { "/var/lib/stealthhub-panel/stealthhub.sqlite" } }
+                        dd { code { "/var/lib/infiproxy/infiproxy.sqlite" } }
                         dt { "Service" }
-                        dd { code { "stealthhub-panel.service" } }
+                        dd { code { "infiproxy.service" } }
                     }
                 }
 
@@ -1292,9 +1345,39 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                         dt { "Install" }
                         dd { code { "sudo bash deploy/install.sh" } }
                         dt { "Reverse proxy" }
-                        dd { code { "deploy/nginx-stealthhub-panel.conf.example" } }
+                        dd { code { "deploy/nginx-infiproxy.conf.example" } }
                         dt { "Core updates" }
                         dd { code { "sudo deploy/cores/install-core.sh --core <name> --version <version> --url <url> --sha256 <sha256> --binary <binary>" } }
+                    }
+                }
+
+                section {
+                    h2 { "Host service registry" }
+                    div class="table-wrap" {
+                        table {
+                            thead {
+                                tr {
+                                    th { "Target" }
+                                    th { "Kind" }
+                                    th { "Unit" }
+                                    th { "Config" }
+                                    th { "Check" }
+                                    th { "Reload / restart" }
+                                }
+                            }
+                            tbody {
+                                @for target in SYSTEM_TARGETS {
+                                    tr {
+                                        td { strong { (target.name) } }
+                                        td { span class="badge neutral" { (target.kind) } }
+                                        td { code { (target.unit) } }
+                                        td { code { (target.config) } }
+                                        td { code { (target.check) } }
+                                        td { code { (target.reload) } }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -2323,7 +2406,7 @@ fn hash_session_token(token: &str) -> String {
 
 fn csrf_token_for_session_token(token: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"stealthhub-admin-csrf-v1:");
+    hasher.update(b"infiproxy-admin-csrf-v1:");
     hasher.update(token.as_bytes());
     URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
@@ -2680,23 +2763,23 @@ fn layout(title: &str, body: Markup) -> Markup {
                     :root {
                         color-scheme: light;
                         font-family: "Aptos", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
-                        background: #e7edf2;
+                        background: #e5e7e3;
                         color: #202a33;
-                        --bg: #e7edf2;
-                        --chrome: #0a4964;
-                        --chrome-dark: #07344a;
-                        --chrome-soft: #d9e8ef;
+                        --bg: #e5e7e3;
+                        --chrome: #4a5049;
+                        --chrome-dark: #343933;
+                        --chrome-soft: #dfe5dc;
                         --panel: #ffffff;
-                        --panel-soft: #f5f8fa;
-                        --panel-strong: #eef4f7;
-                        --border: #c6d2db;
-                        --border-strong: #88a4b5;
-                        --text: #202a33;
-                        --muted: #627483;
-                        --accent: #087da1;
-                        --accent-dark: #075f7b;
-                        --ok-bg: #e2f4e8;
-                        --ok-text: #17653a;
+                        --panel-soft: #f6f7f4;
+                        --panel-strong: #edf1ea;
+                        --border: #c9cfc5;
+                        --border-strong: #8d9a88;
+                        --text: #232923;
+                        --muted: #667064;
+                        --accent: #4f7f35;
+                        --accent-dark: #365f24;
+                        --ok-bg: #e4f1df;
+                        --ok-text: #315f24;
                         --warn-bg: #fff3d5;
                         --warn-text: #875600;
                         --danger-bg: #fbe4e4;
@@ -2722,7 +2805,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                         gap: 18px;
                         padding: 8px 22px;
                         background: linear-gradient(180deg, var(--chrome) 0%, var(--chrome-dark) 100%);
-                        border-bottom: 1px solid #062f42;
+                        border-bottom: 1px solid #2b302b;
                         color: #f6fbfd;
                         box-shadow: 0 1px 0 rgba(255,255,255,0.18) inset;
                     }
@@ -2739,11 +2822,11 @@ fn layout(title: &str, body: Markup) -> Markup {
                         border-radius: 4px;
                         background:
                             linear-gradient(90deg, transparent 0 18%, rgba(255,255,255,0.9) 18% 24%, transparent 24% 38%, rgba(255,255,255,0.9) 38% 44%, transparent 44% 58%, rgba(255,255,255,0.9) 58% 64%, transparent 64%),
-                            #16a0c3;
+                            #5f8f3f;
                         border: 1px solid rgba(255,255,255,0.55);
                     }
                     .masthead-meta {
-                        color: #cde7f1;
+                        color: #dce7d6;
                         font-size: 12px;
                         text-transform: uppercase;
                         letter-spacing: 0.08em;
@@ -2766,28 +2849,28 @@ fn layout(title: &str, body: Markup) -> Markup {
                         font-size: 26px;
                         line-height: 1.2;
                         margin: 0 0 12px;
-                        color: #152633;
+                        color: #20261f;
                     }
                     h2 {
                         margin: 0 0 12px;
                         font-size: 16px;
-                        color: #1b3342;
+                        color: #2c352b;
                     }
                     p { color: var(--muted); line-height: 1.55; }
                     code {
                         display: inline-block;
                         padding: 3px 6px;
                         border-radius: 3px;
-                        background: #edf3f6;
+                        background: #eef1eb;
                         border: 1px solid #c9d7df;
-                        color: #17495e;
+                        color: #2f4f25;
                         word-break: break-all;
                     }
                     .top-nav {
                         min-height: 100%;
                         padding: 16px 10px;
                         border-right: 1px solid var(--border);
-                        background: linear-gradient(180deg, #f8fbfc 0%, #edf3f6 100%);
+                        background: linear-gradient(180deg, #f9faf7 0%, #edf1ea 100%);
                     }
                     .top-nav a {
                         display: block;
@@ -2795,7 +2878,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                         padding: 9px 10px;
                         border: 1px solid transparent;
                         border-radius: 3px;
-                        color: #273a46;
+                        color: #30382f;
                         text-decoration: none;
                         font-size: 14px;
                         font-weight: 650;
@@ -2876,7 +2959,7 @@ fn layout(title: &str, body: Markup) -> Markup {
                         border-radius: 3px;
                         border: 1px solid var(--border-strong);
                         background: linear-gradient(180deg, #ffffff 0%, #e7eef2 100%);
-                        color: #173244;
+                        color: #2a3926;
                         text-decoration: none;
                         cursor: pointer;
                         font-weight: 650;
@@ -2949,10 +3032,10 @@ fn layout(title: &str, body: Markup) -> Markup {
                         font-size: 14px;
                     }
                     tbody tr:hover {
-                        background: #f3f8fa;
+                        background: #f3f7ef;
                     }
                     th {
-                        color: #425563;
+                        color: #4f5a4d;
                         font-size: 12px;
                         text-transform: uppercase;
                         letter-spacing: 0.05em;
@@ -2977,8 +3060,8 @@ fn layout(title: &str, body: Markup) -> Markup {
                         border-color: #e4b0b0;
                     }
                     .badge.neutral {
-                        background: #edf3f6;
-                        color: #315063;
+                        background: #eef1eb;
+                        color: #3c5534;
                         border-color: #c9d7df;
                     }
                     .inline-ok {
@@ -3115,8 +3198,8 @@ fn layout(title: &str, body: Markup) -> Markup {
                         transition: transform 120ms ease;
                     }
                     .switch-field input:checked + .switch-ui {
-                        background: #0d8faf;
-                        border-color: #087da1;
+                        background: #5f8f3f;
+                        border-color: #4f7f35;
                     }
                     .switch-field input:checked + .switch-ui::after {
                         transform: translateX(18px);
@@ -3216,9 +3299,9 @@ fn layout(title: &str, body: Markup) -> Markup {
                     header class="masthead" {
                         div class="masthead-title" {
                             span class="brand-mark" aria-hidden="true" {}
-                            span { "StealthHub Panel" }
+                            span { (APP_NAME) }
                         }
-                        div class="masthead-meta" { "admin console" }
+                        div class="masthead-meta" { "server console" }
                     }
                     div class="layout-shell" {
                         nav class="top-nav" aria-label="Main navigation" {

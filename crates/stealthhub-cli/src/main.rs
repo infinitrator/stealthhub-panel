@@ -9,8 +9,8 @@ use stealthhub_core::{
 };
 
 #[derive(Parser)]
-#[command(name = "stealthhub")]
-#[command(about = "StealthHub Panel CLI")]
+#[command(name = "infiproxy")]
+#[command(about = "Infiproxy CLI")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -20,7 +20,7 @@ struct Cli {
 enum Command {
     GenerateMihomo,
     CreateUser {
-        #[arg(long, default_value = "sqlite://./stealthhub.local.sqlite?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./infiproxy.local.sqlite?mode=rwc")]
         db: String,
         #[arg(long)]
         username: String,
@@ -28,7 +28,7 @@ enum Command {
         traffic_limit_gb: Option<i64>,
     },
     ListUsers {
-        #[arg(long, default_value = "sqlite://./stealthhub.local.sqlite?mode=rwc")]
+        #[arg(long, default_value = "sqlite://./infiproxy.local.sqlite?mode=rwc")]
         db: String,
     },
 }

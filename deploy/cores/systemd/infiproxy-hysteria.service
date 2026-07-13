@@ -1,13 +1,13 @@
 [Unit]
-Description=StealthHub sing-box Core
+Description=Infiproxy Hysteria Core
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=simple
-User=stealthhub
-Group=stealthhub
-ExecStart=/opt/stealthhub/cores/sing-box/current/sing-box run -c /etc/stealthhub-cores/sing-box/config.json
+User=infiproxy
+Group=infiproxy
+ExecStart=/opt/infiproxy/cores/hysteria/current/hysteria server -c /etc/infiproxy-cores/hysteria/config.yaml
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
@@ -16,9 +16,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadOnlyPaths=/etc/stealthhub-cores/sing-box
-ReadOnlyPaths=/opt/stealthhub/cores/sing-box
-ReadWritePaths=/var/log/stealthhub-cores
+ReadOnlyPaths=/etc/infiproxy-cores/hysteria
+ReadOnlyPaths=/opt/infiproxy/cores/hysteria
+ReadWritePaths=/var/log/infiproxy-cores
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CORE_ROOT="${STEALTHHUB_CORE_ROOT:-/opt/stealthhub/cores}"
-STAGING_ROOT="${STEALTHHUB_CORE_STAGING:-/var/lib/stealthhub-panel/core-updates}"
+CORE_ROOT="${INFIPROXY_CORE_ROOT:-${STEALTHHUB_CORE_ROOT:-/opt/infiproxy/cores}}"
+STAGING_ROOT="${INFIPROXY_CORE_STAGING:-${STEALTHHUB_CORE_STAGING:-/var/lib/infiproxy/core-updates}}"
 
 CORE=""
 VERSION=""
@@ -106,10 +106,10 @@ fi
 
 expected_service() {
     case "$CORE" in
-        xray) echo "stealthhub-xray.service" ;;
-        sing-box) echo "stealthhub-sing-box.service" ;;
-        hysteria) echo "stealthhub-hysteria.service" ;;
-        tuic) echo "stealthhub-tuic.service" ;;
+        xray) echo "infiproxy-xray.service" ;;
+        sing-box) echo "infiproxy-sing-box.service" ;;
+        hysteria) echo "infiproxy-hysteria.service" ;;
+        tuic) echo "infiproxy-tuic.service" ;;
     esac
 }
 
