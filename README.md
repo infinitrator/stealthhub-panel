@@ -97,6 +97,7 @@ INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
 INFIPROXY_DB_MAX_CONNECTIONS=2
 INFIPROXY_COOKIE_SECURE=true
 INFIPROXY_ENABLE_DEMO_USER=false
+INFIPROXY_ENABLE_DANGER_SHELL=false
 ```
 
 Настройки окружения:
@@ -105,6 +106,9 @@ INFIPROXY_ENABLE_DEMO_USER=false
 sudo nano /etc/infiproxy/infiproxy.env
 sudo systemctl restart infiproxy.service
 ```
+
+`INFIPROXY_ENABLE_DANGER_SHELL=true` включает break-glass shell во вкладке
+System Danger Zone. Держите его выключенным, пока он реально не нужен.
 
 Первый вход:
 

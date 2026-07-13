@@ -243,3 +243,11 @@ fn config_editor_rejects_unknown_targets() {
     assert!(!report.success);
     assert_eq!(report.message, "unknown config target");
 }
+
+#[tokio::test]
+async fn danger_shell_rejects_empty_commands() {
+    let step = run_danger_shell("   ").await;
+
+    assert!(!step.success);
+    assert_eq!(step.stderr, "command is empty");
+}

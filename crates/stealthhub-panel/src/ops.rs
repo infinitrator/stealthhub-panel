@@ -5,6 +5,10 @@ use std::{
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::{process::Command as TokioCommand, time};
+
+const DANGER_SHELL_TIMEOUT_SECS: u64 = 10;
+const DANGER_SHELL_MAX_CHARS: usize = 2048;
 
 pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
@@ -1014,6 +1018,67 @@ pub(crate) fn run_command_owned(program: &str, args: &[String]) -> CommandStep {
             success: false,
             stdout: String::new(),
             stderr: err.to_string(),
+        },
+    }
+}
+
+pub(crate) async fn run_danger_shell(command: &str) -> CommandStep {
+    let command = command.trim();
+
+    if command.is_empty() {
+        return CommandStep {
+            command: "sh -lc <empty>".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: "command is empty".to_string(),
+        };
+    }
+
+    if command.chars().count() > DANGER_SHELL_MAX_CHARS {
+        return CommandStep {
+            command: "sh -lc <too-long>".to_string(),
+            success: false,
+            stdout: String::new(),
+            stderr: format!("command is longer than {DANGER_SHELL_MAX_CHARS} characters"),
+        };
+    }
+
+    let display = format!("sh -lc {command}");
+    let output = TokioCommand::new("sh")
+        .args(["-lc", command])
+        .current_dir("/")
+        .env_clear()
+        .env(
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        )
+        .env("LANG", "C.UTF-8")
+        .kill_on_drop(true)
+        .output();
+
+    match time::timeout(
+        std::time::Duration::from_secs(DANGER_SHELL_TIMEOUT_SECS),
+        output,
+    )
+    .await
+    {
+        Ok(Ok(output)) => CommandStep {
+            command: display,
+            success: output.status.success(),
+            stdout: trim_command_output(&String::from_utf8_lossy(&output.stdout)),
+            stderr: trim_command_output(&String::from_utf8_lossy(&output.stderr)),
+        },
+        Ok(Err(err)) => CommandStep {
+            command: display,
+            success: false,
+            stdout: String::new(),
+            stderr: err.to_string(),
+        },
+        Err(_) => CommandStep {
+            command: display,
+            success: false,
+            stdout: String::new(),
+            stderr: format!("command timed out after {DANGER_SHELL_TIMEOUT_SECS}s"),
         },
     }
 }

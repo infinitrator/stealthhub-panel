@@ -71,6 +71,7 @@ const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 2048;
 pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
     cookie_secure: bool,
+    danger_shell_enabled: bool,
     login_limiter: Arc<LoginRateLimiter>,
 }
 
@@ -154,6 +155,14 @@ struct ConsoleCommandForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct DangerShellForm {
+    #[serde(default)]
+    csrf_token: String,
+    command: String,
+    confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct UninstallPreviewForm {
     #[serde(default)]
     csrf_token: String,
@@ -213,10 +222,21 @@ async fn main() -> anyhow::Result<()> {
     let enable_demo_user = env_value("INFIPROXY_ENABLE_DEMO_USER", "STEALTHHUB_ENABLE_DEMO_USER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
+    let danger_shell_enabled = env_value(
+        "INFIPROXY_ENABLE_DANGER_SHELL",
+        "STEALTHHUB_ENABLE_DANGER_SHELL",
+    )
+    .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+    .unwrap_or(false);
 
     if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
         tracing::warn!(
             "admin session cookie Secure flag is disabled; set INFIPROXY_COOKIE_SECURE=true behind HTTPS"
+        );
+    }
+    if danger_shell_enabled {
+        tracing::warn!(
+            "danger shell is enabled; keep the panel behind HTTPS, strong auth and trusted network access"
         );
     }
 
@@ -233,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool,
         cookie_secure,
+        danger_shell_enabled,
         login_limiter: Arc::new(LoginRateLimiter::default()),
     };
 
@@ -262,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/system", get(system_page))
         .route("/admin/system/action", post(system_action))
         .route("/admin/system/console", post(system_console_action))
+        .route("/admin/system/shell", post(danger_shell_action))
         .route("/admin/configs", get(configs_page).post(config_save_action))
         .route(
             "/admin/system/uninstall-preview",
@@ -1559,6 +1581,37 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                     }
                 }
 
+                section class="danger-zone" {
+                    h2 { "Danger shell" }
+                    @if state.danger_shell_enabled {
+                        div class="notice error" {
+                            "Break-glass shell is enabled. Commands run as the panel service user through sh -lc, with a 10s timeout, minimal environment and capped output."
+                        }
+                        form method="post" action="/admin/system/shell" class="config-form wide" {
+                            (csrf_field(&auth.csrf_token))
+                            label class="full-span" {
+                                span { "Command" }
+                                textarea class="code-editor" name="command" rows="6" spellcheck="false" placeholder="id && systemctl status infiproxy.service --no-pager" {}
+                                small { "No interactive TTY. Use this only for emergency diagnostics or one-shot maintenance." }
+                            }
+                            label {
+                                span { "Confirmation" }
+                                input type="text" name="confirm" placeholder="I understand" required;
+                                small { "Type exactly: I understand" }
+                            }
+                            button type="submit" class="danger" { "Run danger shell" }
+                        }
+                    } @else {
+                        div class="notice" {
+                            "Disabled. To expose this break-glass tool, set "
+                            code { "INFIPROXY_ENABLE_DANGER_SHELL=true" }
+                            " in the panel environment and restart "
+                            code { "infiproxy.service" }
+                            "."
+                        }
+                    }
+                }
+
                 section {
                     h2 { "Health checks" }
                     ul {
@@ -1880,6 +1933,86 @@ async fn system_console_action(
                 section {
                     h2 { (command.name) }
                     p { (command.description) }
+                    div class="config-row" {
+                        div class="config-row-head" {
+                            h3 { code { (&step.command) } }
+                            @if step.success {
+                                span class="badge ok" { "ok" }
+                            } @else {
+                                span class="badge off" { "failed" }
+                            }
+                        }
+                        div class="command-output" {
+                            @if !step.stdout.is_empty() {
+                                strong { "stdout" }
+                                pre { (&step.stdout) }
+                            }
+                            @if !step.stderr.is_empty() {
+                                strong { "stderr" }
+                                pre { (&step.stderr) }
+                            }
+                            @if step.stdout.is_empty() && step.stderr.is_empty() {
+                                small { "No output." }
+                            }
+                        }
+                    }
+                    a class="button" href="/admin/system" { "Back to System" }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn danger_shell_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DangerShellForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    if !state.danger_shell_enabled {
+        return html_error_response_with_back(
+            StatusCode::FORBIDDEN,
+            "Danger shell disabled",
+            "Set INFIPROXY_ENABLE_DANGER_SHELL=true and restart the panel before using this tool.",
+            "/admin/system",
+            "Back to System",
+        );
+    }
+
+    if form.confirm.trim() != "I understand" {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Danger shell confirmation failed",
+            "Type exactly: I understand",
+            "/admin/system",
+            "Back to System",
+        );
+    }
+
+    let step = run_danger_shell(&form.command).await;
+
+    Html(
+        layout(
+            "Danger shell",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Danger shell" }
+
+                section class="danger-zone" {
+                    h2 { "Command result" }
+                    div class="notice error" {
+                        "This command used the break-glass shell path. Review output carefully and disable the env flag when finished."
+                    }
                     div class="config-row" {
                         div class="config-row-head" {
                             h3 { code { (&step.command) } }
