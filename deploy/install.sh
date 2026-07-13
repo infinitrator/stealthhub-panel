@@ -5,6 +5,7 @@ umask 027
 APP_USER="${INFIPROXY_USER:-${STEALTHHUB_USER:-infiproxy}}"
 APP_GROUP="${INFIPROXY_GROUP:-${STEALTHHUB_GROUP:-$APP_USER}}"
 INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
+MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
@@ -100,6 +101,7 @@ fi
 cat <<EOF
 Infiproxy install plan:
   binary:        $INSTALL_BIN
+  manager:       $MANAGER_BIN
   release bin:   $RELEASE_BIN
   config:        $ENV_FILE
   state:         $STATE_DIR
@@ -126,11 +128,13 @@ fi
 install -d -o root -g root -m 0755 "$CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
+install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g root -m 0755 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
     if [[ -f "$ENV_FILE" ]]; then
@@ -184,6 +188,7 @@ systemctl enable --now infiproxy.service
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
+echo "Manager: sudo infiproxy-manager"
 echo "Health: curl http://127.0.0.1:8080/health"
 echo "Ready:  curl http://127.0.0.1:8080/ready"
 echo "Config: $ENV_FILE"

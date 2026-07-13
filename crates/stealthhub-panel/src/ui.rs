@@ -2,14 +2,6 @@ use maud::{html, Markup, PreEscaped, DOCTYPE};
 
 pub(crate) const APP_NAME: &str = "Infiproxy";
 
-pub(crate) fn brand_mark() -> Markup {
-    html! {
-        span class="brand-mark" aria-hidden="true" {
-            span class="brand-glyph" {}
-        }
-    }
-}
-
 pub(crate) fn layout(title: &str, body: Markup) -> Markup {
     html! {
         (DOCTYPE)
@@ -75,41 +67,6 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                         gap: 10px;
                         font-weight: 750;
                         letter-spacing: 0.01em;
-                    }
-                    .brand-mark {
-                        position: relative;
-                        width: 22px;
-                        height: 22px;
-                        display: inline-block;
-                        overflow: hidden;
-                        border-radius: 5px;
-                        background:
-                            linear-gradient(180deg, rgba(255,255,255,0.2) 0%, rgba(255,255,255,0) 42%),
-                            linear-gradient(135deg, #6f8f59 0%, #2f4f25 100%);
-                        border: 1px solid rgba(255,255,255,0.55);
-                        box-shadow: 0 1px 0 rgba(255,255,255,0.25) inset;
-                    }
-                    .brand-mark::before {
-                        content: "";
-                        position: absolute;
-                        left: 4px;
-                        right: 4px;
-                        bottom: 4px;
-                        height: 4px;
-                        border-radius: 2px 2px 1px 1px;
-                        background: rgba(248,255,242,0.9);
-                    }
-                    .brand-glyph {
-                        position: absolute;
-                        left: 8px;
-                        top: 4px;
-                        width: 6px;
-                        height: 12px;
-                        border-radius: 2px;
-                        background: #f8fff2;
-                        box-shadow:
-                            -4px 4px 0 -2px rgba(248,255,242,0.75),
-                            4px 4px 0 -2px rgba(248,255,242,0.75);
                     }
                     .masthead-meta {
                         color: #dce7d6;
@@ -566,34 +523,10 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                         max-height: 120px;
                     }
                     .product-card {
-                        display: grid;
-                        grid-template-columns: 74px minmax(0, 1fr);
-                        align-items: center;
-                        gap: 16px;
+                        display: block;
                         background:
                             linear-gradient(135deg, rgba(79,127,53,0.1) 0%, rgba(255,255,255,0) 46%),
                             #ffffff;
-                    }
-                    .product-logo {
-                        width: 64px;
-                        height: 64px;
-                        display: grid;
-                        place-items: center;
-                        border: 1px solid var(--border);
-                        border-radius: 8px;
-                        background: linear-gradient(180deg, #f8faf6 0%, #e8efe4 100%);
-                    }
-                    .product-logo .brand-mark {
-                        width: 42px;
-                        height: 42px;
-                        border-radius: 8px;
-                    }
-                    .product-logo .brand-glyph {
-                        left: 16px;
-                        top: 8px;
-                        width: 10px;
-                        height: 24px;
-                        border-radius: 3px;
                     }
                     .runbook ol {
                         margin: 0;
@@ -795,7 +728,6 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                 div class="app-chrome" {
                     header class="masthead" {
                         div class="masthead-title" {
-                            (brand_mark())
                             span { (APP_NAME) }
                         }
                         div class="masthead-meta" { "server console" }

@@ -73,6 +73,7 @@ Bootstrap делает весь базовый серверный цикл:
 systemctl status infiproxy.service
 curl http://127.0.0.1:8080/health
 curl http://127.0.0.1:8080/ready
+sudo infiproxy-manager
 ```
 
 Пути на сервере:
@@ -97,7 +98,7 @@ INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
 INFIPROXY_DB_MAX_CONNECTIONS=2
 INFIPROXY_COOKIE_SECURE=true
 INFIPROXY_ENABLE_DEMO_USER=false
-INFIPROXY_ENABLE_DANGER_SHELL=false
+INFIPROXY_ENABLE_DANGER_SHELL=true
 ```
 
 Настройки окружения:
@@ -107,8 +108,19 @@ sudo nano /etc/infiproxy/infiproxy.env
 sudo systemctl restart infiproxy.service
 ```
 
-`INFIPROXY_ENABLE_DANGER_SHELL=true` включает break-glass shell во вкладке
-System Danger Zone. Держите его выключенным, пока он реально не нужен.
+`INFIPROXY_ENABLE_DANGER_SHELL=true` включает owner-only break-glass shell во
+вкладке System Danger Zone. Доступ есть только у первого админа, созданного при
+первичной настройке.
+
+SSH TUI:
+
+```bash
+sudo infiproxy-manager
+```
+
+Через TUI можно пройти установку/repair, открыть env, переключить danger shell,
+перезапустить сервисы, посмотреть логи, открыть helper установки ядер и выполнить
+root-level удаление: `panel`, `full` или `factory`.
 
 Первый вход:
 

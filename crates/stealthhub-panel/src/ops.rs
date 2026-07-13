@@ -59,6 +59,54 @@ pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
         action_label: "Reload",
         action: SystemActionKind::ReloadFirewall,
     },
+    SystemTarget {
+        slug: "xray",
+        name: "Xray core",
+        kind: "proxy-core",
+        unit: "infiproxy-xray.service",
+        units: &["infiproxy-xray.service"],
+        config: "/etc/infiproxy-cores/xray/config.json",
+        check: "systemctl status infiproxy-xray.service",
+        reload: "systemctl restart infiproxy-xray.service",
+        action_label: "Restart",
+        action: SystemActionKind::RestartUnit("infiproxy-xray.service"),
+    },
+    SystemTarget {
+        slug: "sing-box",
+        name: "sing-box core",
+        kind: "proxy-core",
+        unit: "infiproxy-sing-box.service",
+        units: &["infiproxy-sing-box.service"],
+        config: "/etc/infiproxy-cores/sing-box/config.json",
+        check: "systemctl status infiproxy-sing-box.service",
+        reload: "systemctl restart infiproxy-sing-box.service",
+        action_label: "Restart",
+        action: SystemActionKind::RestartUnit("infiproxy-sing-box.service"),
+    },
+    SystemTarget {
+        slug: "hysteria",
+        name: "Hysteria core",
+        kind: "proxy-core",
+        unit: "infiproxy-hysteria.service",
+        units: &["infiproxy-hysteria.service"],
+        config: "/etc/infiproxy-cores/hysteria/config.yaml",
+        check: "systemctl status infiproxy-hysteria.service",
+        reload: "systemctl restart infiproxy-hysteria.service",
+        action_label: "Restart",
+        action: SystemActionKind::RestartUnit("infiproxy-hysteria.service"),
+    },
+    SystemTarget {
+        slug: "tuic",
+        name: "TUIC core",
+        kind: "proxy-core",
+        unit: "infiproxy-tuic.service",
+        units: &["infiproxy-tuic.service"],
+        config: "/etc/infiproxy-cores/tuic/config.json",
+        check: "systemctl status infiproxy-tuic.service",
+        reload: "systemctl restart infiproxy-tuic.service",
+        action_label: "Restart",
+        action: SystemActionKind::RestartUnit("infiproxy-tuic.service"),
+    },
 ];
 pub(crate) const CORE_RUNTIMES: &[CoreRuntime] = &[
     CoreRuntime {
@@ -121,6 +169,7 @@ pub(crate) struct SystemTarget {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SystemActionKind {
     RestartPanel,
+    RestartUnit(&'static str),
     ReloadSsh,
     ReloadNginx,
     ReloadFirewall,
@@ -646,6 +695,21 @@ pub(crate) struct UninstallPlan {
     pub(crate) commands: Vec<&'static str>,
 }
 
+impl UninstallPlan {
+    pub(crate) fn shell_script(&self) -> String {
+        std::iter::once("set -eu".to_string())
+            .chain(
+                self.commands
+                    .iter()
+                    .copied()
+                    .filter(|line| !line.trim_start().starts_with('#'))
+                    .map(str::to_string),
+            )
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
     match mode {
         "panel" => Some(UninstallPlan {
@@ -676,6 +740,24 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
                 "rm -rf /etc/infiproxy /var/lib/infiproxy",
                 "rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores",
                 "rm -rf /opt/infiproxy/source",
+                "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
+                "nginx -t && systemctl reload nginx.service || true",
+                "userdel infiproxy 2>/dev/null || true",
+                "groupdel infiproxy 2>/dev/null || true",
+            ],
+        }),
+        "factory" => Some(UninstallPlan {
+            title: "Factory footprint cleanup",
+            warning: "Attempts to return the host to a pre-Infiproxy footprint by removing panel services, panel state, proxy cores, core configs/logs, nginx site files, source checkout, manager TUI and the service user. It does not purge OS packages because the installer cannot know which packages existed before Infiproxy.",
+            commands: vec![
+                "# Review paths before running as root.",
+                "systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service || true",
+                "rm -f /etc/systemd/system/infiproxy.service",
+                "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service",
+                "systemctl daemon-reload",
+                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager",
+                "rm -rf /etc/infiproxy /var/lib/infiproxy",
+                "rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores",
                 "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
                 "nginx -t && systemctl reload nginx.service || true",
                 "userdel infiproxy 2>/dev/null || true",
@@ -898,6 +980,7 @@ pub(crate) fn run_system_action(target: SystemTarget) -> SystemActionReport {
         SystemActionKind::RestartPanel => {
             vec![run_command("systemctl", &["restart", "infiproxy.service"])]
         }
+        SystemActionKind::RestartUnit(unit) => vec![run_command("systemctl", &["restart", unit])],
         SystemActionKind::ReloadSsh => {
             let mut steps = vec![run_command("sshd", &["-t"])];
             if steps.last().is_some_and(|step| step.success) {

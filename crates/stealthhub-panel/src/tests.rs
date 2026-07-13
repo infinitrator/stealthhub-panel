@@ -5,7 +5,7 @@ use crate::{health, ip};
 use axum::http::{header, HeaderMap};
 use chrono::{Duration, Utc};
 use std::collections::HashSet;
-use stealthhub_core::storage::UserRecord;
+use stealthhub_core::storage::{AdminRecord, UserRecord};
 
 fn test_user() -> UserRecord {
     let now = Utc::now();
@@ -24,6 +24,18 @@ fn test_user() -> UserRecord {
     }
 }
 
+fn test_admin(id: i64) -> AdminRecord {
+    let now = Utc::now();
+
+    AdminRecord {
+        id,
+        username: format!("admin-{id}"),
+        password_hash: "hash".to_string(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
 #[test]
 fn csrf_token_is_derived_from_session_token() {
     let session_token = "session-token";
@@ -35,6 +47,21 @@ fn csrf_token_is_derived_from_session_token() {
         csrf_token,
         csrf_token_for_session_token("other-session-token")
     );
+}
+
+#[test]
+fn owner_admin_is_first_created_admin() {
+    let owner = AuthenticatedAdmin {
+        admin: test_admin(1),
+        csrf_token: "csrf".to_string(),
+    };
+    let regular = AuthenticatedAdmin {
+        admin: test_admin(2),
+        csrf_token: "csrf".to_string(),
+    };
+
+    assert!(is_owner_admin(&owner));
+    assert!(!is_owner_admin(&regular));
 }
 
 #[test]
@@ -187,9 +214,12 @@ fn console_commands_are_allowlisted_without_shell() {
 fn uninstall_plans_are_preview_runbooks() {
     let panel = uninstall_plan("panel").expect("panel plan exists");
     let full = uninstall_plan("full").expect("full plan exists");
+    let factory = uninstall_plan("factory").expect("factory plan exists");
 
     assert!(panel.title.contains("Panel-only"));
     assert!(full.title.contains("Full"));
+    assert!(factory.title.contains("Factory"));
+    assert!(factory.shell_script().contains("infiproxy-manager"));
     assert!(uninstall_plan("unknown").is_none());
 }
 
@@ -212,15 +242,6 @@ fn reputation_sources_have_ip_templates() {
     assert!(IP_REPUTATION_SOURCES
         .iter()
         .all(|source| source.url_template.contains("{ip}")));
-}
-
-#[test]
-fn brand_mark_uses_gateway_glyph() {
-    let rendered = brand_mark().into_string();
-
-    assert!(rendered.contains("brand-mark"));
-    assert!(rendered.contains("brand-glyph"));
-    assert!(!rendered.contains("brand-node"));
 }
 
 #[test]

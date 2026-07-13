@@ -7,7 +7,7 @@ use crate::{
     health::{health, readiness},
     ip::ip_check_page,
     ops::*,
-    ui::{brand_mark, layout, APP_NAME},
+    ui::{layout, APP_NAME},
 };
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -170,6 +170,14 @@ struct UninstallPreviewForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct UninstallExecuteForm {
+    #[serde(default)]
+    csrf_token: String,
+    mode: String,
+    confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ConfigEditorForm {
     #[serde(default)]
     csrf_token: String,
@@ -227,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         "STEALTHHUB_ENABLE_DANGER_SHELL",
     )
     .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    .unwrap_or(false);
+    .unwrap_or(true);
 
     if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
         tracing::warn!(
@@ -288,6 +296,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/system/uninstall-preview",
             post(uninstall_preview_action),
+        )
+        .route(
+            "/admin/system/uninstall-execute",
+            post(uninstall_execute_action),
         )
         .route("/admin/cores", get(cores_page))
         .route("/admin/ip", get(ip_check_page))
@@ -1565,7 +1577,7 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 section class="danger-zone" {
                     h2 { "Uninstall planner" }
                     div class="notice error" {
-                        "Destructive uninstall is intentionally preview-only from the web UI. Review the generated plan and run it from SSH/root when you really want to remove files."
+                        "Owner-only destructive area. Panel-only removes only the control plane. Full footprint also removes panel-managed cores, configs, logs and nginx site files."
                     }
                     div class="actions" {
                         form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
@@ -1578,12 +1590,46 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                             input type="hidden" name="mode" value="full";
                             button type="submit" class="danger" { "Preview full footprint removal" }
                         }
+                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            input type="hidden" name="mode" value="factory";
+                            button type="submit" class="danger" { "Preview factory footprint cleanup" }
+                        }
+                    }
+                    @if is_owner_admin(&auth) {
+                        div class="notice error" {
+                            "Execution buttons run through the danger shell as the panel service user. On production systemd installs this usually cannot remove root-owned system files; use "
+                            code { "sudo infiproxy-manager" }
+                            " over SSH for guaranteed root cleanup."
+                        }
+                        form method="post" action="/admin/system/uninstall-execute" class="config-form wide" {
+                            (csrf_field(&auth.csrf_token))
+                            label {
+                                span { "Mode" }
+                                select name="mode" {
+                                    option value="panel" { "panel - remove panel only" }
+                                    option value="full" { "full - remove panel-managed footprint" }
+                                    option value="factory" { "factory - deepest Infiproxy cleanup" }
+                                }
+                                small { "Use Preview first. Web execution is limited by panel service permissions." }
+                            }
+                            label {
+                                span { "Confirmation" }
+                                input type="text" name="confirm" placeholder="DELETE INFIPROXY" required;
+                                small { "Type exactly: DELETE INFIPROXY" }
+                            }
+                            button type="submit" class="danger" { "Execute uninstall plan" }
+                        }
+                    } @else {
+                        div class="notice" { "Execution is hidden for non-owner admins." }
                     }
                 }
 
                 section class="danger-zone" {
                     h2 { "Danger shell" }
-                    @if state.danger_shell_enabled {
+                    @if !is_owner_admin(&auth) {
+                        div class="notice" { "Owner-only. This admin can use the allowlisted virtual console, but not the raw shell." }
+                    } @else if state.danger_shell_enabled {
                         div class="notice error" {
                             "Break-glass shell is enabled. Commands run as the panel service user through sh -lc, with a 10s timeout, minimal environment and capped output."
                         }
@@ -1979,6 +2025,10 @@ async fn danger_shell_action(
         return response;
     }
 
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+
     if !state.danger_shell_enabled {
         return html_error_response_with_back(
             StatusCode::FORBIDDEN,
@@ -2012,6 +2062,100 @@ async fn danger_shell_action(
                     h2 { "Command result" }
                     div class="notice error" {
                         "This command used the break-glass shell path. Review output carefully and disable the env flag when finished."
+                    }
+                    div class="config-row" {
+                        div class="config-row-head" {
+                            h3 { code { (&step.command) } }
+                            @if step.success {
+                                span class="badge ok" { "ok" }
+                            } @else {
+                                span class="badge off" { "failed" }
+                            }
+                        }
+                        div class="command-output" {
+                            @if !step.stdout.is_empty() {
+                                strong { "stdout" }
+                                pre { (&step.stdout) }
+                            }
+                            @if !step.stderr.is_empty() {
+                                strong { "stderr" }
+                                pre { (&step.stderr) }
+                            }
+                            @if step.stdout.is_empty() && step.stderr.is_empty() {
+                                small { "No output." }
+                            }
+                        }
+                    }
+                    a class="button" href="/admin/system" { "Back to System" }
+                }
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn uninstall_execute_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<UninstallExecuteForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+
+    if !state.danger_shell_enabled {
+        return html_error_response_with_back(
+            StatusCode::FORBIDDEN,
+            "Uninstall executor disabled",
+            "The web executor uses the danger shell. Enable INFIPROXY_ENABLE_DANGER_SHELL=true or use sudo infiproxy-manager over SSH.",
+            "/admin/system",
+            "Back to System",
+        );
+    }
+
+    if form.confirm.trim() != "DELETE INFIPROXY" {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Uninstall confirmation failed",
+            "Type exactly: DELETE INFIPROXY",
+            "/admin/system",
+            "Back to System",
+        );
+    }
+
+    let Some(plan) = uninstall_plan(&form.mode) else {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Uninstall failed",
+            "Unknown uninstall mode",
+            "/admin/system",
+            "Back to System",
+        );
+    };
+
+    let step = run_danger_shell(&plan.shell_script()).await;
+
+    Html(
+        layout(
+            "Uninstall execute",
+            html! {
+                (admin_bar(&auth))
+                h1 { "Uninstall execute" }
+
+                section class="danger-zone" {
+                    h2 { (plan.title) }
+                    div class="notice error" {
+                        "Execution finished or was interrupted. If this panel is still reachable, review output and use sudo infiproxy-manager from SSH for root-level cleanup."
                     }
                     div class="config-row" {
                         div class="config-row-head" {
@@ -2108,9 +2252,6 @@ async fn credits_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
                 h1 { "Credits" }
 
                 section class="product-card" {
-                    div class="product-logo" {
-                        (brand_mark())
-                    }
                     div {
                         span class="eyebrow" { "commercial-grade control plane" }
                         h2 { (APP_NAME) }
@@ -3522,13 +3663,33 @@ fn core_priority_class(priority: &str) -> &'static str {
 pub(crate) fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
     html! {
         div class="admin-bar" {
-            span { "Signed in as " strong { (auth.admin.username) } }
+            span {
+                "Signed in as " strong { (auth.admin.username) }
+                @if is_owner_admin(auth) {
+                    " "
+                    span class="badge ok" { "owner" }
+                }
+            }
             form method="post" action="/admin/logout" class="inline-form" {
                 (csrf_field(&auth.csrf_token))
                 button type="submit" { "Logout" }
             }
         }
     }
+}
+
+fn is_owner_admin(auth: &AuthenticatedAdmin) -> bool {
+    auth.admin.id == 1
+}
+
+fn owner_only_response() -> Response {
+    html_error_response_with_back(
+        StatusCode::FORBIDDEN,
+        "Owner-only action",
+        "This break-glass operation is available only to the first admin created during initial setup.",
+        "/admin/system",
+        "Back to System",
+    )
 }
 
 async fn security_headers(request: Request<Body>, next: Next) -> Response {
