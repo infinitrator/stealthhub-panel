@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
     collections::HashMap,
+    fs,
     net::{IpAddr, SocketAddr},
+    process::Command,
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
@@ -39,7 +41,7 @@ use stealthhub_core::{
         list_users, load_panel_settings, load_routing_rule_sets, open_pool,
         reset_user_subscription_token, set_user_enabled, touch_admin_session,
         update_protocol_profile, update_routing_rule_set, upsert_setting, AdminRecord, NewUser,
-        UpdateProtocolProfile, UpdateRoutingRuleSet,
+        UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -58,36 +60,52 @@ const LOGIN_RATE_LIMIT_MAX_FAILURES: u32 = 5;
 const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 2048;
 const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
+        slug: "panel",
         name: "Panel service",
         kind: "systemd",
         unit: "infiproxy.service",
+        units: &["infiproxy.service"],
         config: "/etc/infiproxy/infiproxy.env",
         check: "systemctl status infiproxy.service",
         reload: "systemctl restart infiproxy.service",
+        action_label: "Restart",
+        action: SystemActionKind::RestartPanel,
     },
     SystemTarget {
+        slug: "ssh",
         name: "SSH daemon",
         kind: "host",
         unit: "ssh.service / sshd.service",
+        units: &["ssh.service", "sshd.service"],
         config: "/etc/ssh/sshd_config",
         check: "sshd -t && systemctl status ssh || systemctl status sshd",
         reload: "sshd -t && systemctl reload ssh || systemctl reload sshd",
+        action_label: "Validate + reload",
+        action: SystemActionKind::ReloadSsh,
     },
     SystemTarget {
+        slug: "nginx",
         name: "Nginx reverse proxy",
         kind: "host",
         unit: "nginx.service",
+        units: &["nginx.service"],
         config: "/etc/nginx/sites-available/infiproxy.conf",
         check: "nginx -t && systemctl status nginx.service",
         reload: "nginx -t && systemctl reload nginx.service",
+        action_label: "Validate + reload",
+        action: SystemActionKind::ReloadNginx,
     },
     SystemTarget {
+        slug: "firewall",
         name: "Firewall",
         kind: "host",
         unit: "ufw / nftables",
+        units: &["ufw.service", "nftables.service"],
         config: "/etc/ufw / /etc/nftables.conf",
         check: "ufw status verbose || nft list ruleset",
         reload: "ufw reload || systemctl reload nftables.service",
+        action_label: "Reload",
+        action: SystemActionKind::ReloadFirewall,
     },
 ];
 const CORE_RUNTIMES: &[CoreRuntime] = &[
@@ -136,12 +154,24 @@ const CORE_RUNTIMES: &[CoreRuntime] = &[
 
 #[derive(Debug, Clone, Copy)]
 struct SystemTarget {
+    slug: &'static str,
     name: &'static str,
     kind: &'static str,
     unit: &'static str,
+    units: &'static [&'static str],
     config: &'static str,
     check: &'static str,
     reload: &'static str,
+    action_label: &'static str,
+    action: SystemActionKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SystemActionKind {
+    RestartPanel,
+    ReloadSsh,
+    ReloadNginx,
+    ReloadFirewall,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -179,6 +209,8 @@ struct CreateUserForm {
     username: String,
     #[serde(default)]
     traffic_limit_gb: String,
+    #[serde(default)]
+    expires_in_days: String,
     #[serde(default)]
     csrf_token: String,
 }
@@ -224,6 +256,13 @@ struct RoutingRuleSetForm {
     enabled: String,
     target: String,
     payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemActionForm {
+    #[serde(default)]
+    csrf_token: String,
+    target: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
             get(routing_page).post(update_routing_rule_action),
         )
         .route("/admin/system", get(system_page))
+        .route("/admin/system/action", post(system_action))
         .route("/admin/cores", get(cores_page))
         .route("/admin/users/create", post(create_user_action))
         .route("/admin/users/{id}/toggle", post(toggle_user_action))
@@ -330,6 +370,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/health", get(health))
         .route("/ready", get(readiness))
+        .route("/sub/{token}", get(subscription_page))
         .route("/sub/{token}/mihomo.yaml", get(mihomo_subscription))
         .route("/rules/{name}", get(rule_provider))
         .with_state(state)
@@ -385,11 +426,11 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         }
     };
 
-    if !user.enabled {
-        return (StatusCode::FORBIDDEN, "subscription disabled\n").into_response();
+    if let Some(reason) = subscription_block_reason(&user) {
+        return (StatusCode::FORBIDDEN, format!("{reason}\n")).into_response();
     }
 
-    let subscription_user: SubscriptionUser = user.into();
+    let subscription_user: SubscriptionUser = user.clone().into();
     let settings = match load_panel_settings(&state.pool).await {
         Ok(value) => value,
         Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
@@ -427,12 +468,113 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-cache, no-store, must-revalidate"),
     );
-    headers.insert(
-        "Subscription-Userinfo",
-        HeaderValue::from_static("upload=0; download=0; total=0; expire=0"),
-    );
+    headers.insert("Subscription-Userinfo", subscription_userinfo_header(&user));
 
     (headers, yaml).into_response()
+}
+
+async fn subscription_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
+    let user = match get_user_by_token(&state.pool, &token).await {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Html(
+                    layout(
+                        "Subscription",
+                        html! {
+                            h1 { "Subscription" }
+                            div class="notice error" { "Invalid subscription token." }
+                        },
+                    )
+                    .into_string(),
+                ),
+            )
+                .into_response()
+        }
+    };
+
+    let settings = match load_panel_settings(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    };
+
+    let yaml_url = mihomo_subscription_url(&settings.subscription_domain, &user.subscription_token);
+    let import_url = mihomo_import_url(&settings.panel_name, &user.username, &yaml_url);
+    let block_reason = subscription_block_reason(&user);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+
+    (
+        headers,
+        Html(
+            layout(
+                "Subscription",
+                html! {
+                    h1 { "Subscription" }
+
+                    section {
+                        h2 { "Account" }
+                        dl class="details" {
+                            dt { "User" }
+                            dd { code { (&user.username) } }
+                            dt { "Status" }
+                            dd {
+                                @if let Some(reason) = block_reason {
+                                    span class="badge off" { (reason) }
+                                } @else {
+                                    span class="badge ok" { "active" }
+                                }
+                            }
+                            dt { "Traffic" }
+                            dd { (format_user_traffic(&user)) }
+                            dt { "Expires" }
+                            dd { (format_user_expiry(&user)) }
+                        }
+                    }
+
+                    section {
+                        h2 { "Client import" }
+                        @if block_reason.is_none() {
+                            div class="config-list" {
+                                div class="config-row" {
+                                    div class="config-row-head" {
+                                        h3 { "Mihomo / Clash" }
+                                        div class="config-row-meta" {
+                                            a class="button compact" href=(&import_url) { "Import" }
+                                            a class="button compact secondary" href=(&yaml_url) { "Download YAML" }
+                                        }
+                                    }
+                                    div class="config-form wide" {
+                                        label class="full-span" {
+                                            span { "Subscription URL" }
+                                            input type="text" readonly value=(&yaml_url);
+                                            small { "Use this URL in Mihomo-compatible clients when one-click import is unavailable." }
+                                        }
+                                        label class="full-span" {
+                                            span { "One-click import URL" }
+                                            input type="text" readonly value=(&import_url);
+                                            small { "Uses the standard Clash import scheme and points back to the YAML subscription." }
+                                        }
+                                    }
+                                }
+                            }
+                        } @else {
+                            div class="notice error" {
+                                "Subscription is not available for import until the account state is fixed."
+                            }
+                        }
+                    }
+                },
+            )
+            .into_string(),
+        ),
+    )
+        .into_response()
 }
 
 async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -1286,6 +1428,7 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .fetch_one(&state.pool)
         .await
         .is_ok();
+    let host = host_snapshot();
 
     Html(
         layout(
@@ -1326,6 +1469,32 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 }
 
                 section {
+                    h2 { "Host overview" }
+                    div class="sys-grid" {
+                        div class="sys-card" {
+                            span { "OS" }
+                            strong { (&host.os_name) }
+                            small { "Kernel " (&host.kernel) }
+                        }
+                        div class="sys-card" {
+                            span { "Uptime" }
+                            strong { (&host.uptime) }
+                            small { "Load " (&host.load_average) }
+                        }
+                        div class="sys-card" {
+                            span { "Memory" }
+                            strong { (&host.memory_label) }
+                            (meter_bar(host.memory_used_percent))
+                        }
+                        div class="sys-card" {
+                            span { "Root disk" }
+                            strong { (&host.disk_label) }
+                            (meter_bar(host.disk_used_percent))
+                        }
+                    }
+                }
+
+                section {
                     h2 { "Runtime contract" }
                     dl class="details" {
                         dt { "Binary" }
@@ -1354,28 +1523,42 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                 }
 
                 section {
-                    h2 { "Host service registry" }
+                    h2 { "Service control" }
+                    div class="notice" {
+                        "Only built-in allowlisted commands are available here. Actions require OS-level permission for the panel service user."
+                    }
                     div class="table-wrap" {
                         table {
                             thead {
                                 tr {
                                     th { "Target" }
+                                    th { "State" }
                                     th { "Kind" }
                                     th { "Unit" }
                                     th { "Config" }
                                     th { "Check" }
-                                    th { "Reload / restart" }
+                                    th { "Action" }
                                 }
                             }
                             tbody {
                                 @for target in SYSTEM_TARGETS {
+                                    @let state = service_state(target.units);
                                     tr {
                                         td { strong { (target.name) } }
+                                        td { (service_state_badge(&state)) }
                                         td { span class="badge neutral" { (target.kind) } }
                                         td { code { (target.unit) } }
                                         td { code { (target.config) } }
                                         td { code { (target.check) } }
-                                        td { code { (target.reload) } }
+                                        td {
+                                            form method="post" action="/admin/system/action" class="inline-form" {
+                                                (csrf_field(&auth.csrf_token))
+                                                input type="hidden" name="target" value=(target.slug);
+                                                button class=(if target.slug == "panel" { "danger" } else { "" }) type="submit" { (target.action_label) }
+                                            }
+                                            br;
+                                            code { (target.reload) }
+                                        }
                                     }
                                 }
                             }
@@ -1391,6 +1574,88 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
                     }
                 }
 
+            },
+        )
+        .into_string(),
+    )
+    .into_response()
+}
+
+async fn system_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<SystemActionForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let Some(target) = SYSTEM_TARGETS
+        .iter()
+        .find(|target| target.slug == form.target)
+    else {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "System action failed",
+            "Unknown system target",
+            "/admin/system",
+            "Back to System",
+        );
+    };
+
+    let report = run_system_action(*target);
+    let ok = report.steps.iter().all(|step| step.success);
+
+    Html(
+        layout(
+            "System action",
+            html! {
+                (admin_bar(&auth))
+                h1 { "System action" }
+
+                section {
+                    h2 { (target.name) }
+                    div class=(if ok { "notice" } else { "notice error" }) {
+                        @if ok {
+                            "Action completed."
+                        } @else {
+                            "Action failed. Review command output below."
+                        }
+                    }
+                    div class="config-list" {
+                        @for step in &report.steps {
+                            div class="config-row" {
+                                div class="config-row-head" {
+                                    h3 { code { (&step.command) } }
+                                    @if step.success {
+                                        span class="badge ok" { "ok" }
+                                    } @else {
+                                        span class="badge off" { "failed" }
+                                    }
+                                }
+                                div class="command-output" {
+                                    @if !step.stdout.is_empty() {
+                                        strong { "stdout" }
+                                        pre { (&step.stdout) }
+                                    }
+                                    @if !step.stderr.is_empty() {
+                                        strong { "stderr" }
+                                        pre { (&step.stderr) }
+                                    }
+                                    @if step.stdout.is_empty() && step.stderr.is_empty() {
+                                        small { "No output." }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    a class="button" href="/admin/system" { "Back to System" }
+                }
             },
         )
         .into_string(),
@@ -1929,6 +2194,11 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                             input type="number" name="traffic_limit_gb" min="0" placeholder="empty = unlimited";
                         }
 
+                        label {
+                            span { "Expires in days" }
+                            input type="number" name="expires_in_days" min="0" max="3650" placeholder="empty = never";
+                        }
+
                         button type="submit" { "Create" }
                     }
                 }
@@ -1949,6 +2219,7 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                                         th { "UUID" }
                                         th { "Subscription" }
                                         th { "Traffic" }
+                                        th { "Expires" }
                                         th { "Actions" }
                                     }
                                 }
@@ -1968,21 +2239,17 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                                                 code { (user.uuid) }
                                             }
                                             td {
-                                                code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) }
+                                                code { (format!("/sub/{}", user.subscription_token)) }
                                                 br;
+                                                a href=(format!("/sub/{}", user.subscription_token)) { "open" }
+                                                " "
                                                 a href=(format!("/sub/{}/mihomo.yaml", user.subscription_token)) { "download" }
                                             }
                                             td {
-                                                (format_bytes(user.traffic_used_bytes))
-                                                " / "
-                                                @match user.traffic_limit_bytes {
-                                                    Some(limit) => {
-                                                        (format_bytes(limit))
-                                                    },
-                                                    None => {
-                                                        "unlimited"
-                                                    },
-                                                }
+                                                (format_user_traffic(&user))
+                                            }
+                                            td {
+                                                (format_user_expiry(&user))
                                             }
                                             td {
                                                 @if user.enabled {
@@ -2067,11 +2334,35 @@ async fn create_user_action(
             }
         }
     };
+    let expires_at = match form.expires_in_days.trim() {
+        "" | "0" => None,
+        value => {
+            let days = match value.parse::<i64>() {
+                Ok(value) if (1..=3650).contains(&value) => value,
+                Ok(_) => {
+                    return html_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Bad request",
+                        "Expiry must be between 1 and 3650 days",
+                    );
+                }
+                Err(_) => {
+                    return html_error_response(
+                        StatusCode::BAD_REQUEST,
+                        "Bad request",
+                        "Expiry must be a number",
+                    );
+                }
+            };
+
+            Some(Utc::now() + Duration::days(days))
+        }
+    };
 
     let input = NewUser {
         username,
         traffic_limit_bytes,
-        expires_at: None,
+        expires_at,
     };
 
     match create_user(&state.pool, input).await {
@@ -2757,6 +3048,456 @@ fn html_error_response_with_back(
         .into_response()
 }
 
+#[derive(Debug, Clone)]
+struct HostSnapshot {
+    os_name: String,
+    kernel: String,
+    uptime: String,
+    load_average: String,
+    memory_label: String,
+    memory_used_percent: Option<u8>,
+    disk_label: String,
+    disk_used_percent: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct ServiceState {
+    unit: String,
+    status: ServiceStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceStatus {
+    Active,
+    Inactive,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct SystemActionReport {
+    steps: Vec<CommandStep>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandStep {
+    command: String,
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
+
+fn host_snapshot() -> HostSnapshot {
+    let disk_values = disk_values_kb();
+
+    HostSnapshot {
+        os_name: os_pretty_name().unwrap_or_else(|| "unknown Linux".to_string()),
+        kernel: read_trimmed("/proc/sys/kernel/osrelease").unwrap_or_else(|| "unknown".to_string()),
+        uptime: uptime_label().unwrap_or_else(|| "unknown".to_string()),
+        load_average: load_average_label().unwrap_or_else(|| "unknown".to_string()),
+        memory_label: memory_label().unwrap_or_else(|| "unknown".to_string()),
+        memory_used_percent: memory_used_percent(),
+        disk_label: disk_values
+            .map(|(used, total)| {
+                format!("{} / {}", format_kibibytes(used), format_kibibytes(total))
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        disk_used_percent: disk_values.and_then(|(used, total)| percent(used, total)),
+    }
+}
+
+fn os_pretty_name() -> Option<String> {
+    let content = fs::read_to_string("/etc/os-release").ok()?;
+    content.lines().find_map(|line| {
+        let value = line.strip_prefix("PRETTY_NAME=")?;
+        Some(value.trim_matches('"').to_string())
+    })
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn uptime_label() -> Option<String> {
+    let content = fs::read_to_string("/proc/uptime").ok()?;
+    let seconds = content.split_whitespace().next()?.parse::<u64>().ok()?;
+    Some(format_duration(seconds))
+}
+
+fn load_average_label() -> Option<String> {
+    let content = fs::read_to_string("/proc/loadavg").ok()?;
+    let mut parts = content.split_whitespace();
+    Some(format!(
+        "{} {} {}",
+        parts.next()?,
+        parts.next()?,
+        parts.next()?
+    ))
+}
+
+fn memory_values_kb() -> Option<(u64, u64)> {
+    let content = fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total = None;
+    let mut available = None;
+
+    for line in content.lines() {
+        if let Some(value) = meminfo_kb(line, "MemTotal:") {
+            total = Some(value);
+        } else if let Some(value) = meminfo_kb(line, "MemAvailable:") {
+            available = Some(value);
+        }
+    }
+
+    Some((total?, available?))
+}
+
+fn meminfo_kb(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn memory_label() -> Option<String> {
+    let (total, available) = memory_values_kb()?;
+    let used = total.saturating_sub(available);
+    Some(format!(
+        "{} / {}",
+        format_kibibytes(used),
+        format_kibibytes(total)
+    ))
+}
+
+fn memory_used_percent() -> Option<u8> {
+    let (total, available) = memory_values_kb()?;
+    percent(total.saturating_sub(available), total)
+}
+
+fn disk_values_kb() -> Option<(u64, u64)> {
+    let output = Command::new("df").args(["-k", "/"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let fields: Vec<&str> = stdout.lines().nth(1)?.split_whitespace().collect();
+    let used = fields.get(2)?.parse::<u64>().ok()?;
+    let total = fields.get(1)?.parse::<u64>().ok()?;
+    Some((used, total))
+}
+
+fn percent(value: u64, total: u64) -> Option<u8> {
+    if total == 0 {
+        return None;
+    }
+
+    Some(((value.saturating_mul(100)) / total).min(100) as u8)
+}
+
+fn format_duration(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h {minutes}m")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
+fn format_kibibytes(value: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0;
+
+    if value as f64 >= GIB {
+        format!("{:.1} GiB", value as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", value as f64 / MIB)
+    }
+}
+
+fn service_state(units: &[&str]) -> ServiceState {
+    for unit in units {
+        let Ok(output) = Command::new("systemctl")
+            .args(["is-active", "--quiet", unit])
+            .output()
+        else {
+            return ServiceState {
+                unit: (*unit).to_string(),
+                status: ServiceStatus::Unknown,
+            };
+        };
+
+        if output.status.success() {
+            return ServiceState {
+                unit: (*unit).to_string(),
+                status: ServiceStatus::Active,
+            };
+        }
+
+        let status = systemctl_state(unit);
+        if status != ServiceStatus::Unknown {
+            return ServiceState {
+                unit: (*unit).to_string(),
+                status,
+            };
+        }
+    }
+
+    ServiceState {
+        unit: units.first().copied().unwrap_or("unknown").to_string(),
+        status: ServiceStatus::Unknown,
+    }
+}
+
+fn systemctl_state(unit: &str) -> ServiceStatus {
+    let Ok(output) = Command::new("systemctl").args(["is-failed", unit]).output() else {
+        return ServiceStatus::Unknown;
+    };
+
+    if output.status.success() {
+        ServiceStatus::Failed
+    } else {
+        ServiceStatus::Inactive
+    }
+}
+
+fn service_state_badge(state: &ServiceState) -> Markup {
+    let (class, label) = match state.status {
+        ServiceStatus::Active => ("ok", "active"),
+        ServiceStatus::Inactive => ("neutral", "inactive"),
+        ServiceStatus::Failed => ("off", "failed"),
+        ServiceStatus::Unknown => ("off", "unknown"),
+    };
+
+    html! {
+        span class=(format!("badge {class}")) { (label) }
+        br;
+        small { (&state.unit) }
+    }
+}
+
+fn meter_bar(percent: Option<u8>) -> Markup {
+    let value = percent.unwrap_or(0);
+
+    html! {
+        div class="meter" title=(percent.map(|value| format!("{value}%")).unwrap_or_else(|| "unknown".to_string())) {
+            div class="meter-fill" style=(format!("width: {value}%")) {}
+        }
+    }
+}
+
+fn run_system_action(target: SystemTarget) -> SystemActionReport {
+    let steps = match target.action {
+        SystemActionKind::RestartPanel => {
+            vec![run_command("systemctl", &["restart", "infiproxy.service"])]
+        }
+        SystemActionKind::ReloadSsh => {
+            let mut steps = vec![run_command("sshd", &["-t"])];
+            if steps.last().is_some_and(|step| step.success) {
+                steps.push(run_first_success(&[
+                    ("systemctl", &["reload", "ssh.service"][..]),
+                    ("systemctl", &["reload", "sshd.service"][..]),
+                ]));
+            }
+            steps
+        }
+        SystemActionKind::ReloadNginx => {
+            let mut steps = vec![run_command("nginx", &["-t"])];
+            if steps.last().is_some_and(|step| step.success) {
+                steps.push(run_command("systemctl", &["reload", "nginx.service"]));
+            }
+            steps
+        }
+        SystemActionKind::ReloadFirewall => vec![run_first_success(&[
+            ("ufw", &["reload"][..]),
+            ("systemctl", &["reload", "nftables.service"][..]),
+        ])],
+    };
+
+    SystemActionReport { steps }
+}
+
+fn run_first_success(commands: &[(&str, &[&str])]) -> CommandStep {
+    let mut combined = Vec::new();
+
+    for (program, args) in commands {
+        let step = run_command(program, args);
+        let success = step.success;
+        combined.push(step);
+
+        if success {
+            break;
+        }
+    }
+
+    merge_command_steps(combined)
+}
+
+fn merge_command_steps(steps: Vec<CommandStep>) -> CommandStep {
+    let success = steps.iter().any(|step| step.success);
+    let command = steps
+        .iter()
+        .map(|step| step.command.as_str())
+        .collect::<Vec<_>>()
+        .join(" || ");
+    let stdout = steps
+        .iter()
+        .filter(|step| !step.stdout.is_empty())
+        .map(|step| format!("$ {}\n{}", step.command, step.stdout))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = steps
+        .iter()
+        .filter(|step| !step.stderr.is_empty())
+        .map(|step| format!("$ {}\n{}", step.command, step.stderr))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    CommandStep {
+        command,
+        success,
+        stdout,
+        stderr,
+    }
+}
+
+fn run_command(program: &str, args: &[&str]) -> CommandStep {
+    let command = format_command(program, args);
+
+    match Command::new(program).args(args).output() {
+        Ok(output) => CommandStep {
+            command,
+            success: output.status.success(),
+            stdout: trim_command_output(&String::from_utf8_lossy(&output.stdout)),
+            stderr: trim_command_output(&String::from_utf8_lossy(&output.stderr)),
+        },
+        Err(err) => CommandStep {
+            command,
+            success: false,
+            stdout: String::new(),
+            stderr: err.to_string(),
+        },
+    }
+}
+
+fn format_command(program: &str, args: &[&str]) -> String {
+    std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn trim_command_output(value: &str) -> String {
+    const MAX_OUTPUT_CHARS: usize = 4096;
+    let value = value.trim();
+
+    if value.chars().count() <= MAX_OUTPUT_CHARS {
+        return value.to_string();
+    }
+
+    format!(
+        "{}... <truncated>",
+        value.chars().take(MAX_OUTPUT_CHARS).collect::<String>()
+    )
+}
+
+fn subscription_block_reason(user: &UserRecord) -> Option<&'static str> {
+    if !user.enabled {
+        return Some("subscription disabled");
+    }
+
+    if user
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= Utc::now())
+    {
+        return Some("subscription expired");
+    }
+
+    if user
+        .traffic_limit_bytes
+        .is_some_and(|limit| limit > 0 && user.traffic_used_bytes >= limit)
+    {
+        return Some("traffic limit reached");
+    }
+
+    None
+}
+
+fn subscription_userinfo_header(user: &UserRecord) -> HeaderValue {
+    let total = user.traffic_limit_bytes.unwrap_or(0).max(0);
+    let used = user.traffic_used_bytes.max(0);
+    let expire = user
+        .expires_at
+        .map(|value| value.timestamp().max(0))
+        .unwrap_or(0);
+    let value = format!("upload=0; download={used}; total={total}; expire={expire}");
+
+    HeaderValue::from_str(&value)
+        .unwrap_or_else(|_| HeaderValue::from_static("upload=0; download=0; total=0; expire=0"))
+}
+
+fn mihomo_subscription_url(host: &str, token: &str) -> String {
+    format!(
+        "https://{}/sub/{}/mihomo.yaml",
+        host.trim().trim_end_matches('/'),
+        token
+    )
+}
+
+fn mihomo_import_url(panel_name: &str, username: &str, yaml_url: &str) -> String {
+    let name = format!("{panel_name} - {username}");
+    format!(
+        "clash://install-config?url={}&name={}",
+        percent_encode(yaml_url),
+        percent_encode(&name)
+    )
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                encoded.push('%');
+                encoded.push(HEX[(byte >> 4) as usize] as char);
+                encoded.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+        }
+    }
+
+    encoded
+}
+
+fn format_user_traffic(user: &UserRecord) -> String {
+    match user.traffic_limit_bytes {
+        Some(limit) => format!(
+            "{} / {}",
+            format_bytes(user.traffic_used_bytes),
+            format_bytes(limit)
+        ),
+        None => format!("{} / unlimited", format_bytes(user.traffic_used_bytes)),
+    }
+}
+
+fn format_user_expiry(user: &UserRecord) -> String {
+    user.expires_at
+        .map(|value| value.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "never".to_string())
+}
+
 fn format_bytes(value: i64) -> String {
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     if value <= 0 {
@@ -3138,6 +3879,58 @@ fn layout(title: &str, body: Markup) -> Markup {
                         gap: 8px;
                         margin-top: 16px;
                     }
+                    .sys-grid {
+                        display: grid;
+                        grid-template-columns: repeat(4, minmax(0, 1fr));
+                        gap: 8px;
+                    }
+                    .sys-card {
+                        min-height: 88px;
+                        padding: 10px 12px;
+                        border: 1px solid var(--border);
+                        border-radius: 4px;
+                        background: linear-gradient(180deg, #ffffff 0%, #f5f8fa 100%);
+                    }
+                    .sys-card span {
+                        display: block;
+                        color: var(--muted);
+                        font-size: 12px;
+                        font-weight: 800;
+                        text-transform: uppercase;
+                        letter-spacing: 0.05em;
+                    }
+                    .sys-card strong {
+                        display: block;
+                        margin: 7px 0 4px;
+                        font-size: 15px;
+                    }
+                    .meter {
+                        height: 8px;
+                        margin-top: 8px;
+                        overflow: hidden;
+                        border: 1px solid #b8c8b4;
+                        border-radius: 999px;
+                        background: #e8eee4;
+                    }
+                    .meter-fill {
+                        height: 100%;
+                        background: linear-gradient(90deg, #5f8f3f 0%, #8baa52 100%);
+                    }
+                    .command-output {
+                        padding: 12px;
+                    }
+                    .command-output pre {
+                        max-height: 260px;
+                        overflow: auto;
+                        margin: 8px 0 12px;
+                        padding: 10px;
+                        border: 1px solid var(--border);
+                        border-radius: 3px;
+                        background: #20251f;
+                        color: #e7f1de;
+                        font-size: 12px;
+                        white-space: pre-wrap;
+                    }
                     .config-list {
                         display: flex;
                         flex-direction: column;
@@ -3278,6 +4071,9 @@ fn layout(title: &str, body: Markup) -> Markup {
                             align-items: start;
                             gap: 6px;
                         }
+                        .sys-grid {
+                            grid-template-columns: 1fr;
+                        }
                         .config-row-head {
                             align-items: flex-start;
                             flex-direction: column;
@@ -3346,6 +4142,23 @@ fn layout(title: &str, body: Markup) -> Markup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_user() -> UserRecord {
+        let now = Utc::now();
+
+        UserRecord {
+            id: 1,
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "token".to_string(),
+            enabled: true,
+            traffic_limit_bytes: None,
+            traffic_used_bytes: 0,
+            expires_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
 
     #[test]
     fn csrf_token_is_derived_from_session_token() {
@@ -3419,5 +4232,62 @@ mod tests {
             login_rate_limit_keys(&headers, peer_addr, "admin"),
             vec!["username:admin".to_string(), "source:127.0.0.1".to_string()]
         );
+    }
+
+    #[test]
+    fn subscription_block_reason_enforces_user_state() {
+        let mut user = test_user();
+        assert!(subscription_block_reason(&user).is_none());
+
+        user.enabled = false;
+        assert_eq!(
+            subscription_block_reason(&user),
+            Some("subscription disabled")
+        );
+
+        user.enabled = true;
+        user.expires_at = Some(Utc::now() - Duration::days(1));
+        assert_eq!(
+            subscription_block_reason(&user),
+            Some("subscription expired")
+        );
+
+        user.expires_at = None;
+        user.traffic_limit_bytes = Some(1024);
+        user.traffic_used_bytes = 1024;
+        assert_eq!(
+            subscription_block_reason(&user),
+            Some("traffic limit reached")
+        );
+    }
+
+    #[test]
+    fn mihomo_import_url_percent_encodes_values() {
+        let import_url = mihomo_import_url(
+            "Infiproxy",
+            "alice phone",
+            "https://sub.example.test/sub/token/mihomo.yaml",
+        );
+
+        assert!(import_url.starts_with("clash://install-config?url=https%3A%2F%2F"));
+        assert!(import_url.contains("&name=Infiproxy%20-%20alice%20phone"));
+    }
+
+    #[test]
+    fn system_helpers_format_safe_values() {
+        assert_eq!(percent(50, 100), Some(50));
+        assert_eq!(percent(1, 0), None);
+        assert_eq!(format_duration(65), "1m");
+        assert_eq!(format_duration(3_900), "1h 5m");
+        assert_eq!(format_duration(90_000), "1d 1h 0m");
+    }
+
+    #[test]
+    fn command_output_trimming_preserves_utf8() {
+        let input = "ж".repeat(4_200);
+        let output = trim_command_output(&input);
+
+        assert!(output.ends_with("... <truncated>"));
+        assert!(output.is_char_boundary(output.len()));
     }
 }
