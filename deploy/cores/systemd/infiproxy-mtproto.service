@@ -1,0 +1,28 @@
+[Unit]
+Description=Infiproxy Telegram MTProto Proxy
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=infiproxy
+Group=infiproxy
+EnvironmentFile=/etc/infiproxy-cores/mtproto/mtproto.env
+WorkingDirectory=/etc/infiproxy-cores/mtproto
+ExecStart=/opt/infiproxy/cores/mtproto/current/mtproto-proxy -p $MTPROTO_STATS_PORT -H $MTPROTO_PORT -S $MTPROTO_SECRET --aes-pwd $MTPROTO_AES_PWD $MTPROTO_PROXY_CONFIG -M $MTPROTO_WORKERS
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/infiproxy-cores/mtproto
+ReadOnlyPaths=/opt/infiproxy/cores/mtproto
+ReadWritePaths=/var/log/infiproxy-cores
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

@@ -131,6 +131,7 @@ Infiproxy install plan:
   state:         $STATE_DIR
   core binaries: $CORE_DIR
   core configs:  $CORE_CONFIG_DIR
+  headscale cfg: /etc/headscale
   core logs:     $CORE_LOG_DIR
   service:       $SERVICE_FILE
   nginx:         $WITH_NGINX
@@ -151,6 +152,7 @@ if ! id -u "$APP_USER" >/dev/null 2>&1; then
 fi
 
 install -d -o root -g "$APP_GROUP" -m 0770 "$CONFIG_DIR"
+install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
@@ -182,6 +184,7 @@ install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/xray"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/sing-box"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/hysteria"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tuic"
+install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/mtproto"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tls"
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
@@ -196,11 +199,15 @@ fi
 if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
     install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
 fi
+if [[ ! -f "$CORE_CONFIG_DIR/mtproto/mtproto.env" ]]; then
+    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/mtproto.env.example" "$CORE_CONFIG_DIR/mtproto/mtproto.env"
+fi
 for config in \
     "$CORE_CONFIG_DIR/xray/config.json" \
     "$CORE_CONFIG_DIR/sing-box/config.json" \
     "$CORE_CONFIG_DIR/hysteria/config.yaml" \
-    "$CORE_CONFIG_DIR/tuic/config.json"
+    "$CORE_CONFIG_DIR/tuic/config.json" \
+    "$CORE_CONFIG_DIR/mtproto/mtproto.env"
 do
     chown root:"$APP_GROUP" "$config"
     chmod 0660 "$config"

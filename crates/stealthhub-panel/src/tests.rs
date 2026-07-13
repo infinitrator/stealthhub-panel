@@ -224,6 +224,10 @@ fn uninstall_plans_are_preview_runbooks() {
     assert!(panel.title.contains("Panel-only"));
     assert!(full.title.contains("Full"));
     assert!(factory.title.contains("Factory"));
+    assert!(full.shell_script().contains("infiproxy-mtproto.service"));
+    assert!(factory.shell_script().contains("infiproxy-mtproto.service"));
+    assert!(full.shell_script().contains("headscale.service"));
+    assert!(factory.shell_script().contains("headscale.service"));
     assert!(factory.shell_script().contains("infiproxy-manager"));
     assert!(uninstall_plan("unknown").is_none());
 }
@@ -260,6 +264,40 @@ fn config_editor_targets_are_allowlisted_and_unique() {
     }
 
     assert!(CONFIG_FILES.len() >= CORE_RUNTIMES.len());
+}
+
+#[test]
+fn mtproto_runtime_is_wired_into_panel_contracts() {
+    assert!(CORE_RUNTIMES
+        .iter()
+        .any(|core| core.service == "infiproxy-mtproto.service"
+            && core.binary_path.ends_with("/mtproto-proxy")));
+    assert!(SYSTEM_TARGETS.iter().any(|target| target.slug == "mtproto"
+        && target.units == ["infiproxy-mtproto.service"].as_slice()));
+    assert!(CONFIG_FILES.iter().any(|spec| spec.slug == "mtproto-core"
+        && spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env"));
+    assert!(CONSOLE_COMMANDS
+        .iter()
+        .any(|command| command.slug == "mtproto-logs"
+            && command.args.contains(&"infiproxy-mtproto.service")));
+}
+
+#[test]
+fn headscale_module_is_wired_into_panel_contracts() {
+    assert!(SYSTEM_TARGETS.iter().any(
+        |target| target.slug == "headscale" && target.units == ["headscale.service"].as_slice()
+    ));
+    assert!(CONFIG_FILES
+        .iter()
+        .any(|spec| spec.slug == "headscale-config" && spec.path == "/etc/headscale/config.yaml"));
+    assert!(CONFIG_FILES
+        .iter()
+        .any(|spec| spec.slug == "headscale-nginx"
+            && spec.path == "/etc/nginx/sites-available/infiproxy-headscale.conf"));
+    assert!(CONSOLE_COMMANDS
+        .iter()
+        .any(|command| command.slug == "headscale-logs"
+            && command.args.contains(&"headscale.service")));
 }
 
 #[test]

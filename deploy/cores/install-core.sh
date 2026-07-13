@@ -20,7 +20,7 @@ RESTART_SERVICE=""
 usage() {
     cat <<'USAGE'
 Usage:
-  sudo deploy/cores/install-core.sh --core <xray|sing-box|hysteria|tuic> \
+  sudo deploy/cores/install-core.sh --core <xray|sing-box|hysteria|tuic|mtproto> \
     --version <version> --url <release-url> --sha256 <sha256> --binary <binary-name> \
     [--restart <systemd-service>]
 
@@ -80,7 +80,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 case "$CORE" in
-    xray|sing-box|hysteria|tuic) ;;
+    xray|sing-box|hysteria|tuic|mtproto) ;;
     *)
         echo "Unsupported core: $CORE" >&2
         usage >&2
@@ -115,6 +115,7 @@ expected_service() {
         sing-box) echo "infiproxy-sing-box.service" ;;
         hysteria) echo "infiproxy-hysteria.service" ;;
         tuic) echo "infiproxy-tuic.service" ;;
+        mtproto) echo "infiproxy-mtproto.service" ;;
     esac
 }
 
@@ -201,8 +202,22 @@ rm -rf "$TARGET_DIR"
 install -d -m 0755 "$TARGET_DIR"
 install -m 0755 "$FOUND_BINARY" "${TARGET_DIR}/${BINARY}"
 
-"${TARGET_DIR}/${BINARY}" --version >/dev/null 2>&1 || {
-    echo "${BINARY} --version failed; current symlink was not changed." >&2
+smoke_test_binary() {
+    local binary_path="$1"
+
+    case "$CORE" in
+        mtproto)
+            ("$binary_path" --help 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage' \
+                || ("$binary_path" -h 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage'
+            ;;
+        *)
+            "$binary_path" --version >/dev/null 2>&1
+            ;;
+    esac
+}
+
+smoke_test_binary "${TARGET_DIR}/${BINARY}" || {
+    echo "${BINARY} smoke test failed; current symlink was not changed." >&2
     exit 1
 }
 

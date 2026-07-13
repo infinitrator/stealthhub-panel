@@ -1,86 +1,237 @@
 # Infiproxy
 
-Infiproxy — односерверная Rust-панель для управления пользователями,
-Mihomo/Clash-compatible подписками, правилами маршрутизации, профилями
-протоколов и системными proxy-ядрами.
+Infiproxy is a single-server Rust panel for managing users, Mihomo/Clash-compatible
+subscriptions, routing rules, protocol profiles and supervised proxy runtimes.
 
-Основной способ развертывания: **VPS + bare metal + systemd**. Панель не
-реализует proxy-протоколы сама: она управляет пользователями, настройками и
-конфигами, а сетевую работу выполняют внешние ядра.
+It is built for a simple VPS deployment model: **bare metal Linux + systemd +
+SQLite + one SSH TUI**. The panel does not implement proxy protocols itself.
+Network traffic is handled by external cores such as Xray, sing-box, Hysteria,
+TUIC and Telegram MTProxy.
 
-## Установка
+## Quick Install
 
-Поддерживаемый основной путь: Ubuntu 22.04/24.04 или Debian 12 на чистом VPS.
-Fedora/RHEL-like серверы с `dnf` также поддержаны bootstrap-скриптом для
-установки зависимостей.
+Recommended target: a fresh Ubuntu 22.04/24.04 or Debian 12 VPS.
 
-Одна команда для установки на сервер:
+One command for the full guided install:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --guided --with-nginx
 ```
 
-Проверить план установки без изменений на сервере:
+The command installs build dependencies, Rust when needed, clones the project to
+`/opt/infiproxy/source`, builds the release binary, installs systemd units and
+opens the guided SSH TUI. The TUI then walks through panel repair, HTTPS,
+optional core imports, Telegram MTProto and final service checks.
+
+If the guided UI was skipped or the SSH session was interrupted:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --check
+sudo infiproxy-manager --guided
 ```
 
-Установка конкретной ветки, тега или коммита:
+## What You Need
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --ref main
+- A VPS with root access.
+- Ubuntu/Debian is recommended; Fedora/RHEL-like systems with `dnf` are also
+  supported by the bootstrapper.
+- A domain is optional but recommended for HTTPS.
+- For Cloudflare HTTPS automation: an API token with `Zone:Read` and `DNS:Edit`
+  permissions for the target zone.
+- For proxy cores: official release archive URLs and SHA256 checksums. The TUI
+  asks for these values and performs checksum verification before activation.
+
+## First Run
+
+After the quick install, follow the TUI prompts. The normal path is:
+
+```text
+Guided deployment cycle
+Panel install/repair
+HTTPS with Cloudflare DNS-01
+Verified core archive import
+Telegram MTProto setup
+Final service status
 ```
 
-Установка из своего fork:
+When HTTPS is configured, open:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- \
-  --repo https://github.com/<user>/<repo>.git \
-  --ref main
+```text
+https://<your-domain>/admin/setup
 ```
 
-Установка сразу с Nginx:
+Without HTTPS, use an SSH tunnel first:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --with-nginx
+ssh -L 8080:127.0.0.1:8080 root@<server>
 ```
 
-Принудительно пересоздать env-файл при обновлении:
+Then open locally:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --force-env
+```text
+http://127.0.0.1:8080/admin/setup
 ```
 
-Bootstrap делает весь базовый серверный цикл:
+## SSH Manager
 
-- ставит системные зависимости для сборки;
-- ставит Rust stable через `rustup`, если `cargo` не найден;
-- клонирует или обновляет исходники в `/opt/infiproxy/source`;
-- собирает release-бинарник;
-- устанавливает панель в `/usr/local/bin/infiproxy`;
-- создает системного пользователя `infiproxy`;
-- создает SQLite базу и runtime-каталоги;
-- устанавливает `infiproxy.service`;
-- устанавливает systemd-шаблоны для proxy-ядер;
-- раскладывает стартовые config-файлы ядер;
-- при `--with-nginx` устанавливает шаблон сайта в `/etc/nginx/sites-available/infiproxy.conf`;
-- запускает только саму панель.
-
-После установки проверить сервис:
+The installed TUI is the main operations surface:
 
 ```bash
-systemctl status infiproxy.service
-curl http://127.0.0.1:8080/health
-curl http://127.0.0.1:8080/ready
 sudo infiproxy-manager
 ```
 
-Пути на сервере:
+It includes:
+
+- Guided deployment cycle.
+- Service status dashboard.
+- Restart and reload actions.
+- Panel environment editor.
+- HTTPS and Cloudflare certificate setup.
+- Verified proxy core installer.
+- Telegram MTProto setup.
+- Headscale mesh hub setup.
+- Panel logs.
+- Root-level uninstall and cleanup flows.
+
+## Proxy Cores
+
+Infiproxy prepares systemd units and config directories, but proxy core binaries
+are installed only from verified archives. This avoids silently trusting an
+unverified binary during panel installation.
+
+Runtime paths:
+
+```text
+/opt/infiproxy/cores/xray/current/xray
+/opt/infiproxy/cores/sing-box/current/sing-box
+/opt/infiproxy/cores/hysteria/current/hysteria
+/opt/infiproxy/cores/tuic/current/tuic-server
+/opt/infiproxy/cores/mtproto/current/mtproto-proxy
+```
+
+Systemd units:
+
+```text
+infiproxy-xray.service
+infiproxy-sing-box.service
+infiproxy-hysteria.service
+infiproxy-tuic.service
+infiproxy-mtproto.service
+```
+
+Inside the TUI, choose:
+
+```text
+Core installer helper
+```
+
+For each core, paste:
+
+- Core version label.
+- Official release archive URL.
+- SHA256 checksum.
+
+The installer downloads or imports the archive, verifies SHA256, extracts into a
+versioned directory, runs a bounded smoke test and atomically switches the
+`current` symlink.
+
+## Telegram MTProto
+
+Telegram MTProto is managed as a separate server runtime, not as a Mihomo
+outbound. In the TUI, choose:
+
+```text
+Telegram MTProto setup
+```
+
+The guided setup downloads Telegram `proxy-secret` and `proxy-multi.conf`,
+generates a 32-hex client secret, writes:
+
+```text
+/etc/infiproxy-cores/mtproto/mtproto.env
+```
+
+and prints an import link:
+
+```text
+https://t.me/proxy?server=<host>&port=<port>&secret=<secret>
+```
+
+Refresh Telegram upstream config from the same menu when needed.
+
+## Headscale Mesh Hub
+
+Infiproxy can also install and configure Headscale, a self-hosted Tailscale
+coordination server. In the TUI, choose:
+
+```text
+Headscale hub setup
+```
+
+The guided setup:
+
+- Downloads the official Headscale release.
+- Verifies the downloaded asset with upstream `checksums.txt`.
+- Installs the Debian package on Ubuntu/Debian or falls back to a standalone
+  binary on other supported Linux hosts.
+- Writes `/etc/headscale/config.yaml`.
+- Creates a dedicated Nginx HTTPS site at
+  `/etc/nginx/sites-available/infiproxy-headscale.conf`.
+- Issues a Let's Encrypt certificate through Cloudflare DNS-01.
+- Starts `headscale.service`.
+- Can create a Headscale user and pre-auth key for client onboarding.
+
+Headscale must use a **DNS-only** Cloudflare record. Do not enable Cloudflare
+proxying for the Headscale hostname.
+
+Client example:
+
+```bash
+tailscale up --login-server https://hs.example.com --authkey <key>
+```
+
+## Port Plan
+
+The default deployment avoids internal port collisions:
+
+```text
+TCP 80/443              Nginx public edge for panel and Headscale hostnames
+TCP 127.0.0.1:8080      Infiproxy panel
+TCP 127.0.0.1:8088      Headscale control server
+TCP 127.0.0.1:9098      Headscale metrics/debug
+TCP 127.0.0.1:50443     Headscale local gRPC
+TCP/UDP 8443            Telegram MTProto proxy
+UDP 443                 Hysteria2 starter config
+UDP 11443               TUIC starter config
+```
+
+Hysteria2 uses QUIC/UDP on `443`, while Nginx uses TCP `443`; these are separate
+sockets and can coexist. Headscale intentionally does not use its upstream
+example default `127.0.0.1:8080` because that belongs to the panel.
+
+## Updates
+
+Run the same command again:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --guided --with-nginx
+```
+
+Or update from the installed checkout:
+
+```bash
+cd /opt/infiproxy/source
+sudo bash deploy/bootstrap.sh --guided --with-nginx
+```
+
+The installer keeps existing env and core configs unless you explicitly choose
+to overwrite them. Existing env files are backed up before replacement.
+
+## Important Paths
 
 ```text
 /opt/infiproxy/source
 /usr/local/bin/infiproxy
+/usr/local/sbin/infiproxy-manager
 /etc/infiproxy/infiproxy.env
 /var/lib/infiproxy/infiproxy.sqlite
 /etc/systemd/system/infiproxy.service
@@ -90,7 +241,7 @@ sudo infiproxy-manager
 /var/log/infiproxy-cores
 ```
 
-Панель по умолчанию слушает только localhost:
+Default panel environment:
 
 ```env
 INFIPROXY_BIND=127.0.0.1:8080
@@ -101,167 +252,39 @@ INFIPROXY_ENABLE_DEMO_USER=false
 INFIPROXY_ENABLE_DANGER_SHELL=true
 ```
 
-Настройки окружения:
+The web danger shell is owner-only and intended for break-glass administration.
+For destructive host operations, prefer `sudo infiproxy-manager` over SSH.
+
+## Manual Commands
+
+Dry-run the installer:
 
 ```bash
-sudo nano /etc/infiproxy/infiproxy.env
-sudo systemctl restart infiproxy.service
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- --check
 ```
 
-`INFIPROXY_ENABLE_DANGER_SHELL=true` включает owner-only break-glass shell во
-вкладке System Danger Zone. Доступ есть только у первого админа, созданного при
-первичной настройке.
-
-SSH TUI:
+Install from a fork:
 
 ```bash
-sudo infiproxy-manager
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash -s -- \
+  --repo https://github.com/<user>/<repo>.git \
+  --ref main \
+  --guided \
+  --with-nginx
 ```
 
-Через TUI можно пройти установку/repair, открыть env, переключить danger shell,
-перезапустить сервисы, посмотреть логи, открыть helper установки ядер и выполнить
-root-level удаление: `panel`, `full` или `factory`.
-
-HTTPS и Cloudflare:
-
-```bash
-sudo infiproxy-manager
-```
-
-Выбери `HTTPS / Cloudflare setup`. Мастер умеет поставить `nginx`, `certbot`,
-`python3-certbot-dns-cloudflare`, создать или обновить Cloudflare `A` record,
-выпустить Let's Encrypt сертификат через DNS-01 и записать nginx HTTPS config.
-Нужен Cloudflare API token с правами `Zone:Read` и `DNS:Edit` для нужной зоны.
-Токен сохраняется в `/etc/letsencrypt/cloudflare.ini` с правами `0600`.
-
-Первый вход:
-
-```text
-https://<your-domain>/admin/setup
-```
-
-Если HTTPS ещё не настроен, открой панель через SSH-туннель:
-
-```bash
-ssh -L 8080:127.0.0.1:8080 root@<server>
-```
-
-После этого локально открой:
-
-```text
-http://127.0.0.1:8080/admin/setup
-```
-
-Для HTTPS поставь Nginx или Caddy перед панелью. Готовый пример Nginx лежит в:
-
-```text
-deploy/nginx-infiproxy.conf.example
-```
-
-## Обновление Панели
-
-На сервере можно снова выполнить ту же одну команду:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh | sudo bash
-```
-
-Или обновить из уже установленного checkout:
-
-```bash
-cd /opt/infiproxy/source
-sudo bash deploy/bootstrap.sh
-```
-
-Файл `/etc/infiproxy/infiproxy.env` не перезаписывается. Если
-нужно принудительно вернуть env к шаблону:
-
-```bash
-sudo bash /opt/infiproxy/source/deploy/bootstrap.sh --force-env
-```
-
-## Установка Ядер
-
-Панель готовит systemd-сервисы и каталоги для ядер, но не включает proxy-сервисы
-автоматически. Сначала нужно установить бинарник ядра, проверить checksum и
-подготовить финальный конфиг.
-
-Поддержанные каталоги:
-
-```text
-/opt/infiproxy/cores/xray/current/xray
-/opt/infiproxy/cores/sing-box/current/sing-box
-/opt/infiproxy/cores/hysteria/current/hysteria
-/opt/infiproxy/cores/tuic/current/tuic-server
-```
-
-Systemd-сервисы:
-
-```text
-infiproxy-xray.service
-infiproxy-sing-box.service
-infiproxy-hysteria.service
-infiproxy-tuic.service
-```
-
-Установить или обновить ядро через проверенный архив:
+Install or update a core without the TUI:
 
 ```bash
 sudo /opt/infiproxy/source/deploy/cores/install-core.sh \
   --core xray \
-  --version 26.3.27 \
-  --url 'https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip' \
-  --sha256 '<sha256-from-release>' \
+  --version <version> \
+  --url '<release-archive-url>' \
+  --sha256 '<sha256>' \
   --binary xray
 ```
 
-Актуальные версии по официальным GitHub Releases на 2026-07-13:
-
-```text
-Xray stable:     v26.3.27
-sing-box stable: v1.13.14
-Hysteria stable: app/v2.10.0
-TUIC stable:     tuic-server-1.0.0
-```
-
-Для Xray upstream также публикует более свежую prerelease-ветку. Для основной
-установки оставлен stable release; prerelease лучше проверять на тестовом
-пользователе перед переключением production.
-
-Импортировать заранее скачанный архив:
-
-```bash
-sudo /opt/infiproxy/source/deploy/cores/install-core.sh \
-  --core sing-box \
-  --version 1.13.14 \
-  --archive ./sing-box.tar.gz \
-  --sha256 '<sha256>' \
-  --binary sing-box
-```
-
-После настройки конфига ядра:
-
-```bash
-sudo systemctl enable --now infiproxy-xray.service
-sudo systemctl status infiproxy-xray.service
-```
-
-Логика установки ядра:
-
-```text
-download/import archive
-verify SHA256
-extract to staging
-run binary --version
-install into /opt/infiproxy/cores/{core}/{version}
-atomically switch current symlink
-restart service only when --restart is passed
-```
-
-Скрипт не перезаписывает активный бинарник на месте. Новая версия кладется в
-отдельный каталог, а `current` переключается атомарно.
-
-## Локальный Запуск
+## Local Development
 
 ```bash
 INFIPROXY_BIND=127.0.0.1:8080 \
@@ -270,27 +293,20 @@ INFIPROXY_ENABLE_DEMO_USER=true \
 cargo run -p stealthhub-panel
 ```
 
-Открыть:
+Open:
 
 ```text
 http://127.0.0.1:8080/admin/setup
-http://127.0.0.1:8080/admin
-http://127.0.0.1:8080/admin/users
-http://127.0.0.1:8080/admin/settings
-http://127.0.0.1:8080/admin/protocols
-http://127.0.0.1:8080/admin/routing
-http://127.0.0.1:8080/admin/cores
-http://127.0.0.1:8080/admin/system
 ```
 
-Создать тестового пользователя:
+Create a test user:
 
 ```bash
 cargo run -p stealthhub-cli -- create-user --username test-local --traffic-limit-gb 10
 cargo run -p stealthhub-cli -- list-users
 ```
 
-## Проверка Проекта
+## Project Checks
 
 ```bash
 cargo fmt --all -- --check
@@ -298,67 +314,14 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo audit
-bash -n deploy/bootstrap.sh
-bash -n deploy/install.sh
-bash -n deploy/cores/install-core.sh
-```
-
-## Основные Routes
-
-```text
-GET  /
-GET  /admin/setup
-POST /admin/setup
-GET  /admin/login
-POST /admin/login
-POST /admin/logout
-GET  /admin
-GET  /admin/users
-GET  /admin/settings
-POST /admin/settings
-GET  /admin/protocols
-POST /admin/protocols/{name}/update
-GET  /admin/routing
-POST /admin/routing
-GET  /admin/system
-GET  /admin/cores
-POST /admin/users/create
-POST /admin/users/{id}/toggle
-POST /admin/users/{id}/reset-token
-POST /admin/users/{id}/delete
-GET  /health
-GET  /ready
-GET  /sub/{token}/mihomo.yaml
-GET  /rules/{name}
-```
-
-## Структура
-
-```text
-infiproxy/
-├── Cargo.toml
-├── Cargo.lock
-├── crates/
-│   ├── stealthhub-core/
-│   ├── stealthhub-panel/
-│   └── stealthhub-cli/
-├── deploy/
-│   ├── bootstrap.sh
-│   ├── install.sh
-│   ├── nginx-infiproxy.conf.example
-│   ├── infiproxy.env.example
-│   ├── infiproxy.service
-│   └── cores/
-└── .github/
+bash -n deploy/bootstrap.sh deploy/install.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh
+bash deploy/install.sh --check
 ```
 
 ## License
 
-Infiproxy is licensed under the **GNU Affero General Public License v3.0 or later**.
-
-```text
-AGPL-3.0-or-later
-```
+Infiproxy is licensed under the **GNU Affero General Public License v3.0 or
+later**.
 
 See:
 

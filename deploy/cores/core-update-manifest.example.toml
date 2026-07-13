@@ -25,3 +25,10 @@ binary = "tuic-server"
 service = "infiproxy-tuic.service"
 active = "/opt/infiproxy/cores/tuic/current"
 config = "/etc/infiproxy-cores/tuic/config.json"
+
+[mtproto]
+repo = "TelegramMessenger/MTProxy"
+binary = "mtproto-proxy"
+service = "infiproxy-mtproto.service"
+active = "/opt/infiproxy/cores/mtproto/current"
+config = "/etc/infiproxy-cores/mtproto/mtproto.env"

@@ -1821,47 +1821,55 @@ async fn config_save_action(
     }
 
     let report = write_config_file(&form.target, &form.content);
+    let status = if report.success {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
 
-    Html(
-        layout(
-            "Config save",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Config save" }
+    (
+        status,
+        Html(
+            layout(
+                "Config save",
+                html! {
+                    (admin_bar(&auth))
+                    h1 { "Config save" }
 
-                section class="config-row" {
-                    div class="config-row-head" {
-                        h3 { (report.spec.name) }
-                        @if report.success {
-                            span class="badge ok" { "saved" }
-                        } @else {
-                            span class="badge off" { "failed" }
+                    section class="config-row" {
+                        div class="config-row-head" {
+                            h3 { (report.spec.name) }
+                            @if report.success {
+                                span class="badge ok" { "saved" }
+                            } @else {
+                                span class="badge off" { "failed" }
+                            }
+                        }
+                        dl class="details" {
+                            dt { "Path" }
+                            dd { code { (report.spec.path) } }
+                            dt { "Result" }
+                            dd { (report.message) }
+                            @if let Some(path) = &report.backup_path {
+                                dt { "Backup" }
+                                dd { code { (path) } }
+                            }
+                            dt { "Validate" }
+                            dd { code { (report.spec.validate_hint) } }
+                            dt { "Apply" }
+                            dd { code { (report.spec.reload_hint) } }
+                        }
+                        div class="actions" {
+                            a class="button" href="/admin/configs" { "Back to Configs" }
+                            a class="button" href="/admin/system" { "Open System actions" }
                         }
                     }
-                    dl class="details" {
-                        dt { "Path" }
-                        dd { code { (report.spec.path) } }
-                        dt { "Result" }
-                        dd { (report.message) }
-                        @if let Some(path) = &report.backup_path {
-                            dt { "Backup" }
-                            dd { code { (path) } }
-                        }
-                        dt { "Validate" }
-                        dd { code { (report.spec.validate_hint) } }
-                        dt { "Apply" }
-                        dd { code { (report.spec.reload_hint) } }
-                    }
-                    div class="actions" {
-                        a class="button" href="/admin/configs" { "Back to Configs" }
-                        a class="button" href="/admin/system" { "Open System actions" }
-                    }
-                }
-            },
-        )
-        .into_string(),
+                },
+            )
+            .into_string(),
+        ),
     )
-    .into_response()
+        .into_response()
 }
 
 async fn system_action(
@@ -3662,6 +3670,7 @@ fn proxy_role_label(role: &ProxyRole) -> &'static str {
 fn core_priority_class(priority: &str) -> &'static str {
     match priority {
         "primary" | "compat" => "ok",
+        "telegram" => "warn",
         _ => "off",
     }
 }

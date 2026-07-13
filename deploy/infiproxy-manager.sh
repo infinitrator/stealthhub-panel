@@ -20,7 +20,22 @@ CORE_SERVICES=(
   "infiproxy-sing-box.service"
   "infiproxy-hysteria.service"
   "infiproxy-tuic.service"
+  "infiproxy-mtproto.service"
 )
+MTPROTO_DIR="${INFIPROXY_MTPROTO_DIR:-/etc/infiproxy-cores/mtproto}"
+MTPROTO_ENV="${INFIPROXY_MTPROTO_ENV:-${MTPROTO_DIR}/mtproto.env}"
+MTPROTO_BINARY="${INFIPROXY_MTPROTO_BINARY:-/opt/infiproxy/cores/mtproto/current/mtproto-proxy}"
+MTPROTO_SECRET_URL="https://core.telegram.org/getProxySecret"
+MTPROTO_CONFIG_URL="https://core.telegram.org/getProxyConfig"
+HEADSCALE_SERVICE="headscale.service"
+HEADSCALE_CONFIG="${INFIPROXY_HEADSCALE_CONFIG:-/etc/headscale/config.yaml}"
+HEADSCALE_STATE_DIR="${INFIPROXY_HEADSCALE_STATE_DIR:-/var/lib/headscale}"
+HEADSCALE_NGINX_SITE="${INFIPROXY_HEADSCALE_NGINX_SITE:-/etc/nginx/sites-available/infiproxy-headscale.conf}"
+HEADSCALE_NGINX_ENABLED="${INFIPROXY_HEADSCALE_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy-headscale.conf}"
+HEADSCALE_LISTEN_ADDR="${INFIPROXY_HEADSCALE_LISTEN_ADDR:-127.0.0.1:8088}"
+HEADSCALE_METRICS_ADDR="${INFIPROXY_HEADSCALE_METRICS_ADDR:-127.0.0.1:9098}"
+HEADSCALE_GRPC_ADDR="${INFIPROXY_HEADSCALE_GRPC_ADDR:-127.0.0.1:50443}"
+HEADSCALE_LATEST_API="https://api.github.com/repos/juanfont/headscale/releases/latest"
 
 green=$'\033[38;5;71m'
 soft=$'\033[38;5;250m'
@@ -61,6 +76,20 @@ read_menu_choice() {
   read -r -p "> " choice || return 1
 }
 
+confirm_yes() {
+  local prompt="$1"
+  local default="${2:-N}"
+  local answer
+
+  if [[ "$default" == "Y" ]]; then
+    read -r -p "${prompt} [Y/n]: " answer || return 1
+    [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+  else
+    read -r -p "${prompt} [y/N]: " answer || return 1
+    [[ "$answer" =~ ^[Yy]$ ]]
+  fi
+}
+
 header() {
   clear 2>/dev/null || true
   echo "${green}${bold}+--------------------------------------------+${reset}"
@@ -91,8 +120,73 @@ valid_domain() {
   [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
 
+valid_ipv4() {
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  local a b c d octet
+  IFS=. read -r a b c d <<<"$1"
+  for octet in "$a" "$b" "$c" "$d"; do
+    ((10#$octet <= 255)) || return 1
+  done
+}
+
+valid_public_host() {
+  valid_domain "$1" || valid_ipv4 "$1"
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+valid_mtproto_secret() {
+  [[ "$1" =~ ^[A-Fa-f0-9]{32}$ ]]
+}
+
+valid_headscale_user() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,63}$ ]] && [[ "$1" != *@* ]]
+}
+
 public_ip() {
   curl -fsSL --max-time 10 https://api.ipify.org
+}
+
+random_mtproto_secret() {
+  if have_cmd openssl; then
+    openssl rand -hex 16
+  else
+    od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
+  fi
+}
+
+env_value() {
+  local file="$1"
+  local key="$2"
+  awk -F= -v key="$key" '$1 == key { value=$0; sub("^[^=]*=", "", value); print value }' "$file" 2>/dev/null | tail -1
+}
+
+headscale_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo "${danger}Unsupported Headscale architecture: $(uname -m)${reset}" >&2
+      return 1
+      ;;
+  esac
+}
+
+headscale_latest_version() {
+  require_cmd curl || return 1
+  require_cmd python3 || return 1
+  curl -fsSL --max-time 20 "$HEADSCALE_LATEST_API" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))'
+}
+
+cloudflare_token_from_file() {
+  awk -F= '/dns_cloudflare_api_token/ { value=$2; sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value }' "$CLOUDFLARE_CREDENTIALS" 2>/dev/null | tail -1
+}
+
+headscale_cmd() {
+  headscale -c "$HEADSCALE_CONFIG" "$@"
 }
 
 json_first_id() {
@@ -135,7 +229,7 @@ cloudflare_write_a_record() {
   [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
   valid_domain "$zone" || { echo "${danger}Invalid zone: $zone${reset}" >&2; return 1; }
   valid_domain "$record" || { echo "${danger}Invalid record: $record${reset}" >&2; return 1; }
-  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { echo "${danger}Invalid IPv4: $ip${reset}" >&2; return 1; }
+  valid_ipv4 "$ip" || { echo "${danger}Invalid IPv4: $ip${reset}" >&2; return 1; }
 
   local zone_id record_id payload method url
   zone_id="$(cloudflare_zone_id "$token" "$zone")"
@@ -195,6 +289,7 @@ service_status() {
   for service in "${CORE_SERVICES[@]}"; do
     unit_state "$service"
   done
+  unit_state "$HEADSCALE_SERVICE"
   echo
   echo "${bold}Local checks${reset}"
   echo "  curl http://127.0.0.1:8080/health"
@@ -211,15 +306,16 @@ restart_menu() {
   echo "2) Reload nginx"
   echo "3) Validate and reload SSH"
   echo "4) Restart all enabled core services"
-  echo "5) Reboot server"
+  echo "5) Restart Headscale"
+  echo "6) Reboot server"
   echo "0) Back"
   read_menu_choice || return
   case "$choice" in
-    1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" ;;
+    1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" || true ;;
     2)
       need_root
       if command -v nginx >/dev/null 2>&1; then
-        run_cmd nginx -t && run_cmd systemctl reload nginx.service
+        run_cmd nginx -t && run_cmd systemctl reload nginx.service || true
       else
         echo "${danger}nginx is not installed.${reset}"
       fi
@@ -227,7 +323,7 @@ restart_menu() {
     3)
       need_root
       if command -v sshd >/dev/null 2>&1; then
-        run_cmd sshd -t && (run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service)
+        run_cmd sshd -t && (run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service) || true
       else
         echo "${danger}sshd is not installed.${reset}"
       fi
@@ -242,8 +338,15 @@ restart_menu() {
       ;;
     5)
       need_root
+      if have_cmd headscale; then
+        headscale_cmd configtest || true
+      fi
+      run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+      ;;
+    6)
+      need_root
       read -r -p "Type REBOOT to reboot this server: " confirm
-      [[ "$confirm" == "REBOOT" ]] && run_cmd systemctl reboot
+      [[ "$confirm" == "REBOOT" ]] && run_cmd systemctl reboot || true
       ;;
     0) return ;;
     *) invalid_choice; return ;;
@@ -257,7 +360,7 @@ edit_env() {
   secure_env_file
   "$(pick_editor)" "$ENV_FILE"
   secure_env_file
-  run_cmd systemctl restart "$PANEL_SERVICE"
+  run_cmd systemctl restart "$PANEL_SERVICE" || true
   pause
 }
 
@@ -276,7 +379,7 @@ toggle_danger_shell() {
     echo "INFIPROXY_ENABLE_DANGER_SHELL=true" >>"$ENV_FILE"
   fi
   secure_env_file
-  run_cmd systemctl restart "$PANEL_SERVICE"
+  run_cmd systemctl restart "$PANEL_SERVICE" || true
   grep '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE" || true
   pause
 }
@@ -296,44 +399,68 @@ install_or_repair() {
   echo "0) Back"
   read_menu_choice || return
   case "$choice" in
-    1) bash "${SOURCE_DIR}/deploy/install.sh" --build ;;
-    2) bash "${SOURCE_DIR}/deploy/install.sh" --build --with-nginx ;;
-    3) bash "${SOURCE_DIR}/deploy/install.sh" --build --force-env ;;
+    1) run_panel_install_from_source 0 0 || true ;;
+    2) run_panel_install_from_source 1 0 || true ;;
+    3) run_panel_install_from_source 0 1 || true ;;
     0) return ;;
     *) invalid_choice; return ;;
   esac
   pause
 }
 
-core_helper() {
-  need_root
-  header
-  if [[ ! -x "${SOURCE_DIR}/deploy/cores/install-core.sh" ]]; then
-    echo "${danger}Core installer not found at ${SOURCE_DIR}/deploy/cores/install-core.sh${reset}"
-    pause
-    return
+# Reuse the same installer entrypoint from both the menu and the guided flow so
+# repair, nginx setup and env replacement never drift into separate code paths.
+run_panel_install_from_source() {
+  local with_nginx="${1:-0}"
+  local force_env="${2:-0}"
+  local args=(--build)
+
+  if [[ ! -x "${SOURCE_DIR}/deploy/install.sh" ]]; then
+    echo "${danger}Installer not found at ${SOURCE_DIR}/deploy/install.sh${reset}"
+    echo "Clone or bootstrap the source checkout first."
+    return 1
   fi
+
+  [[ "$with_nginx" -eq 1 ]] && args+=(--with-nginx)
+  [[ "$force_env" -eq 1 ]] && args+=(--force-env)
+  bash "${SOURCE_DIR}/deploy/install.sh" "${args[@]}"
+}
+
+select_core_runtime() {
   echo "1) xray"
   echo "2) sing-box"
   echo "3) hysteria"
   echo "4) tuic"
+  echo "5) Telegram MTProto"
   echo "0) Back"
-  read_menu_choice || return
+  read_menu_choice || return 1
   case "$choice" in
     1) core="xray"; binary="xray"; service="infiproxy-xray.service" ;;
     2) core="sing-box"; binary="sing-box"; service="infiproxy-sing-box.service" ;;
     3) core="hysteria"; binary="hysteria"; service="infiproxy-hysteria.service" ;;
     4) core="tuic"; binary="tuic-server"; service="infiproxy-tuic.service" ;;
-    0) return ;;
-    *) invalid_choice; return ;;
+    5) core="mtproto"; binary="mtproto-proxy"; service="infiproxy-mtproto.service" ;;
+    0) return 2 ;;
+    *) invalid_choice; return 1 ;;
   esac
+}
+
+# Import a core archive using the checksum-verifying installer. The TUI only
+# gathers operator input; activation and rollback-safe symlink switching remain
+# centralized in deploy/cores/install-core.sh.
+install_core_from_prompts() {
+  if [[ ! -x "${SOURCE_DIR}/deploy/cores/install-core.sh" ]]; then
+    echo "${danger}Core installer not found at ${SOURCE_DIR}/deploy/cores/install-core.sh${reset}"
+    return 1
+  fi
+
+  select_core_runtime || return $?
   read -r -p "Version: " version
   read -r -p "Release archive URL: " url
   read -r -p "SHA256: " sha256
   if [[ -z "$version" || -z "$url" || -z "$sha256" ]]; then
     echo "${danger}Version, URL and SHA256 are required.${reset}"
-    pause
-    return
+    return 1
   fi
   bash "${SOURCE_DIR}/deploy/cores/install-core.sh" \
     --core "$core" \
@@ -342,6 +469,526 @@ core_helper() {
     --sha256 "$sha256" \
     --binary "$binary" \
     --restart "$service"
+}
+
+core_helper() {
+  need_root
+  header
+  install_core_from_prompts || true
+  pause
+}
+
+secure_mtproto_dir() {
+  install -d -m 0770 -o root -g "$APP_GROUP" "$MTPROTO_DIR"
+  chown root:"$APP_GROUP" "$MTPROTO_DIR" 2>/dev/null || true
+  chmod 0770 "$MTPROTO_DIR" 2>/dev/null || true
+}
+
+# MTProxy needs Telegram-maintained upstream files in addition to its binary.
+# Keep them owned by root/infiproxy so the panel can display/edit metadata while
+# the runtime service only reads the resulting files.
+download_mtproto_upstream_config() {
+  need_root
+  require_cmd curl || return 1
+  secure_mtproto_dir
+
+  local secret_tmp config_tmp
+  secret_tmp="$(mktemp)"
+  config_tmp="$(mktemp)"
+
+  if ! curl -fsSL --max-time 30 "$MTPROTO_SECRET_URL" -o "$secret_tmp"; then
+    rm -f "$secret_tmp" "$config_tmp"
+    echo "${danger}Failed to download Telegram proxy-secret.${reset}" >&2
+    return 1
+  fi
+  if ! curl -fsSL --max-time 30 "$MTPROTO_CONFIG_URL" -o "$config_tmp"; then
+    rm -f "$secret_tmp" "$config_tmp"
+    echo "${danger}Failed to download Telegram proxy-multi.conf.${reset}" >&2
+    return 1
+  fi
+  install -m 0640 -o root -g "$APP_GROUP" "$secret_tmp" "$MTPROTO_DIR/proxy-secret"
+  install -m 0640 -o root -g "$APP_GROUP" "$config_tmp" "$MTPROTO_DIR/proxy-multi.conf"
+  rm -f "$secret_tmp" "$config_tmp"
+  echo "${green}Telegram upstream config refreshed.${reset}"
+}
+
+write_mtproto_env() {
+  local port="$1"
+  local stats_port="$2"
+  local secret="$3"
+  local workers="$4"
+
+  valid_port "$port" || { echo "${danger}Invalid MTProto port: $port${reset}" >&2; return 1; }
+  valid_port "$stats_port" || { echo "${danger}Invalid stats port: $stats_port${reset}" >&2; return 1; }
+  valid_mtproto_secret "$secret" || { echo "${danger}Secret must be exactly 32 hex characters.${reset}" >&2; return 1; }
+  [[ "$workers" =~ ^[0-9]{1,2}$ ]] && ((10#$workers >= 1 && 10#$workers <= 16)) || {
+    echo "${danger}Workers must be between 1 and 16.${reset}" >&2
+    return 1
+  }
+
+  secure_mtproto_dir
+  if [[ -f "$MTPROTO_ENV" ]]; then
+    cp -a "$MTPROTO_ENV" "${MTPROTO_ENV}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  cat >"$MTPROTO_ENV" <<EOF
+# Telegram MTProxy runtime configuration managed by Infiproxy.
+MTPROTO_PORT=${port}
+MTPROTO_STATS_PORT=${stats_port}
+MTPROTO_SECRET=${secret}
+MTPROTO_WORKERS=${workers}
+MTPROTO_AES_PWD=${MTPROTO_DIR}/proxy-secret
+MTPROTO_PROXY_CONFIG=${MTPROTO_DIR}/proxy-multi.conf
+EOF
+  chown root:"$APP_GROUP" "$MTPROTO_ENV" 2>/dev/null || true
+  chmod 0660 "$MTPROTO_ENV" 2>/dev/null || true
+  echo "${green}MTProto env written: ${MTPROTO_ENV}${reset}"
+}
+
+print_mtproto_link() {
+  local host="$1"
+  local port="$2"
+  local secret="$3"
+
+  valid_public_host "$host" || { echo "${danger}Invalid public host: $host${reset}" >&2; return 1; }
+  valid_port "$port" || { echo "${danger}Invalid MTProto port: $port${reset}" >&2; return 1; }
+  valid_mtproto_secret "$secret" || { echo "${danger}Secret must be exactly 32 hex characters.${reset}" >&2; return 1; }
+  echo
+  echo "${green}${bold}Telegram import link:${reset}"
+  echo "https://t.me/proxy?server=${host}&port=${port}&secret=${secret}"
+}
+
+# Generate the client-facing Telegram link from validated host, port and secret
+# values. The service is started only when the operator has already installed a
+# verified mtproto-proxy binary.
+guided_mtproto_setup() {
+  local host port stats_port workers secret custom_secret start_answer
+
+  read -r -p "Public hostname or IPv4 [auto public IPv4]: " host
+  if [[ -z "$host" ]]; then
+    host="$(public_ip || true)"
+  fi
+  read -r -p "Telegram MTProto port [8443]: " port
+  port="${port:-8443}"
+  read -r -p "Local stats port [8888]: " stats_port
+  stats_port="${stats_port:-8888}"
+  read -r -p "Workers [2]: " workers
+  workers="${workers:-2}"
+  secret="$(random_mtproto_secret)"
+  read -r -p "Custom 32-hex secret [generated]: " custom_secret
+  if [[ -n "$custom_secret" ]]; then
+    secret="$custom_secret"
+  fi
+  download_mtproto_upstream_config || return
+  write_mtproto_env "$port" "$stats_port" "$secret" "$workers" || return
+  run_cmd systemctl daemon-reload
+  print_mtproto_link "$host" "$port" "$secret" || return
+  if [[ -x "$MTPROTO_BINARY" ]]; then
+    read -r -p "Enable and start infiproxy-mtproto.service now? [y/N]: " start_answer
+    if [[ "$start_answer" =~ ^[Yy]$ ]]; then
+      run_cmd systemctl enable --now infiproxy-mtproto.service
+      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
+    fi
+  else
+    echo "${muted}Binary is not installed yet: ${MTPROTO_BINARY}${reset}"
+    echo "${muted}Use Core installer helper with core=Telegram MTProto, then start the service.${reset}"
+  fi
+}
+
+mtproto_setup_menu() {
+  need_root
+  header
+  echo "1) Guided initial MTProto setup"
+  echo "2) Refresh Telegram upstream config"
+  echo "3) Show Telegram import link"
+  echo "4) Enable and start MTProto service"
+  echo "5) Restart MTProto service"
+  echo "0) Back"
+  read_menu_choice || return
+  case "$choice" in
+    1)
+      guided_mtproto_setup || true
+      ;;
+    2)
+      download_mtproto_upstream_config || return
+      ;;
+    3)
+      local host port secret
+      read -r -p "Public hostname or IPv4 [auto public IPv4]: " host
+      if [[ -z "$host" ]]; then
+        host="$(public_ip || true)"
+      fi
+      port="$(env_value "$MTPROTO_ENV" MTPROTO_PORT)"
+      secret="$(env_value "$MTPROTO_ENV" MTPROTO_SECRET)"
+      print_mtproto_link "$host" "$port" "$secret" || return
+      ;;
+    4)
+      run_cmd systemctl daemon-reload
+      run_cmd systemctl enable --now infiproxy-mtproto.service || true
+      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
+      ;;
+    5)
+      run_cmd systemctl restart infiproxy-mtproto.service || true
+      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
+      ;;
+    0) return ;;
+    *) invalid_choice; return ;;
+  esac
+  pause
+}
+
+# Install Headscale from an upstream release asset after verifying it against
+# the release checksums file. Debian hosts use the official .deb; other supported
+# hosts get a standalone binary plus a minimal hardened systemd unit.
+install_headscale_release() {
+  need_root
+  require_cmd curl || return 1
+  require_cmd sha256sum || return 1
+
+  local version arch asset ext url checksums tmp checksum_line binary_target input_version
+  version="$(headscale_latest_version || true)"
+  read -r -p "Headscale version [${version:-0.29.2}]: " input_version
+  version="${input_version:-${version:-0.29.2}}"
+  arch="$(headscale_arch)" || return 1
+
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+  checksums="${tmp}/checksums.txt"
+  curl -fsSL --max-time 60 \
+    "https://github.com/juanfont/headscale/releases/download/v${version}/checksums.txt" \
+    -o "$checksums"
+
+  if have_cmd apt-get; then
+    asset="headscale_${version}_linux_${arch}.deb"
+    ext="deb"
+  else
+    asset="headscale_${version}_linux_${arch}"
+    ext="bin"
+  fi
+  url="https://github.com/juanfont/headscale/releases/download/v${version}/${asset}"
+  curl -fL --show-error --output "${tmp}/${asset}" "$url"
+  checksum_line="$(grep -E "  ${asset}$" "$checksums" || true)"
+  if [[ -z "$checksum_line" ]]; then
+    echo "${danger}Checksum for ${asset} was not found in checksums.txt.${reset}" >&2
+    return 1
+  fi
+  printf '%s\n' "$checksum_line" >"${tmp}/checksum.one"
+  (cd "$tmp" && sha256sum -c checksum.one)
+
+  if [[ "$ext" == "deb" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    run_cmd apt-get install -y "${tmp}/${asset}"
+    systemctl disable --now "$HEADSCALE_SERVICE" 2>/dev/null || true
+  else
+    if ! id -u headscale >/dev/null 2>&1; then
+      run_cmd useradd --create-home --home-dir "$HEADSCALE_STATE_DIR" --system --user-group --shell /usr/sbin/nologin headscale
+    fi
+    binary_target="/usr/local/bin/headscale"
+    install -m 0755 "${tmp}/${asset}" "$binary_target"
+    cat >/etc/systemd/system/headscale.service <<EOF
+[Unit]
+Description=Headscale coordination server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=headscale
+Group=headscale
+ExecStart=${binary_target} serve -c ${HEADSCALE_CONFIG}
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=${HEADSCALE_STATE_DIR} /var/run/headscale
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
+  run_cmd systemctl daemon-reload
+  echo "${green}Headscale ${version} installed with verified checksum.${reset}"
+}
+
+secure_headscale_paths() {
+  install -d -m 0770 -o root -g "$APP_GROUP" "$(dirname "$HEADSCALE_CONFIG")"
+  install -d -m 0750 -o headscale -g headscale "$HEADSCALE_STATE_DIR" 2>/dev/null \
+    || install -d -m 0750 "$HEADSCALE_STATE_DIR"
+  if id -u headscale >/dev/null 2>&1; then
+    usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
+  fi
+}
+
+# Headscale upstream examples default to 127.0.0.1:8080, which collides with the
+# panel. Infiproxy pins Headscale to 127.0.0.1:8088 and exposes it through a
+# dedicated HTTPS virtual host.
+write_headscale_config() {
+  local server_url="$1"
+  local base_domain="$2"
+
+  [[ "$server_url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || {
+    echo "${danger}Headscale server URL must look like https://hs.example.com${reset}" >&2
+    return 1
+  }
+  valid_domain "$base_domain" || { echo "${danger}Invalid MagicDNS base domain: $base_domain${reset}" >&2; return 1; }
+
+  secure_headscale_paths
+  if [[ -f "$HEADSCALE_CONFIG" ]]; then
+    cp -a "$HEADSCALE_CONFIG" "${HEADSCALE_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+  fi
+  cat >"$HEADSCALE_CONFIG" <<EOF
+server_url: ${server_url}
+listen_addr: ${HEADSCALE_LISTEN_ADDR}
+metrics_listen_addr: ${HEADSCALE_METRICS_ADDR}
+grpc_listen_addr: ${HEADSCALE_GRPC_ADDR}
+grpc_allow_insecure: false
+trusted_proxies:
+  - 127.0.0.1/32
+  - ::1/128
+
+noise:
+  private_key_path: ${HEADSCALE_STATE_DIR}/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+allocation: sequential
+
+derp:
+  server:
+    enabled: false
+    region_id: 999
+    region_code: "infiproxy"
+    region_name: "Infiproxy Headscale"
+    verify_clients: true
+    stun_listen_addr: "0.0.0.0:3478"
+    private_key_path: ${HEADSCALE_STATE_DIR}/derp_server_private.key
+    automatically_add_embedded_derp_region: true
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  paths: []
+  auto_update_enabled: true
+  update_frequency: 3h
+
+disable_check_updates: false
+node:
+  expiry: 0
+  ephemeral:
+    inactivity_timeout: 30m
+  routes:
+    ha:
+      probe_interval: 10s
+      probe_timeout: 5s
+
+database:
+  type: sqlite
+  sqlite:
+    path: ${HEADSCALE_STATE_DIR}/db.sqlite
+    write_ahead_log: true
+
+tls_cert_path: ""
+tls_key_path: ""
+
+log:
+  level: info
+  format: text
+
+policy:
+  mode: file
+  path: ""
+
+dns:
+  magic_dns: true
+  base_domain: ${base_domain}
+  override_local_dns: true
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 1.0.0.1
+
+unix_socket: /var/run/headscale/headscale.sock
+unix_socket_permission: "0770"
+
+logtail:
+  enabled: false
+taildrop:
+  enabled: true
+auto_update:
+  enabled: false
+EOF
+  chown root:"$APP_GROUP" "$HEADSCALE_CONFIG" 2>/dev/null || true
+  chmod 0660 "$HEADSCALE_CONFIG" 2>/dev/null || true
+
+  if have_cmd headscale; then
+    headscale_cmd configtest
+  fi
+  echo "${green}Headscale config written: ${HEADSCALE_CONFIG}${reset}"
+}
+
+# Serve Headscale through Nginx with WebSocket upgrade forwarding. Tailscale
+# clients use a custom POST-based upgrade, so this site intentionally keeps the
+# proxy rules explicit instead of sharing the simpler panel reverse proxy block.
+write_headscale_nginx_config() {
+  local domain="$1"
+
+  need_root
+  valid_domain "$domain" || { echo "${danger}Invalid Headscale domain: $domain${reset}" >&2; return 1; }
+  install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_SITE")"
+  cat >"$HEADSCALE_NGINX_SITE" <<EOF
+map \$http_upgrade \$headscale_connection_upgrade {
+    default upgrade;
+    '' close;
+}
+
+upstream infiproxy_headscale {
+    server ${HEADSCALE_LISTEN_ADDR} max_fails=1 fail_timeout=5s;
+    keepalive 2;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+
+    location = /generate_204 {
+        return 204;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${domain};
+
+    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+
+    location / {
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$headscale_connection_upgrade;
+        proxy_set_header Host \$host;
+        proxy_set_header True-Client-IP \$remote_addr;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_buffering off;
+        proxy_pass http://infiproxy_headscale;
+    }
+}
+EOF
+  install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_ENABLED")"
+  if [[ ! -e "$HEADSCALE_NGINX_ENABLED" ]]; then
+    ln -s "$HEADSCALE_NGINX_SITE" "$HEADSCALE_NGINX_ENABLED"
+  fi
+  run_cmd nginx -t
+  run_cmd systemctl reload nginx.service
+}
+
+# Full Headscale hub flow: DNS-only Cloudflare record, DNS-01 certificate,
+# reverse proxy, verified binary install, config write and service start.
+guided_headscale_setup() {
+  local zone domain magic_domain email ip token stored_token install_answer proxied=false
+
+  read -r -p "Headscale hostname (hs.example.com): " domain
+  read -r -p "MagicDNS base domain [tailnet.${domain}]: " magic_domain
+  magic_domain="${magic_domain:-tailnet.${domain}}"
+  read -r -p "Cloudflare zone (example.com): " zone
+  read -r -p "Let's Encrypt email: " email
+  read -r -p "IPv4 [auto]: " ip
+  if [[ -z "$ip" ]]; then
+    ip="$(public_ip || true)"
+  fi
+  stored_token="$(cloudflare_token_from_file)"
+  read -r -s -p "Cloudflare API token [stored if blank]: " token
+  echo
+  token="${token:-$stored_token}"
+
+  echo "${muted}Headscale must not be proxied through Cloudflare; DNS-only A record will be used.${reset}"
+  install_https_deps || return
+  cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied" || return
+  save_cloudflare_credentials "$token" || return
+  issue_cloudflare_certificate "$domain" "$email" || return
+  write_headscale_nginx_config "$domain" || return
+
+  if have_cmd headscale; then
+    confirm_yes "Headscale binary already exists. Reinstall/update from verified release?" "N" && install_answer=1 || install_answer=0
+  else
+    install_answer=1
+  fi
+  if [[ "$install_answer" -eq 1 ]]; then
+    install_headscale_release || return
+  fi
+
+  write_headscale_config "https://${domain}" "$magic_domain" || return
+  run_cmd systemctl enable --now "$HEADSCALE_SERVICE" || true
+  run_cmd systemctl --no-pager --full status "$HEADSCALE_SERVICE" || true
+  echo "${green}${bold}Headscale URL: https://${domain}${reset}"
+  echo "Client command:"
+  echo "  tailscale up --login-server https://${domain} --authkey <key>"
+}
+
+headscale_create_preauth_key() {
+  local user expiration key
+
+  require_cmd headscale || return 1
+  read -r -p "Headscale user [admin]: " user
+  user="${user:-admin}"
+  valid_headscale_user "$user" || { echo "${danger}Invalid Headscale user: $user${reset}" >&2; return 1; }
+  read -r -p "Key expiration [24h]: " expiration
+  expiration="${expiration:-24h}"
+  headscale_cmd users create "$user" 2>/dev/null || true
+  key="$(headscale_cmd preauthkeys create --user "$user" --expiration "$expiration")"
+  echo
+  echo "${green}${bold}Pre-auth key:${reset}"
+  echo "$key"
+  echo
+  echo "Client command:"
+  echo "tailscale up --login-server <HEADSCALE_URL> --authkey ${key}"
+}
+
+headscale_menu() {
+  need_root
+  header
+  echo "1) Guided Headscale hub setup"
+  echo "2) Install/update Headscale release only"
+  echo "3) Write Headscale config only"
+  echo "4) Create user and pre-auth key"
+  echo "5) List Headscale users"
+  echo "6) Restart Headscale"
+  echo "7) Headscale logs"
+  echo "0) Back"
+  read_menu_choice || return
+  case "$choice" in
+    1) guided_headscale_setup || true ;;
+    2) install_headscale_release || true ;;
+    3)
+      read -r -p "Headscale URL (https://hs.example.com): " url
+      read -r -p "MagicDNS base domain (tailnet.example.com): " base_domain
+      write_headscale_config "$url" "$base_domain" || true
+      ;;
+    4) headscale_create_preauth_key || true ;;
+    5) run_cmd headscale -c "$HEADSCALE_CONFIG" users list || true ;;
+    6)
+      headscale_cmd configtest || true
+      run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+      ;;
+    7) run_cmd journalctl -u "$HEADSCALE_SERVICE" -n 120 --no-pager || true ;;
+    0) return ;;
+    *) invalid_choice; return ;;
+  esac
   pause
 }
 
@@ -433,6 +1080,31 @@ EOF
   run_cmd systemctl reload nginx.service
 }
 
+guided_https_setup() {
+  local zone domain email ip proxy_answer token proxied
+
+  read -r -p "Cloudflare zone (example.com): " zone
+  read -r -p "Panel hostname (panel.example.com): " domain
+  read -r -p "Let's Encrypt email: " email
+  read -r -p "IPv4 [auto]: " ip
+  if [[ -z "$ip" ]]; then
+    ip="$(public_ip || true)"
+  fi
+  read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
+  read -r -s -p "Cloudflare API token: " token
+  echo
+  proxied=false
+  [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
+
+  install_https_deps || return
+  cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied" || return
+  save_cloudflare_credentials "$token" || return
+  issue_cloudflare_certificate "$domain" "$email" || return
+  write_nginx_https_config "$domain" || return
+  echo
+  echo "${green}${bold}Secure panel URL: https://${domain}/admin/setup${reset}"
+}
+
 https_setup_menu() {
   need_root
   header
@@ -445,59 +1117,124 @@ https_setup_menu() {
   read_menu_choice || return
   case "$choice" in
     1)
-      install_https_deps
+      install_https_deps || true
       ;;
     2)
       read -r -p "Cloudflare zone (example.com): " zone
       read -r -p "Panel hostname (panel.example.com): " domain
       read -r -p "IPv4 [auto]: " ip
       if [[ -z "$ip" ]]; then
-        ip="$(public_ip)"
+        ip="$(public_ip || true)"
       fi
       read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
       read -r -s -p "Cloudflare API token: " token
       echo
       proxied=false
       [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
-      cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied"
+      cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied" || true
       ;;
     3)
       read -r -p "Panel hostname: " domain
       read -r -p "Let's Encrypt email: " email
       read -r -s -p "Cloudflare API token (stored in ${CLOUDFLARE_CREDENTIALS}): " token
       echo
-      save_cloudflare_credentials "$token"
-      issue_cloudflare_certificate "$domain" "$email"
+      save_cloudflare_credentials "$token" || true
+      issue_cloudflare_certificate "$domain" "$email" || true
       ;;
     4)
       read -r -p "Panel hostname: " domain
-      write_nginx_https_config "$domain"
+      write_nginx_https_config "$domain" || true
       echo "${green}Secure panel URL: https://${domain}/admin/setup${reset}"
       ;;
     5)
-      read -r -p "Cloudflare zone (example.com): " zone
-      read -r -p "Panel hostname (panel.example.com): " domain
-      read -r -p "Let's Encrypt email: " email
-      read -r -p "IPv4 [auto]: " ip
-      if [[ -z "$ip" ]]; then
-        ip="$(public_ip)"
-      fi
-      read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
-      read -r -s -p "Cloudflare API token: " token
-      echo
-      proxied=false
-      [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
-      install_https_deps
-      cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied"
-      save_cloudflare_credentials "$token"
-      issue_cloudflare_certificate "$domain" "$email"
-      write_nginx_https_config "$domain"
-      echo
-      echo "${green}${bold}Secure panel URL: https://${domain}/admin/setup${reset}"
+      guided_https_setup || true
       ;;
     0) return ;;
     *) invalid_choice; return ;;
   esac
+  pause
+}
+
+# Commercial-style first-run path: keep the operator in one TUI session and
+# offer every optional module in dependency order without hiding verification.
+guided_deployment() {
+  need_root
+  header
+  echo "${bold}Guided deployment cycle${reset}"
+  echo "This path keeps everything inside one SSH TUI session:"
+  echo "  1. install or repair the panel"
+  echo "  2. optionally publish HTTPS through Cloudflare"
+  echo "  3. optionally import verified proxy core archives"
+  echo "  4. optionally configure Telegram MTProto"
+  echo "  5. optionally configure Headscale mesh hub"
+  echo "  6. show final service status"
+  echo
+
+  if confirm_yes "Install or repair the panel from ${SOURCE_DIR} now?" "Y"; then
+    local with_nginx=0 force_env=0
+    confirm_yes "Install nginx template during panel install?" "Y" && with_nginx=1
+    confirm_yes "Overwrite panel env template? Existing env will be backed up." "N" && force_env=1
+    run_panel_install_from_source "$with_nginx" "$force_env" || {
+      echo "${danger}Panel install/repair failed.${reset}" >&2
+      pause
+      return 1
+    }
+  fi
+
+  echo
+  if confirm_yes "Configure HTTPS with Cloudflare DNS-01 now?" "N"; then
+    guided_https_setup || {
+      echo "${danger}HTTPS setup did not complete. You can rerun this guided cycle later.${reset}" >&2
+    }
+  else
+    echo "${muted}HTTPS skipped. Use SSH tunnel until a reverse proxy is configured:${reset}"
+    echo "ssh -L 8080:127.0.0.1:8080 root@<server>"
+  fi
+
+  echo
+  if confirm_yes "Install or update verified proxy core archives now?" "N"; then
+    while true; do
+      echo
+      install_core_from_prompts || true
+      confirm_yes "Install another core archive?" "N" || break
+    done
+  fi
+
+  echo
+  if confirm_yes "Configure Telegram MTProto module now?" "N"; then
+    if [[ ! -x "$MTPROTO_BINARY" ]]; then
+      echo "${muted}MTProto binary is not installed yet.${reset}"
+      if confirm_yes "Install the MTProto archive first through the core installer?" "Y"; then
+        echo "${muted}Choose 'Telegram MTProto' in the next selector.${reset}"
+        install_core_from_prompts || true
+      fi
+    fi
+    guided_mtproto_setup || {
+      echo "${danger}MTProto setup did not complete. You can rerun Telegram MTProto setup later.${reset}" >&2
+    }
+  fi
+
+  echo
+  if confirm_yes "Configure Headscale mesh hub now?" "N"; then
+    guided_headscale_setup || {
+      echo "${danger}Headscale setup did not complete. You can rerun Headscale hub setup later.${reset}" >&2
+    }
+  fi
+
+  echo
+  echo "${green}${bold}Guided deployment cycle complete.${reset}"
+  echo "Open the panel:"
+  echo "  HTTPS:      https://<your-domain>/admin/setup"
+  echo "  SSH tunnel: http://127.0.0.1:8080/admin/setup"
+  echo
+  echo "${bold}Service summary${reset}"
+  printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
+  printf "%-34s %-12s %-12s\n" "----" "------" "-------"
+  unit_state "$PANEL_SERVICE"
+  for service in "${CORE_SERVICES[@]}"; do
+    unit_state "$service"
+  done
+  unit_state "$HEADSCALE_SERVICE"
   pause
 }
 
@@ -522,15 +1259,18 @@ EOF
       ;;
     full)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service || true
+systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
-rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service
+rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
+rm -f /etc/systemd/system/headscale.service
 systemctl daemon-reload
 rm -f /usr/local/bin/infiproxy
 rm -rf /etc/infiproxy /var/lib/infiproxy
 rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores
+rm -rf /etc/headscale /var/lib/headscale
 rm -rf /opt/infiproxy/source
 rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
 nginx -t && systemctl reload nginx.service || true
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
@@ -538,14 +1278,18 @@ EOF
       ;;
     factory)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service || true
+systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
-rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service
+rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
+rm -f /etc/systemd/system/headscale.service
 systemctl daemon-reload
 rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager
 rm -rf /etc/infiproxy /var/lib/infiproxy
 rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores
+rm -rf /etc/headscale /var/lib/headscale
+rm -f /usr/local/bin/headscale
 rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
 nginx -t && systemctl reload nginx.service || true
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
@@ -590,27 +1334,33 @@ run_uninstall() {
 main_menu() {
   while true; do
     header
-    echo "1) Status dashboard"
-    echo "2) Restart / reload services"
-    echo "3) Edit panel environment"
-    echo "4) Toggle web danger shell"
-    echo "5) HTTPS / Cloudflare setup"
-    echo "6) Install / repair panel"
-    echo "7) Core installer helper"
-    echo "8) Panel logs"
-    echo "${danger}9) Uninstall / cleanup${reset}"
+    echo "1) Guided deployment cycle"
+    echo "2) Status dashboard"
+    echo "3) Restart / reload services"
+    echo "4) Edit panel environment"
+    echo "5) Toggle web danger shell"
+    echo "6) HTTPS / Cloudflare setup"
+    echo "7) Install / repair panel"
+    echo "8) Core installer helper"
+    echo "9) Telegram MTProto setup"
+    echo "10) Headscale hub setup"
+    echo "11) Panel logs"
+    echo "${danger}12) Uninstall / cleanup${reset}"
     echo "0) Exit"
     read_menu_choice || exit 0
     case "$choice" in
-      1) service_status ;;
-      2) restart_menu ;;
-      3) edit_env ;;
-      4) toggle_danger_shell ;;
-      5) https_setup_menu ;;
-      6) install_or_repair ;;
-      7) core_helper ;;
-      8) logs_menu ;;
-      9) run_uninstall ;;
+      1) guided_deployment ;;
+      2) service_status ;;
+      3) restart_menu ;;
+      4) edit_env ;;
+      5) toggle_danger_shell ;;
+      6) https_setup_menu ;;
+      7) install_or_repair ;;
+      8) core_helper ;;
+      9) mtproto_setup_menu ;;
+      10) headscale_menu ;;
+      11) logs_menu ;;
+      12) run_uninstall ;;
       0) exit 0 ;;
       *) invalid_choice ;;
     esac
@@ -618,11 +1368,14 @@ main_menu() {
 }
 
 case "${1:-}" in
+  --guided)
+    guided_deployment
+    ;;
   --uninstall)
     run_uninstall "${2:-}"
     ;;
   --help|-h)
-    echo "Usage: sudo infiproxy-manager [--uninstall panel|full|factory]"
+    echo "Usage: sudo infiproxy-manager [--guided] [--uninstall panel|full|factory]"
     ;;
   *)
     main_menu

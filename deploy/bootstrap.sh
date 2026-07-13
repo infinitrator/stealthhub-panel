@@ -12,6 +12,7 @@ SRC_DIR="${INFIPROXY_SRC_DIR:-${STEALTHHUB_SRC_DIR:-/opt/infiproxy/source}}"
 WITH_NGINX=0
 FORCE_ENV=0
 CHECK_ONLY=0
+GUIDED=0
 
 usage() {
     cat <<'USAGE'
@@ -22,6 +23,7 @@ Options:
   --ref <ref>        Git branch, tag, or commit to install. Default: main
   --src-dir <path>   Source checkout directory. Default: /opt/infiproxy/source
   --with-nginx       Install nginx package together with build dependencies.
+  --guided           Launch the SSH TUI guided deployment cycle after install.
   --force-env        Replace /etc/infiproxy/infiproxy.env.
   --check            Validate source/dependencies and print install plan.
 USAGE
@@ -58,6 +60,10 @@ while [[ $# -gt 0 ]]; do
             WITH_NGINX=1
             shift
             ;;
+        --guided)
+            GUIDED=1
+            shift
+            ;;
         --force-env)
             FORCE_ENV=1
             shift
@@ -89,6 +95,7 @@ echo "  ref:       $REF"
 echo "  source:    $SRC_DIR"
 echo "  nginx:     $WITH_NGINX"
 echo "  force env: $FORCE_ENV"
+echo "  guided:    $GUIDED"
 
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -123,6 +130,7 @@ install_deps() {
             git
             libssl-dev
             pkg-config
+            python3
             sqlite3
             unzip
             xz-utils
@@ -143,6 +151,7 @@ install_deps() {
             make
             openssl-devel
             pkgconf-pkg-config
+            python3
             sqlite
             unzip
             xz
@@ -210,13 +219,22 @@ fi
 
 bash "${SRC_DIR}/deploy/install.sh" "${install_args[@]}"
 
+if [[ "$GUIDED" -eq 1 ]]; then
+    if [[ -r /dev/tty && -w /dev/tty ]]; then
+        /usr/local/sbin/infiproxy-manager --guided </dev/tty >/dev/tty
+    else
+        echo "Guided TUI requested, but no interactive TTY is available." >&2
+        echo "Run later: sudo infiproxy-manager --guided" >&2
+    fi
+fi
+
 cat <<EOF
 
 Infiproxy is installed.
 
 Service:
   systemctl status infiproxy.service
-  sudo infiproxy-manager
+  sudo infiproxy-manager --guided
 
 HTTPS:
   sudo infiproxy-manager
