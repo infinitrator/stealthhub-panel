@@ -6,6 +6,12 @@ members = [
   "crates/stealthhub-cli"
 ]
 
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = true
+
 [workspace.package]
 edition = "2021"
 license = "AGPL-3.0-or-later"

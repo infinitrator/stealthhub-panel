@@ -13,10 +13,13 @@ INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/i
 MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
 UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
+MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
 CORE_INSTALL_BIN="${INFIPROXY_CORE_INSTALL_BIN:-/usr/local/sbin/infiproxy-core-install}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
 ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
+MODULE_MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
+MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
 CORE_CONFIG_DIR="${INFIPROXY_CORE_CONFIG_DIR:-${STEALTHHUB_CORE_CONFIG_DIR:-/etc/infiproxy-cores}}"
 CORE_LOG_DIR="${INFIPROXY_CORE_LOG_DIR:-${STEALTHHUB_CORE_LOG_DIR:-/var/log/infiproxy-cores}}"
@@ -121,7 +124,7 @@ need_cmd() {
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "Preflight commands:"
-    for cmd in getent groupadd id install systemctl useradd; do
+    for cmd in getent groupadd id install python3 systemctl useradd; do
         if command -v "$cmd" >/dev/null 2>&1; then
             echo "  $cmd: found"
         else
@@ -133,6 +136,7 @@ else
     need_cmd groupadd
     need_cmd id
     need_cmd install
+    need_cmd python3
     need_cmd systemctl
     need_cmd useradd
 fi
@@ -141,6 +145,7 @@ required_deploy_files=(
     deploy/infiproxy-manager.sh
     deploy/panel-update.sh
     deploy/module-update.sh
+    deploy/module-manifest.py
     deploy/cores/install-core.sh
     deploy/infiproxy-profile.sh
     deploy/infiproxy.service
@@ -156,6 +161,17 @@ for relative_path in "${required_deploy_files[@]}"; do
         echo "Required deployment file not found: ${ROOT_DIR}/${relative_path}" >&2
         exit 1
     fi
+done
+
+shopt -s nullglob
+bundled_manifests=("${ROOT_DIR}"/deploy/modules.d/*.module)
+shopt -u nullglob
+if [[ "${#bundled_manifests[@]}" -eq 0 ]]; then
+    echo "No bundled module manifests found in ${ROOT_DIR}/deploy/modules.d" >&2
+    exit 1
+fi
+for manifest in "${bundled_manifests[@]}"; do
+    PYTHONDONTWRITEBYTECODE=1 python3 "${ROOT_DIR}/deploy/module-manifest.py" validate "$manifest"
 done
 
 if [[ "$BUILD" -eq 1 ]]; then
@@ -178,11 +194,14 @@ Infiproxy install plan:
   manager:       $MANAGER_BIN
   updater:       $UPDATE_BIN
   module updater:$MODULE_UPDATE_BIN
+  module helper: $MODULE_MANIFEST_HELPER
   core installer:$CORE_INSTALL_BIN
   release bin:   $RELEASE_BIN
   config:        $ENV_FILE
   state:         $STATE_DIR
   root state:    $ROOT_STATE_DIR
+  module registry:$MODULE_MANIFEST_DIR
+  module catalog: $MODULE_AVAILABLE_DIR
   core binaries: $CORE_DIR
   core configs:  $CORE_CONFIG_DIR
   headscale cfg: /etc/headscale
@@ -214,10 +233,14 @@ install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
 install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/module-versions"
+install -d -o root -g root -m 0750 "$ROOT_STATE_DIR/module-disabled"
+install -d -o root -g root -m 0755 "$MODULE_MANIFEST_DIR"
+install -d -o root -g root -m 0755 "$MODULE_AVAILABLE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_UPDATE_BIN")"
+install -d -o root -g root -m 0755 "$(dirname "$MODULE_MANIFEST_HELPER")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
@@ -228,12 +251,21 @@ install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/module-manifest.py" "$MODULE_MANIFEST_HELPER"
 install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
 install -m 0644 -o root -g root /dev/stdin "$UPDATE_CONFIG_FILE" <<EOF
 REPO=${UPDATE_REPO}
 REF=${UPDATE_REF}
 EOF
+
+for manifest in "${bundled_manifests[@]}"; do
+    module_id="$(basename "$manifest" .module)"
+    install -m 0644 -o root -g root "$manifest" "$MODULE_AVAILABLE_DIR/${module_id}.module"
+    if [[ ! -e "$ROOT_STATE_DIR/module-disabled/${module_id}" ]]; then
+        install -m 0644 -o root -g root "$manifest" "$MODULE_MANIFEST_DIR/${module_id}.module"
+    fi
+done
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
     if [[ -f "$ENV_FILE" ]]; then

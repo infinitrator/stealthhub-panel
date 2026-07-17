@@ -20,7 +20,7 @@ RESTART_SERVICE=""
 usage() {
     cat <<'USAGE'
 Usage:
-  sudo deploy/cores/install-core.sh --core <xray|sing-box|hysteria|tuic|mtproto> \
+  sudo deploy/cores/install-core.sh --core <module-id> \
     --version <version> --url <release-url> --sha256 <sha256> --binary <binary-name> \
     [--restart <systemd-service>]
 
@@ -79,14 +79,11 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-case "$CORE" in
-    xray|sing-box|hysteria|tuic|mtproto) ;;
-    *)
-        echo "Unsupported core: $CORE" >&2
-        usage >&2
-        exit 2
-        ;;
-esac
+if [[ ! "$CORE" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+    echo "Invalid core ID: $CORE" >&2
+    usage >&2
+    exit 2
+fi
 
 if [[ -z "$VERSION" || -z "$SHA256" || -z "$BINARY" ]]; then
     echo "--version, --sha256 and --binary are required" >&2
@@ -110,13 +107,7 @@ if [[ ! "$SHA256" =~ ^[A-Fa-f0-9]{64}$ ]]; then
 fi
 
 expected_service() {
-    case "$CORE" in
-        xray) echo "infiproxy-xray.service" ;;
-        sing-box) echo "infiproxy-sing-box.service" ;;
-        hysteria) echo "infiproxy-hysteria.service" ;;
-        tuic) echo "infiproxy-tuic.service" ;;
-        mtproto) echo "infiproxy-mtproto.service" ;;
-    esac
+    echo "infiproxy-${CORE}.service"
 }
 
 if [[ -n "$RESTART_SERVICE" && "$RESTART_SERVICE" != "$(expected_service)" ]]; then

@@ -1,27 +1,31 @@
 #!/usr/bin/env bash
-# Independent updater for Infiproxy runtime modules.
-#
-# Release modules are downloaded only from fixed upstream GitHub repositories
-# and verified with GitHub's SHA-256 digest or an official checksum sidecar.
-# MTProxy is built from an exact commit in Telegram's official repository.
+# Root worker for independently managed Infiproxy module manifests.
 set -Eeuo pipefail
 umask 027
 
 STATE_DIR="${INFIPROXY_STATE_DIR:-/var/lib/infiproxy}"
 ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
+MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
+AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
 MODULE_STATE_DIR="${STATE_DIR}/modules"
 MODULE_VERSION_DIR="${INFIPROXY_MODULE_VERSION_DIR:-${ROOT_STATE_DIR}/module-versions}"
 REQUEST_DIR="${STATE_DIR}/module-requests"
+DISABLED_DIR="${ROOT_STATE_DIR}/module-disabled"
 BUILD_DIR="${ROOT_STATE_DIR}/module-build"
 CORE_ROOT="${INFIPROXY_CORE_ROOT:-/opt/infiproxy/cores}"
 MODULE_ROOT="${INFIPROXY_MODULE_ROOT:-/opt/infiproxy/modules}"
 CORE_INSTALLER="${INFIPROXY_CORE_INSTALLER:-/usr/local/sbin/infiproxy-core-install}"
+MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
 PANEL_STATE="${STATE_DIR}/panel-update-state.env"
 RUN_LOG="${ROOT_STATE_DIR}/module-update.log"
 LOCK_DIR="${INFIPROXY_MODULE_UPDATE_LOCK:-/run/infiproxy-module-update.lock}"
 GITHUB_API="https://api.github.com/repos"
-MODULES=(xray sing-box hysteria tuic mtproto headscale)
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
+
+if [[ ! -x "$MANIFEST_HELPER" ]]; then
+  local_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/module-manifest.py"
+  [[ -x "$local_helper" ]] && MANIFEST_HELPER="$local_helper"
+fi
 
 log() {
   local line
@@ -47,44 +51,25 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
 }
 
-valid_module() {
-  case "$1" in
-    xray|sing-box|hysteria|tuic|mtproto|headscale) return 0 ;;
-    *) return 1 ;;
-  esac
+valid_id() {
+  [[ "$1" =~ ^[a-z][a-z0-9-]{0,31}$ ]]
 }
 
-module_repo() {
-  case "$1" in
-    xray) echo "XTLS/Xray-core" ;;
-    sing-box) echo "SagerNet/sing-box" ;;
-    hysteria) echo "apernet/hysteria" ;;
-    tuic) echo "tuic-protocol/tuic" ;;
-    mtproto) echo "TelegramMessenger/MTProxy" ;;
-    headscale) echo "juanfont/headscale" ;;
-  esac
+manifest_file() {
+  printf '%s/%s.module' "$MANIFEST_DIR" "$1"
 }
 
-module_service() {
-  case "$1" in
-    xray) echo "infiproxy-xray.service" ;;
-    sing-box) echo "infiproxy-sing-box.service" ;;
-    hysteria) echo "infiproxy-hysteria.service" ;;
-    tuic) echo "infiproxy-tuic.service" ;;
-    mtproto) echo "infiproxy-mtproto.service" ;;
-    headscale) echo "headscale.service" ;;
-  esac
+module_ids() {
+  "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned
 }
 
-module_binary() {
-  case "$1" in
-    xray) echo "${CORE_ROOT}/xray/current/xray" ;;
-    sing-box) echo "${CORE_ROOT}/sing-box/current/sing-box" ;;
-    hysteria) echo "${CORE_ROOT}/hysteria/current/hysteria" ;;
-    tuic) echo "${CORE_ROOT}/tuic/current/tuic-server" ;;
-    mtproto) echo "${CORE_ROOT}/mtproto/current/mtproto-proxy" ;;
-    headscale) echo "${MODULE_ROOT}/headscale/current/headscale" ;;
-  esac
+load_module() {
+  local id="$1" record
+  valid_id "$id" || return 1
+  record="$("$MANIFEST_HELPER" read "$(manifest_file "$id")" --root-owned)" || return 1
+  IFS='|' read -r M_ID _ _ _ M_REPO M_UPSTREAM M_REF M_DRIVER \
+    M_ROOT M_BINARY M_SERVICE M_CONFIG M_ASSET_AMD64 M_ASSET_ARM64 <<<"$record"
+  [[ "$M_ID" == "$id" ]]
 }
 
 host_arch() {
@@ -93,6 +78,18 @@ host_arch() {
     aarch64|arm64) echo "arm64" ;;
     *) die "unsupported architecture: $(uname -m)" ;;
   esac
+}
+
+runtime_root() {
+  if [[ "$M_ROOT" == "cores" ]]; then
+    printf '%s/%s' "$CORE_ROOT" "$M_ID"
+  else
+    printf '%s/%s' "$MODULE_ROOT" "$M_ID"
+  fi
+}
+
+module_binary() {
+  printf '%s/current/%s' "$(runtime_root)" "$M_BINARY"
 }
 
 state_value() {
@@ -106,7 +103,11 @@ state_value() {
 
 installed_version() {
   local file="${MODULE_VERSION_DIR}/$1.version"
-  [[ -s "$file" ]] && tr -d '[:space:]' <"$file" || echo "unknown"
+  if [[ -s "$file" ]]; then
+    tr -d '[:space:]' <"$file"
+  else
+    echo "unknown"
+  fi
 }
 
 normalize_version() {
@@ -126,37 +127,29 @@ github_json() {
 
 # Prints: tag|asset-name|asset-url|sha256-or-empty|checksum-url-or-empty
 release_metadata() {
-  local module="$1" arch="$2" repo api_json
-  repo="$(module_repo "$module")"
-  api_json="$(github_json "${GITHUB_API}/${repo}/releases/latest")"
+  local arch="$1" pattern api_json
+  if [[ "$arch" == "amd64" ]]; then
+    pattern="$M_ASSET_AMD64"
+  else
+    pattern="$M_ASSET_ARM64"
+  fi
+  api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases/latest")"
   python3 -c '
 import json, sys
-module, arch = sys.argv[1:3]
+pattern = sys.argv[1]
 d = json.load(sys.stdin)
 tag = d["tag_name"]
 version = tag.removeprefix("app/v").removeprefix("tuic-server-").removeprefix("v")
-names = {
-    ("xray", "amd64"): "Xray-linux-64.zip",
-    ("xray", "arm64"): "Xray-linux-arm64-v8a.zip",
-    ("sing-box", "amd64"): f"sing-box-{version}-linux-amd64.tar.gz",
-    ("sing-box", "arm64"): f"sing-box-{version}-linux-arm64.tar.gz",
-    ("hysteria", "amd64"): "hysteria-linux-amd64",
-    ("hysteria", "arm64"): "hysteria-linux-arm64",
-    ("tuic", "amd64"): f"tuic-server-{version}-x86_64-unknown-linux-gnu",
-    ("tuic", "arm64"): f"tuic-server-{version}-aarch64-unknown-linux-gnu",
-    ("headscale", "amd64"): f"headscale_{version}_linux_amd64",
-    ("headscale", "arm64"): f"headscale_{version}_linux_arm64",
-}
-name = names[(module, arch)]
+name = pattern.replace("{version}", version).replace("{tag}", tag)
 assets = {asset["name"]: asset for asset in d.get("assets", [])}
 asset = assets.get(name)
 if not asset:
     raise SystemExit(f"release asset not found: {name}")
 digest = (asset.get("digest") or "").removeprefix("sha256:")
 sidecars = [name + ".dgst", name + ".sha256sum", "hashes.txt", "checksums.txt"]
-checksum_url = next((assets[n]["browser_download_url"] for n in sidecars if n in assets), "")
+checksum_url = next((assets[item]["browser_download_url"] for item in sidecars if item in assets), "")
 print("|".join((tag, name, asset["browser_download_url"], digest, checksum_url)))
-' "$module" "$arch" <<<"$api_json"
+' "$pattern" <<<"$api_json"
 }
 
 resolve_checksum() {
@@ -165,7 +158,7 @@ resolve_checksum() {
     printf '%s' "$digest" | tr 'A-F' 'a-f'
     return
   fi
-  [[ "$checksum_url" == https://github.com/*/releases/download/* ]] \
+  [[ "$checksum_url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
     || die "no trusted checksum is available for ${expected_asset}"
   checksum_file="$(mktemp)"
   curl --fail --silent --show-error --location --max-time 60 \
@@ -212,56 +205,15 @@ rollback_symlink() {
   log "rolled back ${service} to ${previous_target}"
 }
 
-install_release_module() {
-  local module="$1" arch repo metadata tag asset url digest checksum_url checksum tmp
-  local service was_enabled=0 was_active=0 normalized current_link previous_target
-  arch="$(host_arch)"
-  repo="$(module_repo "$module")"
-  metadata="$(release_metadata "$module" "$arch")"
-  IFS='|' read -r tag asset url digest checksum_url <<<"$metadata"
-  [[ "$url" == "https://github.com/${repo}/releases/download/"* ]] \
-    || die "refusing unexpected release URL for ${module}"
-  checksum="$(resolve_checksum "$asset" "$digest" "$checksum_url")"
-  normalized="$(normalize_version "$tag")"
-
-  if [[ -x "$(module_binary "$module")" ]] \
-    && { [[ "$(installed_version "$module")" == "$tag" ]] \
-      || [[ "$(installed_version "$module")" == "$normalized" ]]; }; then
-    log "${module} is already current (${tag})"
-    return
-  fi
-
-  service="$(module_service "$module")"
-  systemctl is-enabled --quiet "$service" 2>/dev/null && was_enabled=1
-  systemctl is-active --quiet "$service" 2>/dev/null && was_active=1
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"; trap - RETURN' RETURN
-  curl --fail --location --show-error --max-time 300 --output "${tmp}/${asset}" "$url"
-  printf '%s  %s\n' "$checksum" "${tmp}/${asset}" | sha256sum -c -
-
-  if [[ "$module" == "headscale" ]]; then
-    install_headscale_binary "$tag" "${tmp}/${asset}" "$was_enabled" "$was_active"
-  else
-    current_link="${CORE_ROOT}/${module}/current"
-    previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
-    "$CORE_INSTALLER" --core "$module" --version "$normalized" \
-      --archive "${tmp}/${asset}" --sha256 "$checksum" --binary "$(basename "$(module_binary "$module")")"
-    if ! restore_service_state "$service" "$was_enabled" "$was_active"; then
-      rollback_symlink "$current_link" "$previous_target" "$service" "$was_active" || true
-      die "${service} failed after update; previous binary was restored"
-    fi
-  fi
-  remember_version "$module" "$tag"
-  log "updated ${module}: ${tag}"
-}
-
 ensure_headscale_unit() {
   if ! id -u headscale >/dev/null 2>&1; then
     useradd --system --home-dir /var/lib/headscale --create-home \
       --shell /usr/sbin/nologin headscale
   fi
   install -d -o headscale -g headscale -m 0750 /var/lib/headscale
-  if ! systemctl cat headscale.service >/dev/null 2>&1; then
+  if ! systemctl cat "$M_SERVICE" >/dev/null 2>&1; then
+    [[ "$M_ID" == "headscale" && "$M_SERVICE" == "headscale.service" ]] \
+      || die "service unit is missing for ${M_ID}: ${M_SERVICE}"
     install -d -m 0755 /etc/systemd/system
     install -m 0644 /dev/stdin /etc/systemd/system/headscale.service <<'EOF'
 [Unit]
@@ -280,18 +232,11 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/headscale
+ReadWritePaths=/etc/headscale /var/lib/headscale
 RuntimeDirectory=headscale
 
 [Install]
 WantedBy=multi-user.target
-EOF
-  else
-    install -d -m 0755 /etc/systemd/system/headscale.service.d
-    install -m 0644 /dev/stdin /etc/systemd/system/headscale.service.d/infiproxy-module.conf <<'EOF'
-[Service]
-ExecStart=
-ExecStart=/opt/infiproxy/modules/headscale/current/headscale serve -c /etc/headscale/config.yaml
 EOF
   fi
 }
@@ -300,104 +245,207 @@ install_headscale_binary() {
   local version="$1" archive="$2" was_enabled="$3" was_active="$4"
   local normalized target next current_link previous_target
   normalized="$(normalize_version "$version")"
-  target="${MODULE_ROOT}/headscale/${normalized}"
-  next="${MODULE_ROOT}/headscale/.current.${normalized}.next"
-  current_link="${MODULE_ROOT}/headscale/current"
+  target="$(runtime_root)/${normalized}"
+  next="$(runtime_root)/.current.${normalized}.next"
+  current_link="$(runtime_root)/current"
   previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
   install -d -m 0755 "$target"
-  install -m 0755 "$archive" "${target}/headscale"
-  "${target}/headscale" version >/dev/null
+  install -m 0755 "$archive" "${target}/${M_BINARY}"
+  "${target}/${M_BINARY}" version >/dev/null
   ln -sfn "$target" "$next"
   mv -Tf "$next" "$current_link"
-  ln -sfn "${MODULE_ROOT}/headscale/current/headscale" /usr/local/bin/headscale
+  ln -sfn "${current_link}/${M_BINARY}" /usr/local/bin/headscale
   ensure_headscale_unit
-  if ! restore_service_state headscale.service "$was_enabled" "$was_active"; then
-    rollback_symlink "$current_link" "$previous_target" headscale.service "$was_active" || true
-    die "headscale.service failed after update; previous binary was restored"
+  if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
+    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
+    die "${M_SERVICE} failed after update; previous binary was restored"
   fi
 }
 
-latest_mtproto_commit() {
-  github_json "${GITHUB_API}/TelegramMessenger/MTProxy/commits/master" \
+install_release_module() {
+  local metadata tag asset url digest checksum_url checksum tmp normalized
+  local was_enabled=0 was_active=0 current_link previous_target
+  metadata="$(release_metadata "$(host_arch)")"
+  IFS='|' read -r tag asset url digest checksum_url <<<"$metadata"
+  [[ "$url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
+    || die "refusing unexpected release URL for ${M_ID}"
+  checksum="$(resolve_checksum "$asset" "$digest" "$checksum_url")"
+  normalized="$(normalize_version "$tag")"
+
+  if [[ -x "$(module_binary)" ]] \
+    && { [[ "$(installed_version "$M_ID")" == "$tag" ]] \
+      || [[ "$(installed_version "$M_ID")" == "$normalized" ]]; }; then
+    log "${M_ID} is already current (${tag})"
+    return
+  fi
+
+  systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
+  systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"; trap - RETURN' RETURN
+  curl --fail --location --show-error --max-time 300 --output "${tmp}/${asset}" "$url"
+  printf '%s  %s\n' "$checksum" "${tmp}/${asset}" | sha256sum -c -
+
+  if [[ "$M_DRIVER" == "headscale" ]]; then
+    install_headscale_binary "$tag" "${tmp}/${asset}" "$was_enabled" "$was_active"
+  else
+    [[ "$M_DRIVER" == "release" && "$M_ROOT" == "cores" ]] \
+      || die "unsupported generic release contract for ${M_ID}"
+    current_link="$(runtime_root)/current"
+    previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
+    "$CORE_INSTALLER" --core "$M_ID" --version "$normalized" \
+      --archive "${tmp}/${asset}" --sha256 "$checksum" --binary "$M_BINARY"
+    if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
+      rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
+      die "${M_SERVICE} failed after update; previous binary was restored"
+    fi
+  fi
+  remember_version "$M_ID" "$tag"
+  log "updated ${M_ID}: ${tag}"
+}
+
+latest_commit() {
+  github_json "${GITHUB_API}/${M_REPO}/commits/${M_REF}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
 }
 
-install_mtproto_commit() {
-  local commit source binary checksum service current_link previous_target
+install_source_module() {
+  local commit source binary checksum current_link previous_target
   local was_enabled=0 was_active=0
-  commit="$(latest_mtproto_commit)"
-  [[ "$commit" =~ ^[A-Fa-f0-9]{40}$ ]] || die "invalid MTProxy commit returned by GitHub"
-  if [[ -x "$(module_binary mtproto)" && "$(installed_version mtproto)" == "$commit" ]]; then
-    log "mtproto is already current (${commit:0:12})"
+  [[ "$M_DRIVER" == "mtproto-source" ]] || die "unsupported source driver"
+  commit="$(latest_commit)"
+  [[ "$commit" =~ ^[A-Fa-f0-9]{40}$ ]] || die "invalid commit returned by GitHub"
+  if [[ -x "$(module_binary)" && "$(installed_version "$M_ID")" == "$commit" ]]; then
+    log "${M_ID} is already current (${commit:0:12})"
     return
   fi
   need_cmd git
   need_cmd make
-  source="${BUILD_DIR}/mtproto/source"
+  source="${BUILD_DIR}/${M_ID}/source"
   install -d -m 0750 "$(dirname "$source")"
   if [[ -d "${source}/.git" ]]; then
-    git -C "$source" remote set-url origin https://github.com/TelegramMessenger/MTProxy.git
-    git -C "$source" fetch --force --prune origin master
+    git -C "$source" remote set-url origin "https://github.com/${M_REPO}.git"
+    git -C "$source" fetch --force --prune origin "$M_REF"
   else
-    git clone --filter=blob:none https://github.com/TelegramMessenger/MTProxy.git "$source"
+    git clone --filter=blob:none "https://github.com/${M_REPO}.git" "$source"
   fi
   git -C "$source" checkout --force --detach "$commit"
   git -C "$source" clean -fdx
   make -C "$source" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-  binary="${source}/objs/bin/mtproto-proxy"
-  [[ -x "$binary" ]] || die "MTProxy build did not produce ${binary}"
+  binary="${source}/objs/bin/${M_BINARY}"
+  [[ -x "$binary" ]] || die "source build did not produce ${binary}"
   checksum="$(sha256sum "$binary" | awk '{print $1}')"
-  service="$(module_service mtproto)"
-  systemctl is-enabled --quiet "$service" 2>/dev/null && was_enabled=1
-  systemctl is-active --quiet "$service" 2>/dev/null && was_active=1
-  current_link="${CORE_ROOT}/mtproto/current"
+  systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
+  systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
+  current_link="$(runtime_root)/current"
   previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
-  "$CORE_INSTALLER" --core mtproto --version "$commit" --archive "$binary" \
-    --sha256 "$checksum" --binary mtproto-proxy
-  if ! restore_service_state "$service" "$was_enabled" "$was_active"; then
-    rollback_symlink "$current_link" "$previous_target" "$service" "$was_active" || true
-    die "${service} failed after update; previous binary was restored"
+  "$CORE_INSTALLER" --core "$M_ID" --version "$commit" --archive "$binary" \
+    --sha256 "$checksum" --binary "$M_BINARY"
+  if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
+    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
+    die "${M_SERVICE} failed after update; previous binary was restored"
   fi
-  remember_version mtproto "$commit"
-  log "updated mtproto: ${commit:0:12}"
+  remember_version "$M_ID" "$commit"
+  log "updated ${M_ID}: ${commit:0:12}"
 }
 
 latest_version() {
-  local module="$1"
-  if [[ "$module" == "mtproto" ]]; then
-    latest_mtproto_commit
+  if [[ "$M_UPSTREAM" == "commit" ]]; then
+    latest_commit
   else
-    release_metadata "$module" "$(host_arch)" | cut -d'|' -f1
+    release_metadata "$(host_arch)" | cut -d'|' -f1
   fi
 }
 
 check_module() {
   local module="$1" current latest state
-  valid_module "$module" || die "unknown module: $module"
+  load_module "$module" || die "unknown or invalid module: $module"
   current="$(installed_version "$module")"
-  latest="$(latest_version "$module")"
+  latest="$(latest_version)"
   state="update available"
   [[ "$(normalize_version "$current")" == "$(normalize_version "$latest")" ]] && state="current"
-  [[ ! -x "$(module_binary "$module")" ]] && state="not installed"
-  printf '%-12s installed=%-18s latest=%-18s %s\n' \
+  [[ ! -x "$(module_binary)" ]] && state="not installed"
+  printf '%-20s installed=%-18s latest=%-18s %s\n' \
     "$module" "${current:0:18}" "${latest:0:18}" "$state"
 }
 
 update_module() {
   local module="$1"
-  valid_module "$module" || die "unknown module: $module"
+  load_module "$module" || die "unknown or invalid module: $module"
   log "checking ${module}"
-  if [[ "$module" == "mtproto" ]]; then
-    install_mtproto_commit
+  if [[ "$M_UPSTREAM" == "commit" ]]; then
+    install_source_module
   else
-    install_release_module "$module"
+    install_release_module
   fi
+}
+
+register_requested() {
+  local request id source target failed=0
+  install -d -o root -g root -m 0755 "$MANIFEST_DIR"
+  install -d -o root -g root -m 0755 "$AVAILABLE_DIR"
+  install -d -o root -g root -m 0750 "$DISABLED_DIR"
+  shopt -s nullglob
+  for request in "$REQUEST_DIR"/*.register; do
+    id="$(basename "$request" .register)"
+    source="${AVAILABLE_DIR}/${id}.module"
+    target="$(manifest_file "$id")"
+    if valid_id "$id" \
+      && [[ ! -e "$target" ]] \
+      && "$MANIFEST_HELPER" validate "$source" --root-owned; then
+      install -o root -g root -m 0644 "$source" "$target"
+      rm -f "${DISABLED_DIR}/${id}" "${request}.failed"
+      load_module "$id" || die "installed manifest could not be reloaded: ${id}"
+      install -d -o root -g "$APP_GROUP" -m 0770 "$(dirname "$M_CONFIG")"
+      if (update_module "$id"); then
+        rm -f "$request"
+      else
+        mv -f "$target" "${target}.failed"
+        mv -f "$request" "${request}.failed"
+        log "registration install failed for ${id}"
+        failed=1
+      fi
+    else
+      mv -f "$request" "${request}.failed"
+      log "registration rejected for ${id}"
+      failed=1
+    fi
+  done
+  shopt -u nullglob
+  return "$failed"
+}
+
+remove_requested() {
+  local request id failed=0
+  install -d -o root -g root -m 0750 "$DISABLED_DIR"
+  install -d -o root -g root -m 0755 "$AVAILABLE_DIR"
+  shopt -s nullglob
+  for request in "$REQUEST_DIR"/*.remove; do
+    id="$(basename "$request" .remove)"
+    if load_module "$id"; then
+      if [[ ! -e "${AVAILABLE_DIR}/${id}.module" ]]; then
+        install -o root -g root -m 0644 "$(manifest_file "$id")" "${AVAILABLE_DIR}/${id}.module"
+      fi
+      systemctl disable --now "$M_SERVICE" 2>/dev/null || true
+      rm -rf "$(runtime_root)"
+      rm -f "$(manifest_file "$id")" "${MODULE_VERSION_DIR}/${id}.version" \
+        "${MODULE_STATE_DIR}/${id}.env" "$request" "${request}.failed"
+      install -o root -g root -m 0644 /dev/null "${DISABLED_DIR}/${id}"
+      systemctl daemon-reload || true
+      log "removed ${id}; configuration preserved at ${M_CONFIG}"
+    else
+      mv -f "$request" "${request}.failed"
+      failed=1
+    fi
+  done
+  shopt -u nullglob
+  return "$failed"
 }
 
 run_requested() {
   local module request failed=0
   install -d -m 0750 "$REQUEST_DIR"
-  for module in "${MODULES[@]}"; do
+  while IFS= read -r module; do
     request="${REQUEST_DIR}/${module}.request"
     [[ -f "$request" ]] || continue
     if (update_module "$module"); then
@@ -407,7 +455,7 @@ run_requested() {
       log "request failed for ${module}; details retained in ${request}.failed"
       failed=1
     fi
-  done
+  done < <(module_ids)
   return "$failed"
 }
 
@@ -429,7 +477,7 @@ run_automatic() {
   marker="${ROOT_STATE_DIR}/module-last-auto-date"
   [[ "$(cat "$marker" 2>/dev/null || true)" != "$today" ]] || return 0
 
-  for module in "${MODULES[@]}"; do
+  while IFS= read -r module; do
     state_file="${MODULE_STATE_DIR}/${module}.env"
     enabled="$(state_value "$state_file" AUTO_ENABLED || true)"
     installed="$(state_value "$state_file" INSTALLED || true)"
@@ -438,10 +486,17 @@ run_automatic() {
       log "automatic update failed for ${module}; the scheduler will retry"
       failed=1
     fi
-  done
+  done < <(module_ids)
   [[ "$failed" -eq 0 ]] || return 1
   printf '%s\n' "$today" >"$marker"
   chmod 0640 "$marker"
+}
+
+run_due() {
+  register_requested || true
+  remove_requested || true
+  run_requested || true
+  run_automatic
 }
 
 with_lock() {
@@ -459,9 +514,9 @@ Usage: sudo infiproxy-module-update <command> [module]
 
 Commands:
   --check <module>   Compare installed and latest upstream version.
-  --check-all        Compare all supported modules.
+  --check-all        Compare all registered modules.
   --update <module>  Install or update one module now.
-  --run-due          Process web requests and the daily automatic window.
+  --run-due          Process registration, removal, update and automatic jobs.
 EOF
 }
 
@@ -470,33 +525,20 @@ main() {
   need_cmd curl
   need_cmd python3
   need_cmd sha256sum
+  [[ -x "$MANIFEST_HELPER" ]] || die "module manifest helper is missing"
+  "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned >/dev/null \
+    || die "module registry validation failed"
   case "${1:-}" in
-    --check)
-      check_module "${2:-}"
-      ;;
+    --check) check_module "${2:-}" ;;
     --check-all)
       local module
-      for module in "${MODULES[@]}"; do check_module "$module"; done
+      while IFS= read -r module; do check_module "$module"; done < <(module_ids)
       ;;
-    --update)
-      with_lock update_module "${2:-}"
-      ;;
-    --run-due)
-      with_lock run_due
-      ;;
-    -h|--help)
-      usage
-      ;;
-    *)
-      usage >&2
-      exit 2
-      ;;
+    --update) with_lock update_module "${2:-}" ;;
+    --run-due) with_lock run_due ;;
+    -h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
   esac
-}
-
-run_due() {
-  run_requested || true
-  run_automatic
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

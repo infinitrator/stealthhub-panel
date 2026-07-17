@@ -133,12 +133,17 @@ main() {
     git -C "$SOURCE_DIR" reset --hard "origin/$ref" 2>/dev/null || true
 
     if ! bash "${SOURCE_DIR}/deploy/bootstrap.sh" --repo "$repo_url" --ref "$ref" --src-dir "$SOURCE_DIR" --with-nginx; then
-        log "panel update failed; restoring previous binary and source revision"
+        log "panel update failed; restoring previous control plane and source revision"
         if [[ -n "$previous_commit" ]]; then
             git -C "$SOURCE_DIR" checkout --force --detach "$previous_commit" || true
         fi
         if [[ -f "$backup_binary" ]]; then
             install -m 0755 "$backup_binary" /usr/local/bin/infiproxy
+            install -d -m 0755 "${SOURCE_DIR}/target/release"
+            install -m 0755 "$backup_binary" "${SOURCE_DIR}/target/release/stealthhub-panel"
+            INFIPROXY_UPDATE_REPO="$repo" INFIPROXY_UPDATE_REF="$ref" \
+                bash "${SOURCE_DIR}/deploy/install.sh" --with-nginx \
+                || log "warning: previous installer could not fully repair the control plane"
             systemctl restart infiproxy.service || true
         fi
         exit 1

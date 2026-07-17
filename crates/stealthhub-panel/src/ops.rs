@@ -4,17 +4,12 @@
 //! command execution, uninstall runbooks and host metrics. Keeping these helpers
 //! outside route handlers makes dangerous behavior easier to audit.
 
-use maud::{html, Markup};
 use std::{
     fs,
     path::Path,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::{process::Command as TokioCommand, time};
-
-const DANGER_SHELL_TIMEOUT_SECS: u64 = 10;
-const DANGER_SHELL_MAX_CHARS: usize = 2048;
 
 pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
     SystemTarget {
@@ -161,151 +156,8 @@ pub(crate) enum SystemActionKind {
     ReloadFirewall,
 }
 
-pub(crate) const CONSOLE_COMMANDS: &[ConsoleCommand] = &[
-    ConsoleCommand {
-        slug: "panel-status",
-        name: "Panel service status",
-        description: "Read systemd state for the Infiproxy panel service.",
-        program: "systemctl",
-        args: &["--no-pager", "--full", "status", "infiproxy.service"],
-    },
-    ConsoleCommand {
-        slug: "panel-logs",
-        name: "Panel logs",
-        description: "Read the last 80 journal lines for the panel service.",
-        program: "journalctl",
-        args: &["-u", "infiproxy.service", "-n", "80", "--no-pager"],
-    },
-    ConsoleCommand {
-        slug: "disk-usage",
-        name: "Disk usage",
-        description: "Show filesystem capacity for the root volume.",
-        program: "df",
-        args: &["-h", "/"],
-    },
-    ConsoleCommand {
-        slug: "memory",
-        name: "Memory snapshot",
-        description: "Show kernel memory accounting from /proc/meminfo.",
-        program: "head",
-        args: &["-n", "12", "/proc/meminfo"],
-    },
-    ConsoleCommand {
-        slug: "nginx-test",
-        name: "Nginx config test",
-        description: "Validate Nginx configuration without reloading it.",
-        program: "nginx",
-        args: &["-t"],
-    },
-    ConsoleCommand {
-        slug: "ssh-test",
-        name: "SSH config test",
-        description: "Validate sshd configuration without reloading it.",
-        program: "sshd",
-        args: &["-t"],
-    },
-    ConsoleCommand {
-        slug: "routes",
-        name: "Route table",
-        description: "Show kernel routing table for network debugging.",
-        program: "ip",
-        args: &["route"],
-    },
-    ConsoleCommand {
-        slug: "listeners",
-        name: "Listening sockets",
-        description: "Show listening TCP/UDP sockets for service exposure checks.",
-        program: "ss",
-        args: &["-tulpn"],
-    },
-    ConsoleCommand {
-        slug: "failed-units",
-        name: "Failed systemd units",
-        description: "Show failed units that can explain degraded server state.",
-        program: "systemctl",
-        args: &["--failed", "--no-pager"],
-    },
-    ConsoleCommand {
-        slug: "unit-inventory",
-        name: "Service inventory",
-        description: "List active systemd services without opening a raw shell.",
-        program: "systemctl",
-        args: &[
-            "list-units",
-            "--type=service",
-            "--state=running",
-            "--no-pager",
-        ],
-    },
-    ConsoleCommand {
-        slug: "network-addresses",
-        name: "Network addresses",
-        description: "Show interface addresses for routing and binding checks.",
-        program: "ip",
-        args: &["addr", "show"],
-    },
-    ConsoleCommand {
-        slug: "dns-status",
-        name: "DNS resolver status",
-        description: "Read resolver state when systemd-resolved is available.",
-        program: "resolvectl",
-        args: &["status"],
-    },
-    ConsoleCommand {
-        slug: "time-status",
-        name: "Time sync status",
-        description: "Show clock and NTP state for TLS and certificate debugging.",
-        program: "timedatectl",
-        args: &["status"],
-    },
-    ConsoleCommand {
-        slug: "infiproxy-footprint",
-        name: "Infiproxy disk footprint",
-        description: "Show storage used by panel state, source checkout and core runtimes.",
-        program: "du",
-        args: &[
-            "-sh",
-            "/var/lib/infiproxy",
-            "/var/lib/infiproxy-maintenance",
-            "/opt/infiproxy",
-            "/etc/infiproxy",
-            "/etc/infiproxy-cores",
-        ],
-    },
-    ConsoleCommand {
-        slug: "mtproto-logs",
-        name: "MTProto logs",
-        description: "Read the last 80 journal lines for Telegram MTProto proxy.",
-        program: "journalctl",
-        args: &["-u", "infiproxy-mtproto.service", "-n", "80", "--no-pager"],
-    },
-    ConsoleCommand {
-        slug: "headscale-users",
-        name: "Headscale users",
-        description: "List Headscale users through the local unix socket.",
-        program: "headscale",
-        args: &["users", "list"],
-    },
-    ConsoleCommand {
-        slug: "headscale-logs",
-        name: "Headscale logs",
-        description: "Read the last 80 journal lines for Headscale.",
-        program: "journalctl",
-        args: &["-u", "headscale.service", "-n", "80", "--no-pager"],
-    },
-];
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ConsoleCommand {
-    pub(crate) slug: &'static str,
-    pub(crate) name: &'static str,
-    pub(crate) description: &'static str,
-    pub(crate) program: &'static str,
-    pub(crate) args: &'static [&'static str],
-}
-
-pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
-    ConfigFileSpec {
+pub(crate) const CONFIG_FILES: &[StaticConfigFileSpec] = &[
+    StaticConfigFileSpec {
         slug: "panel-env",
         name: "Panel environment",
         category: "panel",
@@ -316,7 +168,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy.service",
         max_bytes: 16 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "nginx-site",
         name: "Nginx reverse proxy",
         category: "edge",
@@ -327,7 +179,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl reload nginx.service",
         max_bytes: 64 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "ssh-daemon",
         name: "SSH daemon",
         category: "host",
@@ -338,7 +190,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl reload ssh.service",
         max_bytes: 64 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "xray-core",
         name: "Xray core",
         category: "proxy-core",
@@ -349,7 +201,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy-xray.service",
         max_bytes: 256 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "sing-box-core",
         name: "sing-box core",
         category: "proxy-core",
@@ -360,7 +212,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy-sing-box.service",
         max_bytes: 256 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "hysteria-core",
         name: "Hysteria core",
         category: "proxy-core",
@@ -371,7 +223,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy-hysteria.service",
         max_bytes: 128 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "tuic-core",
         name: "TUIC core",
         category: "proxy-core",
@@ -382,7 +234,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy-tuic.service",
         max_bytes: 128 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "mtproto-core",
         name: "Telegram MTProto",
         category: "proxy-core",
@@ -393,7 +245,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart infiproxy-mtproto.service",
         max_bytes: 16 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "headscale-config",
         name: "Headscale hub",
         category: "mesh-control",
@@ -404,7 +256,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
         reload_hint: "systemctl restart headscale.service",
         max_bytes: 128 * 1024,
     },
-    ConfigFileSpec {
+    StaticConfigFileSpec {
         slug: "headscale-nginx",
         name: "Headscale HTTPS site",
         category: "edge",
@@ -419,7 +271,7 @@ pub(crate) const CONFIG_FILES: &[ConfigFileSpec] = &[
 ];
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct ConfigFileSpec {
+pub(crate) struct StaticConfigFileSpec {
     pub(crate) slug: &'static str,
     pub(crate) name: &'static str,
     pub(crate) category: &'static str,
@@ -429,6 +281,35 @@ pub(crate) struct ConfigFileSpec {
     pub(crate) validate_hint: &'static str,
     pub(crate) reload_hint: &'static str,
     pub(crate) max_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigFileSpec {
+    pub(crate) slug: String,
+    pub(crate) name: String,
+    pub(crate) category: String,
+    pub(crate) path: String,
+    pub(crate) syntax: String,
+    pub(crate) description: String,
+    pub(crate) validate_hint: String,
+    pub(crate) reload_hint: String,
+    pub(crate) max_bytes: usize,
+}
+
+impl From<StaticConfigFileSpec> for ConfigFileSpec {
+    fn from(spec: StaticConfigFileSpec) -> Self {
+        Self {
+            slug: spec.slug.to_string(),
+            name: spec.name.to_string(),
+            category: spec.category.to_string(),
+            path: spec.path.to_string(),
+            syntax: spec.syntax.to_string(),
+            description: spec.description.to_string(),
+            validate_hint: spec.validate_hint.to_string(),
+            reload_hint: spec.reload_hint.to_string(),
+            max_bytes: spec.max_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -448,27 +329,63 @@ pub(crate) struct ConfigWriteReport {
     pub(crate) backup_path: Option<String>,
 }
 
-pub(crate) fn config_file_by_slug(slug: &str) -> Option<ConfigFileSpec> {
-    CONFIG_FILES.iter().copied().find(|spec| spec.slug == slug)
+pub(crate) fn config_files() -> Vec<ConfigFileSpec> {
+    let mut specs = CONFIG_FILES
+        .iter()
+        .copied()
+        .map(ConfigFileSpec::from)
+        .collect::<Vec<_>>();
+    let existing_paths = specs
+        .iter()
+        .map(|spec| spec.path.clone())
+        .collect::<std::collections::HashSet<_>>();
+    if let Ok(modules) = crate::modules::registry() {
+        specs.extend(
+            modules
+                .into_iter()
+                .filter(|module| !existing_paths.contains(&module.config_path))
+                .map(|module| ConfigFileSpec {
+                    slug: format!("module-{}", module.id),
+                    name: module.name,
+                    category: module.kind,
+                    syntax: config_syntax(&module.config_path).to_string(),
+                    description: format!("{} module runtime configuration.", module.role),
+                    validate_hint: "Run the module-specific validation before restart.".to_string(),
+                    reload_hint: format!("systemctl restart {}", module.service),
+                    path: module.config_path,
+                    max_bytes: 256 * 1024,
+                }),
+        );
+    }
+    specs
 }
 
-pub(crate) fn read_config_file(slug: &str) -> ConfigFileSnapshot {
-    let Some(spec) = config_file_by_slug(slug) else {
-        return ConfigFileSnapshot {
-            spec: CONFIG_FILES[0],
-            exists: false,
-            bytes: 0,
-            content: String::new(),
-            status: "unknown config target".to_string(),
-        };
-    };
+pub(crate) fn config_file_by_slug(slug: &str) -> Option<ConfigFileSpec> {
+    config_files().into_iter().find(|spec| spec.slug == slug)
+}
 
-    read_config_spec(spec)
+fn config_syntax(path: &str) -> &'static str {
+    match Path::new(path).extension().and_then(|value| value.to_str()) {
+        Some("json") => "json",
+        Some("yaml" | "yml") => "yaml",
+        Some("toml") => "toml",
+        Some("env") => "dotenv",
+        _ => "text",
+    }
 }
 
 pub(crate) fn read_config_spec(spec: ConfigFileSpec) -> ConfigFileSnapshot {
-    let path = Path::new(spec.path);
-    let Ok(metadata) = fs::metadata(path) else {
+    let path = Path::new(&spec.path);
+    if path_has_symlink_component(path) {
+        return ConfigFileSnapshot {
+            spec,
+            exists: true,
+            bytes: 0,
+            content: String::new(),
+            status: "symlinked config paths are not allowed".to_string(),
+        };
+    }
+    let Ok(metadata) = fs::symlink_metadata(path) else {
         return ConfigFileSnapshot {
             spec,
             exists: false,
@@ -489,15 +406,16 @@ pub(crate) fn read_config_spec(spec: ConfigFileSpec) -> ConfigFileSnapshot {
     }
 
     if metadata.len() > spec.max_bytes as u64 {
+        let status = format!(
+            "file is larger than the {} byte editor limit",
+            spec.max_bytes
+        );
         return ConfigFileSnapshot {
             spec,
             exists: true,
             bytes: metadata.len(),
             content: String::new(),
-            status: format!(
-                "file is larger than the {} byte editor limit",
-                spec.max_bytes
-            ),
+            status,
         };
     }
 
@@ -522,7 +440,7 @@ pub(crate) fn read_config_spec(spec: ConfigFileSpec) -> ConfigFileSnapshot {
 pub(crate) fn write_config_file(slug: &str, content: &str) -> ConfigWriteReport {
     let Some(spec) = config_file_by_slug(slug) else {
         return ConfigWriteReport {
-            spec: CONFIG_FILES[0],
+            spec: CONFIG_FILES[0].into(),
             success: false,
             message: "unknown config target".to_string(),
             backup_path: None,
@@ -530,13 +448,14 @@ pub(crate) fn write_config_file(slug: &str, content: &str) -> ConfigWriteReport 
     };
 
     if content.len() > spec.max_bytes {
+        let message = format!(
+            "content is larger than the {} byte editor limit",
+            spec.max_bytes
+        );
         return ConfigWriteReport {
             spec,
             success: false,
-            message: format!(
-                "content is larger than the {} byte editor limit",
-                spec.max_bytes
-            ),
+            message,
             backup_path: None,
         };
     }
@@ -550,7 +469,15 @@ pub(crate) fn write_config_file(slug: &str, content: &str) -> ConfigWriteReport 
         };
     }
 
-    let path = Path::new(spec.path);
+    let path = Path::new(&spec.path);
+    if path_has_symlink_component(path) {
+        return ConfigWriteReport {
+            spec,
+            success: false,
+            message: "symlinked config paths are not allowed".to_string(),
+            backup_path: None,
+        };
+    }
     let backup_path = if path.exists() {
         match backup_config_file(path) {
             Ok(value) => Some(value),
@@ -581,6 +508,16 @@ pub(crate) fn write_config_file(slug: &str, content: &str) -> ConfigWriteReport 
             backup_path,
         },
     }
+}
+
+fn path_has_symlink_component(path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|component| !component.as_os_str().is_empty())
+        .any(|component| {
+            fs::symlink_metadata(component)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        })
 }
 
 fn backup_config_file(path: &Path) -> std::io::Result<String> {
@@ -725,21 +662,6 @@ pub(crate) struct UninstallPlan {
     pub(crate) commands: Vec<&'static str>,
 }
 
-impl UninstallPlan {
-    pub(crate) fn shell_script(&self) -> String {
-        std::iter::once("set -eu".to_string())
-            .chain(
-                self.commands
-                    .iter()
-                    .copied()
-                    .filter(|line| !line.trim_start().starts_with('#'))
-                    .map(str::to_string),
-            )
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
 pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
     match mode {
         "panel" => Some(UninstallPlan {
@@ -750,8 +672,8 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
                 "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path || true",
                 "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
-                "rm -rf /etc/infiproxy",
+                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
+                "rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d",
                 "rm -rf /var/lib/infiproxy /var/lib/infiproxy-maintenance",
                 "userdel infiproxy 2>/dev/null || true",
                 "groupdel infiproxy 2>/dev/null || true",
@@ -762,19 +684,20 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
             warning: "Removes panel-managed services, panel state, core binaries/configs/logs and the source checkout. It does not remove system packages such as nginx, git or Rust.",
             commands: vec![
                 "# Review paths before running as root.",
+                "for manifest in /etc/infiproxy-modules.d/*.module; do [ -f \"$manifest\" ] || continue; service=$(/usr/local/libexec/infiproxy-module-manifest read \"$manifest\" --root-owned | cut -d'|' -f11); systemctl disable --now \"$service\" || true; rm -f \"/etc/systemd/system/$service\"; done",
                 "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
                 "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service",
                 "rm -f /etc/systemd/system/headscale.service",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
-                "rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance",
+                "rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
+                "rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance",
                 "rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /opt/infiproxy/modules /var/log/infiproxy-cores",
                 "rm -rf /etc/headscale /var/lib/headscale",
                 "rm -rf /opt/infiproxy/source",
                 "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
                 "rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf",
-                "nginx -t && systemctl reload nginx.service || true",
+                "if nginx -t; then systemctl reload nginx.service || true; fi",
                 "userdel infiproxy 2>/dev/null || true",
                 "groupdel infiproxy 2>/dev/null || true",
             ],
@@ -784,19 +707,20 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
             warning: "Attempts to return the host to a pre-Infiproxy footprint by removing panel services, panel state, proxy cores, core configs/logs, nginx site files, source checkout, manager TUI and the service user. It does not purge OS packages because the installer cannot know which packages existed before Infiproxy.",
             commands: vec![
                 "# Review paths before running as root.",
+                "for manifest in /etc/infiproxy-modules.d/*.module; do [ -f \"$manifest\" ] || continue; service=$(/usr/local/libexec/infiproxy-module-manifest read \"$manifest\" --root-owned | cut -d'|' -f11); systemctl disable --now \"$service\" || true; rm -f \"/etc/systemd/system/$service\"; done",
                 "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
                 "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service",
                 "rm -f /etc/systemd/system/headscale.service",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
-                "rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance",
+                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
+                "rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance",
                 "rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores",
                 "rm -rf /etc/headscale /var/lib/headscale",
                 "rm -f /usr/local/bin/headscale",
                 "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
                 "rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf",
-                "nginx -t && systemctl reload nginx.service || true",
+                "if nginx -t; then systemctl reload nginx.service || true; fi",
                 "userdel infiproxy 2>/dev/null || true",
                 "groupdel infiproxy 2>/dev/null || true",
             ],
@@ -987,31 +911,6 @@ fn systemctl_state(unit: &str) -> ServiceStatus {
     }
 }
 
-pub(crate) fn service_state_badge(state: &ServiceState) -> Markup {
-    let (class, label) = match state.status {
-        ServiceStatus::Active => ("ok", "active"),
-        ServiceStatus::Inactive => ("neutral", "inactive"),
-        ServiceStatus::Failed => ("off", "failed"),
-        ServiceStatus::Unknown => ("off", "unknown"),
-    };
-
-    html! {
-        span class=(format!("badge {class}")) { (label) }
-        br;
-        small { (&state.unit) }
-    }
-}
-
-pub(crate) fn meter_bar(percent: Option<u8>) -> Markup {
-    let value = percent.unwrap_or(0);
-
-    html! {
-        div class="meter" title=(percent.map(|value| format!("{value}%")).unwrap_or_else(|| "unknown".to_string())) {
-            div class="meter-fill" style=(format!("width: {value}%")) {}
-        }
-    }
-}
-
 pub(crate) fn run_system_action(target: SystemTarget) -> SystemActionReport {
     let steps = match target.action {
         SystemActionKind::RestartPanel => {
@@ -1138,67 +1037,6 @@ pub(crate) fn run_command_owned(program: &str, args: &[String]) -> CommandStep {
             success: false,
             stdout: String::new(),
             stderr: err.to_string(),
-        },
-    }
-}
-
-pub(crate) async fn run_danger_shell(command: &str) -> CommandStep {
-    let command = command.trim();
-
-    if command.is_empty() {
-        return CommandStep {
-            command: "sh -lc <empty>".to_string(),
-            success: false,
-            stdout: String::new(),
-            stderr: "command is empty".to_string(),
-        };
-    }
-
-    if command.chars().count() > DANGER_SHELL_MAX_CHARS {
-        return CommandStep {
-            command: "sh -lc <too-long>".to_string(),
-            success: false,
-            stdout: String::new(),
-            stderr: format!("command is longer than {DANGER_SHELL_MAX_CHARS} characters"),
-        };
-    }
-
-    let display = format!("sh -lc {command}");
-    let output = TokioCommand::new("sh")
-        .args(["-lc", command])
-        .current_dir("/")
-        .env_clear()
-        .env(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        )
-        .env("LANG", "C.UTF-8")
-        .kill_on_drop(true)
-        .output();
-
-    match time::timeout(
-        std::time::Duration::from_secs(DANGER_SHELL_TIMEOUT_SECS),
-        output,
-    )
-    .await
-    {
-        Ok(Ok(output)) => CommandStep {
-            command: display,
-            success: output.status.success(),
-            stdout: trim_command_output(&String::from_utf8_lossy(&output.stdout)),
-            stderr: trim_command_output(&String::from_utf8_lossy(&output.stderr)),
-        },
-        Ok(Err(err)) => CommandStep {
-            command: display,
-            success: false,
-            stdout: String::new(),
-            stderr: err.to_string(),
-        },
-        Err(_) => CommandStep {
-            command: display,
-            success: false,
-            stdout: String::new(),
-            stderr: format!("command timed out after {DANGER_SHELL_TIMEOUT_SECS}s"),
         },
     }
 }

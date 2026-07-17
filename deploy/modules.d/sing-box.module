@@ -1,0 +1,14 @@
+id=sing-box
+name=sing-box
+kind=proxy core
+role=SS2022, ShadowTLS, AnyTLS and compatibility
+repo=SagerNet/sing-box
+upstream=release
+ref=
+driver=release
+root=cores
+binary=sing-box
+service=infiproxy-sing-box.service
+config=/etc/infiproxy-cores/sing-box/config.json
+asset_amd64=sing-box-{version}-linux-amd64.tar.gz
+asset_arm64=sing-box-{version}-linux-arm64.tar.gz

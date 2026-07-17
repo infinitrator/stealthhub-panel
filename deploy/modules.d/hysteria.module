@@ -1,0 +1,14 @@
+id=hysteria
+name=Hysteria
+kind=proxy core
+role=Hysteria2 high-loss network fallback
+repo=apernet/hysteria
+upstream=release
+ref=
+driver=release
+root=cores
+binary=hysteria
+service=infiproxy-hysteria.service
+config=/etc/infiproxy-cores/hysteria/config.yaml
+asset_amd64=hysteria-linux-amd64
+asset_arm64=hysteria-linux-arm64

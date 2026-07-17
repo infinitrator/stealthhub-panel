@@ -11,12 +11,14 @@ mod modules;
 mod ops;
 mod ui;
 mod update;
+mod views;
 
+pub(crate) use crate::views::components::{admin_bar, csrf_field};
 use crate::{
     health::{health, readiness},
     ip::ip_check_page,
     ops::*,
-    ui::{layout, APP_NAME},
+    ui::APP_NAME,
 };
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -27,14 +29,13 @@ use axum::{
     extract::{connect_info::ConnectInfo, Form, Path, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{Duration, Utc};
 use cookie::{time::Duration as CookieDuration, Cookie, SameSite};
-use maud::{html, Markup};
 use rand_core::{OsRng, RngCore};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -47,8 +48,8 @@ use std::{
 };
 use stealthhub_core::{
     mihomo::generate_mihomo_yaml,
-    models::{ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole, SubscriptionUser},
-    rules::{routing_rule_payload_yaml, ROUTING_TARGETS},
+    models::{ProtocolConfig, ProtocolProfile, SubscriptionUser},
+    rules::routing_rule_payload_yaml,
     storage::{
         admin_count, create_admin, create_admin_session, create_user, delete_admin_session,
         delete_expired_admin_sessions, delete_user, ensure_default_protocol_profiles,
@@ -79,7 +80,6 @@ const LOGIN_RATE_LIMIT_MAX_KEYS: usize = 2048;
 pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
     cookie_secure: bool,
-    danger_shell_enabled: bool,
     login_limiter: Arc<LoginRateLimiter>,
 }
 
@@ -117,6 +117,13 @@ struct ModuleAutoUpdateForm {
     csrf_token: String,
     #[serde(default)]
     enabled: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModuleRemovalForm {
+    #[serde(default)]
+    csrf_token: String,
+    confirm: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,33 +171,10 @@ struct SystemActionForm {
 }
 
 #[derive(Debug, Deserialize)]
-struct ConsoleCommandForm {
-    #[serde(default)]
-    csrf_token: String,
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct DangerShellForm {
-    #[serde(default)]
-    csrf_token: String,
-    command: String,
-    confirm: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct UninstallPreviewForm {
     #[serde(default)]
     csrf_token: String,
     mode: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct UninstallExecuteForm {
-    #[serde(default)]
-    csrf_token: String,
-    mode: String,
-    confirm: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,21 +235,9 @@ async fn main() -> anyhow::Result<()> {
     let enable_demo_user = env_value("INFIPROXY_ENABLE_DEMO_USER", "STEALTHHUB_ENABLE_DEMO_USER")
         .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(false);
-    let danger_shell_enabled = env_value(
-        "INFIPROXY_ENABLE_DANGER_SHELL",
-        "STEALTHHUB_ENABLE_DANGER_SHELL",
-    )
-    .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    .unwrap_or(true);
-
     if !cookie_secure && !bind.starts_with("127.0.0.1:") && !bind.starts_with("localhost:") {
         tracing::warn!(
             "admin session cookie Secure flag is disabled; set INFIPROXY_COOKIE_SECURE=true behind HTTPS"
-        );
-    }
-    if danger_shell_enabled {
-        tracing::warn!(
-            "danger shell is enabled; keep the panel behind HTTPS, strong auth and trusted network access"
         );
     }
 
@@ -284,7 +256,6 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool,
         cookie_secure,
-        danger_shell_enabled,
         login_limiter: Arc::new(LoginRateLimiter::default()),
     };
 
@@ -316,6 +287,14 @@ async fn main() -> anyhow::Result<()> {
             "/admin/modules/{module_id}/auto",
             post(module_auto_update_action),
         )
+        .route(
+            "/admin/modules/{module_id}/remove",
+            post(remove_module_action),
+        )
+        .route(
+            "/admin/modules/{module_id}/install",
+            post(register_module_action),
+        )
         .route("/admin/protocols", get(protocols_page))
         .route(
             "/admin/protocols/{name}/update",
@@ -327,16 +306,10 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/system", get(system_page))
         .route("/admin/system/action", post(system_action))
-        .route("/admin/system/console", post(system_console_action))
-        .route("/admin/system/shell", post(danger_shell_action))
         .route("/admin/configs", get(configs_page).post(config_save_action))
         .route(
             "/admin/system/uninstall-preview",
             post(uninstall_preview_action),
-        )
-        .route(
-            "/admin/system/uninstall-execute",
-            post(uninstall_execute_action),
         )
         .route("/admin/cores", get(cores_page))
         .route("/admin/ip", get(ip_check_page))
@@ -436,22 +409,7 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
 async fn subscription_page(State(state): State<AppState>, Path(token): Path<String>) -> Response {
     let user = match get_user_by_token(&state.pool, &token).await {
         Ok(value) => value,
-        Err(_) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Html(
-                    layout(
-                        "Subscription",
-                        html! {
-                            h1 { "Subscription" }
-                            div class="notice error" { "Invalid subscription token." }
-                        },
-                    )
-                    .into_string(),
-                ),
-            )
-                .into_response()
-        }
+        Err(_) => return views::subscription::render_invalid(),
     };
 
     let settings = match load_panel_settings(&state.pool).await {
@@ -463,78 +421,14 @@ async fn subscription_page(State(state): State<AppState>, Path(token): Path<Stri
     let import_url = mihomo_import_url(&settings.panel_name, &user.username, &yaml_url);
     let block_reason = subscription_block_reason(&user);
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, max-age=0"),
-    );
-
-    (
-        headers,
-        Html(
-            layout(
-                "Subscription",
-                html! {
-                    h1 { "Subscription" }
-
-                    section {
-                        h2 { "Account" }
-                        dl class="details" {
-                            dt { "User" }
-                            dd { code { (&user.username) } }
-                            dt { "Status" }
-                            dd {
-                                @if let Some(reason) = block_reason {
-                                    span class="badge off" { (reason) }
-                                } @else {
-                                    span class="badge ok" { "active" }
-                                }
-                            }
-                            dt { "Traffic" }
-                            dd { (format_user_traffic(&user)) }
-                            dt { "Expires" }
-                            dd { (format_user_expiry(&user)) }
-                        }
-                    }
-
-                    section {
-                        h2 { "Client import" }
-                        @if block_reason.is_none() {
-                            div class="config-list" {
-                                div class="config-row" {
-                                    div class="config-row-head" {
-                                        h3 { "Mihomo / Clash" }
-                                        div class="config-row-meta" {
-                                            a class="button compact" href=(&import_url) { "Import" }
-                                            a class="button compact secondary" href=(&yaml_url) { "Download YAML" }
-                                        }
-                                    }
-                                    div class="config-form wide" {
-                                        label class="full-span" {
-                                            span { "Subscription URL" }
-                                            input type="text" readonly value=(&yaml_url);
-                                            small { "Use this URL in Mihomo-compatible clients when one-click import is unavailable." }
-                                        }
-                                        label class="full-span" {
-                                            span { "One-click import URL" }
-                                            input type="text" readonly value=(&import_url);
-                                            small { "Uses the standard Clash import scheme and points back to the YAML subscription." }
-                                        }
-                                    }
-                                }
-                            }
-                        } @else {
-                            div class="notice error" {
-                                "Subscription is not available for import until the account state is fixed."
-                            }
-                        }
-                    }
-                },
-            )
-            .into_string(),
-        ),
+    views::subscription::render(
+        &user,
+        block_reason,
+        &format_user_traffic(&user),
+        &format_user_expiry(&user),
+        &yaml_url,
+        &import_url,
     )
-        .into_response()
 }
 
 async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -570,33 +464,7 @@ async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) 
 }
 
 async fn index() -> impl IntoResponse {
-    Html(
-        layout(
-            APP_NAME,
-            html! {
-                h1 { (APP_NAME) }
-                div class="cards" {
-                    a class="card" href="/admin" {
-                        h2 { "Dashboard" }
-                        p { "Admin session, storage, subscription status." }
-                    }
-                    a class="card" href="/admin/users" {
-                        h2 { "Users" }
-                        p { "UUID, subscription token, traffic limit." }
-                    }
-                    a class="card" href="/admin/protocols" {
-                        h2 { "Protocols" }
-                        p { "Proxy profile parameters for Mihomo YAML." }
-                    }
-                    a class="card" href="/admin/routing" {
-                        h2 { "Routing" }
-                        p { "Rule providers imported by the subscription." }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
+    views::public::render_home()
 }
 
 async fn setup_admin_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -605,37 +473,7 @@ async fn setup_admin_page(State(state): State<AppState>, headers: HeaderMap) -> 
     }
 
     match admin_count(&state.pool).await {
-        Ok(0) => Html(
-            layout(
-                "Initial admin setup",
-                html! {
-                    h1 { "Initial admin setup" }
-                    div class="notice" {
-                        "Create the first local administrator account. This page disappears after setup."
-                    }
-                    section {
-                        h2 { "Admin account" }
-                        form method="post" action="/admin/setup" class="form" {
-                            label {
-                                span { "Username" }
-                                input type="text" name="username" minlength="3" maxlength="64" required autocomplete="username";
-                            }
-                            label {
-                                span { "Password" }
-                                input type="password" name="password" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
-                            }
-                            label {
-                                span { "Confirm password" }
-                                input type="password" name="password_confirm" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
-                            }
-                            button type="submit" { "Create admin" }
-                        }
-                    }
-                },
-            )
-            .into_string(),
-        )
-        .into_response(),
+        Ok(0) => views::public::render_setup(),
         Ok(_) => Redirect::to("/admin/login").into_response(),
         Err(err) => html_error_response_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -734,30 +572,7 @@ async fn login_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         return Redirect::to("/admin").into_response();
     }
 
-    Html(
-        layout(
-            "Admin login",
-            html! {
-                h1 { "Admin login" }
-                section {
-                    h2 { "Sign in" }
-                    form method="post" action="/admin/login" class="form" {
-                        label {
-                            span { "Username" }
-                            input type="text" name="username" required autocomplete="username";
-                        }
-                        label {
-                            span { "Password" }
-                            input type="password" name="password" required autocomplete="current-password";
-                        }
-                        button type="submit" { "Login" }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::public::render_login()
 }
 
 async fn login_action(
@@ -844,74 +659,7 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         Err(response) => return response,
     };
 
-    Html(
-        layout(
-            "Dashboard",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Dashboard" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Admin" }
-                        strong { "protected" }
-                    }
-                    div class="metric" {
-                        span { "Storage" }
-                        strong { "SQLite" }
-                    }
-                    div class="metric" {
-                        span { "Client" }
-                        strong { "Mihomo YAML" }
-                    }
-                    div class="metric" {
-                        span { "Mode" }
-                        strong { "single-node" }
-                    }
-                }
-
-                div class="grid" {
-                    section {
-                        h2 { "Users" }
-                        p { "UUID, subscription token, enable flag, traffic limit." }
-                        a class="button" href="/admin/users" { "Open Users" }
-                    }
-
-                    section {
-                        h2 { "Settings" }
-                        p { "Panel name, subscription host, node host." }
-                        a class="button" href="/admin/settings" { "Open Settings" }
-                    }
-
-                    section {
-                        h2 { "Protocols" }
-                        p { "Enabled profiles, endpoint, SNI, transport path, secret names." }
-                        a class="button" href="/admin/protocols" { "Open Protocols" }
-                    }
-
-                    section {
-                        h2 { "Routing" }
-                        p { "Mihomo rule providers, RULE-SET targets, classical payload." }
-                        a class="button" href="/admin/routing" { "Open Routing" }
-                    }
-
-                    section {
-                        h2 { "System" }
-                        p { "Bind address, SQLite readiness, cookie mode, service paths." }
-                        a class="button" href="/admin/system" { "Open System" }
-                    }
-
-                    section {
-                        h2 { "Modules" }
-                        p { "Independent versions, update policies, services and configuration paths." }
-                        a class="button" href="/admin/cores" { "Open Modules" }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::dashboard::render(&auth)
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -945,108 +693,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
         }
     };
 
-    Html(
-        layout(
-            "Settings",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Settings" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Panel name" }
-                        strong { (&settings.panel_name) }
-                    }
-                    div class="metric" {
-                        span { "Subscription host" }
-                        strong { (&settings.subscription_domain) }
-                    }
-                    div class="metric" {
-                        span { "Node host" }
-                        strong { (&settings.node_domain) }
-                    }
-                    div class="metric" {
-                        span { "Config source" }
-                        strong { "SQLite settings" }
-                    }
-                    div class="metric" {
-                        span { "Panel update" }
-                        strong { (update::status_label(&update_status)) }
-                    }
-                }
-
-                section {
-                    h2 { "Global parameters" }
-                    form method="post" action="/admin/settings" class="config-form" {
-                        (csrf_field(&auth.csrf_token))
-                        label {
-                            span { "Panel name" }
-                            input type="text" name="panel_name" value=(&settings.panel_name) minlength="2" maxlength="80" required;
-                            small { "Displayed in generated metadata and admin screens." }
-                        }
-                        label {
-                            span { "Subscription host" }
-                            input type="text" name="subscription_domain" value=(&settings.subscription_domain) required;
-                            small { "Public HTTPS host used by clients to fetch subscription and rule providers." }
-                        }
-                        label {
-                            span { "Node host" }
-                            input type="text" name="node_domain" value=(&settings.node_domain) required;
-                            small { "Public host that Mihomo clients use to connect to proxy profiles." }
-                        }
-                        label {
-                            span { "Panel auto-update" }
-                            select name="panel_update_enabled" disabled[!is_owner_admin(&auth)] {
-                                option value="true" selected[update_status.enabled] { "Enabled" }
-                                option value="false" selected[!update_status.enabled] { "Disabled" }
-                            }
-                            small { "Owner-only. GitHub is checked every two hours; a pending update is applied in the maintenance window." }
-                        }
-                        label {
-                            span { "Maintenance time (server time)" }
-                            input type="time" name="panel_update_time" value=(&update_status.schedule_time) step="60" required disabled[!is_owner_admin(&auth)];
-                            small { "Owner-only. Default: 05:00. Automatic execution starts in the first 15-minute scheduler window at or after this time." }
-                        }
-                        label {
-                            span { "GitHub repository" }
-                            input type="text" value=(&update_status.repo) disabled;
-                            small { "Pinned by the root-owned bootstrap configuration." }
-                        }
-                        label {
-                            span { "Git reference" }
-                            input type="text" value=(&update_status.git_ref) disabled;
-                            small { "Change the deployment channel by rerunning bootstrap with --ref." }
-                        }
-                        div class="full-span" {
-                            button type="submit" { "Save Settings" }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Generated client endpoints" }
-                    dl class="details" {
-                        dt { "Subscription template" }
-                        dd { code { (format!("https://{}/sub/{{token}}/mihomo.yaml", settings.subscription_domain)) } }
-                        dt { "Rule provider template" }
-                        dd { code { (format!("https://{}/rules/{{name}}", settings.subscription_domain)) } }
-                        dt { "Proxy endpoint host" }
-                        dd { code { (&settings.node_domain) } }
-                        dt { "Update checker" }
-                        dd { code { (format!("{} / checked {}", update_status.status, update_status.checked_at)) } }
-                        dt { "Current commit" }
-                        dd { code { (update::short_sha(&update_status.current_sha)) } }
-                        dt { "Latest commit" }
-                        dd { code { (update::short_sha(&update_status.latest_sha)) } }
-                        dt { "Planned update" }
-                        dd { code { (&update_status.planned_for) } }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::settings::render(&auth, &settings, &update_status)
 }
 
 async fn update_settings_action(
@@ -1208,150 +855,20 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
             );
         }
     };
-    let installed_count = statuses.iter().filter(|status| status.installed).count();
-    let updates_count = statuses
-        .iter()
-        .filter(|status| status.update_available)
-        .count();
-    let auto_count = statuses.iter().filter(|status| status.auto_update).count();
+    let available = match modules::available() {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Module catalog unavailable",
+                err.to_string(),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
 
-    Html(
-        layout(
-            "Modules",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Modules" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Installed" }
-                        strong { (installed_count) "/" (statuses.len()) }
-                    }
-                    div class="metric" {
-                        span { "Updates available" }
-                        strong { (updates_count) }
-                    }
-                    div class="metric" {
-                        span { "Automatic updates" }
-                        strong { (auto_count) "/" (statuses.len()) }
-                    }
-                    div class="metric" {
-                        span { "Upstream check" }
-                        strong { "every 2 hours" }
-                    }
-                }
-
-                section {
-                    div class="section-heading" {
-                        div {
-                            h2 { "Runtime registry" }
-                            p { "Each runtime keeps its own binary, configuration, systemd state and update history." }
-                        }
-                        @if is_owner_admin(&auth) {
-                            form method="post" action="/admin/modules/check" class="inline-form" {
-                                (csrf_field(&auth.csrf_token))
-                                button type="submit" { "Check all" }
-                            }
-                        }
-                    }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Module" }
-                                    th { "Role" }
-                                    th { "Installed" }
-                                    th { "Latest" }
-                                    th { "State" }
-                                    th { "Automatic" }
-                                    th { "Actions" }
-                                }
-                            }
-                            tbody {
-                                @for status in &statuses {
-                                    tr {
-                                        td {
-                                            strong { (status.spec.name) }
-                                            br;
-                                            small { (status.spec.kind) " / " (status.spec.repo) }
-                                        }
-                                        td {
-                                            (status.spec.role)
-                                            br;
-                                            small { (status.spec.service) }
-                                            br;
-                                            small { (status.spec.config_path) }
-                                        }
-                                        td { code { (modules::short_version(&status.installed_version)) } }
-                                        td { code { (modules::short_version(&status.latest_version)) } }
-                                        td {
-                                            span class=(format!("badge {}", modules::status_class(status))) {
-                                                (&status.status)
-                                            }
-                                            br;
-                                            small { "checked " (&status.checked_at) }
-                                        }
-                                        td {
-                                            @if is_owner_admin(&auth) {
-                                                form method="post" action=(format!("/admin/modules/{}/auto", status.spec.id)) class="inline-form" {
-                                                    (csrf_field(&auth.csrf_token))
-                                                    select name="enabled" aria-label=(format!("Automatic updates for {}", status.spec.name)) {
-                                                        option value="true" selected[status.auto_update] { "On" }
-                                                        option value="false" selected[!status.auto_update] { "Off" }
-                                                    }
-                                                    button class="compact" type="submit" { "Save" }
-                                                }
-                                            } @else if status.auto_update {
-                                                span class="badge ok" { "on" }
-                                            } @else {
-                                                span class="badge neutral" { "off" }
-                                            }
-                                        }
-                                        td class="module-actions" {
-                                            @if is_owner_admin(&auth) {
-                                                form method="post" action=(format!("/admin/modules/{}/check", status.spec.id)) class="inline-form" {
-                                                    (csrf_field(&auth.csrf_token))
-                                                    button class="compact secondary" type="submit" { "Check" }
-                                                }
-                                                @if status.latest_version != "unknown" && (!status.installed || status.update_available) {
-                                                    form method="post" action=(format!("/admin/modules/{}/update", status.spec.id)) class="inline-form" {
-                                                        (csrf_field(&auth.csrf_token))
-                                                        button class="compact" type="submit" {
-                                                            @if status.installed { "Update" } @else { "Install latest" }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Module contract" }
-                    dl class="details" {
-                        dt { "Proxy runtimes" }
-                        dd { code { "/opt/infiproxy/cores/{core}/{version}" } }
-                        dt { "Headscale runtime" }
-                        dd { code { "/opt/infiproxy/modules/headscale/{version}" } }
-                        dt { "Active version" }
-                        dd { code { "/opt/infiproxy/cores/{core}/current" } }
-                        dt { "Configs" }
-                        dd { code { "/etc/infiproxy-cores/{core} and /etc/headscale" } }
-                        dt { "Verification" }
-                        dd { "GitHub release digest or official checksum sidecar, followed by a binary smoke test." }
-                        dt { "Activation" }
-                        dd { "Atomic current symlink switch; active/enabled service state is restored after update." }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::modules::render(&auth, &statuses, &available)
 }
 
 async fn check_all_modules_action(
@@ -1397,8 +914,18 @@ async fn check_module_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    if modules::find(&module_id).is_none() {
-        return (StatusCode::NOT_FOUND, "unknown module\n").into_response();
+    match modules::find(&module_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown module\n").into_response(),
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Module registry unavailable",
+                err.to_string(),
+                "/admin/cores",
+                "Back to Modules",
+            );
+        }
     }
     if let Err(err) = modules::refresh_one(&state.pool, &module_id).await {
         return html_error_response_with_back(
@@ -1428,10 +955,20 @@ async fn update_module_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    let Some(spec) = modules::find(&module_id) else {
-        return (StatusCode::NOT_FOUND, "unknown module\n").into_response();
+    let spec = match modules::find(&module_id) {
+        Ok(Some(spec)) => spec,
+        Ok(None) => return (StatusCode::NOT_FOUND, "unknown module\n").into_response(),
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Module registry unavailable",
+                err.to_string(),
+                "/admin/cores",
+                "Back to Modules",
+            );
+        }
     };
-    if let Err(err) = modules::request_update(spec.id) {
+    if let Err(err) = modules::request_update(&spec.id) {
         return html_error_response_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Module update not requested",
@@ -1474,6 +1011,72 @@ async fn module_auto_update_action(
     Redirect::to("/admin/cores").into_response()
 }
 
+async fn register_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+
+    if let Err(err) = modules::request_register(&module_id) {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Module registration rejected",
+            err.to_string(),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
+}
+
+async fn remove_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<ModuleRemovalForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if form.confirm.trim() != module_id {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Module removal confirmation failed",
+            format!("Type exactly: {module_id}"),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    if let Err(err) = modules::request_remove(&module_id) {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Module removal rejected",
+            err.to_string(),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
+}
+
 async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
@@ -1493,79 +1096,7 @@ async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         }
     };
 
-    Html(
-        layout(
-            "Routing",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Routing" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Rule sets" }
-                        strong { (rule_sets.len()) }
-                    }
-                    div class="metric" {
-                        span { "Enabled" }
-                        strong { (rule_sets.iter().filter(|rule_set| rule_set.enabled).count()) }
-                    }
-                    div class="metric" {
-                        span { "Provider type" }
-                        strong { "http / classical / yaml" }
-                    }
-                    div class="metric" {
-                        span { "Import" }
-                        strong { "RULE-SET" }
-                    }
-                }
-
-                section {
-                    h2 { "Mihomo rule sets" }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Name" }
-                                    th { "Target" }
-                                    th { "Provider URL" }
-                                    th { "Rules" }
-                                    th { "State" }
-                                }
-                            }
-                            tbody {
-                                @for rule_set in &rule_sets {
-                                    tr {
-                                        td { strong { (&rule_set.title) } br; code { (&rule_set.slug) } }
-                                        td { code { (&rule_set.target) } }
-                                        td { code { (format!("/rules/{}.yaml", rule_set.slug)) } }
-                                        td { (rule_set.payload.lines().filter(|line| !line.trim().is_empty()).count()) }
-                                        td {
-                                            @if rule_set.enabled {
-                                                span class="badge ok" { "enabled" }
-                                            } @else {
-                                                span class="badge off" { "disabled" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Rule parameters" }
-                    div class="config-list" {
-                        @for rule_set in &rule_sets {
-                            (routing_rule_editor(rule_set, &auth))
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::routing::render(&auth, &rule_sets)
 }
 
 async fn update_routing_rule_action(
@@ -1599,383 +1130,18 @@ async fn update_routing_rule_action(
     }
 }
 
-fn routing_rule_editor(
-    rule_set: &stealthhub_core::rules::RoutingRuleSet,
-    auth: &AuthenticatedAdmin,
-) -> Markup {
-    html! {
-        section class="config-row" {
-            div class="config-row-head" {
-                h3 { (&rule_set.title) }
-                div class="config-row-meta" {
-                    span class=(format!("badge {}", if rule_set.enabled { "ok" } else { "off" })) {
-                        @if rule_set.enabled { "enabled" } @else { "disabled" }
-                    }
-                    span class="badge neutral" { (&rule_set.target) }
-                    code { (format!("/rules/{}.yaml", rule_set.slug)) }
-                }
-            }
-            form method="post" action="/admin/routing" class="config-form wide" {
-                (csrf_field(&auth.csrf_token))
-                input type="hidden" name="slug" value=(&rule_set.slug);
-                label class="switch-field" {
-                    input type="checkbox" name="enabled" checked[rule_set.enabled];
-                    span class="switch-ui" {}
-                    span {
-                        strong { "Enabled" }
-                        small { "Include this rule provider and RULE-SET line in generated Mihomo YAML." }
-                    }
-                }
-                label {
-                    span { "Target group" }
-                    select name="target" {
-                        @for target in ROUTING_TARGETS {
-                            option value=(target) selected[*target == rule_set.target] { (target) }
-                        }
-                    }
-                    small { (&rule_set.effect) }
-                }
-                label class="full-span" {
-                    span { "Classical payload" }
-                    textarea name="payload" rows="10" spellcheck="false" { (&rule_set.payload) }
-                    small { "One Mihomo classical rule per line, for example DOMAIN-SUFFIX,example.com or IP-CIDR,10.0.0.0/8,no-resolve." }
-                }
-                button type="submit" { "Save rule set" }
-            }
-        }
-    }
-}
-
 async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
-
     let db_ready = sqlx::query_scalar::<_, i64>("SELECT 1")
         .fetch_one(&state.pool)
         .await
         .is_ok();
     let host = host_snapshot();
 
-    Html(
-        layout(
-            "System",
-            html! {
-                (admin_bar(&auth))
-                h1 { "System" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Deploy mode" }
-                        strong { (DEPLOYMENT_MODE) }
-                    }
-                    div class="metric" {
-                        span { "Version" }
-                        strong { (env!("CARGO_PKG_VERSION")) }
-                    }
-                    div class="metric" {
-                        span { "Database" }
-                        strong {
-                            @if db_ready {
-                                "ready"
-                            } @else {
-                                "not ready"
-                            }
-                        }
-                    }
-                    div class="metric" {
-                        span { "Cookie Secure" }
-                        strong {
-                            @if state.cookie_secure {
-                                "enabled"
-                            } @else {
-                                "disabled"
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Host overview" }
-                    div class="sys-grid" {
-                        div class="sys-card" {
-                            span { "OS" }
-                            strong { (&host.os_name) }
-                            small { "Kernel " (&host.kernel) }
-                        }
-                        div class="sys-card" {
-                            span { "Uptime" }
-                            strong { (&host.uptime) }
-                            small { "Load " (&host.load_average) }
-                        }
-                        div class="sys-card" {
-                            span { "Memory" }
-                            strong { (&host.memory_label) }
-                            (meter_bar(host.memory_used_percent))
-                        }
-                        div class="sys-card" {
-                            span { "Root disk" }
-                            strong { (&host.disk_label) }
-                            (meter_bar(host.disk_used_percent))
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Runtime contract" }
-                    dl class="details" {
-                        dt { "Binary" }
-                        dd { code { "/usr/local/bin/infiproxy" } }
-                        dt { "Environment" }
-                        dd { code { "/etc/infiproxy/infiproxy.env" } }
-                        dt { "Database" }
-                        dd { code { "/var/lib/infiproxy/infiproxy.sqlite" } }
-                        dt { "Service" }
-                        dd { code { "infiproxy.service" } }
-                    }
-                }
-
-                section {
-                    h2 { "VPS install path" }
-                    dl class="details" {
-                        dt { "Build" }
-                        dd { code { "cargo build --release -p stealthhub-panel" } }
-                        dt { "Install" }
-                        dd { code { "sudo bash deploy/install.sh" } }
-                        dt { "Reverse proxy" }
-                        dd { code { "deploy/nginx-infiproxy.conf.example" } }
-                        dt { "Core updates" }
-                        dd { code { "sudo deploy/cores/install-core.sh --core <name> --version <version> --url <url> --sha256 <sha256> --binary <binary>" } }
-                    }
-                }
-
-                section {
-                    h2 { "Service control" }
-                    div class="notice" {
-                        "Only built-in allowlisted commands are available here. Actions require OS-level permission for the panel service user."
-                    }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Target" }
-                                    th { "State" }
-                                    th { "Kind" }
-                                    th { "Unit" }
-                                    th { "Config" }
-                                    th { "Check" }
-                                    th { "Action" }
-                                }
-                            }
-                            tbody {
-                                @for target in SYSTEM_TARGETS {
-                                    @let state = service_state(target.units);
-                                    tr {
-                                        td { strong { (target.name) } }
-                                        td { (service_state_badge(&state)) }
-                                        td { span class="badge neutral" { (target.kind) } }
-                                        td { code { (target.unit) } }
-                                        td { code { (target.config) } }
-                                        td { code { (target.check) } }
-                                        td {
-                                            form method="post" action="/admin/system/action" class="inline-form" {
-                                                (csrf_field(&auth.csrf_token))
-                                                input type="hidden" name="target" value=(target.slug);
-                                                button class=(if target.slug == "panel" { "danger" } else { "" }) type="submit" { (target.action_label) }
-                                            }
-                                            br;
-                                            code { (target.reload) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Virtual console" }
-                    div class="notice" {
-                        "This is an operator console, not a raw shell. Commands are allowlisted, arguments are fixed in code, and output is capped."
-                    }
-                    form method="post" action="/admin/system/console" class="config-form wide" {
-                        (csrf_field(&auth.csrf_token))
-                        label {
-                            span { "Command" }
-                            select name="command" {
-                                @for command in CONSOLE_COMMANDS {
-                                    option value=(command.slug) { (command.name) }
-                                }
-                            }
-                        }
-                        label class="full-span" {
-                            span { "Available operations" }
-                            textarea readonly rows="6" {
-                                @for command in CONSOLE_COMMANDS {
-                                    (command.slug) " - " (command.description) "\n"
-                                }
-                            }
-                        }
-                        button type="submit" { "Run selected command" }
-                    }
-                }
-
-                section {
-                    h2 { "Configuration workspace" }
-                    div class="notice" {
-                        "Full editor moved to the Configs tab. This table stays as a quick operational map."
-                    }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Config" }
-                                    th { "Path" }
-                                    th { "Validation" }
-                                    th { "Reload" }
-                                }
-                            }
-                            tbody {
-                                tr {
-                                    td { "Panel environment" }
-                                    td { code { "/etc/infiproxy/infiproxy.env" } }
-                                    td { code { "systemctl show infiproxy.service" } }
-                                    td { code { "systemctl restart infiproxy.service" } }
-                                }
-                                tr {
-                                    td { "Nginx reverse proxy" }
-                                    td { code { "/etc/nginx/sites-available/infiproxy.conf" } }
-                                    td { code { "nginx -t" } }
-                                    td { code { "systemctl reload nginx.service" } }
-                                }
-                                tr {
-                                    td { "SSH daemon" }
-                                    td { code { "/etc/ssh/sshd_config" } }
-                                    td { code { "sshd -t" } }
-                                    td { code { "systemctl reload ssh.service" } }
-                                }
-                                tr {
-                                    td { "Proxy cores" }
-                                    td { code { "/etc/infiproxy-cores/{xray,sing-box,hysteria,tuic}" } }
-                                    td { code { "<core> check / --version" } }
-                                    td { code { "systemctl restart infiproxy-<core>.service" } }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Bare server bootstrap" }
-                    div class="runbook" {
-                        ol {
-                            li { "Install panel with " code { "deploy/bootstrap.sh" } " and bind it to localhost behind HTTPS." }
-                            li { "Create admin, set subscription domain, node domain and cookie secure mode." }
-                            li { "Install verified proxy cores into " code { "/opt/infiproxy/cores/{core}/{version}" } "." }
-                            li { "Activate " code { "current" } " symlinks and enable only the core services you use." }
-                            li { "Edit core configs under " code { "/etc/infiproxy-cores" } " and validate before reload." }
-                        }
-                    }
-                }
-
-                section class="danger-zone" {
-                    h2 { "Uninstall planner" }
-                    div class="notice error" {
-                        "Owner-only destructive area. Panel-only removes only the control plane. Full footprint also removes panel-managed cores, configs, logs and nginx site files."
-                    }
-                    div class="actions" {
-                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            input type="hidden" name="mode" value="panel";
-                            button type="submit" class="danger" { "Preview panel-only removal" }
-                        }
-                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            input type="hidden" name="mode" value="full";
-                            button type="submit" class="danger" { "Preview full footprint removal" }
-                        }
-                        form method="post" action="/admin/system/uninstall-preview" class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            input type="hidden" name="mode" value="factory";
-                            button type="submit" class="danger" { "Preview factory footprint cleanup" }
-                        }
-                    }
-                    @if is_owner_admin(&auth) {
-                        div class="notice error" {
-                            "Execution buttons run through the danger shell as the panel service user. On production systemd installs this usually cannot remove root-owned system files; use "
-                            code { "sudo infiproxy-manager" }
-                            " over SSH for guaranteed root cleanup."
-                        }
-                        form method="post" action="/admin/system/uninstall-execute" class="config-form wide" {
-                            (csrf_field(&auth.csrf_token))
-                            label {
-                                span { "Mode" }
-                                select name="mode" {
-                                    option value="panel" { "panel - remove panel only" }
-                                    option value="full" { "full - remove panel-managed footprint" }
-                                    option value="factory" { "factory - deepest Infiproxy cleanup" }
-                                }
-                                small { "Use Preview first. Web execution is limited by panel service permissions." }
-                            }
-                            label {
-                                span { "Confirmation" }
-                                input type="text" name="confirm" placeholder="DELETE INFIPROXY" required;
-                                small { "Type exactly: DELETE INFIPROXY" }
-                            }
-                            button type="submit" class="danger" { "Execute uninstall plan" }
-                        }
-                    } @else {
-                        div class="notice" { "Execution is hidden for non-owner admins." }
-                    }
-                }
-
-                section class="danger-zone" {
-                    h2 { "Danger shell" }
-                    @if !is_owner_admin(&auth) {
-                        div class="notice" { "Owner-only. This admin can use the allowlisted virtual console, but not the raw shell." }
-                    } @else if state.danger_shell_enabled {
-                        div class="notice error" {
-                            "Break-glass shell is enabled. Commands run as the panel service user through sh -lc, with a 10s timeout, minimal environment and capped output."
-                        }
-                        form method="post" action="/admin/system/shell" class="config-form wide" {
-                            (csrf_field(&auth.csrf_token))
-                            label class="full-span" {
-                                span { "Command" }
-                                textarea class="code-editor" name="command" rows="6" spellcheck="false" placeholder="id && systemctl status infiproxy.service --no-pager" {}
-                                small { "No interactive TTY. Use this only for emergency diagnostics or one-shot maintenance." }
-                            }
-                            label {
-                                span { "Confirmation" }
-                                input type="text" name="confirm" placeholder="I understand" required;
-                                small { "Type exactly: I understand" }
-                            }
-                            button type="submit" class="danger" { "Run danger shell" }
-                        }
-                    } @else {
-                        div class="notice" {
-                            "Disabled. To expose this break-glass tool, set "
-                            code { "INFIPROXY_ENABLE_DANGER_SHELL=true" }
-                            " in the panel environment and restart "
-                            code { "infiproxy.service" }
-                            "."
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Health checks" }
-                    ul {
-                        li { code { "/health" } " returns process liveness." }
-                        li { code { "/ready" } " checks SQLite connectivity." }
-                    }
-                }
-
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::system::render(&auth, db_ready, state.cookie_secure, &host)
 }
 
 async fn configs_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1984,125 +1150,12 @@ async fn configs_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Err(response) => return response,
     };
 
-    let snapshots = CONFIG_FILES
-        .iter()
-        .map(|spec| read_config_file(spec.slug))
+    let snapshots = config_files()
+        .into_iter()
+        .map(read_config_spec)
         .collect::<Vec<_>>();
 
-    Html(
-        layout(
-            "Configs",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Configs" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Allowlisted files" }
-                        strong { (CONFIG_FILES.len()) }
-                    }
-                    div class="metric" {
-                        span { "Readable" }
-                        strong { (snapshots.iter().filter(|item| item.status == "ready").count()) }
-                    }
-                    div class="metric" {
-                        span { "Editor model" }
-                        strong { "backup-first" }
-                    }
-                    div class="metric" {
-                        span { "Shell access" }
-                        strong { "none" }
-                    }
-                }
-
-                section {
-                    h2 { "Config workbench" }
-                    div class="notice" {
-                        "Only allowlisted files are editable. Every save creates a sibling backup before writing. Validation and reload stay explicit so one bad edit does not silently restart services."
-                    }
-                    div class="config-list" {
-                        @for snapshot in &snapshots {
-                            (config_editor_card(snapshot, &auth))
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Operational checklist" }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Change" }
-                                    th { "Validate" }
-                                    th { "Apply" }
-                                }
-                            }
-                            tbody {
-                                @for spec in CONFIG_FILES {
-                                    tr {
-                                        td { strong { (spec.name) } br; code { (spec.path) } }
-                                        td { code { (spec.validate_hint) } }
-                                        td { code { (spec.reload_hint) } }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
-}
-
-fn config_editor_card(snapshot: &ConfigFileSnapshot, auth: &AuthenticatedAdmin) -> Markup {
-    let status_class = if snapshot.status == "ready" {
-        "ok"
-    } else if snapshot.exists {
-        "warn"
-    } else {
-        "neutral"
-    };
-
-    html! {
-        section class="config-row" {
-            div class="config-row-head" {
-                h3 { (snapshot.spec.name) }
-                div class="config-row-meta" {
-                    span class=(format!("badge {status_class}")) { (&snapshot.status) }
-                    span class="badge neutral" { (snapshot.spec.category) }
-                    span class="badge neutral" { (snapshot.spec.syntax) }
-                }
-            }
-            form method="post" action="/admin/configs" class="config-form wide" {
-                (csrf_field(&auth.csrf_token))
-                input type="hidden" name="target" value=(snapshot.spec.slug);
-                label {
-                    span { "Path" }
-                    input type="text" value=(snapshot.spec.path) readonly;
-                    small { (snapshot.spec.description) }
-                }
-                label {
-                    span { "Limits" }
-                    input type="text" value=(format!("{} bytes now, {} bytes max", snapshot.bytes, snapshot.spec.max_bytes)) readonly;
-                    small { "Large files are intentionally not loaded into the browser editor." }
-                }
-                label class="full-span" {
-                    span { "Content" }
-                    textarea class="code-editor" name="content" rows="18" spellcheck="false" {
-                        (&snapshot.content)
-                    }
-                    small {
-                        "Validate: " code { (snapshot.spec.validate_hint) }
-                        " | Apply: " code { (snapshot.spec.reload_hint) }
-                    }
-                }
-                button type="submit" { "Save with backup" }
-            }
-        }
-    }
+    views::configs::render_index(&auth, &snapshots)
 }
 
 async fn config_save_action(
@@ -2126,49 +1179,7 @@ async fn config_save_action(
         StatusCode::BAD_REQUEST
     };
 
-    (
-        status,
-        Html(
-            layout(
-                "Config save",
-                html! {
-                    (admin_bar(&auth))
-                    h1 { "Config save" }
-
-                    section class="config-row" {
-                        div class="config-row-head" {
-                            h3 { (report.spec.name) }
-                            @if report.success {
-                                span class="badge ok" { "saved" }
-                            } @else {
-                                span class="badge off" { "failed" }
-                            }
-                        }
-                        dl class="details" {
-                            dt { "Path" }
-                            dd { code { (report.spec.path) } }
-                            dt { "Result" }
-                            dd { (report.message) }
-                            @if let Some(path) = &report.backup_path {
-                                dt { "Backup" }
-                                dd { code { (path) } }
-                            }
-                            dt { "Validate" }
-                            dd { code { (report.spec.validate_hint) } }
-                            dt { "Apply" }
-                            dd { code { (report.spec.reload_hint) } }
-                        }
-                        div class="actions" {
-                            a class="button" href="/admin/configs" { "Back to Configs" }
-                            a class="button" href="/admin/system" { "Open System actions" }
-                        }
-                    }
-                },
-            )
-            .into_string(),
-        ),
-    )
-        .into_response()
+    views::configs::render_save(&auth, &report, status)
 }
 
 async fn system_action(
@@ -2199,307 +1210,7 @@ async fn system_action(
     };
 
     let report = run_system_action(*target);
-    let ok = report.steps.iter().all(|step| step.success);
-
-    Html(
-        layout(
-            "System action",
-            html! {
-                (admin_bar(&auth))
-                h1 { "System action" }
-
-                section {
-                    h2 { (target.name) }
-                    div class=(if ok { "notice" } else { "notice error" }) {
-                        @if ok {
-                            "Action completed."
-                        } @else {
-                            "Action failed. Review command output below."
-                        }
-                    }
-                    div class="config-list" {
-                        @for step in &report.steps {
-                            div class="config-row" {
-                                div class="config-row-head" {
-                                    h3 { code { (&step.command) } }
-                                    @if step.success {
-                                        span class="badge ok" { "ok" }
-                                    } @else {
-                                        span class="badge off" { "failed" }
-                                    }
-                                }
-                                div class="command-output" {
-                                    @if !step.stdout.is_empty() {
-                                        strong { "stdout" }
-                                        pre { (&step.stdout) }
-                                    }
-                                    @if !step.stderr.is_empty() {
-                                        strong { "stderr" }
-                                        pre { (&step.stderr) }
-                                    }
-                                    @if step.stdout.is_empty() && step.stderr.is_empty() {
-                                        small { "No output." }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
-}
-
-async fn system_console_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<ConsoleCommandForm>,
-) -> Response {
-    let auth = match require_admin(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
-        return response;
-    }
-
-    let Some(command) = CONSOLE_COMMANDS
-        .iter()
-        .find(|command| command.slug == form.command)
-    else {
-        return html_error_response_with_back(
-            StatusCode::BAD_REQUEST,
-            "Console command failed",
-            "Unknown console command",
-            "/admin/system",
-            "Back to System",
-        );
-    };
-
-    let step = run_command(command.program, command.args);
-
-    Html(
-        layout(
-            "Console",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Virtual console" }
-
-                section {
-                    h2 { (command.name) }
-                    p { (command.description) }
-                    div class="config-row" {
-                        div class="config-row-head" {
-                            h3 { code { (&step.command) } }
-                            @if step.success {
-                                span class="badge ok" { "ok" }
-                            } @else {
-                                span class="badge off" { "failed" }
-                            }
-                        }
-                        div class="command-output" {
-                            @if !step.stdout.is_empty() {
-                                strong { "stdout" }
-                                pre { (&step.stdout) }
-                            }
-                            @if !step.stderr.is_empty() {
-                                strong { "stderr" }
-                                pre { (&step.stderr) }
-                            }
-                            @if step.stdout.is_empty() && step.stderr.is_empty() {
-                                small { "No output." }
-                            }
-                        }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
-}
-
-async fn danger_shell_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<DangerShellForm>,
-) -> Response {
-    let auth = match require_admin(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
-        return response;
-    }
-
-    if !is_owner_admin(&auth) {
-        return owner_only_response();
-    }
-
-    if !state.danger_shell_enabled {
-        return html_error_response_with_back(
-            StatusCode::FORBIDDEN,
-            "Danger shell disabled",
-            "Set INFIPROXY_ENABLE_DANGER_SHELL=true and restart the panel before using this tool.",
-            "/admin/system",
-            "Back to System",
-        );
-    }
-
-    if form.confirm.trim() != "I understand" {
-        return html_error_response_with_back(
-            StatusCode::BAD_REQUEST,
-            "Danger shell confirmation failed",
-            "Type exactly: I understand",
-            "/admin/system",
-            "Back to System",
-        );
-    }
-
-    let step = run_danger_shell(&form.command).await;
-
-    Html(
-        layout(
-            "Danger shell",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Danger shell" }
-
-                section class="danger-zone" {
-                    h2 { "Command result" }
-                    div class="notice error" {
-                        "This command used the break-glass shell path. Review output carefully and disable the env flag when finished."
-                    }
-                    div class="config-row" {
-                        div class="config-row-head" {
-                            h3 { code { (&step.command) } }
-                            @if step.success {
-                                span class="badge ok" { "ok" }
-                            } @else {
-                                span class="badge off" { "failed" }
-                            }
-                        }
-                        div class="command-output" {
-                            @if !step.stdout.is_empty() {
-                                strong { "stdout" }
-                                pre { (&step.stdout) }
-                            }
-                            @if !step.stderr.is_empty() {
-                                strong { "stderr" }
-                                pre { (&step.stderr) }
-                            }
-                            @if step.stdout.is_empty() && step.stderr.is_empty() {
-                                small { "No output." }
-                            }
-                        }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
-}
-
-async fn uninstall_execute_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<UninstallExecuteForm>,
-) -> Response {
-    let auth = match require_admin(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
-        return response;
-    }
-
-    if !is_owner_admin(&auth) {
-        return owner_only_response();
-    }
-
-    if !state.danger_shell_enabled {
-        return html_error_response_with_back(
-            StatusCode::FORBIDDEN,
-            "Uninstall executor disabled",
-            "The web executor uses the danger shell. Enable INFIPROXY_ENABLE_DANGER_SHELL=true or use sudo infiproxy-manager over SSH.",
-            "/admin/system",
-            "Back to System",
-        );
-    }
-
-    if form.confirm.trim() != "DELETE INFIPROXY" {
-        return html_error_response_with_back(
-            StatusCode::BAD_REQUEST,
-            "Uninstall confirmation failed",
-            "Type exactly: DELETE INFIPROXY",
-            "/admin/system",
-            "Back to System",
-        );
-    }
-
-    let Some(plan) = uninstall_plan(&form.mode) else {
-        return html_error_response_with_back(
-            StatusCode::BAD_REQUEST,
-            "Uninstall failed",
-            "Unknown uninstall mode",
-            "/admin/system",
-            "Back to System",
-        );
-    };
-
-    let step = run_danger_shell(&plan.shell_script()).await;
-
-    Html(
-        layout(
-            "Uninstall execute",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Uninstall execute" }
-
-                section class="danger-zone" {
-                    h2 { (plan.title) }
-                    div class="notice error" {
-                        "Execution finished or was interrupted. If this panel is still reachable, review output and use sudo infiproxy-manager from SSH for root-level cleanup."
-                    }
-                    div class="config-row" {
-                        div class="config-row-head" {
-                            h3 { code { (&step.command) } }
-                            @if step.success {
-                                span class="badge ok" { "ok" }
-                            } @else {
-                                span class="badge off" { "failed" }
-                            }
-                        }
-                        div class="command-output" {
-                            @if !step.stdout.is_empty() {
-                                strong { "stdout" }
-                                pre { (&step.stdout) }
-                            }
-                            @if !step.stderr.is_empty() {
-                                strong { "stderr" }
-                                pre { (&step.stderr) }
-                            }
-                            @if step.stdout.is_empty() && step.stderr.is_empty() {
-                                small { "No output." }
-                            }
-                        }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::system::render_action(&auth, target, &report)
 }
 
 async fn uninstall_preview_action(
@@ -2526,29 +1237,7 @@ async fn uninstall_preview_action(
         );
     };
 
-    Html(
-        layout(
-            "Uninstall preview",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Uninstall preview" }
-
-                section class="danger-zone" {
-                    h2 { (plan.title) }
-                    div class="notice error" {
-                        (plan.warning)
-                    }
-                    div class="command-output" {
-                        strong { "review-only shell runbook" }
-                        pre { (plan.commands.join("\n")) }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::system::render_uninstall(&auth, &plan)
 }
 
 async fn credits_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2557,76 +1246,7 @@ async fn credits_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Err(response) => return response,
     };
 
-    Html(
-        layout(
-            "Credits",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Credits" }
-
-                section class="product-card" {
-                    div {
-                        span class="eyebrow" { "commercial-grade control plane" }
-                        h2 { (APP_NAME) }
-                        p { "Rust, SQLite, systemd and Mihomo-compatible subscriptions with a conservative server-first UI." }
-                    }
-                }
-
-                section {
-                    h2 { "Project" }
-                    dl class="details" {
-                        dt { "Repository" }
-                        dd { a href="https://github.com/infinitrator/stealthhub-panel" rel="noreferrer" { "github.com/infinitrator/stealthhub-panel" } }
-                        dt { "License" }
-                        dd { code { "AGPL-3.0-or-later" } }
-                        dt { "Runtime" }
-                        dd { code { "Rust + Axum + SQLx + SQLite" } }
-                        dt { "Brand" }
-                        dd { "Infiproxy" }
-                    }
-                }
-
-                section {
-                    h2 { "GitHub stars" }
-                    div class="notice" {
-                        "Live stars are intentionally not fetched by the panel yet: keeping the control plane offline-capable avoids an extra HTTPS client dependency and background network calls."
-                    }
-                    dl class="details" {
-                        dt { "Recommended API" }
-                        dd { code { "GET https://api.github.com/repos/infinitrator/stealthhub-panel" } }
-                        dt { "Field" }
-                        dd { code { "stargazers_count" } }
-                        dt { "Production approach" }
-                        dd { "Fetch with ETag, cache for 6-24 hours in SQLite, render the cached value in this tab." }
-                    }
-                    a class="button" href="https://github.com/infinitrator/stealthhub-panel" rel="noreferrer" { "Open GitHub" }
-                }
-
-                section {
-                    h2 { "Acknowledgements" }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Area" }
-                                    th { "Technology" }
-                                    th { "Role" }
-                                }
-                            }
-                            tbody {
-                                tr { td { "Web" } td { "Axum / Maud" } td { "Server-rendered admin interface" } }
-                                tr { td { "Storage" } td { "SQLite / SQLx" } td { "Single-node durable state" } }
-                                tr { td { "Subscriptions" } td { "Mihomo YAML" } td { "Client import format" } }
-                                tr { td { "Deployment" } td { "systemd" } td { "Bare-metal VPS runtime" } }
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::credits::render(&auth)
 }
 
 async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2674,161 +1294,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     };
 
-    Html(
-        layout(
-            "Protocols",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Protocols" }
-
-                div class="status-strip" {
-                    div class="metric" {
-                        span { "Profiles" }
-                        strong { (profiles.len()) }
-                    }
-                    div class="metric" {
-                        span { "Enabled" }
-                        strong { (profiles.iter().filter(|profile| profile.enabled).count()) }
-                    }
-                    div class="metric" {
-                        span { "Secrets" }
-                        strong { (secret_names.len()) }
-                    }
-                    div class="metric" {
-                        span { "Subscription host" }
-                        strong { (&settings.subscription_domain) }
-                    }
-                }
-
-                section {
-                    h2 { "Mihomo subscription endpoint" }
-                    dl class="details" {
-                        dt { "Subscription domain" }
-                        dd { code { (&settings.subscription_domain) } }
-                        dt { "Node domain" }
-                        dd { code { (&settings.node_domain) } }
-                    }
-                }
-
-                section {
-                    h2 { "Transport matrix" }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Profile" }
-                                    th { "Purpose" }
-                                    th { "Masking knobs" }
-                                    th { "Client impact" }
-                                }
-                            }
-                            tbody {
-                                tr {
-                                    td { code { "vless-reality-xhttp" } }
-                                    td { "Primary TLS-like profile for modern Mihomo clients." }
-                                    td { code { "server_name" } " + " code { "path" } " + REALITY public key/short ID." }
-                                    td { "Best default when client supports XHTTP." }
-                                }
-                                tr {
-                                    td { code { "vless-reality-tcp" } }
-                                    td { "Lean fallback with fewer moving parts." }
-                                    td { code { "server_name" } " + REALITY public key/short ID." }
-                                    td { "Useful for conservative client profiles." }
-                                }
-                                tr {
-                                    td { code { "ss2022-shadowtls" } }
-                                    td { "Compatibility transport with ShadowTLS front." }
-                                    td { code { "server_name" } " + independent SS/ShadowTLS secrets." }
-                                    td { "Good fallback when VLESS is undesirable." }
-                                }
-                                tr {
-                                    td { code { "hysteria2" } " / " code { "tuic" } }
-                                    td { "QUIC speed fallback for high-latency routes." }
-                                    td { code { "sni" } " + password/obfs secrets." }
-                                    td { "Enable only when UDP path is healthy." }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Protocol profiles" }
-                    @if profiles.is_empty() {
-                        p { "No protocol profiles configured yet." }
-                    } @else {
-                        div class="table-wrap" {
-                            table {
-                                thead {
-                                    tr {
-                                        th { "Name" }
-                                        th { "Kind" }
-                                        th { "Role" }
-                                        th { "Enabled" }
-                                        th { "Endpoint" }
-                                        th { "Secrets" }
-                                    }
-                                }
-                                tbody {
-                                    @for profile in &profiles {
-                                        tr {
-                                            td { code { (&profile.name) } }
-                                            td { (proxy_kind_label(&profile.kind)) }
-                                            td { (proxy_role_label(&profile.role)) }
-                                            td {
-                                                @if profile.enabled {
-                                                    span class="badge ok" { "on" }
-                                                } @else {
-                                                    span class="badge off" { "off" }
-                                                }
-                                            }
-                                            td { code { (format!("{}:{}", profile.server, profile.port)) } }
-                                            td {
-                                                @let missing = missing_secret_names(profile, &secret_names);
-                                                @if profile.required_secret_names().is_empty() {
-                                                    span class="badge ok" { "none" }
-                                                } @else if missing.is_empty() {
-                                                    span class="badge ok" { "ready" }
-                                                    br;
-                                                    @for secret in profile.required_secret_names() {
-                                                        code { (secret) }
-                                                        " "
-                                                    }
-                                                } @else {
-                                                    span class="badge off" { "missing" }
-                                                    br;
-                                                    @for secret in missing {
-                                                        code { (secret) }
-                                                        " "
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                section {
-                    h2 { "Profile parameters" }
-                    datalist id="secret-names" {
-                        @for secret in &secret_names {
-                            option value=(secret) {}
-                        }
-                    }
-                    div class="config-list" {
-                        @for profile in &profiles {
-                            (protocol_profile_editor(profile, &auth, &secret_names))
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::protocols::render(&auth, &settings, &profiles, &secret_names)
 }
 
 async fn update_protocol_action(
@@ -2996,166 +1462,6 @@ fn checkbox_enabled(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
 }
 
-fn protocol_profile_editor(
-    profile: &ProtocolProfile,
-    auth: &AuthenticatedAdmin,
-    secret_names: &[String],
-) -> Markup {
-    html! {
-        section class="config-row" {
-            div class="config-row-head" {
-                h3 { (&profile.name) }
-                div class="config-row-meta" {
-                    span class=(format!("badge {}", if profile.enabled { "ok" } else { "off" })) {
-                        @if profile.enabled { "enabled" } @else { "disabled" }
-                    }
-                    span class="badge neutral" { (proxy_kind_label(&profile.kind)) }
-                    span class="badge neutral" { (proxy_role_label(&profile.role)) }
-                }
-            }
-            form method="post" action=(format!("/admin/protocols/{}/update", profile.name)) class="config-form" {
-                (csrf_field(&auth.csrf_token))
-                label class="switch-field" {
-                    input type="checkbox" name="enabled" checked[profile.enabled];
-                    span class="switch-ui" {}
-                    span {
-                        strong { "Enabled" }
-                        small { "Include this proxy in generated Mihomo subscriptions." }
-                    }
-                }
-                label {
-                    span { "Server address" }
-                    input type="text" name="server" value=(&profile.server) required;
-                    small { "Hostname or IP used by the Mihomo proxy object." }
-                }
-                label {
-                    span { "Server port" }
-                    input type="number" name="port" min="1" max="65535" value=(profile.port) required;
-                    small { "Remote port used by the client." }
-                }
-                (protocol_specific_fields(profile, secret_names))
-                button type="submit" { "Save profile" }
-            }
-        }
-    }
-}
-
-fn protocol_specific_fields(profile: &ProtocolProfile, secret_names: &[String]) -> Markup {
-    match &profile.config {
-        ProtocolConfig::VlessRealityXhttp {
-            server_name,
-            path,
-            public_key_secret,
-            short_id_secret,
-            ..
-        } => html! {
-            (text_input("server_name", "TLS server name", server_name, "SNI and XHTTP Host value used by Mihomo."))
-            (text_input("path", "XHTTP path", path, "HTTP path sent by the xhttp transport."))
-            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
-            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
-        },
-        ProtocolConfig::VlessRealityTcp {
-            server_name,
-            public_key_secret,
-            short_id_secret,
-            ..
-        } => html! {
-            (text_input("server_name", "TLS server name", server_name, "SNI value for REALITY verification."))
-            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
-            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
-        },
-        ProtocolConfig::Shadowsocks2022ShadowTls {
-            server_name,
-            password_secret,
-            shadow_tls_password_secret,
-        } => html! {
-            (text_input("server_name", "ShadowTLS server name", server_name, "TLS host presented by ShadowTLS v3."))
-            (secret_input("password_secret", "Shadowsocks password secret", password_secret, secret_names))
-            (secret_input(
-                "shadow_tls_password_secret",
-                "ShadowTLS password secret",
-                shadow_tls_password_secret,
-                secret_names
-            ))
-        },
-        ProtocolConfig::Hysteria2 {
-            password_secret,
-            sni,
-            obfs_password_secret,
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by the TLS handshake."))
-            (secret_input("password_secret", "Hysteria2 password secret", password_secret, secret_names))
-            (optional_secret_input(
-                "obfs_password_secret",
-                "Salamander obfs secret",
-                obfs_password_secret.as_deref().unwrap_or(""),
-                secret_names
-            ))
-        },
-        ProtocolConfig::AnyTls {
-            password_secret,
-            sni,
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by AnyTLS."))
-            (secret_input("password_secret", "AnyTLS password secret", password_secret, secret_names))
-        },
-        ProtocolConfig::Tuic {
-            password_secret,
-            sni,
-            ..
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by TUIC."))
-            (secret_input("password_secret", "TUIC password secret", password_secret, secret_names))
-        },
-    }
-}
-
-fn text_input(name: &str, label: &str, value: &str, help: &str) -> Markup {
-    html! {
-        label {
-            span { (label) }
-            input type="text" name=(name) value=(value) required;
-            small { (help) }
-        }
-    }
-}
-
-fn secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
-    html! {
-        label {
-            span { (label) }
-            input type="text" name=(name) value=(value) list="secret-names" required;
-            small {
-                "SQLite secret name. "
-                @if secret_names.iter().any(|secret| secret == value) {
-                    span class="inline-ok" { "present" }
-                } @else {
-                    span class="inline-warn" { "missing" }
-                }
-            }
-        }
-    }
-}
-
-fn optional_secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
-    html! {
-        label {
-            span { (label) }
-            input type="text" name=(name) value=(value) list="secret-names";
-            small {
-                "Optional SQLite secret name."
-                @if !value.is_empty() && secret_names.iter().any(|secret| secret == value) {
-                    " "
-                    span class="inline-ok" { "present" }
-                } @else if !value.is_empty() {
-                    " "
-                    span class="inline-warn" { "missing" }
-                }
-            }
-        }
-    }
-}
-
 async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
@@ -3165,128 +1471,17 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
     let users = match list_users(&state.pool).await {
         Ok(value) => value,
         Err(err) => {
-            return Html(
-                layout(
-                    "Users error",
-                    html! {
-                        h1 { "Users" }
-                        div class="notice error" {
-                            "Failed to load users: " (err.to_string())
-                        }
-                    },
-                )
-                .into_string(),
-            )
-            .into_response();
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Users unavailable",
+                format!("Failed to load users: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
         }
     };
 
-    Html(
-        layout(
-            "Users",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Users" }
-
-                section {
-                    h2 { "Create user" }
-                    form method="post" action="/admin/users/create" class="form" {
-                        (csrf_field(&auth.csrf_token))
-                        label {
-                            span { "Username" }
-                            input type="text" name="username" placeholder="fedor-phone" required;
-                        }
-
-                        label {
-                            span { "Traffic limit, GB" }
-                            input type="number" name="traffic_limit_gb" min="0" placeholder="empty = unlimited";
-                        }
-
-                        label {
-                            span { "Expires in days" }
-                            input type="number" name="expires_in_days" min="0" max="3650" placeholder="empty = never";
-                        }
-
-                        button type="submit" { "Create" }
-                    }
-                }
-
-                section {
-                    h2 { "Existing users" }
-
-                    @if users.is_empty() {
-                        p { "No users yet." }
-                    } @else {
-                        div class="table-wrap" {
-                            table {
-                                thead {
-                                    tr {
-                                        th { "ID" }
-                                        th { "Username" }
-                                        th { "Enabled" }
-                                        th { "UUID" }
-                                        th { "Subscription" }
-                                        th { "Traffic" }
-                                        th { "Expires" }
-                                        th { "Actions" }
-                                    }
-                                }
-                                tbody {
-                                    @for user in users {
-                                        tr {
-                                            td { (user.id) }
-                                            td { (user.username) }
-                                            td {
-                                                @if user.enabled {
-                                                    span class="badge ok" { "on" }
-                                                } @else {
-                                                    span class="badge off" { "off" }
-                                                }
-                                            }
-                                            td {
-                                                code { (user.uuid) }
-                                            }
-                                            td {
-                                                code { (format!("/sub/{}", user.subscription_token)) }
-                                                br;
-                                                a href=(format!("/sub/{}", user.subscription_token)) { "open" }
-                                                " "
-                                                a href=(format!("/sub/{}/mihomo.yaml", user.subscription_token)) { "download" }
-                                            }
-                                            td {
-                                                (format_user_traffic(&user))
-                                            }
-                                            td {
-                                                (format_user_expiry(&user))
-                                            }
-                                            td {
-                                                @if user.enabled {
-                                                    form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
-                                                        (csrf_field(&auth.csrf_token))
-                                                        button type="submit" { "Disable" }
-                                                    }
-                                                } @else {
-                                                    form method="post" action=(format!("/admin/users/{}/toggle", user.id)) class="inline-form" {
-                                                        (csrf_field(&auth.csrf_token))
-                                                        button type="submit" { "Enable" }
-                                                    }
-                                                }
-
-                                                a class="button compact" href=(format!("/admin/users/{}/reset-token", user.id)) { "Reset token" }
-                                                a class="button compact danger" href=(format!("/admin/users/{}/delete", user.id)) { "Delete" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::users::render_index(&auth, &users)
 }
 
 async fn create_user_action(
@@ -3439,45 +1634,7 @@ async fn reset_user_token_page(
         }
     };
 
-    Html(
-        layout(
-            "Reset token",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Reset token" }
-
-                section class="confirm-panel" {
-                    h2 { "Confirm subscription token reset" }
-                    p {
-                        "Old subscription URL for "
-                        strong { (user.username) }
-                        " will stop working immediately. The user will need the new URL."
-                    }
-                    dl class="details" {
-                        dt { "Current subscription" }
-                        dd { code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) } }
-                        dt { "Status" }
-                        dd {
-                            @if user.enabled {
-                                span class="badge ok" { "on" }
-                            } @else {
-                                span class="badge off" { "off" }
-                            }
-                        }
-                    }
-                    div class="actions" {
-                        form method="post" action=(format!("/admin/users/{}/reset-token", user.id)) class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            button type="submit" class="danger" { "Reset token" }
-                        }
-                        a class="button secondary" href="/admin/users" { "Cancel" }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::users::render_reset(&auth, &user)
 }
 
 async fn reset_user_token_action(
@@ -3526,52 +1683,7 @@ async fn delete_user_page(
         }
     };
 
-    Html(
-        layout(
-            "Delete user",
-            html! {
-                (admin_bar(&auth))
-                h1 { "Delete user" }
-
-                section class="confirm-panel danger-zone" {
-                    h2 { "Confirm user deletion" }
-                    p {
-                        "This removes "
-                        strong { (user.username) }
-                        " from the users table and invalidates the subscription token."
-                    }
-                    dl class="details" {
-                        dt { "UUID" }
-                        dd { code { (user.uuid) } }
-                        dt { "Subscription" }
-                        dd { code { (format!("/sub/{}/mihomo.yaml", user.subscription_token)) } }
-                        dt { "Traffic" }
-                        dd {
-                            (format_bytes(user.traffic_used_bytes))
-                            " / "
-                            @match user.traffic_limit_bytes {
-                                Some(limit) => {
-                                    (format_bytes(limit))
-                                },
-                                None => {
-                                    "unlimited"
-                                },
-                            }
-                        }
-                    }
-                    div class="actions" {
-                        form method="post" action=(format!("/admin/users/{}/delete", user.id)) class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            button type="submit" class="danger" { "Delete user" }
-                        }
-                        a class="button secondary" href="/admin/users" { "Cancel" }
-                    }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
+    views::users::render_delete(&auth, &user)
 }
 
 async fn delete_user_action(
@@ -3911,12 +2023,6 @@ fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Re
     ))
 }
 
-fn csrf_field(token: &str) -> Markup {
-    html! {
-        input type="hidden" name="csrf_token" value=(token);
-    }
-}
-
 async fn load_secret_values_map(
     pool: &SqlitePool,
     profiles: &[ProtocolProfile],
@@ -3937,76 +2043,6 @@ async fn load_secret_values_map(
     }
 
     Ok(secrets)
-}
-
-fn missing_secret_names(profile: &ProtocolProfile, present_secret_names: &[String]) -> Vec<String> {
-    profile
-        .required_secret_names()
-        .into_iter()
-        .filter(|name| !present_secret_names.iter().any(|present| present == name))
-        .map(str::to_string)
-        .collect()
-}
-
-fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
-    match kind {
-        ProxyKind::VlessRealityXhttp => "VLESS + REALITY + XHTTP",
-        ProxyKind::VlessRealityTcp => "VLESS + REALITY + TCP",
-        ProxyKind::Shadowsocks2022ShadowTls => "SS2022 + ShadowTLS",
-        ProxyKind::Hysteria2 => "Hysteria2",
-        ProxyKind::AnyTls => "AnyTLS",
-        ProxyKind::Tuic => "TUIC",
-    }
-}
-
-fn proxy_role_label(role: &ProxyRole) -> &'static str {
-    match role {
-        ProxyRole::AutoSafe => "AUTO-SAFE",
-        ProxyRole::Speed => "SPEED",
-        ProxyRole::Compatibility => "COMPAT",
-        ProxyRole::RuAccess => "RU-ACCESS",
-        ProxyRole::Manual => "MANUAL",
-    }
-}
-
-pub(crate) fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
-    html! {
-        div class="admin-stack" {
-            @if let Some(notice) = &auth.update_notice {
-                div class="update-banner" role="status" {
-                    div {
-                        strong { "Panel update available" }
-                        span {
-                            " Latest commit "
-                            code { (update::short_sha(&notice.latest_sha)) }
-                            " is scheduled "
-                            (notice.planned_for)
-                            "."
-                        }
-                    }
-                    @if is_owner_admin(auth) {
-                        form method="post" action="/admin/panel-update-now" class="inline-form" {
-                            (csrf_field(&auth.csrf_token))
-                            button type="submit" { "Update Now" }
-                        }
-                    }
-                }
-            }
-            div class="admin-bar" {
-                span {
-                    "Signed in as " strong { (auth.admin.username) }
-                    @if is_owner_admin(auth) {
-                        " "
-                        span class="badge ok" { "owner" }
-                    }
-                }
-                form method="post" action="/admin/logout" class="inline-form" {
-                    (csrf_field(&auth.csrf_token))
-                    button type="submit" { "Logout" }
-                }
-            }
-        }
-    }
 }
 
 fn is_owner_admin(auth: &AuthenticatedAdmin) -> bool {
@@ -4073,25 +2109,7 @@ fn html_error_response_with_back(
     back_href: &'static str,
     back_label: &'static str,
 ) -> Response {
-    let message = message.into();
-
-    (
-        status,
-        Html(
-            layout(
-                title,
-                html! {
-                    h1 { (title) }
-                    div class="notice error" {
-                        (message)
-                    }
-                    a class="button" href=(back_href) { (back_label) }
-                },
-            )
-            .into_string(),
-        ),
-    )
-        .into_response()
+    views::components::error_response(status, title, message, back_href, back_label)
 }
 
 fn subscription_block_reason(user: &UserRecord) -> Option<&'static str> {

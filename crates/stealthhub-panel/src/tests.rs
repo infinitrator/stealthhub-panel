@@ -214,19 +214,6 @@ fn health_content_negotiation_only_html_for_browsers() {
 }
 
 #[test]
-fn console_commands_are_allowlisted_without_shell() {
-    assert!(CONSOLE_COMMANDS
-        .iter()
-        .all(|command| command.program != "sh"));
-    assert!(CONSOLE_COMMANDS
-        .iter()
-        .all(|command| command.program != "bash"));
-    assert!(CONSOLE_COMMANDS
-        .iter()
-        .all(|command| !command.args.iter().any(|arg| arg.contains(';'))));
-}
-
-#[test]
 fn uninstall_plans_are_preview_runbooks() {
     let panel = uninstall_plan("panel").expect("panel plan exists");
     let full = uninstall_plan("full").expect("full plan exists");
@@ -235,11 +222,13 @@ fn uninstall_plans_are_preview_runbooks() {
     assert!(panel.title.contains("Panel-only"));
     assert!(full.title.contains("Full"));
     assert!(factory.title.contains("Factory"));
-    assert!(full.shell_script().contains("infiproxy-mtproto.service"));
-    assert!(factory.shell_script().contains("infiproxy-mtproto.service"));
-    assert!(full.shell_script().contains("headscale.service"));
-    assert!(factory.shell_script().contains("headscale.service"));
-    assert!(factory.shell_script().contains("infiproxy-manager"));
+    let full_commands = full.commands.join("\n");
+    let factory_commands = factory.commands.join("\n");
+    assert!(full_commands.contains("infiproxy-mtproto.service"));
+    assert!(factory_commands.contains("infiproxy-mtproto.service"));
+    assert!(full_commands.contains("headscale.service"));
+    assert!(factory_commands.contains("headscale.service"));
+    assert!(factory_commands.contains("infiproxy-manager"));
     assert!(uninstall_plan("unknown").is_none());
 }
 
@@ -268,18 +257,23 @@ fn reputation_sources_have_ip_templates() {
 fn config_editor_targets_are_allowlisted_and_unique() {
     let mut slugs = HashSet::new();
 
-    for spec in CONFIG_FILES {
-        assert!(slugs.insert(spec.slug));
+    let specs = config_files();
+    for spec in &specs {
+        assert!(slugs.insert(&spec.slug));
         assert!(spec.path.starts_with("/etc/"));
         assert!(spec.max_bytes <= 256 * 1024);
     }
 
-    assert!(CONFIG_FILES.len() >= modules::MODULES.len());
+    assert!(specs.len() >= modules::registry().unwrap().len());
+    for module in modules::registry().unwrap() {
+        assert!(specs.iter().any(|spec| spec.path == module.config_path));
+    }
 }
 
 #[test]
 fn mtproto_runtime_is_wired_into_panel_contracts() {
-    assert!(modules::MODULES
+    assert!(modules::registry()
+        .unwrap()
         .iter()
         .any(|module| module.service == "infiproxy-mtproto.service"
             && module.binary_path.ends_with("/mtproto-proxy")));
@@ -287,15 +281,12 @@ fn mtproto_runtime_is_wired_into_panel_contracts() {
         && target.units == ["infiproxy-mtproto.service"].as_slice()));
     assert!(CONFIG_FILES.iter().any(|spec| spec.slug == "mtproto-core"
         && spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env"));
-    assert!(CONSOLE_COMMANDS
-        .iter()
-        .any(|command| command.slug == "mtproto-logs"
-            && command.args.contains(&"infiproxy-mtproto.service")));
 }
 
 #[test]
 fn headscale_module_is_wired_into_panel_contracts() {
-    assert!(modules::MODULES
+    assert!(modules::registry()
+        .unwrap()
         .iter()
         .any(|module| module.id == "headscale"
             && module.service == "headscale.service"
@@ -310,10 +301,6 @@ fn headscale_module_is_wired_into_panel_contracts() {
         .iter()
         .any(|spec| spec.slug == "headscale-nginx"
             && spec.path == "/etc/nginx/sites-available/infiproxy-headscale.conf"));
-    assert!(CONSOLE_COMMANDS
-        .iter()
-        .any(|command| command.slug == "headscale-logs"
-            && command.args.contains(&"headscale.service")));
 }
 
 #[test]
@@ -322,12 +309,4 @@ fn config_editor_rejects_unknown_targets() {
 
     assert!(!report.success);
     assert_eq!(report.message, "unknown config target");
-}
-
-#[tokio::test]
-async fn danger_shell_rejects_empty_commands() {
-    let step = run_danger_shell("   ").await;
-
-    assert!(!step.success);
-    assert_eq!(step.stderr, "command is empty");
 }

@@ -3,6 +3,8 @@ Description=Immediate Infiproxy module update trigger
 
 [Path]
 PathExistsGlob=/var/lib/infiproxy/module-requests/*.request
+PathExistsGlob=/var/lib/infiproxy/module-requests/*.register
+PathExistsGlob=/var/lib/infiproxy/module-requests/*.remove
 Unit=infiproxy-module-update.service
 
 [Install]

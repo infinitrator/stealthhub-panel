@@ -7,18 +7,14 @@
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
 };
-use maud::{html, Markup};
 use std::{sync::OnceLock, time::Instant};
 
 use crate::{
-    ops::{
-        format_duration, host_snapshot, meter_bar, service_state, service_state_badge,
-        SYSTEM_TARGETS,
-    },
-    ui::layout,
-    AppState, DEPLOYMENT_MODE,
+    ops::{format_duration, host_snapshot},
+    views::health::Component,
+    AppState,
 };
 
 static APP_STARTED_AT: OnceLock<Instant> = OnceLock::new();
@@ -32,16 +28,32 @@ pub(crate) async fn health(headers: HeaderMap) -> Response {
         return "ok\n".into_response();
     }
 
-    health_dashboard(
+    render_dashboard(
         StatusCode::OK,
         "operational",
         "Process liveness probe is passing.",
-        html! {
-            (health_component("Process", "ok", "Runtime is accepting HTTP requests."))
-            (health_component("Router", "ok", "Public and admin routes are registered."))
-            (health_component("Security headers", "ok", "Frame, content type, referrer and CSP headers are enforced."))
-            (health_component("Probe contract", "ok", "Non-browser clients still receive plain text ok."))
-        },
+        &[
+            Component {
+                name: "Process",
+                state: "ok",
+                detail: "Runtime is accepting HTTP requests.",
+            },
+            Component {
+                name: "Router",
+                state: "ok",
+                detail: "Public and admin routes are registered.",
+            },
+            Component {
+                name: "Security headers",
+                state: "ok",
+                detail: "Frame, content type, referrer and CSP headers are enforced.",
+            },
+            Component {
+                name: "Probe contract",
+                state: "ok",
+                detail: "Non-browser clients still receive plain text ok.",
+            },
+        ],
     )
 }
 
@@ -66,27 +78,60 @@ pub(crate) async fn readiness(State(state): State<AppState>, headers: HeaderMap)
     }
 
     match readiness {
-        Ok(()) => health_dashboard(
+        Ok(()) => render_dashboard(
             StatusCode::OK,
             "ready",
             "SQLite readiness probe is passing.",
-            html! {
-                (health_component("Process", "ok", "Runtime is alive."))
-                (health_component("SQLite", "ok", "Database connection returned the expected readiness value."))
-                (health_component("Subscriptions", "ok", "Mihomo YAML generation can use persisted settings."))
-                (health_component("Admin panel", "ok", "Authenticated control plane is available."))
-            },
+            &[
+                Component {
+                    name: "Process",
+                    state: "ok",
+                    detail: "Runtime is alive.",
+                },
+                Component {
+                    name: "SQLite",
+                    state: "ok",
+                    detail: "Database connection returned the expected readiness value.",
+                },
+                Component {
+                    name: "Subscriptions",
+                    state: "ok",
+                    detail: "Mihomo YAML generation can use persisted settings.",
+                },
+                Component {
+                    name: "Admin panel",
+                    state: "ok",
+                    detail: "Authenticated control plane is available.",
+                },
+            ],
         ),
-        Err((status, message)) => health_dashboard(
+        Err((status, message)) => render_dashboard(
             status,
             "degraded",
             message,
-            html! {
-                (health_component("Process", "ok", "Runtime is alive."))
-                (health_component("SQLite", "off", message))
-                (health_component("Subscriptions", "off", "Subscription generation may fail until storage recovers."))
-                (health_component("Admin panel", "warn", "Login may work, but state-changing operations require database access."))
-            },
+            &[
+                Component {
+                    name: "Process",
+                    state: "ok",
+                    detail: "Runtime is alive.",
+                },
+                Component {
+                    name: "SQLite",
+                    state: "off",
+                    detail: message,
+                },
+                Component {
+                    name: "Subscriptions",
+                    state: "off",
+                    detail: "Subscription generation may fail until storage recovers.",
+                },
+                Component {
+                    name: "Admin panel",
+                    state: "warn",
+                    detail:
+                        "Login may work, but state-changing operations require database access.",
+                },
+            ],
         ),
     }
 }
@@ -102,161 +147,21 @@ pub(crate) fn wants_html(headers: &HeaderMap) -> bool {
         })
 }
 
-fn health_dashboard(
+fn render_dashboard(
     status: StatusCode,
     state_label: &'static str,
     summary: &'static str,
-    components: Markup,
+    components: &[Component],
 ) -> Response {
     let host = host_snapshot();
-
-    (
+    crate::views::health::render(
         status,
-        Html(
-            layout(
-                "Health",
-                html! {
-                    h1 { "Health" }
-
-                    section class=(format!("health-hero {}", health_state_class(state_label))) {
-                        div {
-                            span class="eyebrow" { "Infiproxy control plane" }
-                            h2 { (state_label) }
-                            p { (summary) }
-                        }
-                        div class="health-ring" {
-                            span class=(format!("health-led {}", health_state_class(state_label))) {}
-                            strong { (status.as_u16()) }
-                            small { (status.canonical_reason().unwrap_or("status")) }
-                        }
-                    }
-
-                    section {
-                        h2 { "Component status" }
-                        div class="health-grid" {
-                            (components)
-                        }
-                    }
-
-                    section {
-                        h2 { "Runtime statistics" }
-                        div class="status-strip compact-status" {
-                            div class="metric" {
-                                span { "Version" }
-                                strong { (env!("CARGO_PKG_VERSION")) }
-                            }
-                            div class="metric" {
-                                span { "Uptime" }
-                                strong { (app_uptime_label()) }
-                            }
-                            div class="metric" {
-                                span { "Deployment" }
-                                strong { (DEPLOYMENT_MODE) }
-                            }
-                            div class="metric" {
-                                span { "Probe mode" }
-                                strong { "html + plain text" }
-                            }
-                        }
-                    }
-
-                    section {
-                        h2 { "Host sensors" }
-                        div class="sys-grid" {
-                            div class="sys-card" {
-                                span { "OS" }
-                                strong { (&host.os_name) }
-                                small { "Kernel " (&host.kernel) }
-                            }
-                            div class="sys-card" {
-                                span { "Load" }
-                                strong { (&host.load_average) }
-                                small { "Uptime " (&host.uptime) }
-                            }
-                            div class="sys-card" {
-                                span { "Memory" }
-                                strong { (&host.memory_label) }
-                                (meter_bar(host.memory_used_percent))
-                            }
-                            div class="sys-card" {
-                                span { "Root disk" }
-                                strong { (&host.disk_label) }
-                                (meter_bar(host.disk_used_percent))
-                            }
-                        }
-                    }
-
-                    section {
-                        h2 { "Service sensors" }
-                        div class="table-wrap" {
-                            table {
-                                thead {
-                                    tr {
-                                        th { "Target" }
-                                        th { "State" }
-                                        th { "Config" }
-                                    }
-                                }
-                                tbody {
-                                    @for target in SYSTEM_TARGETS {
-                                        @let state = service_state(target.units);
-                                        tr {
-                                            td { strong { (target.name) } }
-                                            td { (service_state_badge(&state)) }
-                                            td { code { (target.config) } }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    section {
-                        h2 { "Probe contract" }
-                        dl class="details" {
-                            dt { "Browser" }
-                            dd { "HTML health console with component status." }
-                            dt { "Automation" }
-                            dd { code { "curl -H 'Accept: */*' /health" } " returns " code { "ok" } "." }
-                            dt { "Readiness" }
-                            dd { code { "/ready" } " includes SQLite connectivity and preserves HTTP status semantics." }
-                        }
-                    }
-                },
-            )
-            .into_string(),
-        ),
+        state_label,
+        summary,
+        components,
+        &host,
+        &app_uptime_label(),
     )
-        .into_response()
-}
-
-fn health_component(name: &'static str, state: &'static str, detail: &'static str) -> Markup {
-    html! {
-        div class="health-card" {
-            div class="health-card-head" {
-                span class=(format!("health-led {}", health_state_class(state))) {}
-                strong { (name) }
-            }
-            p { (detail) }
-            span class=(format!("badge {}", health_badge_class(state))) { (state) }
-        }
-    }
-}
-
-fn health_state_class(state: &str) -> &'static str {
-    match state {
-        "ok" | "ready" | "operational" => "ok",
-        "warn" | "degraded" => "warn",
-        _ => "off",
-    }
-}
-
-fn health_badge_class(state: &str) -> &'static str {
-    match health_state_class(state) {
-        "ok" => "ok",
-        "warn" => "neutral",
-        _ => "off",
-    }
 }
 
 pub(crate) fn app_uptime_label() -> String {

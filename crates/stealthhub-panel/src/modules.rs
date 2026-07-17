@@ -1,15 +1,15 @@
-//! Independently updateable runtime-module registry.
+//! Dynamic runtime-module registry and unprivileged update bridge.
 //!
-//! The panel only discovers upstream versions and creates fixed-name request
-//! files. A root-owned systemd worker performs downloads, checksum validation,
-//! atomic activation and service restarts, so HTTP handlers never execute
-//! privileged package-management commands.
+//! Module definitions are root-owned declarative manifests. The panel can read
+//! the registry, discover upstream versions and create fixed-format requests,
+//! but it never downloads binaries or executes package-management commands.
 
 use crate::ui::APP_NAME;
 use chrono::Utc;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -18,101 +18,38 @@ use stealthhub_core::storage::{get_setting, upsert_setting};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 const INITIAL_DELAY: Duration = Duration::from_secs(35);
+const DEFAULT_MANIFEST_DIR: &str = "/etc/infiproxy-modules.d";
+const DEFAULT_AVAILABLE_DIR: &str = "/etc/infiproxy-modules.available.d";
 const DEFAULT_STATE_DIR: &str = "/var/lib/infiproxy/modules";
 const DEFAULT_REQUEST_DIR: &str = "/var/lib/infiproxy/module-requests";
 const DEFAULT_VERSION_DIR: &str = "/var/lib/infiproxy-maintenance/module-versions";
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
 
-/// Supported upstream version-discovery mechanism.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Upstream version-discovery mechanism declared by a module manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UpstreamKind {
     Release,
-    Commit { git_ref: &'static str },
+    Commit { git_ref: String },
 }
 
-/// Immutable module metadata shared by status rendering and request validation.
-#[derive(Debug, Clone, Copy)]
+/// Validated module metadata loaded from the manifest directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModuleSpec {
-    pub(crate) id: &'static str,
-    pub(crate) name: &'static str,
-    pub(crate) kind: &'static str,
-    pub(crate) role: &'static str,
-    pub(crate) repo: &'static str,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) role: String,
+    pub(crate) repo: String,
     pub(crate) upstream: UpstreamKind,
-    pub(crate) binary_path: &'static str,
-    pub(crate) service: &'static str,
-    pub(crate) config_path: &'static str,
+    pub(crate) driver: String,
+    pub(crate) root: String,
+    pub(crate) binary: String,
+    pub(crate) binary_path: String,
+    pub(crate) service: String,
+    pub(crate) config_path: String,
+    pub(crate) asset_amd64: String,
+    pub(crate) asset_arm64: String,
 }
-
-/// Complete module registry. IDs are also the only values accepted by the
-/// privileged request bridge and `deploy/module-update.sh`.
-pub(crate) const MODULES: &[ModuleSpec] = &[
-    ModuleSpec {
-        id: "xray",
-        name: "Xray",
-        kind: "proxy core",
-        role: "VLESS REALITY and XHTTP/TCP",
-        repo: "XTLS/Xray-core",
-        upstream: UpstreamKind::Release,
-        binary_path: "/opt/infiproxy/cores/xray/current/xray",
-        service: "infiproxy-xray.service",
-        config_path: "/etc/infiproxy-cores/xray/config.json",
-    },
-    ModuleSpec {
-        id: "sing-box",
-        name: "sing-box",
-        kind: "proxy core",
-        role: "SS2022, ShadowTLS, AnyTLS and compatibility",
-        repo: "SagerNet/sing-box",
-        upstream: UpstreamKind::Release,
-        binary_path: "/opt/infiproxy/cores/sing-box/current/sing-box",
-        service: "infiproxy-sing-box.service",
-        config_path: "/etc/infiproxy-cores/sing-box/config.json",
-    },
-    ModuleSpec {
-        id: "hysteria",
-        name: "Hysteria",
-        kind: "proxy core",
-        role: "Hysteria2 high-loss network fallback",
-        repo: "apernet/hysteria",
-        upstream: UpstreamKind::Release,
-        binary_path: "/opt/infiproxy/cores/hysteria/current/hysteria",
-        service: "infiproxy-hysteria.service",
-        config_path: "/etc/infiproxy-cores/hysteria/config.yaml",
-    },
-    ModuleSpec {
-        id: "tuic",
-        name: "TUIC",
-        kind: "proxy core",
-        role: "QUIC low-latency fallback",
-        repo: "tuic-protocol/tuic",
-        upstream: UpstreamKind::Release,
-        binary_path: "/opt/infiproxy/cores/tuic/current/tuic-server",
-        service: "infiproxy-tuic.service",
-        config_path: "/etc/infiproxy-cores/tuic/config.json",
-    },
-    ModuleSpec {
-        id: "mtproto",
-        name: "Telegram MTProto",
-        kind: "proxy service",
-        role: "Native Telegram proxy",
-        repo: "TelegramMessenger/MTProxy",
-        upstream: UpstreamKind::Commit { git_ref: "master" },
-        binary_path: "/opt/infiproxy/cores/mtproto/current/mtproto-proxy",
-        service: "infiproxy-mtproto.service",
-        config_path: "/etc/infiproxy-cores/mtproto/mtproto.env",
-    },
-    ModuleSpec {
-        id: "headscale",
-        name: "Headscale",
-        kind: "mesh service",
-        role: "Tailscale-compatible coordination hub",
-        repo: "juanfont/headscale",
-        upstream: UpstreamKind::Release,
-        binary_path: "/opt/infiproxy/modules/headscale/current/headscale",
-        service: "headscale.service",
-        config_path: "/etc/headscale/config.yaml",
-    },
-];
 
 /// Persisted and locally observed module update state.
 #[derive(Debug, Clone)]
@@ -150,17 +87,67 @@ pub(crate) fn spawn_checker(pool: SqlitePool) {
     });
 }
 
+/// Loads every valid manifest in deterministic ID order.
+pub(crate) fn registry() -> anyhow::Result<Vec<ModuleSpec>> {
+    load_registry(&manifest_dir())
+}
+
+/// Loads catalog entries that are not currently active.
+pub(crate) fn available() -> anyhow::Result<Vec<ModuleSpec>> {
+    let active = registry()?
+        .into_iter()
+        .map(|spec| spec.id)
+        .collect::<HashSet<_>>();
+    Ok(load_registry(&available_dir())?
+        .into_iter()
+        .filter(|spec| !active.contains(&spec.id))
+        .collect())
+}
+
+fn load_registry(directory: &Path) -> anyhow::Result<Vec<ModuleSpec>> {
+    let mut specs = Vec::new();
+    let mut ids = HashSet::new();
+
+    if !directory.is_dir() {
+        return Ok(specs);
+    }
+
+    let mut paths = fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("module"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in paths {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+            tracing::warn!(path = %path.display(), "ignoring unsafe module manifest");
+            continue;
+        }
+        let content = fs::read_to_string(&path)?;
+        let spec = parse_manifest(&content, &path)?;
+        if !ids.insert(spec.id.clone()) {
+            anyhow::bail!("duplicate module id: {}", spec.id);
+        }
+        specs.push(spec);
+    }
+    specs.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(specs)
+}
+
 /// Refreshes all upstream versions with one reusable, time-bounded client.
 pub(crate) async fn refresh_all(pool: &SqlitePool) -> anyhow::Result<Vec<ModuleStatus>> {
     let client = github_client()?;
-    let mut statuses = Vec::with_capacity(MODULES.len());
-    for spec in MODULES {
-        match refresh_with_client(pool, *spec, &client).await {
+    let specs = registry()?;
+    let mut statuses = Vec::with_capacity(specs.len());
+    for spec in specs {
+        match refresh_with_client(pool, spec.clone(), &client).await {
             Ok(status) => statuses.push(status),
             Err(err) => {
                 tracing::warn!(module = spec.id, "upstream check failed: {err}");
-                persist_check_error(pool, *spec, &err.to_string()).await?;
-                statuses.push(load_one(pool, *spec).await?);
+                persist_check_error(pool, &spec, &err.to_string()).await?;
+                statuses.push(load_one(pool, spec).await?);
             }
         }
     }
@@ -172,15 +159,23 @@ pub(crate) async fn refresh_one(
     pool: &SqlitePool,
     module_id: &str,
 ) -> anyhow::Result<ModuleStatus> {
-    let spec = find(module_id).ok_or_else(|| anyhow::anyhow!("unknown module"))?;
+    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
     refresh_with_client(pool, spec, &github_client()?).await
 }
 
 /// Loads all last-known states without making network requests.
 pub(crate) async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<ModuleStatus>> {
-    let mut statuses = Vec::with_capacity(MODULES.len());
-    for spec in MODULES {
-        statuses.push(load_one(pool, *spec).await?);
+    let specs = registry()?;
+    let mut statuses = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let status = load_one(pool, spec).await?;
+        if let Err(err) = write_state_file(&status) {
+            tracing::warn!(
+                module = status.spec.id,
+                "could not mirror module state: {err}"
+            );
+        }
+        statuses.push(status);
     }
     Ok(statuses)
 }
@@ -191,10 +186,10 @@ pub(crate) async fn set_auto_update(
     module_id: &str,
     enabled: bool,
 ) -> anyhow::Result<()> {
-    let spec = find(module_id).ok_or_else(|| anyhow::anyhow!("unknown module"))?;
+    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
     upsert_setting(
         pool,
-        &setting_key(spec.id, "auto_update"),
+        &setting_key(&spec.id, "auto_update"),
         bool_str(enabled),
     )
     .await?;
@@ -203,22 +198,52 @@ pub(crate) async fn set_auto_update(
     Ok(())
 }
 
-/// Creates a fixed-name request consumed by the root-owned module updater.
-pub(crate) fn request_update(module_id: &str) -> anyhow::Result<()> {
-    let spec = find(module_id).ok_or_else(|| anyhow::anyhow!("unknown module"))?;
-    let request_dir = request_dir();
-    fs::create_dir_all(&request_dir)?;
-    let path = request_dir.join(format!("{}.request", spec.id));
-    fs::write(&path, format!("requested_at={}\n", Utc::now().to_rfc3339()))?;
-    set_private_permissions(&request_dir, &path);
-    Ok(())
+/// Returns one manifest entry without relying on a compiled-in allowlist.
+pub(crate) fn find(module_id: &str) -> anyhow::Result<Option<ModuleSpec>> {
+    if !valid_id(module_id) {
+        return Ok(None);
+    }
+    Ok(registry()?
+        .into_iter()
+        .find(|module| module.id == module_id))
 }
 
-pub(crate) fn find(module_id: &str) -> Option<ModuleSpec> {
-    MODULES
-        .iter()
-        .copied()
-        .find(|module| module.id == module_id)
+/// Creates an update request consumed by the root-owned module worker.
+pub(crate) fn request_update(module_id: &str) -> anyhow::Result<()> {
+    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
+    write_request(
+        &spec.id,
+        "request",
+        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
+    )
+}
+
+/// Requests safe removal of a registered runtime while preserving its config.
+pub(crate) fn request_remove(module_id: &str) -> anyhow::Result<()> {
+    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
+    write_request(
+        &spec.id,
+        "remove",
+        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
+    )
+}
+
+/// Queues activation of a root-owned catalog manifest.
+pub(crate) fn request_register(module_id: &str) -> anyhow::Result<()> {
+    if !valid_id(module_id) || find(module_id)?.is_some() {
+        anyhow::bail!("module already exists");
+    }
+    let available = available()?
+        .into_iter()
+        .any(|module| module.id == module_id);
+    if !available {
+        anyhow::bail!("module is not present in the root-owned catalog");
+    }
+    write_request(
+        module_id,
+        "register",
+        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
+    )
 }
 
 pub(crate) fn short_version(value: &str) -> String {
@@ -241,12 +266,188 @@ pub(crate) fn status_class(status: &ModuleStatus) -> &'static str {
     }
 }
 
+fn parse_manifest(content: &str, path: &Path) -> anyhow::Result<ModuleSpec> {
+    let mut values = HashMap::new();
+    for (index, raw_line) in content.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("{}:{}: expected key=value", path.display(), index + 1)
+        })?;
+        let key = key.trim();
+        if !matches!(
+            key,
+            "id" | "name"
+                | "kind"
+                | "role"
+                | "repo"
+                | "upstream"
+                | "ref"
+                | "driver"
+                | "root"
+                | "binary"
+                | "service"
+                | "config"
+                | "asset_amd64"
+                | "asset_arm64"
+        ) {
+            anyhow::bail!("{}:{}: unknown key {key}", path.display(), index + 1);
+        }
+        if values
+            .insert(key.to_string(), value.trim().to_string())
+            .is_some()
+        {
+            anyhow::bail!("{}:{}: duplicate key {key}", path.display(), index + 1);
+        }
+    }
+
+    let value = |key: &str| -> anyhow::Result<String> {
+        values
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{}: missing {key}", path.display()))
+    };
+    let upstream_name = value("upstream")?;
+    let git_ref = value("ref")?;
+    let upstream = match upstream_name.as_str() {
+        "release" => UpstreamKind::Release,
+        "commit" => UpstreamKind::Commit { git_ref },
+        _ => anyhow::bail!("{}: unsupported upstream", path.display()),
+    };
+    let mut spec = ModuleSpec {
+        id: value("id")?,
+        name: value("name")?,
+        kind: value("kind")?,
+        role: value("role")?,
+        repo: value("repo")?,
+        upstream,
+        driver: value("driver")?,
+        root: value("root")?,
+        binary: value("binary")?,
+        binary_path: String::new(),
+        service: value("service")?,
+        config_path: value("config")?,
+        asset_amd64: value("asset_amd64")?,
+        asset_arm64: value("asset_arm64")?,
+    };
+    let expected_id = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if spec.id != expected_id {
+        anyhow::bail!("{}: id must match the file name", path.display());
+    }
+    spec = validate_spec(spec)?;
+    Ok(spec)
+}
+
+fn validate_spec(mut spec: ModuleSpec) -> anyhow::Result<ModuleSpec> {
+    if !valid_id(&spec.id) {
+        anyhow::bail!("invalid module id");
+    }
+    for (label, value, max) in [
+        ("name", spec.name.as_str(), 80),
+        ("kind", spec.kind.as_str(), 48),
+        ("role", spec.role.as_str(), 160),
+    ] {
+        if value.is_empty() || value.len() > max || !safe_text(value) {
+            anyhow::bail!("invalid module {label}");
+        }
+    }
+    if !valid_repo(&spec.repo) {
+        anyhow::bail!("invalid GitHub repository");
+    }
+    if let UpstreamKind::Commit { git_ref } = &spec.upstream {
+        if !valid_ref(git_ref) {
+            anyhow::bail!("invalid Git reference");
+        }
+    }
+    if !matches!(
+        spec.driver.as_str(),
+        "release" | "headscale" | "mtproto-source"
+    ) {
+        anyhow::bail!("unsupported module driver");
+    }
+    if !matches!(spec.root.as_str(), "cores" | "modules") {
+        anyhow::bail!("invalid runtime root");
+    }
+    if !safe_filename(&spec.binary) {
+        anyhow::bail!("invalid binary name");
+    }
+    if !safe_service(&spec.service) {
+        anyhow::bail!("invalid service name");
+    }
+    if !spec.config_path.starts_with("/etc/")
+        || spec.config_path.contains("..")
+        || !spec.config_path.chars().all(safe_path_char)
+    {
+        anyhow::bail!("invalid config path");
+    }
+    if matches!(spec.upstream, UpstreamKind::Release)
+        && (!safe_asset(&spec.asset_amd64) || !safe_asset(&spec.asset_arm64))
+    {
+        anyhow::bail!("invalid release asset template");
+    }
+    match spec.driver.as_str() {
+        "release" => {
+            if spec.root != "cores"
+                || spec.service != format!("infiproxy-{}.service", spec.id)
+                || !spec
+                    .config_path
+                    .starts_with(&format!("/etc/infiproxy-cores/{}/", spec.id))
+            {
+                anyhow::bail!("generic modules must use their own core service and config tree");
+            }
+        }
+        "headscale" => {
+            if spec.id != "headscale"
+                || spec.root != "modules"
+                || spec.service != "headscale.service"
+                || spec.config_path != "/etc/headscale/config.yaml"
+            {
+                anyhow::bail!("invalid Headscale module contract");
+            }
+        }
+        "mtproto-source" => {
+            if spec.id != "mtproto"
+                || spec.root != "cores"
+                || spec.service != "infiproxy-mtproto.service"
+                || !spec
+                    .config_path
+                    .starts_with("/etc/infiproxy-cores/mtproto/")
+            {
+                anyhow::bail!("invalid MTProto module contract");
+            }
+        }
+        _ => unreachable!("driver was validated above"),
+    }
+    spec.binary_path = format!(
+        "/opt/infiproxy/{}/{}/current/{}",
+        spec.root, spec.id, spec.binary
+    );
+    Ok(spec)
+}
+
+fn write_request(module_id: &str, extension: &str, content: &str) -> anyhow::Result<()> {
+    if !valid_id(module_id) || !matches!(extension, "request" | "register" | "remove") {
+        anyhow::bail!("invalid module request");
+    }
+    let directory = request_dir();
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{module_id}.{extension}"));
+    fs::write(&path, content)?;
+    set_private_permissions(&directory, &path);
+    Ok(())
+}
+
 async fn refresh_with_client(
     pool: &SqlitePool,
     spec: ModuleSpec,
     client: &reqwest::Client,
 ) -> anyhow::Result<ModuleStatus> {
-    let latest_version = match spec.upstream {
+    let latest_version = match &spec.upstream {
         UpstreamKind::Release => {
             let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
             client
@@ -273,12 +474,12 @@ async fn refresh_with_client(
                 .sha
         }
     };
-    let installed_version = installed_version(spec);
-    let installed = Path::new(spec.binary_path).is_file();
+    let installed_version = installed_version(&spec);
+    let installed = Path::new(&spec.binary_path).is_file();
     let update_available = installed
         && installed_version != "unknown"
         && normalize_version(&installed_version) != normalize_version(&latest_version);
-    let auto_update = load_auto_update(pool, spec.id).await?;
+    let auto_update = load_auto_update(pool, &spec.id).await?;
     let status = ModuleStatus {
         spec,
         installed,
@@ -302,16 +503,16 @@ async fn refresh_with_client(
 }
 
 async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleStatus> {
-    let installed = Path::new(spec.binary_path).is_file();
-    let installed_version = installed_version(spec);
-    let latest_version = setting_or_default(pool, spec.id, "latest_version", "unknown").await?;
+    let installed = Path::new(&spec.binary_path).is_file();
+    let installed_version = installed_version(&spec);
+    let latest_version = setting_or_default(pool, &spec.id, "latest_version", "unknown").await?;
     let update_available = installed
         && latest_version != "unknown"
         && installed_version != "unknown"
         && normalize_version(&installed_version) != normalize_version(&latest_version);
     let persisted_status = setting_or_default(
         pool,
-        spec.id,
+        &spec.id,
         "status",
         if installed {
             "unchecked"
@@ -330,13 +531,13 @@ async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleS
         persisted_status
     };
     Ok(ModuleStatus {
-        spec,
+        spec: spec.clone(),
         installed,
         installed_version,
         latest_version,
         update_available,
-        auto_update: load_auto_update(pool, spec.id).await?,
-        checked_at: setting_or_default(pool, spec.id, "checked_at", "never").await?,
+        auto_update: load_auto_update(pool, &spec.id).await?,
+        checked_at: setting_or_default(pool, &spec.id, "checked_at", "never").await?,
         status,
     })
 }
@@ -347,21 +548,21 @@ async fn persist_status(pool: &SqlitePool, status: &ModuleStatus) -> anyhow::Res
         ("checked_at", status.checked_at.as_str()),
         ("status", status.status.as_str()),
     ] {
-        upsert_setting(pool, &setting_key(status.spec.id, suffix), value).await?;
+        upsert_setting(pool, &setting_key(&status.spec.id, suffix), value).await?;
     }
     Ok(())
 }
 
 async fn persist_check_error(
     pool: &SqlitePool,
-    spec: ModuleSpec,
+    spec: &ModuleSpec,
     error: &str,
 ) -> anyhow::Result<()> {
     let message = format!(
         "check failed: {}",
         error.chars().take(120).collect::<String>()
     );
-    upsert_setting(pool, &setting_key(spec.id, "status"), &message).await
+    upsert_setting(pool, &setting_key(&spec.id, "status"), &message).await
 }
 
 async fn load_auto_update(pool: &SqlitePool, module_id: &str) -> anyhow::Result<bool> {
@@ -383,13 +584,13 @@ async fn setting_or_default(
         .unwrap_or_else(|| default_value.to_string()))
 }
 
-fn installed_version(spec: ModuleSpec) -> String {
+fn installed_version(spec: &ModuleSpec) -> String {
     let state_path = version_dir().join(format!("{}.version", spec.id));
     fs::read_to_string(state_path)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .or_else(|| version_from_symlink(spec.binary_path))
+        .or_else(|| version_from_symlink(&spec.binary_path))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -410,16 +611,12 @@ fn github_client() -> anyhow::Result<reqwest::Client> {
 }
 
 fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
-    let state_dir = state_dir();
-    fs::create_dir_all(&state_dir)?;
+    let directory = state_dir();
+    fs::create_dir_all(&directory)?;
     let content = format!(
         concat!(
-            "AUTO_ENABLED={}\n",
-            "INSTALLED={}\n",
-            "UPDATE_AVAILABLE={}\n",
-            "INSTALLED_VERSION={}\n",
-            "LATEST_VERSION={}\n",
-            "CHECKED_AT={}\n"
+            "AUTO_ENABLED={}\nINSTALLED={}\nUPDATE_AVAILABLE={}\n",
+            "INSTALLED_VERSION={}\nLATEST_VERSION={}\nCHECKED_AT={}\n"
         ),
         bool_str(status.auto_update),
         bool_str(status.installed),
@@ -428,9 +625,9 @@ fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
         safe_state_value(&status.latest_version),
         safe_state_value(&status.checked_at),
     );
-    fs::write(state_dir.join(format!("{}.env", status.spec.id)), content)?;
-    let state_path = state_dir.join(format!("{}.env", status.spec.id));
-    set_private_permissions(&state_dir, &state_path);
+    let path = directory.join(format!("{}.env", status.spec.id));
+    fs::write(&path, content)?;
+    set_private_permissions(&directory, &path);
     Ok(())
 }
 
@@ -440,6 +637,30 @@ fn set_private_permissions(directory: &Path, file: &Path) {
         use std::os::unix::fs::PermissionsExt;
         let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o750));
         let _ = fs::set_permissions(file, fs::Permissions::from_mode(0o640));
+    }
+}
+
+fn manifest_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("INFIPROXY_MODULE_MANIFEST_DIR") {
+        return PathBuf::from(path);
+    }
+    let installed = PathBuf::from(DEFAULT_MANIFEST_DIR);
+    if installed.is_dir() {
+        installed
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/modules.d")
+    }
+}
+
+fn available_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("INFIPROXY_MODULE_AVAILABLE_DIR") {
+        return PathBuf::from(path);
+    }
+    let installed = PathBuf::from(DEFAULT_AVAILABLE_DIR);
+    if installed.is_dir() {
+        installed
+    } else {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/modules.d")
     }
 }
 
@@ -459,6 +680,72 @@ fn version_dir() -> PathBuf {
     std::env::var_os("INFIPROXY_MODULE_VERSION_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_VERSION_DIR))
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+fn valid_repo(value: &str) -> bool {
+    let mut parts = value.split('/');
+    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if safe_repo_part(owner) && safe_repo_part(repo))
+}
+
+fn safe_repo_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn valid_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 120
+        && !value.starts_with('/')
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-'))
+}
+
+fn safe_text(value: &str) -> bool {
+    value
+        .chars()
+        .all(|ch| ch.is_ascii() && !ch.is_ascii_control() && !matches!(ch, '=' | '|'))
+}
+
+fn safe_filename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-'))
+}
+
+fn safe_service(value: &str) -> bool {
+    value.ends_with(".service")
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '@' | '-'))
+}
+
+fn safe_asset(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 180
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-' | '{' | '}'))
+}
+
+fn safe_path_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-')
 }
 
 fn setting_key(module_id: &str, suffix: &str) -> String {
@@ -493,15 +780,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn module_ids_are_unique_and_shell_safe() {
-        let mut ids = std::collections::HashSet::new();
-        for module in MODULES {
-            assert!(ids.insert(module.id));
-            assert!(module
-                .id
-                .chars()
-                .all(|ch| ch.is_ascii_lowercase() || ch == '-'));
-        }
+    fn bundled_registry_is_dynamic_and_valid() {
+        let specs = registry().expect("bundled manifests load");
+        assert!(specs.len() >= 6);
+        assert!(specs.iter().any(|spec| spec.id == "xray"));
+        assert!(specs.iter().any(|spec| spec.id == "headscale"));
+    }
+
+    #[test]
+    fn manifest_rejects_filename_mismatch_and_unknown_keys() {
+        let valid = "id=demo\nname=Demo\nkind=core\nrole=Test\nrepo=owner/repo\nupstream=release\nref=\ndriver=release\nroot=cores\nbinary=demo\nservice=infiproxy-demo.service\nconfig=/etc/infiproxy-cores/demo/config.json\nasset_amd64=demo-{version}-amd64\nasset_arm64=demo-{version}-arm64\n";
+        assert!(parse_manifest(valid, Path::new("demo.module")).is_ok());
+        assert!(parse_manifest(valid, Path::new("other.module")).is_err());
+        assert!(parse_manifest(
+            &format!("{valid}command=rm -rf /\n"),
+            Path::new("demo.module")
+        )
+        .is_err());
+        assert!(parse_manifest(
+            &valid.replace("infiproxy-demo.service", "ssh.service"),
+            Path::new("demo.module")
+        )
+        .is_err());
     }
 
     #[test]
@@ -512,7 +812,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_module_cannot_create_a_request() {
-        assert!(find("../root").is_none());
+    fn unsafe_module_inputs_are_rejected() {
+        assert!(!valid_id("../root"));
+        assert!(!valid_repo("owner/repo/extra"));
+        assert!(!safe_asset("../../payload"));
+        assert!(!safe_service("demo;reboot.service"));
     }
 }

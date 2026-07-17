@@ -1,0 +1,14 @@
+id=mtproto
+name=Telegram MTProto
+kind=proxy service
+role=Native Telegram proxy
+repo=TelegramMessenger/MTProxy
+upstream=commit
+ref=master
+driver=mtproto-source
+root=cores
+binary=mtproto-proxy
+service=infiproxy-mtproto.service
+config=/etc/infiproxy-cores/mtproto/mtproto.env
+asset_amd64=
+asset_arm64=

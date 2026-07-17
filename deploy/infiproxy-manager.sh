@@ -10,8 +10,13 @@ APP="Infiproxy"
 ENV_FILE="${INFIPROXY_ENV_FILE:-/etc/infiproxy/infiproxy.env}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
+APP_USER="${INFIPROXY_USER:-infiproxy}"
 PANEL_SERVICE="infiproxy.service"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
+MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
+MODULE_MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
+MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
+MODULE_REQUEST_DIR="${INFIPROXY_MODULE_REQUEST_DIR:-/var/lib/infiproxy/module-requests}"
 MODULE_UPDATE_LOG="${INFIPROXY_MODULE_UPDATE_LOG:-/var/lib/infiproxy-maintenance/module-update.log}"
 PANEL_UPDATE_REQUEST="${INFIPROXY_PANEL_UPDATE_REQUEST:-/var/lib/infiproxy/panel-update-now.request}"
 UPDATE_CONFIG_FILE="${INFIPROXY_UPDATE_CONFIG_FILE:-/etc/infiproxy-update.conf}"
@@ -19,13 +24,6 @@ NGINX_SITE="${INFIPROXY_NGINX_SITE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 CLOUDFLARE_CREDENTIALS="${INFIPROXY_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
 CF_API="https://api.cloudflare.com/client/v4"
-CORE_SERVICES=(
-  "infiproxy-xray.service"
-  "infiproxy-sing-box.service"
-  "infiproxy-hysteria.service"
-  "infiproxy-tuic.service"
-  "infiproxy-mtproto.service"
-)
 MTPROTO_DIR="${INFIPROXY_MTPROTO_DIR:-/etc/infiproxy-cores/mtproto}"
 MTPROTO_ENV="${INFIPROXY_MTPROTO_ENV:-${MTPROTO_DIR}/mtproto.env}"
 MTPROTO_BINARY="${INFIPROXY_MTPROTO_BINARY:-/opt/infiproxy/cores/mtproto/current/mtproto-proxy}"
@@ -96,20 +94,39 @@ confirm_yes() {
   fi
 }
 
+registered_module_records() {
+  local module
+  [[ -x "$MODULE_MANIFEST_HELPER" && -d "$MODULE_MANIFEST_DIR" ]] || return 0
+  while IFS= read -r module; do
+    "$MODULE_MANIFEST_HELPER" read "$MODULE_MANIFEST_DIR/${module}.module" --root-owned
+  done < <("$MODULE_MANIFEST_HELPER" list "$MODULE_MANIFEST_DIR" --root-owned)
+}
+
+registered_services() {
+  local record service
+  while IFS= read -r record; do
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ service _ _ _ <<<"$record"
+    printf '%s\n' "$service"
+  done < <(registered_module_records)
+}
+
 header() {
-  local panel_state host uptime_label module_count
+  local panel_state host uptime_label module_count service record
   clear 2>/dev/null || true
   host="$(hostname -f 2>/dev/null || hostname)"
   panel_state="$(systemctl is-active "$PANEL_SERVICE" 2>/dev/null || true)"
   uptime_label="$(uptime -p 2>/dev/null | sed 's/^up //' || true)"
   module_count=0
-  for service in "${CORE_SERVICES[@]}" "$HEADSCALE_SERVICE"; do
-    systemctl is-active --quiet "$service" 2>/dev/null && ((module_count += 1)) || true
-  done
+  while IFS= read -r record; do
+    IFS='|' read -r _ _ _ _ _ _ _ _ _ _ service _ _ _ <<<"$record"
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+      ((module_count += 1))
+    fi
+  done < <(registered_module_records)
   echo "${green}${bold}+------------------------------------------------------------------+${reset}"
   printf '%s| %-64s |%s\n' "${green}${bold}" "${APP} Manager / ${host}" "${reset}"
   echo "${green}${bold}+------------------------------------------------------------------+${reset}"
-  printf "${muted}panel %-10s modules active %-2s/6  uptime %s${reset}\n" \
+  printf "${muted}panel %-10s modules active %-2s    uptime %s${reset}\n" \
     "${panel_state:-unknown}" "$module_count" "${uptime_label:-unknown}"
   echo "${muted}systemd bare-metal / env ${ENV_FILE}${reset}"
   echo
@@ -336,10 +353,9 @@ service_status() {
   printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
   printf "%-34s %-12s %-12s\n" "----" "------" "-------"
   unit_state "$PANEL_SERVICE"
-  for service in "${CORE_SERVICES[@]}"; do
+  while IFS= read -r service; do
     unit_state "$service"
-  done
-  unit_state "$HEADSCALE_SERVICE"
+  done < <(registered_services)
   echo
   echo "${bold}Local checks${reset}"
   echo "  curl http://127.0.0.1:8080/health"
@@ -365,7 +381,9 @@ restart_menu() {
     2)
       need_root
       if command -v nginx >/dev/null 2>&1; then
-        run_cmd nginx -t && run_cmd systemctl reload nginx.service || true
+        if run_cmd nginx -t; then
+          run_cmd systemctl reload nginx.service || true
+        fi
       else
         echo "${danger}nginx is not installed.${reset}"
       fi
@@ -373,18 +391,20 @@ restart_menu() {
     3)
       need_root
       if command -v sshd >/dev/null 2>&1; then
-        run_cmd sshd -t && (run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service) || true
+        if run_cmd sshd -t; then
+          run_cmd systemctl reload ssh.service || run_cmd systemctl reload sshd.service || true
+        fi
       else
         echo "${danger}sshd is not installed.${reset}"
       fi
       ;;
     4)
       need_root
-      for service in "${CORE_SERVICES[@]}"; do
+      while IFS= read -r service; do
         if systemctl is-enabled --quiet "$service" 2>/dev/null; then
           run_cmd systemctl restart "$service" || true
         fi
-      done
+      done < <(registered_services)
       ;;
     5)
       need_root
@@ -396,7 +416,9 @@ restart_menu() {
     6)
       need_root
       read -r -p "Type REBOOT to reboot this server: " confirm
-      [[ "$confirm" == "REBOOT" ]] && run_cmd systemctl reboot || true
+      if [[ "$confirm" == "REBOOT" ]]; then
+        run_cmd systemctl reboot || true
+      fi
       ;;
     0) return ;;
     *) invalid_choice; return ;;
@@ -411,26 +433,6 @@ edit_env() {
   "$(pick_editor)" "$ENV_FILE"
   secure_env_file
   run_cmd systemctl restart "$PANEL_SERVICE" || true
-  pause
-}
-
-toggle_danger_shell() {
-  need_root
-  header
-  secure_env_file
-  if grep -q '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE"; then
-    current="$(grep '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)"
-    if [[ "$current" == "true" ]]; then
-      sed -i.bak 's/^INFIPROXY_ENABLE_DANGER_SHELL=.*/INFIPROXY_ENABLE_DANGER_SHELL=false/' "$ENV_FILE"
-    else
-      sed -i.bak 's/^INFIPROXY_ENABLE_DANGER_SHELL=.*/INFIPROXY_ENABLE_DANGER_SHELL=true/' "$ENV_FILE"
-    fi
-  else
-    echo "INFIPROXY_ENABLE_DANGER_SHELL=true" >>"$ENV_FILE"
-  fi
-  secure_env_file
-  run_cmd systemctl restart "$PANEL_SERVICE" || true
-  grep '^INFIPROXY_ENABLE_DANGER_SHELL=' "$ENV_FILE" || true
   pause
 }
 
@@ -477,22 +479,30 @@ run_panel_install_from_source() {
 }
 
 select_core_runtime() {
-  echo "1) xray"
-  echo "2) sing-box"
-  echo "3) hysteria"
-  echo "4) tuic"
-  echo "5) Telegram MTProto"
+  local record id name root binary_name unit index selected
+  local -a ids=() binaries=() services=()
+  while IFS= read -r record; do
+    IFS='|' read -r id name _ _ _ _ _ _ root binary_name unit _ _ _ <<<"$record"
+    [[ "$root" == "cores" ]] || continue
+    ids+=("$id")
+    binaries+=("$binary_name")
+    services+=("$unit")
+    printf '%s) %s [%s]\n' "${#ids[@]}" "$name" "$id"
+  done < <(registered_module_records)
+  if [[ "${#ids[@]}" -eq 0 ]]; then
+    echo "No registered core modules."
+    return 1
+  fi
   echo "0) Back"
   read_menu_choice || return 1
-  case "$choice" in
-    1) core="xray"; binary="xray"; service="infiproxy-xray.service" ;;
-    2) core="sing-box"; binary="sing-box"; service="infiproxy-sing-box.service" ;;
-    3) core="hysteria"; binary="hysteria"; service="infiproxy-hysteria.service" ;;
-    4) core="tuic"; binary="tuic-server"; service="infiproxy-tuic.service" ;;
-    5) core="mtproto"; binary="mtproto-proxy"; service="infiproxy-mtproto.service" ;;
-    0) return 2 ;;
-    *) invalid_choice; return 1 ;;
-  esac
+  [[ "$choice" == "0" ]] && return 2
+  [[ "$choice" =~ ^[0-9]+$ ]] || { invalid_choice; return 1; }
+  index=$((choice - 1))
+  selected="${ids[$index]:-}"
+  [[ -n "$selected" ]] || { invalid_choice; return 1; }
+  core="$selected"
+  binary="${binaries[$index]}"
+  service="${services[$index]}"
 }
 
 # Import a core archive using the checksum-verifying installer. The TUI only
@@ -904,7 +914,11 @@ guided_headscale_setup() {
   write_headscale_nginx_config "$domain" || return
 
   if have_cmd headscale; then
-    confirm_yes "Headscale binary already exists. Reinstall/update from verified release?" "N" && install_answer=1 || install_answer=0
+    if confirm_yes "Headscale binary already exists. Reinstall/update from verified release?" "N"; then
+      install_answer=1
+    else
+      install_answer=0
+    fi
   else
     install_answer=1
   fi
@@ -1173,14 +1187,16 @@ guided_deployment() {
 
   echo
   if confirm_yes "Install current verified proxy modules now?" "Y"; then
-    local module
-    for module in xray sing-box hysteria tuic; do
-      if confirm_yes "Install or update ${module}?" "N"; then
+    local record module name driver root
+    while IFS= read -r record; do
+      IFS='|' read -r module name _ _ _ _ _ driver root _ _ _ _ _ <<<"$record"
+      [[ "$driver" == "release" && "$root" == "cores" ]] || continue
+      if confirm_yes "Install or update ${name} [${module}]?" "N"; then
         "$MODULE_UPDATE_BIN" --update "$module" || {
-          echo "${danger}${module} installation failed; see ${MODULE_UPDATE_LOG}.${reset}" >&2
+          echo "${danger}${name} installation failed; see ${MODULE_UPDATE_LOG}.${reset}" >&2
         }
       fi
-    done
+    done < <(registered_module_records)
   fi
 
   echo
@@ -1213,10 +1229,9 @@ guided_deployment() {
   printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
   printf "%-34s %-12s %-12s\n" "----" "------" "-------"
   unit_state "$PANEL_SERVICE"
-  for service in "${CORE_SERVICES[@]}"; do
+  while IFS= read -r service; do
     unit_state "$service"
-  done
-  unit_state "$HEADSCALE_SERVICE"
+  done < <(registered_services)
   pause
 }
 
@@ -1264,24 +1279,94 @@ admin_access() {
 }
 
 select_module_runtime() {
-  echo "1) xray"
-  echo "2) sing-box"
-  echo "3) hysteria"
-  echo "4) tuic"
-  echo "5) Telegram MTProto"
-  echo "6) Headscale"
+  local record id name index selected
+  local -a ids=()
+  while IFS= read -r record; do
+    IFS='|' read -r id name _ <<<"$record"
+    ids+=("$id")
+    printf '%s) %s [%s]\n' "${#ids[@]}" "$name" "$id"
+  done < <(registered_module_records)
+  if [[ "${#ids[@]}" -eq 0 ]]; then
+    echo "No registered modules."
+    return 1
+  fi
   echo "0) Back"
   read_menu_choice || return 1
-  case "$choice" in
-    1) module="xray" ;;
-    2) module="sing-box" ;;
-    3) module="hysteria" ;;
-    4) module="tuic" ;;
-    5) module="mtproto" ;;
-    6) module="headscale" ;;
-    0) return 2 ;;
-    *) invalid_choice; return 1 ;;
-  esac
+  [[ "$choice" == "0" ]] && return 2
+  [[ "$choice" =~ ^[0-9]+$ ]] || { invalid_choice; return 1; }
+  index=$((choice - 1))
+  selected="${ids[$index]:-}"
+  [[ -n "$selected" ]] || { invalid_choice; return 1; }
+  module="$selected"
+}
+
+import_module_manifest() {
+  local source id target request record root binary service config
+  read -r -p "Manifest path: " source
+  [[ -f "$source" ]] || { echo "${danger}Manifest not found.${reset}"; return 1; }
+  id="$(basename "$source" .module)"
+  "$MODULE_MANIFEST_HELPER" validate "$source" --registration || return 1
+  record="$("$MODULE_MANIFEST_HELPER" read "$source" --registration)" || return 1
+  IFS='|' read -r _ _ _ _ _ _ _ _ root binary service config _ _ <<<"$record"
+  install_generic_module_unit "$source" "$id" "$root" "$binary" "$service" || return 1
+  target="${MODULE_AVAILABLE_DIR}/${id}.module"
+  request="${MODULE_REQUEST_DIR}/${id}.register"
+  install -d -o root -g root -m 0755 "$MODULE_AVAILABLE_DIR"
+  install -d -o root -g "$APP_GROUP" -m 0770 "$(dirname "$config")"
+  install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$MODULE_REQUEST_DIR"
+  install -o root -g root -m 0644 "$source" "$target"
+  printf 'requested_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$request"
+  chown "$APP_USER":"$APP_GROUP" "$request"
+  chmod 0640 "$request"
+  run_cmd systemctl start infiproxy-module-update.service || true
+}
+
+install_generic_module_unit() {
+  local manifest="$1" id="$2" root="$3" binary="$4" service="$5"
+  local suggested unit_source expected_binary exec_count
+  [[ "$root" == "cores" && "$service" == "infiproxy-${id}.service" ]] || return 1
+  systemctl cat "$service" >/dev/null 2>&1 && return 0
+
+  suggested="${manifest%.module}.service"
+  read -r -p "Service unit path [${suggested}]: " unit_source
+  unit_source="${unit_source:-$suggested}"
+  if [[ ! -f "$unit_source" || -L "$unit_source" || "$(wc -c <"$unit_source")" -gt 65536 ]]; then
+    echo "${danger}Unit must be a regular non-symlink file no larger than 64 KiB.${reset}" >&2
+    return 1
+  fi
+
+  expected_binary="/opt/infiproxy/cores/${id}/current/${binary}"
+  exec_count="$(grep -Ec '^Exec[A-Za-z]*=' "$unit_source" || true)"
+  if [[ "$exec_count" -ne 1 ]] \
+    || [[ "$(grep -Ec '^User=' "$unit_source" || true)" -ne 1 ]] \
+    || [[ "$(grep -Ec '^Group=' "$unit_source" || true)" -ne 1 ]] \
+    || [[ "$(grep -Ec '^NoNewPrivileges=' "$unit_source" || true)" -ne 1 ]] \
+    || [[ "$(grep -Ec '^ProtectSystem=' "$unit_source" || true)" -ne 1 ]] \
+    || ! awk -F= -v expected="$expected_binary" '
+      $1 == "ExecStart" {
+        command = $2
+        sub(/^[[:space:]]+/, "", command)
+        split(command, parts, /[[:space:]]+/)
+        if (parts[1] == expected) valid = 1
+      }
+      END { exit(valid ? 0 : 1) }
+    ' "$unit_source" \
+    || ! grep -Fxq "User=${APP_USER}" "$unit_source" \
+    || ! grep -Fxq "Group=${APP_GROUP}" "$unit_source" \
+    || ! grep -Fxq 'NoNewPrivileges=true' "$unit_source" \
+    || ! grep -Fxq 'ProtectSystem=strict' "$unit_source"; then
+    echo "${danger}Unit rejected: require one fixed ExecStart, infiproxy user/group, NoNewPrivileges and ProtectSystem=strict.${reset}" >&2
+    return 1
+  fi
+  if grep -Eq '^(SupplementaryGroups|PermissionsStartOnly)=' "$unit_source" \
+    || grep -E '^(AmbientCapabilities|CapabilityBoundingSet)=' "$unit_source" \
+      | grep -Ev '^(AmbientCapabilities|CapabilityBoundingSet)=CAP_NET_BIND_SERVICE$' >/dev/null; then
+    echo "${danger}Unit rejected: elevated groups or capabilities are not allowed.${reset}" >&2
+    return 1
+  fi
+
+  install -o root -g root -m 0644 "$unit_source" "/etc/systemd/system/${service}"
+  systemctl daemon-reload
 }
 
 module_update_menu() {
@@ -1295,6 +1380,8 @@ module_update_menu() {
     echo "3) Install or update one module"
     echo "4) Restart module updater"
     echo "5) Show module updater log"
+    echo "6) Import a generic release manifest"
+    echo "7) Remove a registered module"
     echo "0) Back"
     read_menu_choice || return
     case "$choice" in
@@ -1318,6 +1405,19 @@ module_update_menu() {
         pause
         ;;
       5) run_cmd tail -n 160 "$MODULE_UPDATE_LOG" || true; pause ;;
+      6) import_module_manifest || true; pause ;;
+      7)
+        select_module_runtime || continue
+        read -r -p "Type ${module} to remove its runtime and preserve config: " confirm
+        if [[ "$confirm" == "$module" ]]; then
+          install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$MODULE_REQUEST_DIR"
+          printf 'requested_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"${MODULE_REQUEST_DIR}/${module}.remove"
+          chown "$APP_USER":"$APP_GROUP" "${MODULE_REQUEST_DIR}/${module}.remove"
+          chmod 0640 "${MODULE_REQUEST_DIR}/${module}.remove"
+          run_cmd systemctl start infiproxy-module-update.service || true
+        fi
+        pause
+        ;;
       0) return ;;
       *) invalid_choice ;;
     esac
@@ -1387,7 +1487,6 @@ advanced_menu() {
     echo "2) Telegram MTProto configuration"
     echo "3) Headscale hub configuration"
     echo "4) Manual verified archive import"
-    echo "5) Toggle web danger shell"
     echo "0) Back"
     read_menu_choice || return
     case "$choice" in
@@ -1395,7 +1494,6 @@ advanced_menu() {
       2) mtproto_setup_menu ;;
       3) headscale_menu ;;
       4) core_helper ;;
-      5) toggle_danger_shell ;;
       0) return ;;
       *) invalid_choice ;;
     esac
@@ -1413,16 +1511,22 @@ rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
-rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
+rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
 EOF
       ;;
     full)
       cat <<'EOF'
+for manifest in /etc/infiproxy-modules.d/*.module; do
+  [ -f "$manifest" ] || continue
+  service=$(/usr/local/libexec/infiproxy-module-manifest read "$manifest" --root-owned | cut -d'|' -f11)
+  systemctl disable --now "$service" || true
+  rm -f "/etc/systemd/system/$service"
+done
 systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
@@ -1432,22 +1536,30 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
-rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
+rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
 rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /opt/infiproxy/modules /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -rf /opt/infiproxy/source
 rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
 rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
-nginx -t && systemctl reload nginx.service || true
+if nginx -t; then
+  systemctl reload nginx.service || true
+fi
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
 EOF
       ;;
     factory)
       cat <<'EOF'
+for manifest in /etc/infiproxy-modules.d/*.module; do
+  [ -f "$manifest" ] || continue
+  service=$(/usr/local/libexec/infiproxy-module-manifest read "$manifest" --root-owned | cut -d'|' -f11)
+  systemctl disable --now "$service" || true
+  rm -f "/etc/systemd/system/$service"
+done
 systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
@@ -1457,16 +1569,18 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
-rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
+rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
 rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -f /usr/local/bin/headscale
 rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
 rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
-nginx -t && systemctl reload nginx.service || true
+if nginx -t; then
+  systemctl reload nginx.service || true
+fi
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
 EOF

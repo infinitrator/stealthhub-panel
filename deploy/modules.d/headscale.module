@@ -1,0 +1,14 @@
+id=headscale
+name=Headscale
+kind=mesh service
+role=Tailscale-compatible coordination hub
+repo=juanfont/headscale
+upstream=release
+ref=
+driver=headscale
+root=modules
+binary=headscale
+service=headscale.service
+config=/etc/headscale/config.yaml
+asset_amd64=headscale_{version}_linux_amd64
+asset_arm64=headscale_{version}_linux_arm64

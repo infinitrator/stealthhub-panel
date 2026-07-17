@@ -38,6 +38,14 @@ jobs:
           sudo apt-get install -y shellcheck
           shellcheck -x deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/module-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh deploy/infiproxy-profile.sh
 
+      - name: Deployment contracts
+        run: |
+          set -euo pipefail
+          for file in deploy/*.sh deploy/cores/*.sh; do bash -n "$file"; done
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/module-manifest.py list deploy/modules.d
+          bash deploy/install.sh --check
+          bash deploy/bootstrap.sh --check --src-dir "$PWD"
+
       - name: Dependency audit
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:

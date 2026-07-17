@@ -136,10 +136,23 @@ root update source. Change channels by rerunning bootstrap with `--repo` and
 
 ## Runtime Modules
 
-Open `Modules` in the web panel or `Runtime modules` in the SSH manager. Xray,
-sing-box, Hysteria, TUIC, Telegram MTProto and Headscale can be checked and
-updated independently. Automatic updates are configurable per module and use
-the same maintenance time as the panel.
+Open `Modules` in the web panel or `Runtime modules` in the SSH manager. The
+runtime list is loaded from root-owned manifests rather than compiled into the
+panel. Each active module can be checked, installed, updated, disabled for
+automatic updates or removed independently. Removing a module preserves its
+configuration and places it back in the available catalog.
+
+The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC,
+Telegram MTProto and Headscale. A root operator can import another compatible
+generic GitHub-release manifest from the SSH manager. Browser sessions can only
+activate manifests already approved in that root-owned catalog; they cannot
+submit repositories, download commands or systemd unit names.
+
+For a new generic provider, the SSH manager also asks for its systemd unit when
+the expected `infiproxy-<module-id>.service` is not installed. The unit is
+accepted only when it runs the module's versioned binary as the unprivileged
+`infiproxy` user, contains no extra `Exec*` hooks and enables
+`NoNewPrivileges` plus `ProtectSystem=strict`.
 
 Runtime paths:
 
@@ -169,11 +182,13 @@ Show installed/latest status
 Install or update one module
 ```
 
-Release assets come only from fixed official GitHub repositories. GitHub's asset
-digest or the upstream checksum sidecar is verified before a bounded smoke test
-and atomic `current` symlink switch. If an active service fails after restart,
-the updater restores the previous symlink and service. Config files are never
-replaced by a module update.
+Release assets come from the repository pinned in each validated manifest.
+GitHub's asset digest or the upstream checksum sidecar is verified before a
+bounded smoke test and atomic `current` symlink switch. A generic module may
+control only `infiproxy-<module-id>.service` and its own
+`/etc/infiproxy-cores/<module-id>/` configuration tree. If an active service
+fails after restart, the updater restores the previous symlink and service.
+Config files are never replaced by a module update.
 
 ## Telegram MTProto
 
@@ -296,8 +311,11 @@ cannot prove whether they existed before Infiproxy.
 /usr/local/bin/infiproxy
 /usr/local/sbin/infiproxy-manager
 /usr/local/sbin/infiproxy-module-update
+/usr/local/libexec/infiproxy-module-manifest
 /etc/infiproxy/infiproxy.env
 /etc/infiproxy-update.conf
+/etc/infiproxy-modules.d
+/etc/infiproxy-modules.available.d
 /var/lib/infiproxy/infiproxy.sqlite
 /var/lib/infiproxy-maintenance
 /etc/systemd/system/infiproxy.service
@@ -315,11 +333,10 @@ INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
 INFIPROXY_DB_MAX_CONNECTIONS=2
 INFIPROXY_COOKIE_SECURE=true
 INFIPROXY_ENABLE_DEMO_USER=false
-INFIPROXY_ENABLE_DANGER_SHELL=true
 ```
 
-The web danger shell is owner-only and intended for break-glass administration.
-For destructive host operations, prefer `sudo infiproxy-manager` over SSH.
+Shell and terminal execution are intentionally unavailable in the web panel.
+Use the structured controls, config editors or `sudo infiproxy-manager` over SSH.
 
 ## Manual Commands
 
@@ -345,6 +362,12 @@ Install or update a module without the TUI:
 sudo infiproxy-module-update --check xray
 sudo infiproxy-module-update --update xray
 ```
+
+The web frontend is isolated under
+`crates/stealthhub-panel/src/views/`, with the shared page shell in `ui.rs` and
+all styling in `assets/panel.css`. Route handlers, authentication, module
+updates and storage do not contain page markup, so visual changes are delivered
+through the normal in-place panel update without a reinstall.
 
 ## Local Development
 

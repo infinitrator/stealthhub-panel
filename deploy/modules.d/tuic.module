@@ -1,0 +1,14 @@
+id=tuic
+name=TUIC
+kind=proxy core
+role=QUIC low-latency fallback
+repo=tuic-protocol/tuic
+upstream=release
+ref=
+driver=release
+root=cores
+binary=tuic-server
+service=infiproxy-tuic.service
+config=/etc/infiproxy-cores/tuic/config.json
+asset_amd64=tuic-server-{version}-x86_64-unknown-linux-gnu
+asset_arm64=tuic-server-{version}-aarch64-unknown-linux-gnu
