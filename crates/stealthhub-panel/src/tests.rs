@@ -6,7 +6,7 @@
 #![cfg(test)]
 
 use super::*;
-use crate::{health, ip};
+use crate::{health, ip, modules};
 use axum::http::{header, HeaderMap};
 use chrono::{Duration, Utc};
 use std::collections::HashSet;
@@ -181,6 +181,15 @@ fn system_helpers_format_safe_values() {
 }
 
 #[test]
+fn update_schedule_accepts_only_complete_24_hour_times() {
+    assert_eq!(update::parse_schedule_time("05:00"), Some((5, 0)));
+    assert_eq!(update::parse_schedule_time("23:59"), Some((23, 59)));
+    assert_eq!(update::parse_schedule_time("5:00"), None);
+    assert_eq!(update::parse_schedule_time("24:00"), None);
+    assert_eq!(update::parse_schedule_time("12:60"), None);
+}
+
+#[test]
 fn command_output_trimming_preserves_utf8() {
     let input = "ж".repeat(4_200);
     let output = trim_command_output(&input);
@@ -265,15 +274,15 @@ fn config_editor_targets_are_allowlisted_and_unique() {
         assert!(spec.max_bytes <= 256 * 1024);
     }
 
-    assert!(CONFIG_FILES.len() >= CORE_RUNTIMES.len());
+    assert!(CONFIG_FILES.len() >= modules::MODULES.len());
 }
 
 #[test]
 fn mtproto_runtime_is_wired_into_panel_contracts() {
-    assert!(CORE_RUNTIMES
+    assert!(modules::MODULES
         .iter()
-        .any(|core| core.service == "infiproxy-mtproto.service"
-            && core.binary_path.ends_with("/mtproto-proxy")));
+        .any(|module| module.service == "infiproxy-mtproto.service"
+            && module.binary_path.ends_with("/mtproto-proxy")));
     assert!(SYSTEM_TARGETS.iter().any(|target| target.slug == "mtproto"
         && target.units == ["infiproxy-mtproto.service"].as_slice()));
     assert!(CONFIG_FILES.iter().any(|spec| spec.slug == "mtproto-core"
@@ -286,6 +295,11 @@ fn mtproto_runtime_is_wired_into_panel_contracts() {
 
 #[test]
 fn headscale_module_is_wired_into_panel_contracts() {
+    assert!(modules::MODULES
+        .iter()
+        .any(|module| module.id == "headscale"
+            && module.service == "headscale.service"
+            && module.binary_path.ends_with("/headscale")));
     assert!(SYSTEM_TARGETS.iter().any(
         |target| target.slug == "headscale" && target.units == ["headscale.service"].as_slice()
     ));

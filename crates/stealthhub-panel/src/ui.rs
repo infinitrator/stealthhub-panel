@@ -161,6 +161,16 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                     section {
                         margin-top: 12px;
                     }
+                    .section-heading {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 14px;
+                        margin-bottom: 12px;
+                    }
+                    .section-heading h2, .section-heading p {
+                        margin: 0;
+                    }
                     .cards .card, .grid section {
                         min-height: 52px;
                         display: grid;
@@ -323,6 +333,17 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                     .inline-form {
                         display: inline-block;
                         margin: 0 6px 6px 0;
+                    }
+                    .inline-form select {
+                        width: auto;
+                        min-height: 30px;
+                        padding: 5px 24px 5px 8px;
+                        margin-right: 4px;
+                        font-size: 13px;
+                    }
+                    .module-actions {
+                        min-width: 175px;
+                        white-space: nowrap;
                     }
                     .admin-stack {
                         display: grid;
@@ -764,7 +785,7 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                             a href="/admin/settings" { "Settings" }
                             a href="/admin/protocols" { "Protocols" }
                             a href="/admin/routing" { "Routing" }
-                            a href="/admin/cores" { "Cores" }
+                            a href="/admin/cores" { "Modules" }
                             a href="/admin/ip" { "IP Check" }
                             div class="nav-section" { "Maintenance" }
                             a href="/admin/system" { "System" }

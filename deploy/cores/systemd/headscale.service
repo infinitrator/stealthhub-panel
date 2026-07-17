@@ -1,0 +1,27 @@
+[Unit]
+Description=Infiproxy Headscale Coordination Module
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=headscale
+Group=headscale
+ExecStart=/opt/infiproxy/modules/headscale/current/headscale serve -c /etc/headscale/config.yaml
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=headscale
+RuntimeDirectoryMode=0750
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/headscale
+ReadOnlyPaths=/opt/infiproxy/modules/headscale
+ReadWritePaths=/var/lib/headscale
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

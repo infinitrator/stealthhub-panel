@@ -12,8 +12,11 @@ APP_GROUP="${INFIPROXY_GROUP:-${STEALTHHUB_GROUP:-$APP_USER}}"
 INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
 MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
 UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
+MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
+CORE_INSTALL_BIN="${INFIPROXY_CORE_INSTALL_BIN:-/usr/local/sbin/infiproxy-core-install}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
+ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
 CORE_CONFIG_DIR="${INFIPROXY_CORE_CONFIG_DIR:-${STEALTHHUB_CORE_CONFIG_DIR:-/etc/infiproxy-cores}}"
 CORE_LOG_DIR="${INFIPROXY_CORE_LOG_DIR:-${STEALTHHUB_CORE_LOG_DIR:-/var/log/infiproxy-cores}}"
@@ -21,12 +24,39 @@ SERVICE_FILE="${INFIPROXY_SERVICE_FILE:-${STEALTHHUB_SERVICE_FILE:-/etc/systemd/
 UPDATE_SERVICE_FILE="${INFIPROXY_UPDATE_SERVICE_FILE:-/etc/systemd/system/infiproxy-panel-update.service}"
 UPDATE_TIMER_FILE="${INFIPROXY_UPDATE_TIMER_FILE:-/etc/systemd/system/infiproxy-panel-update.timer}"
 UPDATE_PATH_FILE="${INFIPROXY_UPDATE_PATH_FILE:-/etc/systemd/system/infiproxy-panel-update.path}"
+MODULE_UPDATE_SERVICE_FILE="${INFIPROXY_MODULE_UPDATE_SERVICE_FILE:-/etc/systemd/system/infiproxy-module-update.service}"
+MODULE_UPDATE_TIMER_FILE="${INFIPROXY_MODULE_UPDATE_TIMER_FILE:-/etc/systemd/system/infiproxy-module-update.timer}"
+MODULE_UPDATE_PATH_FILE="${INFIPROXY_MODULE_UPDATE_PATH_FILE:-/etc/systemd/system/infiproxy-module-update.path}"
+PROFILE_FILE="${INFIPROXY_PROFILE_FILE:-/etc/profile.d/infiproxy-manager.sh}"
+UPDATE_CONFIG_FILE="${INFIPROXY_UPDATE_CONFIG_FILE:-/etc/infiproxy-update.conf}"
 ENV_FILE="${CONFIG_DIR}/infiproxy.env"
 NGINX_AVAILABLE="${INFIPROXY_NGINX_AVAILABLE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
+
+normalize_github_repo() {
+    local value="$1"
+    value="${value#https://github.com/}"
+    value="${value#http://github.com/}"
+    value="${value#git@github.com:}"
+    value="${value%.git}"
+    [[ "$value" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+    printf '%s' "$value"
+}
+
+source_origin="${INFIPROXY_UPDATE_REPO:-$(git -C "$ROOT_DIR" remote get-url origin 2>/dev/null || true)}"
+UPDATE_REPO="$(normalize_github_repo "$source_origin")" || {
+    echo "Update source must be a GitHub owner/repo or repository URL: $source_origin" >&2
+    exit 2
+}
+UPDATE_REF="${INFIPROXY_UPDATE_REF:-$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || true)}"
+UPDATE_REF="${UPDATE_REF:-main}"
+if [[ ! "$UPDATE_REF" =~ ^[A-Za-z0-9_./-]+$ || "$UPDATE_REF" == /* || "$UPDATE_REF" == *..* ]]; then
+    echo "Invalid update reference: $UPDATE_REF" >&2
+    exit 2
+fi
 
 usage() {
     cat <<'USAGE'
@@ -107,14 +137,26 @@ else
     need_cmd useradd
 fi
 
-if [[ ! -f "${ROOT_DIR}/deploy/infiproxy-manager.sh" ]]; then
-    echo "Manager script not found: ${ROOT_DIR}/deploy/infiproxy-manager.sh" >&2
-    exit 1
-fi
-if [[ ! -f "${ROOT_DIR}/deploy/panel-update.sh" ]]; then
-    echo "Panel updater script not found: ${ROOT_DIR}/deploy/panel-update.sh" >&2
-    exit 1
-fi
+required_deploy_files=(
+    deploy/infiproxy-manager.sh
+    deploy/panel-update.sh
+    deploy/module-update.sh
+    deploy/cores/install-core.sh
+    deploy/infiproxy-profile.sh
+    deploy/infiproxy.service
+    deploy/infiproxy-panel-update.service
+    deploy/infiproxy-panel-update.timer
+    deploy/infiproxy-panel-update.path
+    deploy/infiproxy-module-update.service
+    deploy/infiproxy-module-update.timer
+    deploy/infiproxy-module-update.path
+)
+for relative_path in "${required_deploy_files[@]}"; do
+    if [[ ! -f "${ROOT_DIR}/${relative_path}" ]]; then
+        echo "Required deployment file not found: ${ROOT_DIR}/${relative_path}" >&2
+        exit 1
+    fi
+done
 
 if [[ "$BUILD" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
@@ -135,15 +177,21 @@ Infiproxy install plan:
   binary:        $INSTALL_BIN
   manager:       $MANAGER_BIN
   updater:       $UPDATE_BIN
+  module updater:$MODULE_UPDATE_BIN
+  core installer:$CORE_INSTALL_BIN
   release bin:   $RELEASE_BIN
   config:        $ENV_FILE
   state:         $STATE_DIR
+  root state:    $ROOT_STATE_DIR
   core binaries: $CORE_DIR
   core configs:  $CORE_CONFIG_DIR
   headscale cfg: /etc/headscale
   core logs:     $CORE_LOG_DIR
   service:       $SERVICE_FILE
   updater units: $UPDATE_SERVICE_FILE, $UPDATE_TIMER_FILE, $UPDATE_PATH_FILE
+  module units:  $MODULE_UPDATE_SERVICE_FILE, $MODULE_UPDATE_TIMER_FILE, $MODULE_UPDATE_PATH_FILE
+  SSH launcher:  $PROFILE_FILE
+  update source: $UPDATE_REPO @ $UPDATE_REF ($UPDATE_CONFIG_FILE)
   nginx:         $WITH_NGINX
   web config:    /etc/infiproxy and /etc/infiproxy-cores are group-writable by $APP_GROUP
 EOF
@@ -164,16 +212,28 @@ fi
 install -d -o root -g "$APP_GROUP" -m 0770 "$CONFIG_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
+install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
+install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/module-versions"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$UPDATE_BIN")"
+install -d -o root -g root -m 0755 "$(dirname "$MODULE_UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/modules"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/module-requests"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
+install -m 0644 -o root -g root /dev/stdin "$UPDATE_CONFIG_FILE" <<EOF
+REPO=${UPDATE_REPO}
+REF=${UPDATE_REF}
+EOF
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
     if [[ -f "$ENV_FILE" ]]; then
@@ -190,6 +250,9 @@ install -m 0644 "${ROOT_DIR}/deploy/infiproxy.service" "$SERVICE_FILE"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.service" "$UPDATE_SERVICE_FILE"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.timer" "$UPDATE_TIMER_FILE"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.path" "$UPDATE_PATH_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.service" "$MODULE_UPDATE_SERVICE_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.timer" "$MODULE_UPDATE_TIMER_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.path" "$MODULE_UPDATE_PATH_FILE"
 
 for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
     install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
@@ -245,10 +308,13 @@ systemctl daemon-reload
 systemctl enable --now infiproxy.service
 systemctl enable --now infiproxy-panel-update.timer
 systemctl enable --now infiproxy-panel-update.path
+systemctl enable --now infiproxy-module-update.timer
+systemctl enable --now infiproxy-module-update.path
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
 echo "Updater: systemctl list-timers infiproxy-panel-update.timer"
+echo "Modules: systemctl list-timers infiproxy-module-update.timer"
 echo "Manager: sudo infiproxy-manager"
 echo "HTTPS:  sudo infiproxy-manager  # choose HTTPS / Cloudflare setup"
 echo "Health: curl http://127.0.0.1:8080/health"

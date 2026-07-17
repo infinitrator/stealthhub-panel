@@ -1,11 +1,11 @@
 [Unit]
-Description=Infiproxy panel maintenance-window scheduler
+Description=Infiproxy module maintenance-window scheduler
 
 [Timer]
 OnCalendar=*-*-* *:00/15:00
 Persistent=true
 AccuracySec=1min
-Unit=infiproxy-panel-update.service
+Unit=infiproxy-module-update.service
 
 [Install]
 WantedBy=timers.target

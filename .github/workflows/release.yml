@@ -6,15 +6,18 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Build panel
         run: cargo build --release -p stealthhub-panel
@@ -28,7 +31,7 @@ jobs:
           tar -C dist -czf infiproxy-linux-x86_64.tar.gz infiproxy-linux-x86_64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: infiproxy-linux-x86_64
           path: infiproxy-linux-x86_64.tar.gz

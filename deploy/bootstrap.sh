@@ -133,7 +133,9 @@ install_deps() {
             python3
             sqlite3
             unzip
+            whiptail
             xz-utils
+            zlib1g-dev
         )
         if [[ "$WITH_NGINX" -eq 1 ]]; then
             packages+=(nginx)
@@ -154,7 +156,9 @@ install_deps() {
             python3
             sqlite
             unzip
+            newt
             xz
+            zlib-devel
         )
         if [[ "$WITH_NGINX" -eq 1 ]]; then
             packages+=(nginx)
@@ -217,7 +221,8 @@ if [[ "$WITH_NGINX" -eq 1 ]]; then
     install_args+=(--with-nginx)
 fi
 
-bash "${SRC_DIR}/deploy/install.sh" "${install_args[@]}"
+INFIPROXY_UPDATE_REPO="$REPO_URL" INFIPROXY_UPDATE_REF="$REF" \
+    bash "${SRC_DIR}/deploy/install.sh" "${install_args[@]}"
 
 if [[ "$GUIDED" -eq 1 ]]; then
     if [[ -r /dev/tty && -w /dev/tty ]]; then

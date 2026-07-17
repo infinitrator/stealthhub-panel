@@ -1,0 +1,9 @@
+[Unit]
+Description=Immediate Infiproxy module update trigger
+
+[Path]
+PathExistsGlob=/var/lib/infiproxy/module-requests/*.request
+Unit=infiproxy-module-update.service
+
+[Install]
+WantedBy=multi-user.target

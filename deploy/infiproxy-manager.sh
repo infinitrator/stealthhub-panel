@@ -11,6 +11,10 @@ ENV_FILE="${INFIPROXY_ENV_FILE:-/etc/infiproxy/infiproxy.env}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 PANEL_SERVICE="infiproxy.service"
+MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
+MODULE_UPDATE_LOG="${INFIPROXY_MODULE_UPDATE_LOG:-/var/lib/infiproxy-maintenance/module-update.log}"
+PANEL_UPDATE_REQUEST="${INFIPROXY_PANEL_UPDATE_REQUEST:-/var/lib/infiproxy/panel-update-now.request}"
+UPDATE_CONFIG_FILE="${INFIPROXY_UPDATE_CONFIG_FILE:-/etc/infiproxy-update.conf}"
 NGINX_SITE="${INFIPROXY_NGINX_SITE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 CLOUDFLARE_CREDENTIALS="${INFIPROXY_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
@@ -43,6 +47,8 @@ muted=$'\033[38;5;245m'
 danger=$'\033[38;5;167m'
 reset=$'\033[0m'
 bold=$'\033[1m'
+
+export NEWT_COLORS='root=white,black;window=white,black;border=green,black;title=green,black;button=black,green;actbutton=white,green;entry=black,white;checkbox=green,black;actcheckbox=green,black;listbox=white,black;actlistbox=black,green;compactbutton=green,black'
 
 if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
   green=""
@@ -91,13 +97,57 @@ confirm_yes() {
 }
 
 header() {
+  local panel_state host uptime_label module_count
   clear 2>/dev/null || true
-  echo "${green}${bold}+--------------------------------------------+${reset}"
-  printf '%s| %-42s |%s\n' "${green}${bold}" "${APP} manager" "${reset}"
-  echo "${green}${bold}+--------------------------------------------+${reset}"
-  echo "${muted}systemd / bare-metal / KISS control surface${reset}"
-  echo "${muted}env: ${ENV_FILE}${reset}"
+  host="$(hostname -f 2>/dev/null || hostname)"
+  panel_state="$(systemctl is-active "$PANEL_SERVICE" 2>/dev/null || true)"
+  uptime_label="$(uptime -p 2>/dev/null | sed 's/^up //' || true)"
+  module_count=0
+  for service in "${CORE_SERVICES[@]}" "$HEADSCALE_SERVICE"; do
+    systemctl is-active --quiet "$service" 2>/dev/null && ((module_count += 1)) || true
+  done
+  echo "${green}${bold}+------------------------------------------------------------------+${reset}"
+  printf '%s| %-64s |%s\n' "${green}${bold}" "${APP} Manager / ${host}" "${reset}"
+  echo "${green}${bold}+------------------------------------------------------------------+${reset}"
+  printf "${muted}panel %-10s modules active %-2s/6  uptime %s${reset}\n" \
+    "${panel_state:-unknown}" "$module_count" "${uptime_label:-unknown}"
+  echo "${muted}systemd bare-metal / env ${ENV_FILE}${reset}"
   echo
+}
+
+main_menu_choice() {
+  if have_cmd whiptail && [[ -t 0 && -t 1 ]]; then
+    whiptail --title "Infiproxy Manager" \
+      --menu "Host: $(hostname)\nSelect an operations area" 25 78 15 \
+      1 "Overview and service status" \
+      2 "Admin access and panel URL" \
+      3 "Runtime modules" \
+      4 "Restart and reload" \
+      5 "Logs and diagnostics" \
+      6 "HTTPS and Cloudflare" \
+      7 "Panel updates" \
+      8 "Panel environment" \
+      9 "Guided deployment" \
+      10 "Advanced tools" \
+      11 "Danger zone" \
+      0 "Exit to shell" 3>&1 1>&2 2>&3
+  else
+    header >&2
+    echo "1) Overview and service status" >&2
+    echo "2) Admin access and panel URL" >&2
+    echo "3) Runtime modules" >&2
+    echo "4) Restart and reload" >&2
+    echo "5) Logs and diagnostics" >&2
+    echo "6) HTTPS and Cloudflare" >&2
+    echo "7) Panel updates" >&2
+    echo "8) Panel environment" >&2
+    echo "9) Guided deployment" >&2
+    echo "10) Advanced tools" >&2
+    echo "${danger}11) Danger zone${reset}" >&2
+    echo "0) Exit to shell" >&2
+    read_menu_choice || return 1
+    printf '%s' "$choice"
+  fi
 }
 
 run_cmd() {
@@ -521,10 +571,10 @@ write_mtproto_env() {
   valid_port "$port" || { echo "${danger}Invalid MTProto port: $port${reset}" >&2; return 1; }
   valid_port "$stats_port" || { echo "${danger}Invalid stats port: $stats_port${reset}" >&2; return 1; }
   valid_mtproto_secret "$secret" || { echo "${danger}Secret must be exactly 32 hex characters.${reset}" >&2; return 1; }
-  [[ "$workers" =~ ^[0-9]{1,2}$ ]] && ((10#$workers >= 1 && 10#$workers <= 16)) || {
+  if [[ ! "$workers" =~ ^[0-9]{1,2}$ ]] || ((10#$workers < 1 || 10#$workers > 16)); then
     echo "${danger}Workers must be between 1 and 16.${reset}" >&2
     return 1
-  }
+  fi
 
   secure_mtproto_dir
   if [[ -f "$MTPROTO_ENV" ]]; then
@@ -590,7 +640,7 @@ guided_mtproto_setup() {
     fi
   else
     echo "${muted}Binary is not installed yet: ${MTPROTO_BINARY}${reset}"
-    echo "${muted}Use Core installer helper with core=Telegram MTProto, then start the service.${reset}"
+    echo "${muted}Use Runtime modules to build the latest official MTProto commit, then start the service.${reset}"
   fi
 }
 
@@ -636,92 +686,12 @@ mtproto_setup_menu() {
   pause
 }
 
-# Install Headscale from an upstream release asset after verifying it against
-# the release checksums file. Debian hosts use the official .deb; other supported
-# hosts get a standalone binary plus a minimal hardened systemd unit.
+# Install Headscale through the same versioned module pipeline used by every
+# other runtime. Its configuration and service state survive the binary switch.
 install_headscale_release() {
   need_root
-  require_cmd curl || return 1
-  require_cmd sha256sum || return 1
-
-  local version arch asset ext url checksums tmp checksum_line binary_target input_version was_enabled was_active
-  was_enabled=0
-  was_active=0
-  systemctl is-enabled --quiet "$HEADSCALE_SERVICE" 2>/dev/null && was_enabled=1
-  systemctl is-active --quiet "$HEADSCALE_SERVICE" 2>/dev/null && was_active=1
-  version="$(headscale_latest_version || true)"
-  read -r -p "Headscale version [${version:-0.29.2}]: " input_version
-  version="${input_version:-${version:-0.29.2}}"
-  arch="$(headscale_arch)" || return 1
-
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"; trap - RETURN' RETURN
-  checksums="${tmp}/checksums.txt"
-  curl -fsSL --max-time 60 \
-    "https://github.com/juanfont/headscale/releases/download/v${version}/checksums.txt" \
-    -o "$checksums"
-
-  if have_cmd apt-get; then
-    asset="headscale_${version}_linux_${arch}.deb"
-    ext="deb"
-  else
-    asset="headscale_${version}_linux_${arch}"
-    ext="bin"
-  fi
-  url="https://github.com/juanfont/headscale/releases/download/v${version}/${asset}"
-  curl -fL --show-error --output "${tmp}/${asset}" "$url"
-  checksum_line="$(grep -E "  ${asset}$" "$checksums" || true)"
-  if [[ -z "$checksum_line" ]]; then
-    echo "${danger}Checksum for ${asset} was not found in checksums.txt.${reset}" >&2
-    return 1
-  fi
-  printf '%s\n' "$checksum_line" >"${tmp}/checksum.one"
-  (cd "$tmp" && sha256sum -c checksum.one)
-
-  if [[ "$ext" == "deb" ]]; then
-    export DEBIAN_FRONTEND=noninteractive
-    run_cmd apt-get install -y "${tmp}/${asset}"
-    systemctl disable --now "$HEADSCALE_SERVICE" 2>/dev/null || true
-  else
-    if ! id -u headscale >/dev/null 2>&1; then
-      run_cmd useradd --create-home --home-dir "$HEADSCALE_STATE_DIR" --system --user-group --shell /usr/sbin/nologin headscale
-    fi
-    binary_target="/usr/local/bin/headscale"
-    install -m 0755 "${tmp}/${asset}" "$binary_target"
-    cat >/etc/systemd/system/headscale.service <<EOF
-[Unit]
-Description=Headscale coordination server
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-User=headscale
-Group=headscale
-ExecStart=${binary_target} serve -c ${HEADSCALE_CONFIG}
-Restart=on-failure
-RestartSec=5
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=${HEADSCALE_STATE_DIR} /var/run/headscale
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  fi
-
+  run_cmd "$MODULE_UPDATE_BIN" --update headscale
   usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
-  run_cmd systemctl daemon-reload
-  if [[ "$was_enabled" -eq 1 ]]; then
-    run_cmd systemctl enable "$HEADSCALE_SERVICE" || true
-  fi
-  if [[ "$was_active" -eq 1 ]]; then
-    run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
-  fi
-  echo "${green}Headscale ${version} installed with verified checksum.${reset}"
 }
 
 secure_headscale_paths() {
@@ -1174,7 +1144,7 @@ guided_deployment() {
   echo "This path keeps everything inside one SSH TUI session:"
   echo "  1. install or repair the panel"
   echo "  2. optionally publish HTTPS through Cloudflare"
-  echo "  3. optionally import verified proxy core archives"
+  echo "  3. optionally install current verified runtime modules"
   echo "  4. optionally configure Telegram MTProto"
   echo "  5. optionally configure Headscale mesh hub"
   echo "  6. show final service status"
@@ -1202,11 +1172,14 @@ guided_deployment() {
   fi
 
   echo
-  if confirm_yes "Install or update verified proxy core archives now?" "N"; then
-    while true; do
-      echo
-      install_core_from_prompts || true
-      confirm_yes "Install another core archive?" "N" || break
+  if confirm_yes "Install current verified proxy modules now?" "Y"; then
+    local module
+    for module in xray sing-box hysteria tuic; do
+      if confirm_yes "Install or update ${module}?" "N"; then
+        "$MODULE_UPDATE_BIN" --update "$module" || {
+          echo "${danger}${module} installation failed; see ${MODULE_UPDATE_LOG}.${reset}" >&2
+        }
+      fi
     done
   fi
 
@@ -1214,9 +1187,8 @@ guided_deployment() {
   if confirm_yes "Configure Telegram MTProto module now?" "N"; then
     if [[ ! -x "$MTPROTO_BINARY" ]]; then
       echo "${muted}MTProto binary is not installed yet.${reset}"
-      if confirm_yes "Install the MTProto archive first through the core installer?" "Y"; then
-        echo "${muted}Choose 'Telegram MTProto' in the next selector.${reset}"
-        install_core_from_prompts || true
+      if confirm_yes "Build and install it from the latest official commit?" "Y"; then
+        "$MODULE_UPDATE_BIN" --update mtproto || true
       fi
     fi
     guided_mtproto_setup || {
@@ -1249,9 +1221,128 @@ guided_deployment() {
 }
 
 logs_menu() {
+  while true; do
+    header
+    echo "1) Panel journal"
+    echo "2) Module updater log"
+    echo "3) Panel updater log"
+    echo "4) Nginx journal"
+    echo "5) Failed systemd units"
+    echo "0) Back"
+    read_menu_choice || return
+    case "$choice" in
+      1) run_cmd journalctl -u "$PANEL_SERVICE" -n 120 --no-pager || true; pause ;;
+      2) run_cmd tail -n 160 "$MODULE_UPDATE_LOG" || true; pause ;;
+      3) run_cmd tail -n 160 /var/lib/infiproxy-maintenance/panel-update-run.log || true; pause ;;
+      4) run_cmd journalctl -u nginx.service -n 120 --no-pager || true; pause ;;
+      5) run_cmd systemctl --failed --no-pager --full || true; pause ;;
+      0) return ;;
+      *) invalid_choice ;;
+    esac
+  done
+}
+
+admin_access() {
+  local domain
   header
-  run_cmd journalctl -u "$PANEL_SERVICE" -n 120 --no-pager || true
+  domain="$(awk '$1 == "server_name" { gsub(";", "", $2); if ($2 != "_") { print $2; exit } }' "$NGINX_SITE" 2>/dev/null || true)"
+  echo "${bold}Web panel${reset}"
+  if [[ -n "$domain" ]]; then
+    echo "  https://${domain}/admin"
+    echo "  first owner: https://${domain}/admin/setup"
+  else
+    echo "  SSH tunnel: ssh -L 8080:127.0.0.1:8080 root@$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "  local URL:  http://127.0.0.1:8080/admin"
+  fi
+  echo
+  echo "${bold}Local probes${reset}"
+  curl -fsS --max-time 3 http://127.0.0.1:8080/health || true
+  echo
+  curl -fsS --max-time 3 http://127.0.0.1:8080/ready || true
+  echo
   pause
+}
+
+select_module_runtime() {
+  echo "1) xray"
+  echo "2) sing-box"
+  echo "3) hysteria"
+  echo "4) tuic"
+  echo "5) Telegram MTProto"
+  echo "6) Headscale"
+  echo "0) Back"
+  read_menu_choice || return 1
+  case "$choice" in
+    1) module="xray" ;;
+    2) module="sing-box" ;;
+    3) module="hysteria" ;;
+    4) module="tuic" ;;
+    5) module="mtproto" ;;
+    6) module="headscale" ;;
+    0) return 2 ;;
+    *) invalid_choice; return 1 ;;
+  esac
+}
+
+module_update_menu() {
+  need_root
+  while true; do
+    header
+    echo "Runtime modules"
+    echo
+    echo "1) Show installed/latest status"
+    echo "2) Check one module"
+    echo "3) Install or update one module"
+    echo "4) Restart module updater"
+    echo "5) Show module updater log"
+    echo "0) Back"
+    read_menu_choice || return
+    case "$choice" in
+      1) run_cmd "$MODULE_UPDATE_BIN" --check-all || true; pause ;;
+      2)
+        select_module_runtime || continue
+        run_cmd "$MODULE_UPDATE_BIN" --check "$module" || true
+        pause
+        ;;
+      3)
+        select_module_runtime || continue
+        run_cmd "$MODULE_UPDATE_BIN" --check "$module" || true
+        if confirm_yes "Install the latest verified ${module} version now?" "N"; then
+          run_cmd "$MODULE_UPDATE_BIN" --update "$module" || true
+        fi
+        pause
+        ;;
+      4)
+        run_cmd systemctl daemon-reload
+        run_cmd systemctl enable --now infiproxy-module-update.timer infiproxy-module-update.path || true
+        pause
+        ;;
+      5) run_cmd tail -n 160 "$MODULE_UPDATE_LOG" || true; pause ;;
+      0) return ;;
+      *) invalid_choice ;;
+    esac
+  done
+}
+
+panel_update_check() {
+  local repo ref current latest
+  repo="$(env_value "$UPDATE_CONFIG_FILE" REPO)"
+  ref="$(env_value "$UPDATE_CONFIG_FILE" REF)"
+  repo="${repo:-infinitrator/stealthhub-panel}"
+  ref="${ref:-main}"
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
+  [[ "$ref" =~ ^[A-Za-z0-9_./-]+$ && "$ref" != *..* ]] || return 1
+  current="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+  latest="$(git ls-remote "https://github.com/${repo}.git" "$ref" | awk 'NR == 1 {print $1}')"
+  echo "repository  ${repo}"
+  echo "reference   ${ref}"
+  echo "installed   ${current:0:12}"
+  echo "latest      ${latest:0:12}"
+  if [[ -n "$latest" && "$current" == "$latest" ]]; then
+    echo "status      current"
+  else
+    echo "status      update available"
+  fi
 }
 
 panel_update_menu() {
@@ -1261,19 +1352,50 @@ panel_update_menu() {
     echo
     systemctl --no-pager --full status infiproxy-panel-update.timer infiproxy-panel-update.path 2>/dev/null || true
     echo
-    echo "1) Run panel update check/apply now"
-    echo "2) Show updater log"
-    echo "3) Restart update timer and path watcher"
+    echo "1) Check GitHub now"
+    echo "2) Update panel now"
+    echo "3) Show updater log"
+    echo "4) Restart update timer and path watcher"
     echo "0) Back"
     read_menu_choice || return
     case "$choice" in
-      1) run_cmd /usr/local/sbin/infiproxy-panel-update || true; pause ;;
-      2) run_cmd tail -n 120 /var/lib/infiproxy/panel-update-run.log || true; pause ;;
-      3)
+      1) panel_update_check || true; pause ;;
+      2)
+        panel_update_check || true
+        if confirm_yes "Apply the latest panel commit now?" "N"; then
+          install -m 0640 -o root -g root /dev/null "$PANEL_UPDATE_REQUEST"
+          run_cmd systemctl start infiproxy-panel-update.service || true
+        fi
+        pause
+        ;;
+      3) run_cmd tail -n 120 /var/lib/infiproxy-maintenance/panel-update-run.log || true; pause ;;
+      4)
         run_cmd systemctl daemon-reload
         run_cmd systemctl enable --now infiproxy-panel-update.timer infiproxy-panel-update.path || true
         pause
         ;;
+      0) return ;;
+      *) invalid_choice ;;
+    esac
+  done
+}
+
+advanced_menu() {
+  while true; do
+    header
+    echo "1) Install or repair panel"
+    echo "2) Telegram MTProto configuration"
+    echo "3) Headscale hub configuration"
+    echo "4) Manual verified archive import"
+    echo "5) Toggle web danger shell"
+    echo "0) Back"
+    read_menu_choice || return
+    case "$choice" in
+      1) install_or_repair ;;
+      2) mtproto_setup_menu ;;
+      3) headscale_menu ;;
+      4) core_helper ;;
+      5) toggle_danger_shell ;;
       0) return ;;
       *) invalid_choice ;;
     esac
@@ -1286,26 +1408,35 @@ uninstall_commands() {
       cat <<'EOF'
 systemctl disable --now infiproxy.service || true
 systemctl disable --now infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service || true
+systemctl disable --now infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
+rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update
-rm -rf /etc/infiproxy /var/lib/infiproxy
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /etc/profile.d/infiproxy-manager.sh
+rm -f /etc/infiproxy-update.conf
+rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
 EOF
       ;;
     full)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
+rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
 rm -f /etc/systemd/system/headscale.service
+rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
+rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update
-rm -rf /etc/infiproxy /var/lib/infiproxy
-rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores
+rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /etc/profile.d/infiproxy-manager.sh
+rm -f /etc/infiproxy-update.conf
+rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
+rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /opt/infiproxy/modules /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -rf /opt/infiproxy/source
 rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
@@ -1317,14 +1448,19 @@ EOF
       ;;
     factory)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
+rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
 rm -f /etc/systemd/system/headscale.service
+rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
+rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update
-rm -rf /etc/infiproxy /var/lib/infiproxy
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install
+rm -f /etc/profile.d/infiproxy-manager.sh
+rm -f /etc/infiproxy-update.conf
+rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance
 rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -f /usr/local/bin/headscale
@@ -1372,37 +1508,21 @@ run_uninstall() {
 }
 
 main_menu() {
+  local menu_choice
   while true; do
-    header
-    echo "1) Guided deployment cycle"
-    echo "2) Status dashboard"
-    echo "3) Restart / reload services"
-    echo "4) Edit panel environment"
-    echo "5) Toggle web danger shell"
-    echo "6) HTTPS / Cloudflare setup"
-    echo "7) Install / repair panel"
-    echo "8) Core installer helper"
-    echo "9) Telegram MTProto setup"
-    echo "10) Headscale hub setup"
-    echo "11) Panel updater"
-    echo "12) Panel logs"
-    echo "${danger}13) Uninstall / cleanup${reset}"
-    echo "0) Exit"
-    read_menu_choice || exit 0
-    case "$choice" in
-      1) guided_deployment ;;
-      2) service_status ;;
-      3) restart_menu ;;
-      4) edit_env ;;
-      5) toggle_danger_shell ;;
+    menu_choice="$(main_menu_choice)" || exit 0
+    case "$menu_choice" in
+      1) service_status ;;
+      2) admin_access ;;
+      3) module_update_menu ;;
+      4) restart_menu ;;
+      5) logs_menu ;;
       6) https_setup_menu ;;
-      7) install_or_repair ;;
-      8) core_helper ;;
-      9) mtproto_setup_menu ;;
-      10) headscale_menu ;;
-      11) panel_update_menu ;;
-      12) logs_menu ;;
-      13) run_uninstall ;;
+      7) panel_update_menu ;;
+      8) edit_env ;;
+      9) guided_deployment ;;
+      10) advanced_menu ;;
+      11) run_uninstall ;;
       0) exit 0 ;;
       *) invalid_choice ;;
     esac

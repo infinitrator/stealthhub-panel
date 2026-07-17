@@ -7,7 +7,7 @@
 set -euo pipefail
 
 CORE_ROOT="${INFIPROXY_CORE_ROOT:-${STEALTHHUB_CORE_ROOT:-/opt/infiproxy/cores}}"
-STAGING_ROOT="${INFIPROXY_CORE_STAGING:-${STEALTHHUB_CORE_STAGING:-/var/lib/infiproxy/core-updates}}"
+STAGING_ROOT="${INFIPROXY_CORE_STAGING:-${STEALTHHUB_CORE_STAGING:-/var/lib/infiproxy-maintenance/core-updates}}"
 
 CORE=""
 VERSION=""
@@ -170,17 +170,39 @@ printf '%s  %s\n' "$SHA256" "$ARCHIVE_PATH" | sha256sum -c -
 EXTRACT_DIR="${STAGING_DIR}/extract"
 install -d -m 0750 "$EXTRACT_DIR"
 
+validate_member_names() {
+    local member
+    while IFS= read -r member; do
+        case "$member" in
+            ""|/*|../*|*/../*|*/..|*\\*)
+                echo "Unsafe archive member: $member" >&2
+                return 1
+                ;;
+        esac
+    done
+}
+
 case "$ARCHIVE_PATH" in
     *.tar.gz|*.tgz)
         need_cmd tar
-        tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+        tar -tzf "$ARCHIVE_PATH" | validate_member_names
+        tar -tvzf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) ~ /[lh]/ { exit 1 }' \
+            || { echo "Archive links are not allowed" >&2; exit 1; }
+        tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
         ;;
     *.tar.xz|*.txz)
         need_cmd tar
-        tar -xJf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+        tar -tJf "$ARCHIVE_PATH" | validate_member_names
+        tar -tvJf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) ~ /[lh]/ { exit 1 }' \
+            || { echo "Archive links are not allowed" >&2; exit 1; }
+        tar --no-same-owner --no-same-permissions -xJf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
         ;;
     *.zip)
         need_cmd unzip
+        need_cmd zipinfo
+        unzip -Z -1 "$ARCHIVE_PATH" | validate_member_names
+        zipinfo -l "$ARCHIVE_PATH" | awk '$1 ~ /^l/ { exit 1 }' \
+            || { echo "Archive links are not allowed" >&2; exit 1; }
         unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR"
         ;;
     *)

@@ -138,60 +138,6 @@ pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
         action: SystemActionKind::RestartUnit("headscale.service"),
     },
 ];
-pub(crate) const CORE_RUNTIMES: &[CoreRuntime] = &[
-    CoreRuntime {
-        name: "Xray",
-        role: "VLESS REALITY XHTTP/TCP",
-        service: "infiproxy-xray.service",
-        binary_path: "/opt/infiproxy/cores/xray/current/xray",
-        local_binary_path: ".runtime/cores/xray/current/xray",
-        config_path: "/etc/infiproxy-cores/xray/config.json",
-        update_channel:
-            "XTLS/Xray-core latest stable v26.3.27; upstream has newer prerelease stream",
-        priority: "primary",
-    },
-    CoreRuntime {
-        name: "sing-box",
-        role: "SS2022 ShadowTLS, AnyTLS, compatibility",
-        service: "infiproxy-sing-box.service",
-        binary_path: "/opt/infiproxy/cores/sing-box/current/sing-box",
-        local_binary_path: ".runtime/cores/sing-box/current/sing-box",
-        config_path: "/etc/infiproxy-cores/sing-box/config.json",
-        update_channel: "SagerNet/sing-box latest stable v1.13.14",
-        priority: "compat",
-    },
-    CoreRuntime {
-        name: "Hysteria",
-        role: "Hysteria2 speed fallback",
-        service: "infiproxy-hysteria.service",
-        binary_path: "/opt/infiproxy/cores/hysteria/current/hysteria",
-        local_binary_path: ".runtime/cores/hysteria/current/hysteria",
-        config_path: "/etc/infiproxy-cores/hysteria/config.yaml",
-        update_channel: "apernet/hysteria latest stable app/v2.10.0",
-        priority: "speed",
-    },
-    CoreRuntime {
-        name: "TUIC",
-        role: "TUIC QUIC speed fallback",
-        service: "infiproxy-tuic.service",
-        binary_path: "/opt/infiproxy/cores/tuic/current/tuic-server",
-        local_binary_path: ".runtime/cores/tuic/current/tuic-server",
-        config_path: "/etc/infiproxy-cores/tuic/config.json",
-        update_channel: "tuic-protocol/tuic latest stable tuic-server-1.0.0",
-        priority: "optional",
-    },
-    CoreRuntime {
-        name: "MTProto",
-        role: "Telegram native proxy",
-        service: "infiproxy-mtproto.service",
-        binary_path: "/opt/infiproxy/cores/mtproto/current/mtproto-proxy",
-        local_binary_path: ".runtime/cores/mtproto/current/mtproto-proxy",
-        config_path: "/etc/infiproxy-cores/mtproto/mtproto.env",
-        update_channel: "TelegramMessenger/MTProxy source build or vetted release archive",
-        priority: "telegram",
-    },
-];
-
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SystemTarget {
     pub(crate) slug: &'static str,
@@ -320,6 +266,7 @@ pub(crate) const CONSOLE_COMMANDS: &[ConsoleCommand] = &[
         args: &[
             "-sh",
             "/var/lib/infiproxy",
+            "/var/lib/infiproxy-maintenance",
             "/opt/infiproxy",
             "/etc/infiproxy",
             "/etc/infiproxy-cores",
@@ -732,18 +679,6 @@ pub(crate) struct IpReputationSource {
     pub(crate) url_template: &'static str,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct CoreRuntime {
-    pub(crate) name: &'static str,
-    pub(crate) role: &'static str,
-    pub(crate) service: &'static str,
-    pub(crate) binary_path: &'static str,
-    pub(crate) local_binary_path: &'static str,
-    pub(crate) config_path: &'static str,
-    pub(crate) update_channel: &'static str,
-    pub(crate) priority: &'static str,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct HostSnapshot {
     pub(crate) os_name: String,
@@ -812,12 +747,12 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
             warning: "Removes only the Infiproxy panel service, binary and panel state. Proxy cores and third-party services are left intact.",
             commands: vec![
                 "# Review paths before running as root.",
-                "systemctl disable --now infiproxy.service || true",
-                "rm -f /etc/systemd/system/infiproxy.service",
+                "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path || true",
+                "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy",
+                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
                 "rm -rf /etc/infiproxy",
-                "rm -rf /var/lib/infiproxy",
+                "rm -rf /var/lib/infiproxy /var/lib/infiproxy-maintenance",
                 "userdel infiproxy 2>/dev/null || true",
                 "groupdel infiproxy 2>/dev/null || true",
             ],
@@ -827,14 +762,14 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
             warning: "Removes panel-managed services, panel state, core binaries/configs/logs and the source checkout. It does not remove system packages such as nginx, git or Rust.",
             commands: vec![
                 "# Review paths before running as root.",
-                "systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
-                "rm -f /etc/systemd/system/infiproxy.service",
+                "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
+                "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service",
                 "rm -f /etc/systemd/system/headscale.service",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy",
-                "rm -rf /etc/infiproxy /var/lib/infiproxy",
-                "rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores",
+                "rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
+                "rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance",
+                "rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /opt/infiproxy/modules /var/log/infiproxy-cores",
                 "rm -rf /etc/headscale /var/lib/headscale",
                 "rm -rf /opt/infiproxy/source",
                 "rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf",
@@ -849,13 +784,13 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
             warning: "Attempts to return the host to a pre-Infiproxy footprint by removing panel services, panel state, proxy cores, core configs/logs, nginx site files, source checkout, manager TUI and the service user. It does not purge OS packages because the installer cannot know which packages existed before Infiproxy.",
             commands: vec![
                 "# Review paths before running as root.",
-                "systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
-                "rm -f /etc/systemd/system/infiproxy.service",
+                "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-module-update.timer infiproxy-module-update.path infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true",
+                "rm -f /etc/systemd/system/infiproxy.service /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path",
                 "rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service",
                 "rm -f /etc/systemd/system/headscale.service",
                 "systemctl daemon-reload",
-                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager",
-                "rm -rf /etc/infiproxy /var/lib/infiproxy",
+                "rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /etc/profile.d/infiproxy-manager.sh /etc/infiproxy-update.conf",
+                "rm -rf /etc/infiproxy /var/lib/infiproxy /var/lib/infiproxy-maintenance",
                 "rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores",
                 "rm -rf /etc/headscale /var/lib/headscale",
                 "rm -f /usr/local/bin/headscale",

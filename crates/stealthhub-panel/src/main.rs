@@ -7,6 +7,7 @@
 
 mod health;
 mod ip;
+mod modules;
 mod ops;
 mod ui;
 mod update;
@@ -111,6 +112,14 @@ struct CsrfForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModuleAutoUpdateForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    enabled: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProtocolProfileForm {
     #[serde(default)]
     csrf_token: String,
@@ -202,11 +211,7 @@ struct PanelSettingsForm {
     #[serde(default)]
     panel_update_enabled: String,
     #[serde(default)]
-    panel_update_hour: String,
-    #[serde(default)]
-    panel_update_repo: String,
-    #[serde(default)]
-    panel_update_ref: String,
+    panel_update_time: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -274,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
     ensure_default_routing_rule_sets(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
     update::spawn_checker(pool.clone());
+    modules::spawn_checker(pool.clone());
 
     let state = AppState {
         pool,
@@ -297,6 +303,19 @@ async fn main() -> anyhow::Result<()> {
             get(settings_page).post(update_settings_action),
         )
         .route("/admin/panel-update-now", post(panel_update_now_action))
+        .route("/admin/modules/check", post(check_all_modules_action))
+        .route(
+            "/admin/modules/{module_id}/check",
+            post(check_module_action),
+        )
+        .route(
+            "/admin/modules/{module_id}/update",
+            post(update_module_action),
+        )
+        .route(
+            "/admin/modules/{module_id}/auto",
+            post(module_auto_update_action),
+        )
         .route("/admin/protocols", get(protocols_page))
         .route(
             "/admin/protocols/{name}/update",
@@ -883,9 +902,9 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
                     }
 
                     section {
-                        h2 { "Cores" }
-                        p { "Binary paths, service names, config paths, local runtime state." }
-                        a class="button" href="/admin/cores" { "Open Cores" }
+                        h2 { "Modules" }
+                        p { "Independent versions, update policies, services and configuration paths." }
+                        a class="button" href="/admin/cores" { "Open Modules" }
                     }
                 }
             },
@@ -981,22 +1000,22 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                                 option value="true" selected[update_status.enabled] { "Enabled" }
                                 option value="false" selected[!update_status.enabled] { "Disabled" }
                             }
-                            small { "Owner-only. Hourly GitHub check schedules a root-level update for the maintenance window." }
+                            small { "Owner-only. GitHub is checked every two hours; a pending update is applied in the maintenance window." }
                         }
                         label {
-                            span { "Maintenance hour UTC" }
-                            input type="number" name="panel_update_hour" value=(update_status.hour) min="0" max="23" required disabled[!is_owner_admin(&auth)];
-                            small { "Owner-only. Server-side updater runs once per hour and applies pending panel updates at this UTC hour." }
+                            span { "Maintenance time (server time)" }
+                            input type="time" name="panel_update_time" value=(&update_status.schedule_time) step="60" required disabled[!is_owner_admin(&auth)];
+                            small { "Owner-only. Default: 05:00. Automatic execution starts in the first 15-minute scheduler window at or after this time." }
                         }
                         label {
                             span { "GitHub repository" }
-                            input type="text" name="panel_update_repo" value=(&update_status.repo) pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" required disabled[!is_owner_admin(&auth)];
-                            small { "Owner-only. Owner/repo used by the checker, for example infinitrator/stealthhub-panel." }
+                            input type="text" value=(&update_status.repo) disabled;
+                            small { "Pinned by the root-owned bootstrap configuration." }
                         }
                         label {
                             span { "Git reference" }
-                            input type="text" name="panel_update_ref" value=(&update_status.git_ref) pattern="[A-Za-z0-9_./-]+" required disabled[!is_owner_admin(&auth)];
-                            small { "Owner-only. Branch, tag or safe ref name. Default: main." }
+                            input type="text" value=(&update_status.git_ref) disabled;
+                            small { "Change the deployment channel by rerunning bootstrap with --ref." }
                         }
                         div class="full-span" {
                             button type="submit" { "Save Settings" }
@@ -1089,46 +1108,23 @@ async fn update_settings_action(
     if is_owner_admin(&auth) {
         let update_enabled = form.panel_update_enabled.trim().is_empty()
             || update::parse_bool_setting(&form.panel_update_enabled);
-        let update_hour_raw = update::non_empty_or_default(&form.panel_update_hour, "4");
-        let update_hour = match update::parse_hour(update_hour_raw) {
-            Some(value) => value,
+        let update_time = update::non_empty_or_default(&form.panel_update_time, "05:00");
+        let update_hour = match update::parse_schedule_time(update_time) {
+            Some((hour, _)) => hour,
             None => {
                 return html_error_response_with_back(
                     StatusCode::BAD_REQUEST,
                     "Invalid update window",
-                    "Maintenance hour must be a number from 0 to 23.",
+                    "Maintenance time must use 24-hour HH:MM format.",
                     "/admin/settings",
                     "Back to Settings",
                 );
             }
         };
-        let update_repo =
-            update::non_empty_or_default(&form.panel_update_repo, "infinitrator/stealthhub-panel");
-        if let Err(message) = update::validate_repo(update_repo) {
-            return html_error_response_with_back(
-                StatusCode::BAD_REQUEST,
-                "Invalid update repository",
-                message,
-                "/admin/settings",
-                "Back to Settings",
-            );
-        }
-        let update_ref = update::non_empty_or_default(&form.panel_update_ref, "main");
-        if let Err(message) = update::validate_ref(update_ref) {
-            return html_error_response_with_back(
-                StatusCode::BAD_REQUEST,
-                "Invalid update reference",
-                message,
-                "/admin/settings",
-                "Back to Settings",
-            );
-        }
-
         settings_to_save.extend([
             ("panel_update_enabled", update_enabled.to_string()),
+            ("panel_update_time", update_time.to_string()),
             ("panel_update_hour", update_hour.to_string()),
-            ("panel_update_repo", update_repo.to_string()),
-            ("panel_update_ref", update_ref.to_string()),
         ]);
     }
 
@@ -1200,74 +1196,133 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(value) => value,
         Err(response) => return response,
     };
-    let installed_local_cores = CORE_RUNTIMES
+    let statuses = match modules::load_all(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Module state unavailable",
+                format!("Failed to load module state: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
+    let installed_count = statuses.iter().filter(|status| status.installed).count();
+    let updates_count = statuses
         .iter()
-        .filter(|core| std::path::Path::new(core.local_binary_path).is_file())
+        .filter(|status| status.update_available)
         .count();
+    let auto_count = statuses.iter().filter(|status| status.auto_update).count();
 
     Html(
         layout(
-            "Cores",
+            "Modules",
             html! {
                 (admin_bar(&auth))
-                h1 { "Cores" }
+                h1 { "Modules" }
 
                 div class="status-strip" {
                     div class="metric" {
-                        span { "Local binaries" }
-                        strong { (installed_local_cores) "/" (CORE_RUNTIMES.len()) }
+                        span { "Installed" }
+                        strong { (installed_count) "/" (statuses.len()) }
                     }
                     div class="metric" {
-                        span { "Supervisor" }
-                        strong { "systemd" }
+                        span { "Updates available" }
+                        strong { (updates_count) }
                     }
                     div class="metric" {
-                        span { "Configured cores" }
-                        strong { (CORE_RUNTIMES.len()) }
+                        span { "Automatic updates" }
+                        strong { (auto_count) "/" (statuses.len()) }
                     }
                     div class="metric" {
-                        span { "Update policy" }
-                        strong { "staged rollback" }
+                        span { "Upstream check" }
+                        strong { "every 2 hours" }
                     }
                 }
 
                 section {
-                    h2 { "Runtime registry" }
+                    div class="section-heading" {
+                        div {
+                            h2 { "Runtime registry" }
+                            p { "Each runtime keeps its own binary, configuration, systemd state and update history." }
+                        }
+                        @if is_owner_admin(&auth) {
+                            form method="post" action="/admin/modules/check" class="inline-form" {
+                                (csrf_field(&auth.csrf_token))
+                                button type="submit" { "Check all" }
+                            }
+                        }
+                    }
                     div class="table-wrap" {
                         table {
                             thead {
                                 tr {
-                                    th { "Core" }
-                                    th { "Priority" }
+                                    th { "Module" }
                                     th { "Role" }
-                                    th { "Service" }
-                                    th { "Local" }
-                                    th { "Binary" }
-                                    th { "Config" }
-                                    th { "Updates" }
+                                    th { "Installed" }
+                                    th { "Latest" }
+                                    th { "State" }
+                                    th { "Automatic" }
+                                    th { "Actions" }
                                 }
                             }
                             tbody {
-                                @for core in CORE_RUNTIMES {
+                                @for status in &statuses {
                                     tr {
-                                        td { strong { (core.name) } }
-                                        td { span class=(format!("badge {}", core_priority_class(core.priority))) { (core.priority) } }
-                                        td { (core.role) }
-                                        td { code { (core.service) } }
                                         td {
-                                            @if std::path::Path::new(core.local_binary_path).is_file() {
-                                                span class="badge ok" { "installed" }
-                                                " "
-                                                code { (core.local_binary_path) }
+                                            strong { (status.spec.name) }
+                                            br;
+                                            small { (status.spec.kind) " / " (status.spec.repo) }
+                                        }
+                                        td {
+                                            (status.spec.role)
+                                            br;
+                                            small { (status.spec.service) }
+                                            br;
+                                            small { (status.spec.config_path) }
+                                        }
+                                        td { code { (modules::short_version(&status.installed_version)) } }
+                                        td { code { (modules::short_version(&status.latest_version)) } }
+                                        td {
+                                            span class=(format!("badge {}", modules::status_class(status))) {
+                                                (&status.status)
+                                            }
+                                            br;
+                                            small { "checked " (&status.checked_at) }
+                                        }
+                                        td {
+                                            @if is_owner_admin(&auth) {
+                                                form method="post" action=(format!("/admin/modules/{}/auto", status.spec.id)) class="inline-form" {
+                                                    (csrf_field(&auth.csrf_token))
+                                                    select name="enabled" aria-label=(format!("Automatic updates for {}", status.spec.name)) {
+                                                        option value="true" selected[status.auto_update] { "On" }
+                                                        option value="false" selected[!status.auto_update] { "Off" }
+                                                    }
+                                                    button class="compact" type="submit" { "Save" }
+                                                }
+                                            } @else if status.auto_update {
+                                                span class="badge ok" { "on" }
                                             } @else {
-                                                span class="badge off" { "missing" }
-                                                " "
-                                                code { (core.local_binary_path) }
+                                                span class="badge neutral" { "off" }
                                             }
                                         }
-                                        td { code { (core.binary_path) } }
-                                        td { code { (core.config_path) } }
-                                        td { (core.update_channel) }
+                                        td class="module-actions" {
+                                            @if is_owner_admin(&auth) {
+                                                form method="post" action=(format!("/admin/modules/{}/check", status.spec.id)) class="inline-form" {
+                                                    (csrf_field(&auth.csrf_token))
+                                                    button class="compact secondary" type="submit" { "Check" }
+                                                }
+                                                @if status.latest_version != "unknown" && (!status.installed || status.update_available) {
+                                                    form method="post" action=(format!("/admin/modules/{}/update", status.spec.id)) class="inline-form" {
+                                                        (csrf_field(&auth.csrf_token))
+                                                        button class="compact" type="submit" {
+                                                            @if status.installed { "Update" } @else { "Install latest" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1276,50 +1331,20 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 }
 
                 section {
-                    h2 { "Local install contract" }
+                    h2 { "Module contract" }
                     dl class="details" {
-                        dt { "Local dev root" }
-                        dd { code { ".runtime/cores/{core}/{version}" } }
-                        dt { "Core root" }
+                        dt { "Proxy runtimes" }
                         dd { code { "/opt/infiproxy/cores/{core}/{version}" } }
-                        dt { "Active binary" }
+                        dt { "Headscale runtime" }
+                        dd { code { "/opt/infiproxy/modules/headscale/{version}" } }
+                        dt { "Active version" }
                         dd { code { "/opt/infiproxy/cores/{core}/current" } }
                         dt { "Configs" }
-                        dd { code { "/etc/infiproxy-cores/{core}" } }
-                        dt { "Service templates" }
-                        dd { code { "deploy/cores/systemd/*.service" } }
-                    }
-                }
-
-                section {
-                    h2 { "Safe core import" }
-                    div class="table-wrap" {
-                        table {
-                            thead {
-                                tr {
-                                    th { "Step" }
-                                    th { "Command / contract" }
-                                }
-                            }
-                            tbody {
-                                tr {
-                                    td { "Download or import" }
-                                    td { code { "sudo deploy/cores/install-core.sh --core xray --version 26.3.27 --url <release-archive-url> --sha256 <sha256> --binary xray --restart infiproxy-xray.service" } }
-                                }
-                                tr {
-                                    td { "Staging" }
-                                    td { code { "/var/lib/infiproxy/core-updates/{core}/{version}" } }
-                                }
-                                tr {
-                                    td { "Activation" }
-                                    td { code { "/opt/infiproxy/cores/{core}/current -> /opt/infiproxy/cores/{core}/{version}" } }
-                                }
-                                tr {
-                                    td { "Validation" }
-                                    td { code { "sha256sum -c, binary --version, optional systemctl restart/status" } }
-                                }
-                            }
-                        }
+                        dd { code { "/etc/infiproxy-cores/{core} and /etc/headscale" } }
+                        dt { "Verification" }
+                        dd { "GitHub release digest or official checksum sidecar, followed by a binary smoke test." }
+                        dt { "Activation" }
+                        dd { "Atomic current symlink switch; active/enabled service state is restored after update." }
                     }
                 }
             },
@@ -1327,6 +1352,126 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         .into_string(),
     )
     .into_response()
+}
+
+async fn check_all_modules_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if let Err(err) = modules::refresh_all(&state.pool).await {
+        return html_error_response_with_back(
+            StatusCode::BAD_GATEWAY,
+            "Module check failed",
+            format!("Could not refresh upstream versions: {err}"),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
+}
+
+async fn check_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if modules::find(&module_id).is_none() {
+        return (StatusCode::NOT_FOUND, "unknown module\n").into_response();
+    }
+    if let Err(err) = modules::refresh_one(&state.pool, &module_id).await {
+        return html_error_response_with_back(
+            StatusCode::BAD_GATEWAY,
+            "Module check failed",
+            format!("Could not refresh {module_id}: {err}"),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
+}
+
+async fn update_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let Some(spec) = modules::find(&module_id) else {
+        return (StatusCode::NOT_FOUND, "unknown module\n").into_response();
+    };
+    if let Err(err) = modules::request_update(spec.id) {
+        return html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Module update not requested",
+            format!("Could not notify the root updater: {err}"),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    let status_key = format!("module_{}_status", spec.id);
+    let _ = upsert_setting(&state.pool, &status_key, "update requested").await;
+    Redirect::to("/admin/cores").into_response()
+}
+
+async fn module_auto_update_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<ModuleAutoUpdateForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let enabled = update::parse_bool_setting(&form.enabled);
+    if let Err(err) = modules::set_auto_update(&state.pool, &module_id, enabled).await {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Module policy not saved",
+            format!("Could not update module policy: {err}"),
+            "/admin/cores",
+            "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
 }
 
 async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -3821,14 +3966,6 @@ fn proxy_role_label(role: &ProxyRole) -> &'static str {
         ProxyRole::Compatibility => "COMPAT",
         ProxyRole::RuAccess => "RU-ACCESS",
         ProxyRole::Manual => "MANUAL",
-    }
-}
-
-fn core_priority_class(priority: &str) -> &'static str {
-    match priority {
-        "primary" | "compat" => "ok",
-        "telegram" => "warn",
-        _ => "off",
     }
 }
 

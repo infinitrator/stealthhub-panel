@@ -5,16 +5,17 @@
 //! root-owned systemd updater when the owner asks to apply an update now.
 
 use crate::ui::APP_NAME;
-use chrono::{Timelike, Utc};
+use chrono::{Local, Timelike, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::{fs, path::Path, process::Command, time::Duration as StdDuration};
+use std::{fs, path::PathBuf, process::Command, time::Duration as StdDuration};
 use stealthhub_core::storage::{get_setting, upsert_setting};
 
-const CHECK_INTERVAL: StdDuration = StdDuration::from_secs(60 * 60);
+const CHECK_INTERVAL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
 const INITIAL_DELAY: StdDuration = StdDuration::from_secs(20);
-const STATE_PATH: &str = "/var/lib/infiproxy/panel-update-state.env";
-const REQUEST_PATH: &str = "/var/lib/infiproxy/panel-update-now.request";
+const DEFAULT_STATE_PATH: &str = "/var/lib/infiproxy/panel-update-state.env";
+const DEFAULT_REQUEST_PATH: &str = "/var/lib/infiproxy/panel-update-now.request";
+const DEFAULT_CONFIG_PATH: &str = "/etc/infiproxy-update.conf";
 
 /// Short update payload shown in the admin bar.
 #[derive(Debug, Clone)]
@@ -26,7 +27,7 @@ pub(crate) struct Notice {
 #[derive(Debug, Clone)]
 struct Config {
     enabled: bool,
-    hour: u32,
+    schedule_time: String,
     repo: String,
     git_ref: String,
 }
@@ -35,7 +36,7 @@ struct Config {
 #[derive(Debug, Clone)]
 pub(crate) struct Status {
     pub(crate) enabled: bool,
-    pub(crate) hour: u32,
+    pub(crate) schedule_time: String,
     pub(crate) repo: String,
     pub(crate) git_ref: String,
     pub(crate) current_sha: String,
@@ -51,7 +52,7 @@ struct GithubCommitRef {
     sha: String,
 }
 
-/// Starts the lightweight hourly GitHub checker in the panel process.
+/// Starts the lightweight two-hour GitHub checker in the panel process.
 pub(crate) fn spawn_checker(pool: SqlitePool) {
     tokio::spawn(async move {
         tokio::time::sleep(INITIAL_DELAY).await;
@@ -74,7 +75,7 @@ pub(crate) async fn refresh_state(pool: &SqlitePool) -> anyhow::Result<Status> {
     if !config.enabled {
         let status = Status {
             enabled: false,
-            hour: config.hour,
+            schedule_time: config.schedule_time,
             repo: config.repo,
             git_ref: config.git_ref,
             current_sha,
@@ -93,7 +94,7 @@ pub(crate) async fn refresh_state(pool: &SqlitePool) -> anyhow::Result<Status> {
     let available = current_sha != "unknown" && latest_sha != current_sha;
     let status = Status {
         enabled: config.enabled,
-        hour: config.hour,
+        schedule_time: config.schedule_time.clone(),
         repo: config.repo,
         git_ref: config.git_ref,
         current_sha,
@@ -101,7 +102,7 @@ pub(crate) async fn refresh_state(pool: &SqlitePool) -> anyhow::Result<Status> {
         available,
         checked_at: Utc::now().to_rfc3339(),
         planned_for: if available {
-            next_window_label(config.hour)
+            next_window_label(&config.schedule_time)
         } else {
             "not scheduled".to_string()
         },
@@ -118,7 +119,7 @@ pub(crate) async fn load_status(pool: &SqlitePool) -> anyhow::Result<Status> {
     let config = load_config(pool).await?;
     Ok(Status {
         enabled: config.enabled,
-        hour: config.hour,
+        schedule_time: config.schedule_time,
         repo: config.repo,
         git_ref: config.git_ref,
         current_sha: setting_or_default(pool, "panel_update_current_sha", "unknown").await?,
@@ -148,15 +149,15 @@ pub(crate) async fn load_notice(pool: &SqlitePool) -> anyhow::Result<Option<Noti
 
 /// Creates the systemd path trigger consumed by `infiproxy-panel-update.path`.
 pub(crate) fn request_now() -> anyhow::Result<()> {
-    let path = Path::new(REQUEST_PATH);
+    let path = configured_path("INFIPROXY_PANEL_UPDATE_REQUEST", DEFAULT_REQUEST_PATH);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, format!("requested_at={}\n", Utc::now().to_rfc3339()))?;
+    fs::write(&path, format!("requested_at={}\n", Utc::now().to_rfc3339()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o640))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
     }
     Ok(())
 }
@@ -187,6 +188,16 @@ pub(crate) fn parse_bool_setting(value: &str) -> bool {
 
 pub(crate) fn parse_hour(value: &str) -> Option<u32> {
     value.trim().parse::<u32>().ok().filter(|hour| *hour <= 23)
+}
+
+pub(crate) fn parse_schedule_time(value: &str) -> Option<(u32, u32)> {
+    let (hour_text, minute_text) = value.trim().split_once(':')?;
+    if hour_text.len() != 2 || minute_text.len() != 2 {
+        return None;
+    }
+    let hour = hour_text.parse::<u32>().ok()?;
+    let minute = minute_text.parse::<u32>().ok()?;
+    (hour <= 23 && minute <= 59).then_some((hour, minute))
 }
 
 pub(crate) fn non_empty_or_default<'a>(value: &'a str, default_value: &'a str) -> &'a str {
@@ -225,17 +236,53 @@ pub(crate) fn validate_ref(git_ref: &str) -> Result<(), &'static str> {
 async fn load_config(pool: &SqlitePool) -> anyhow::Result<Config> {
     let enabled =
         parse_bool_setting(&setting_or_default(pool, "panel_update_enabled", "true").await?);
-    let hour = parse_hour(&setting_or_default(pool, "panel_update_hour", "4").await?).unwrap_or(4);
-    let repo =
-        setting_or_default(pool, "panel_update_repo", "infinitrator/stealthhub-panel").await?;
-    let git_ref = setting_or_default(pool, "panel_update_ref", "main").await?;
+    let legacy_hour =
+        parse_hour(&setting_or_default(pool, "panel_update_hour", "5").await?).unwrap_or(5);
+    let legacy_time = format!("{legacy_hour:02}:00");
+    let schedule_time = setting_or_default(pool, "panel_update_time", &legacy_time).await?;
+    let schedule_time = if parse_schedule_time(&schedule_time).is_some() {
+        schedule_time
+    } else {
+        "05:00".to_string()
+    };
+    let (repo, git_ref) = if let Some(source) = load_pinned_source()? {
+        source
+    } else {
+        (
+            setting_or_default(pool, "panel_update_repo", "infinitrator/stealthhub-panel").await?,
+            setting_or_default(pool, "panel_update_ref", "main").await?,
+        )
+    };
 
     Ok(Config {
         enabled,
-        hour,
+        schedule_time,
         repo,
         git_ref,
     })
+}
+
+fn load_pinned_source() -> anyhow::Result<Option<(String, String)>> {
+    let path = configured_path("INFIPROXY_UPDATE_CONFIG_FILE", DEFAULT_CONFIG_PATH);
+    let content = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let mut repo = None;
+    let mut git_ref = None;
+    for line in content.lines() {
+        if let Some(value) = line.strip_prefix("REPO=") {
+            repo = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("REF=") {
+            git_ref = Some(value.trim().to_string());
+        }
+    }
+    let repo = repo.ok_or_else(|| anyhow::anyhow!("update config is missing REPO"))?;
+    let git_ref = git_ref.ok_or_else(|| anyhow::anyhow!("update config is missing REF"))?;
+    validate_repo(&repo).map_err(anyhow::Error::msg)?;
+    validate_ref(&git_ref).map_err(anyhow::Error::msg)?;
+    Ok(Some((repo, git_ref)))
 }
 
 async fn setting_or_default(
@@ -323,18 +370,21 @@ fn is_safe_git_ref_char(ch: char) -> bool {
     is_safe_git_segment(ch) || ch == '/'
 }
 
-fn next_window_label(hour: u32) -> String {
-    let now = Utc::now();
-    let suffix = if now.hour() < hour {
+fn next_window_label(schedule_time: &str) -> String {
+    let now = Local::now();
+    let (hour, minute) = parse_schedule_time(schedule_time).unwrap_or((5, 0));
+    let now_minutes = now.hour() * 60 + now.minute();
+    let schedule_minutes = hour * 60 + minute;
+    let suffix = if now_minutes < schedule_minutes {
         "today"
     } else {
         "tomorrow"
     };
-    format!("{suffix} at {hour:02}:00 server UTC")
+    format!("{suffix} at {schedule_time} server time")
 }
 
 fn write_state_file(status: &Status) {
-    let path = Path::new(STATE_PATH);
+    let path = configured_path("INFIPROXY_PANEL_UPDATE_STATE", DEFAULT_STATE_PATH);
     let Some(parent) = path.parent() else {
         return;
     };
@@ -346,6 +396,7 @@ fn write_state_file(status: &Status) {
         concat!(
             "AUTO_ENABLED={}\n",
             "SCHEDULE_HOUR={}\n",
+            "SCHEDULE_TIME={}\n",
             "UPDATE_AVAILABLE={}\n",
             "REPO={}\n",
             "REF={}\n",
@@ -355,7 +406,8 @@ fn write_state_file(status: &Status) {
             "PLANNED_FOR={}\n"
         ),
         env_bool(status.enabled),
-        status.hour,
+        status.schedule_time.split(':').next().unwrap_or("5"),
+        shell_env_value(&status.schedule_time),
         env_bool(status.available),
         shell_env_value(&status.repo),
         shell_env_value(&status.git_ref),
@@ -365,13 +417,19 @@ fn write_state_file(status: &Status) {
         shell_env_value(&status.planned_for),
     );
 
-    if fs::write(path, content).is_ok() {
+    if fs::write(&path, content).is_ok() {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
         }
     }
+}
+
+fn configured_path(variable: &str, default_path: &str) -> PathBuf {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default_path))
 }
 
 fn env_bool(value: bool) -> &'static str {

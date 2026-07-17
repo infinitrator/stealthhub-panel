@@ -39,8 +39,8 @@ sudo infiproxy-manager --guided
 - A domain is optional but recommended for HTTPS.
 - For Cloudflare HTTPS automation: an API token with `Zone:Read` and `DNS:Edit`
   permissions for the target zone.
-- For proxy cores: official release archive URLs and SHA256 checksums. The TUI
-  asks for these values and performs checksum verification before activation.
+- Internet access to GitHub releases. The module updater selects the correct
+  official asset for the server architecture and verifies it before activation.
 
 ## First Run
 
@@ -88,7 +88,7 @@ It includes:
 - Restart and reload actions.
 - Panel environment editor.
 - HTTPS and Cloudflare certificate setup.
-- Verified proxy core installer.
+- Independent runtime-module manager with installed/latest comparison.
 - Telegram MTProto setup.
 - Headscale mesh hub setup.
 - Panel update scheduler and immediate update trigger.
@@ -98,8 +98,8 @@ It includes:
 ## Updates And Autostart
 
 The panel and every runtime are installed as systemd-managed components.
-`infiproxy.service` starts the Rust panel after boot. Installed proxy modules
-use their own services and the core installer enables the selected service after
+`infiproxy.service` starts the Rust panel after boot. Every configured module
+keeps its own systemd unit and returns to its previous enabled/active state after
 a verified binary update:
 
 ```text
@@ -113,26 +113,33 @@ headscale.service
 
 Panel self-updates are split into two layers:
 
-- The web panel checks GitHub once per hour and stores update state in
+- The web panel checks GitHub every two hours and stores update state in
   `/var/lib/infiproxy/panel-update-state.env`.
-- `infiproxy-panel-update.timer` runs the root updater hourly and applies a
-  pending update at the UTC maintenance hour configured in Settings.
+- `infiproxy-panel-update.timer` runs the root updater every 15 minutes and applies a
+  pending update at the server-local maintenance hour configured in Settings.
+  A fresh install defaults to `05:00`; custom `HH:MM` values run in the first
+  15-minute scheduler window at or after that time.
 - `infiproxy-panel-update.path` watches for
   `/var/lib/infiproxy/panel-update-now.request`; the owner-admin "Update Now"
   button creates this file for immediate update.
 - The root updater uses `/opt/infiproxy/source`, rebuilds the release binary and
-  reruns the idempotent installer, so reboot recovery and package layout stay
-  identical to a fresh install.
+  reruns the idempotent installer. It creates a binary and SQLite backup first
+  and restores the previous binary if the update fails. Root-only logs, backups,
+  build files and applied-version markers live in
+  `/var/lib/infiproxy-maintenance`, separate from web-writable state.
 
-Change the update repository, ref and UTC maintenance hour in
-`/admin/settings`. For forked deployments, keep the repository value in
-`owner/repo` format and the ref as a branch, tag or safe git ref.
+Change automatic-update enablement and maintenance time in `/admin/settings`.
+The repository and ref are pinned in root-owned `/etc/infiproxy-update.conf`
+during bootstrap; this prevents a stolen web-admin session from replacing the
+root update source. Change channels by rerunning bootstrap with `--repo` and
+`--ref`.
 
-## Proxy Cores
+## Runtime Modules
 
-Infiproxy prepares systemd units and config directories, but proxy core binaries
-are installed only from verified archives. This avoids silently trusting an
-unverified binary during panel installation.
+Open `Modules` in the web panel or `Runtime modules` in the SSH manager. Xray,
+sing-box, Hysteria, TUIC, Telegram MTProto and Headscale can be checked and
+updated independently. Automatic updates are configurable per module and use
+the same maintenance time as the panel.
 
 Runtime paths:
 
@@ -154,21 +161,19 @@ infiproxy-tuic.service
 infiproxy-mtproto.service
 ```
 
-Inside the TUI, choose:
+The normal TUI flow is:
 
 ```text
-Core installer helper
+Runtime modules
+Show installed/latest status
+Install or update one module
 ```
 
-For each core, paste:
-
-- Core version label.
-- Official release archive URL.
-- SHA256 checksum.
-
-The installer downloads or imports the archive, verifies SHA256, extracts into a
-versioned directory, runs a bounded smoke test and atomically switches the
-`current` symlink.
+Release assets come only from fixed official GitHub repositories. GitHub's asset
+digest or the upstream checksum sidecar is verified before a bounded smoke test
+and atomic `current` symlink switch. If an active service fails after restart,
+the updater restores the previous symlink and service. Config files are never
+replaced by a module update.
 
 ## Telegram MTProto
 
@@ -205,10 +210,8 @@ Headscale hub setup
 
 The guided setup:
 
-- Downloads the official Headscale release.
-- Verifies the downloaded asset with upstream `checksums.txt`.
-- Installs the Debian package on Ubuntu/Debian or falls back to a standalone
-  binary on other supported Linux hosts.
+- Installs a versioned official Headscale binary through the shared module
+  updater and verifies its SHA256 digest.
 - Writes `/etc/headscale/config.yaml`.
 - Creates a dedicated Nginx HTTPS site at
   `/etc/nginx/sites-available/infiproxy-headscale.conf`.
@@ -262,14 +265,41 @@ sudo bash deploy/bootstrap.sh --guided --with-nginx
 The installer keeps existing env and core configs unless you explicitly choose
 to overwrite them. Existing env files are backed up before replacement.
 
+Direct maintenance commands:
+
+```bash
+sudo infiproxy-module-update --check-all
+sudo infiproxy-module-update --update xray
+sudo systemctl start infiproxy-panel-update.service
+```
+
+## Uninstall
+
+Use the SSH manager and review the generated command list before confirmation:
+
+```bash
+sudo infiproxy-manager --uninstall panel
+sudo infiproxy-manager --uninstall full
+sudo infiproxy-manager --uninstall factory
+```
+
+`panel` removes the control plane and its update machinery while leaving module
+binaries and services. `full` removes the complete Infiproxy runtime footprint.
+`factory` also removes the source checkout and manager integration. OS packages
+such as Git, Rust or Nginx are deliberately not purged because the installer
+cannot prove whether they existed before Infiproxy.
+
 ## Important Paths
 
 ```text
 /opt/infiproxy/source
 /usr/local/bin/infiproxy
 /usr/local/sbin/infiproxy-manager
+/usr/local/sbin/infiproxy-module-update
 /etc/infiproxy/infiproxy.env
+/etc/infiproxy-update.conf
 /var/lib/infiproxy/infiproxy.sqlite
+/var/lib/infiproxy-maintenance
 /etc/systemd/system/infiproxy.service
 /etc/systemd/system/infiproxy-*.service
 /opt/infiproxy/cores
@@ -309,15 +339,11 @@ curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/
   --with-nginx
 ```
 
-Install or update a core without the TUI:
+Install or update a module without the TUI:
 
 ```bash
-sudo /opt/infiproxy/source/deploy/cores/install-core.sh \
-  --core xray \
-  --version <version> \
-  --url '<release-archive-url>' \
-  --sha256 '<sha256>' \
-  --binary xray
+sudo infiproxy-module-update --check xray
+sudo infiproxy-module-update --update xray
 ```
 
 ## Local Development
@@ -350,7 +376,7 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo audit
-bash -n deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh
+bash -n deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/module-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh deploy/infiproxy-profile.sh
 bash deploy/install.sh --check
 ```
 

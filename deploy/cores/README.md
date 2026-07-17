@@ -26,12 +26,12 @@ The panel should generate and validate configs, then let systemd supervise each 
 /etc/infiproxy-cores/mtproto/mtproto.env
 /etc/infiproxy-cores/mtproto/proxy-secret
 /etc/infiproxy-cores/mtproto/proxy-multi.conf
-/var/lib/infiproxy/core-updates/{core}/{version}
+/var/lib/infiproxy-maintenance/core-updates/{core}/{version}
 ```
 
 ## Update Rules
 
-1. Download into `/var/lib/infiproxy/core-updates/{core}/{version}`.
+1. Download into `/var/lib/infiproxy-maintenance/core-updates/{core}/{version}`.
 2. Verify SHA256 before extracting or activating.
 3. Run the staged binary's version command.
 4. Validate the staged config.
@@ -44,7 +44,17 @@ Do not overwrite active binaries in place.
 
 ## Install Script
 
-Use `deploy/cores/install-core.sh` for checksum-verified installs and updates.
+The supported operator entrypoint is the shared module updater. It discovers the
+latest official release for the host architecture, verifies it and preserves
+the service state:
+
+```bash
+sudo infiproxy-module-update --check xray
+sudo infiproxy-module-update --update xray
+```
+
+Use `deploy/cores/install-core.sh` only for an advanced checksum-verified manual
+import when an upstream release cannot be reached automatically.
 
 ```bash
 sudo deploy/cores/install-core.sh \
