@@ -375,6 +375,16 @@ pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
     upsert_setting_if_missing(pool, "panel_name", "Infiproxy").await?;
     upsert_setting_if_missing(pool, "subscription_domain", "sub.infiproxy.local").await?;
     upsert_setting_if_missing(pool, "node_domain", "node.infiproxy.local").await?;
+    upsert_setting_if_missing(pool, "panel_update_enabled", "true").await?;
+    upsert_setting_if_missing(pool, "panel_update_hour", "4").await?;
+    upsert_setting_if_missing(pool, "panel_update_repo", "infinitrator/stealthhub-panel").await?;
+    upsert_setting_if_missing(pool, "panel_update_ref", "main").await?;
+    upsert_setting_if_missing(pool, "panel_update_available", "false").await?;
+    upsert_setting_if_missing(pool, "panel_update_checked_at", "never").await?;
+    upsert_setting_if_missing(pool, "panel_update_current_sha", "unknown").await?;
+    upsert_setting_if_missing(pool, "panel_update_latest_sha", "unknown").await?;
+    upsert_setting_if_missing(pool, "panel_update_planned_for", "not scheduled").await?;
+    upsert_setting_if_missing(pool, "panel_update_status", "idle").await?;
 
     Ok(())
 }

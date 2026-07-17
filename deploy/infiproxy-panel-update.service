@@ -1,0 +1,14 @@
+[Unit]
+Description=Infiproxy panel updater
+Documentation=https://github.com/infinitrator/stealthhub-panel
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/local/sbin/infiproxy-panel-update
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

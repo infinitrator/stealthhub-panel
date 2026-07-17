@@ -59,10 +59,12 @@ fn owner_admin_is_first_created_admin() {
     let owner = AuthenticatedAdmin {
         admin: test_admin(1),
         csrf_token: "csrf".to_string(),
+        update_notice: None,
     };
     let regular = AuthenticatedAdmin {
         admin: test_admin(2),
         csrf_token: "csrf".to_string(),
+        update_notice: None,
     };
 
     assert!(is_owner_admin(&owner));

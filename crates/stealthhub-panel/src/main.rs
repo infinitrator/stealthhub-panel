@@ -9,6 +9,7 @@ mod health;
 mod ip;
 mod ops;
 mod ui;
+mod update;
 
 use crate::{
     health::{health, readiness},
@@ -198,6 +199,14 @@ struct PanelSettingsForm {
     panel_name: String,
     subscription_domain: String,
     node_domain: String,
+    #[serde(default)]
+    panel_update_enabled: String,
+    #[serde(default)]
+    panel_update_hour: String,
+    #[serde(default)]
+    panel_update_repo: String,
+    #[serde(default)]
+    panel_update_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +226,7 @@ struct LoginForm {
 pub(crate) struct AuthenticatedAdmin {
     admin: AdminRecord,
     csrf_token: String,
+    update_notice: Option<update::Notice>,
 }
 
 #[tokio::main]
@@ -263,6 +273,7 @@ async fn main() -> anyhow::Result<()> {
     ensure_default_protocol_profiles(&pool).await?;
     ensure_default_routing_rule_sets(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
+    update::spawn_checker(pool.clone());
 
     let state = AppState {
         pool,
@@ -285,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/settings",
             get(settings_page).post(update_settings_action),
         )
+        .route("/admin/panel-update-now", post(panel_update_now_action))
         .route("/admin/protocols", get(protocols_page))
         .route(
             "/admin/protocols/{name}/update",
@@ -901,6 +913,18 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
             );
         }
     };
+    let update_status = match update::load_status(&state.pool).await {
+        Ok(value) => value,
+        Err(err) => {
+            return html_error_response_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Update state unavailable",
+                format!("Failed to load panel update settings: {err}"),
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
 
     Html(
         layout(
@@ -926,6 +950,10 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                         span { "Config source" }
                         strong { "SQLite settings" }
                     }
+                    div class="metric" {
+                        span { "Panel update" }
+                        strong { (update::status_label(&update_status)) }
+                    }
                 }
 
                 section {
@@ -947,6 +975,29 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                             input type="text" name="node_domain" value=(&settings.node_domain) required;
                             small { "Public host that Mihomo clients use to connect to proxy profiles." }
                         }
+                        label {
+                            span { "Panel auto-update" }
+                            select name="panel_update_enabled" disabled[!is_owner_admin(&auth)] {
+                                option value="true" selected[update_status.enabled] { "Enabled" }
+                                option value="false" selected[!update_status.enabled] { "Disabled" }
+                            }
+                            small { "Owner-only. Hourly GitHub check schedules a root-level update for the maintenance window." }
+                        }
+                        label {
+                            span { "Maintenance hour UTC" }
+                            input type="number" name="panel_update_hour" value=(update_status.hour) min="0" max="23" required disabled[!is_owner_admin(&auth)];
+                            small { "Owner-only. Server-side updater runs once per hour and applies pending panel updates at this UTC hour." }
+                        }
+                        label {
+                            span { "GitHub repository" }
+                            input type="text" name="panel_update_repo" value=(&update_status.repo) pattern="[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" required disabled[!is_owner_admin(&auth)];
+                            small { "Owner-only. Owner/repo used by the checker, for example infinitrator/stealthhub-panel." }
+                        }
+                        label {
+                            span { "Git reference" }
+                            input type="text" name="panel_update_ref" value=(&update_status.git_ref) pattern="[A-Za-z0-9_./-]+" required disabled[!is_owner_admin(&auth)];
+                            small { "Owner-only. Branch, tag or safe ref name. Default: main." }
+                        }
                         div class="full-span" {
                             button type="submit" { "Save Settings" }
                         }
@@ -962,6 +1013,14 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                         dd { code { (format!("https://{}/rules/{{name}}", settings.subscription_domain)) } }
                         dt { "Proxy endpoint host" }
                         dd { code { (&settings.node_domain) } }
+                        dt { "Update checker" }
+                        dd { code { (format!("{} / checked {}", update_status.status, update_status.checked_at)) } }
+                        dt { "Current commit" }
+                        dd { code { (update::short_sha(&update_status.current_sha)) } }
+                        dt { "Latest commit" }
+                        dd { code { (update::short_sha(&update_status.latest_sha)) } }
+                        dt { "Planned update" }
+                        dd { code { (&update_status.planned_for) } }
                     }
                 }
             },
@@ -1021,12 +1080,59 @@ async fn update_settings_action(
             );
         }
     };
-
-    for (key, value) in [
+    let mut settings_to_save = vec![
         ("panel_name", panel_name.to_string()),
         ("subscription_domain", subscription_domain),
         ("node_domain", node_domain),
-    ] {
+    ];
+
+    if is_owner_admin(&auth) {
+        let update_enabled = form.panel_update_enabled.trim().is_empty()
+            || update::parse_bool_setting(&form.panel_update_enabled);
+        let update_hour_raw = update::non_empty_or_default(&form.panel_update_hour, "4");
+        let update_hour = match update::parse_hour(update_hour_raw) {
+            Some(value) => value,
+            None => {
+                return html_error_response_with_back(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid update window",
+                    "Maintenance hour must be a number from 0 to 23.",
+                    "/admin/settings",
+                    "Back to Settings",
+                );
+            }
+        };
+        let update_repo =
+            update::non_empty_or_default(&form.panel_update_repo, "infinitrator/stealthhub-panel");
+        if let Err(message) = update::validate_repo(update_repo) {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Invalid update repository",
+                message,
+                "/admin/settings",
+                "Back to Settings",
+            );
+        }
+        let update_ref = update::non_empty_or_default(&form.panel_update_ref, "main");
+        if let Err(message) = update::validate_ref(update_ref) {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Invalid update reference",
+                message,
+                "/admin/settings",
+                "Back to Settings",
+            );
+        }
+
+        settings_to_save.extend([
+            ("panel_update_enabled", update_enabled.to_string()),
+            ("panel_update_hour", update_hour.to_string()),
+            ("panel_update_repo", update_repo.to_string()),
+            ("panel_update_ref", update_ref.to_string()),
+        ]);
+    }
+
+    for (key, value) in settings_to_save {
         if let Err(err) = upsert_setting(&state.pool, key, &value).await {
             return html_error_response_with_back(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1036,6 +1142,54 @@ async fn update_settings_action(
                 "Back to Settings",
             );
         }
+    }
+    if is_owner_admin(&auth) {
+        let pool = state.pool.clone();
+        tokio::spawn(async move {
+            if let Err(err) = update::refresh_state(&pool).await {
+                tracing::warn!("panel update check after settings save failed: {err}");
+            }
+        });
+    }
+
+    Redirect::to("/admin/settings").into_response()
+}
+
+async fn panel_update_now_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+
+    if let Err(err) = upsert_setting(&state.pool, "panel_update_status", "requested").await {
+        return html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Update not requested",
+            format!("Failed to persist update request: {err}"),
+            "/admin/settings",
+            "Back to Settings",
+        );
+    }
+
+    if let Err(err) = update::request_now() {
+        return html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Update not requested",
+            format!("Failed to notify root updater: {err}"),
+            "/admin/settings",
+            "Back to Settings",
+        );
     }
 
     Redirect::to("/admin/settings").into_response()
@@ -3347,9 +3501,12 @@ async fn current_admin(
         delete_admin_session(&state.pool, &token_hash).await?;
     }
 
+    let update_notice = update::load_notice(&state.pool).await?;
+
     Ok(admin.map(|admin| AuthenticatedAdmin {
         admin,
         csrf_token: csrf_token_for_session_token(&token),
+        update_notice,
     }))
 }
 
@@ -3677,17 +3834,39 @@ fn core_priority_class(priority: &str) -> &'static str {
 
 pub(crate) fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
     html! {
-        div class="admin-bar" {
-            span {
-                "Signed in as " strong { (auth.admin.username) }
-                @if is_owner_admin(auth) {
-                    " "
-                    span class="badge ok" { "owner" }
+        div class="admin-stack" {
+            @if let Some(notice) = &auth.update_notice {
+                div class="update-banner" role="status" {
+                    div {
+                        strong { "Panel update available" }
+                        span {
+                            " Latest commit "
+                            code { (update::short_sha(&notice.latest_sha)) }
+                            " is scheduled "
+                            (notice.planned_for)
+                            "."
+                        }
+                    }
+                    @if is_owner_admin(auth) {
+                        form method="post" action="/admin/panel-update-now" class="inline-form" {
+                            (csrf_field(&auth.csrf_token))
+                            button type="submit" { "Update Now" }
+                        }
+                    }
                 }
             }
-            form method="post" action="/admin/logout" class="inline-form" {
-                (csrf_field(&auth.csrf_token))
-                button type="submit" { "Logout" }
+            div class="admin-bar" {
+                span {
+                    "Signed in as " strong { (auth.admin.username) }
+                    @if is_owner_admin(auth) {
+                        " "
+                        span class="badge ok" { "owner" }
+                    }
+                }
+                form method="post" action="/admin/logout" class="inline-form" {
+                    (csrf_field(&auth.csrf_token))
+                    button type="submit" { "Logout" }
+                }
             }
         }
     }

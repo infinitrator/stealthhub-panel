@@ -644,7 +644,11 @@ install_headscale_release() {
   require_cmd curl || return 1
   require_cmd sha256sum || return 1
 
-  local version arch asset ext url checksums tmp checksum_line binary_target input_version
+  local version arch asset ext url checksums tmp checksum_line binary_target input_version was_enabled was_active
+  was_enabled=0
+  was_active=0
+  systemctl is-enabled --quiet "$HEADSCALE_SERVICE" 2>/dev/null && was_enabled=1
+  systemctl is-active --quiet "$HEADSCALE_SERVICE" 2>/dev/null && was_active=1
   version="$(headscale_latest_version || true)"
   read -r -p "Headscale version [${version:-0.29.2}]: " input_version
   version="${input_version:-${version:-0.29.2}}"
@@ -711,6 +715,12 @@ EOF
 
   usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
   run_cmd systemctl daemon-reload
+  if [[ "$was_enabled" -eq 1 ]]; then
+    run_cmd systemctl enable "$HEADSCALE_SERVICE" || true
+  fi
+  if [[ "$was_active" -eq 1 ]]; then
+    run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+  fi
   echo "${green}Headscale ${version} installed with verified checksum.${reset}"
 }
 
@@ -1244,14 +1254,42 @@ logs_menu() {
   pause
 }
 
+panel_update_menu() {
+  while true; do
+    header
+    echo "Panel updater"
+    echo
+    systemctl --no-pager --full status infiproxy-panel-update.timer infiproxy-panel-update.path 2>/dev/null || true
+    echo
+    echo "1) Run panel update check/apply now"
+    echo "2) Show updater log"
+    echo "3) Restart update timer and path watcher"
+    echo "0) Back"
+    read_menu_choice || return
+    case "$choice" in
+      1) run_cmd /usr/local/sbin/infiproxy-panel-update || true; pause ;;
+      2) run_cmd tail -n 120 /var/lib/infiproxy/panel-update-run.log || true; pause ;;
+      3)
+        run_cmd systemctl daemon-reload
+        run_cmd systemctl enable --now infiproxy-panel-update.timer infiproxy-panel-update.path || true
+        pause
+        ;;
+      0) return ;;
+      *) invalid_choice ;;
+    esac
+  done
+}
+
 uninstall_commands() {
   case "$1" in
     panel)
       cat <<'EOF'
 systemctl disable --now infiproxy.service || true
+systemctl disable --now infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service || true
 rm -f /etc/systemd/system/infiproxy.service
+rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update
 rm -rf /etc/infiproxy /var/lib/infiproxy
 userdel infiproxy 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
@@ -1259,12 +1297,13 @@ EOF
       ;;
     full)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
+rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
 rm -f /etc/systemd/system/headscale.service
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update
 rm -rf /etc/infiproxy /var/lib/infiproxy
 rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
@@ -1278,12 +1317,13 @@ EOF
       ;;
     factory)
       cat <<'EOF'
-systemctl disable --now infiproxy.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
 rm -f /etc/systemd/system/infiproxy.service
+rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
 rm -f /etc/systemd/system/headscale.service
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update
 rm -rf /etc/infiproxy /var/lib/infiproxy
 rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
@@ -1344,8 +1384,9 @@ main_menu() {
     echo "8) Core installer helper"
     echo "9) Telegram MTProto setup"
     echo "10) Headscale hub setup"
-    echo "11) Panel logs"
-    echo "${danger}12) Uninstall / cleanup${reset}"
+    echo "11) Panel updater"
+    echo "12) Panel logs"
+    echo "${danger}13) Uninstall / cleanup${reset}"
     echo "0) Exit"
     read_menu_choice || exit 0
     case "$choice" in
@@ -1359,8 +1400,9 @@ main_menu() {
       8) core_helper ;;
       9) mtproto_setup_menu ;;
       10) headscale_menu ;;
-      11) logs_menu ;;
-      12) run_uninstall ;;
+      11) panel_update_menu ;;
+      12) logs_menu ;;
+      13) run_uninstall ;;
       0) exit 0 ;;
       *) invalid_choice ;;
     esac

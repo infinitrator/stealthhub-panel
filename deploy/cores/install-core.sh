@@ -225,6 +225,7 @@ ln -sfn "$TARGET_DIR" "$NEXT_LINK"
 mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
 
 if [[ -n "$RESTART_SERVICE" ]]; then
+    systemctl enable "$RESTART_SERVICE"
     systemctl restart "$RESTART_SERVICE"
     systemctl --no-pager --full status "$RESTART_SERVICE"
 fi

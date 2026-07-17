@@ -1,0 +1,9 @@
+[Unit]
+Description=Immediate Infiproxy panel update trigger
+
+[Path]
+PathExists=/var/lib/infiproxy/panel-update-now.request
+Unit=infiproxy-panel-update.service
+
+[Install]
+WantedBy=multi-user.target

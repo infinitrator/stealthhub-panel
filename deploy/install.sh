@@ -11,12 +11,16 @@ APP_USER="${INFIPROXY_USER:-${STEALTHHUB_USER:-infiproxy}}"
 APP_GROUP="${INFIPROXY_GROUP:-${STEALTHHUB_GROUP:-$APP_USER}}"
 INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
 MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
+UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
 CORE_CONFIG_DIR="${INFIPROXY_CORE_CONFIG_DIR:-${STEALTHHUB_CORE_CONFIG_DIR:-/etc/infiproxy-cores}}"
 CORE_LOG_DIR="${INFIPROXY_CORE_LOG_DIR:-${STEALTHHUB_CORE_LOG_DIR:-/var/log/infiproxy-cores}}"
 SERVICE_FILE="${INFIPROXY_SERVICE_FILE:-${STEALTHHUB_SERVICE_FILE:-/etc/systemd/system/infiproxy.service}}"
+UPDATE_SERVICE_FILE="${INFIPROXY_UPDATE_SERVICE_FILE:-/etc/systemd/system/infiproxy-panel-update.service}"
+UPDATE_TIMER_FILE="${INFIPROXY_UPDATE_TIMER_FILE:-/etc/systemd/system/infiproxy-panel-update.timer}"
+UPDATE_PATH_FILE="${INFIPROXY_UPDATE_PATH_FILE:-/etc/systemd/system/infiproxy-panel-update.path}"
 ENV_FILE="${CONFIG_DIR}/infiproxy.env"
 NGINX_AVAILABLE="${INFIPROXY_NGINX_AVAILABLE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
@@ -107,6 +111,10 @@ if [[ ! -f "${ROOT_DIR}/deploy/infiproxy-manager.sh" ]]; then
     echo "Manager script not found: ${ROOT_DIR}/deploy/infiproxy-manager.sh" >&2
     exit 1
 fi
+if [[ ! -f "${ROOT_DIR}/deploy/panel-update.sh" ]]; then
+    echo "Panel updater script not found: ${ROOT_DIR}/deploy/panel-update.sh" >&2
+    exit 1
+fi
 
 if [[ "$BUILD" -eq 1 ]]; then
     if ! command -v cargo >/dev/null 2>&1; then
@@ -126,6 +134,7 @@ cat <<EOF
 Infiproxy install plan:
   binary:        $INSTALL_BIN
   manager:       $MANAGER_BIN
+  updater:       $UPDATE_BIN
   release bin:   $RELEASE_BIN
   config:        $ENV_FILE
   state:         $STATE_DIR
@@ -134,6 +143,7 @@ Infiproxy install plan:
   headscale cfg: /etc/headscale
   core logs:     $CORE_LOG_DIR
   service:       $SERVICE_FILE
+  updater units: $UPDATE_SERVICE_FILE, $UPDATE_TIMER_FILE, $UPDATE_PATH_FILE
   nginx:         $WITH_NGINX
   web config:    /etc/infiproxy and /etc/infiproxy-cores are group-writable by $APP_GROUP
 EOF
@@ -156,12 +166,14 @@ install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
+install -d -o root -g root -m 0755 "$(dirname "$UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
 
 if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
     if [[ -f "$ENV_FILE" ]]; then
@@ -175,6 +187,9 @@ chown root:"$APP_GROUP" "$ENV_FILE"
 chmod 0660 "$ENV_FILE"
 
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy.service" "$SERVICE_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.service" "$UPDATE_SERVICE_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.timer" "$UPDATE_TIMER_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.path" "$UPDATE_PATH_FILE"
 
 for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
     install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
@@ -228,9 +243,12 @@ fi
 
 systemctl daemon-reload
 systemctl enable --now infiproxy.service
+systemctl enable --now infiproxy-panel-update.timer
+systemctl enable --now infiproxy-panel-update.path
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
+echo "Updater: systemctl list-timers infiproxy-panel-update.timer"
 echo "Manager: sudo infiproxy-manager"
 echo "HTTPS:  sudo infiproxy-manager  # choose HTTPS / Cloudflare setup"
 echo "Health: curl http://127.0.0.1:8080/health"

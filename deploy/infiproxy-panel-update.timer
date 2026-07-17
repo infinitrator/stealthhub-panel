@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly Infiproxy panel update scheduler
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=infiproxy-panel-update.service
+
+[Install]
+WantedBy=timers.target

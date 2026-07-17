@@ -22,6 +22,8 @@ The command installs build dependencies, Rust when needed, clones the project to
 `/opt/infiproxy/source`, builds the release binary, installs systemd units and
 opens the guided SSH TUI. The TUI then walks through panel repair, HTTPS,
 optional core imports, Telegram MTProto and final service checks.
+Headscale can also be configured from the same TUI cycle when a mesh hub is
+needed.
 
 If the guided UI was skipped or the SSH session was interrupted:
 
@@ -89,8 +91,42 @@ It includes:
 - Verified proxy core installer.
 - Telegram MTProto setup.
 - Headscale mesh hub setup.
+- Panel update scheduler and immediate update trigger.
 - Panel logs.
 - Root-level uninstall and cleanup flows.
+
+## Updates And Autostart
+
+The panel and every runtime are installed as systemd-managed components.
+`infiproxy.service` starts the Rust panel after boot. Installed proxy modules
+use their own services and the core installer enables the selected service after
+a verified binary update:
+
+```text
+infiproxy-xray.service
+infiproxy-sing-box.service
+infiproxy-hysteria.service
+infiproxy-tuic.service
+infiproxy-mtproto.service
+headscale.service
+```
+
+Panel self-updates are split into two layers:
+
+- The web panel checks GitHub once per hour and stores update state in
+  `/var/lib/infiproxy/panel-update-state.env`.
+- `infiproxy-panel-update.timer` runs the root updater hourly and applies a
+  pending update at the UTC maintenance hour configured in Settings.
+- `infiproxy-panel-update.path` watches for
+  `/var/lib/infiproxy/panel-update-now.request`; the owner-admin "Update Now"
+  button creates this file for immediate update.
+- The root updater uses `/opt/infiproxy/source`, rebuilds the release binary and
+  reruns the idempotent installer, so reboot recovery and package layout stay
+  identical to a fresh install.
+
+Change the update repository, ref and UTC maintenance hour in
+`/admin/settings`. For forked deployments, keep the repository value in
+`owner/repo` format and the ref as a branch, tag or safe git ref.
 
 ## Proxy Cores
 
@@ -314,7 +350,7 @@ cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo audit
-bash -n deploy/bootstrap.sh deploy/install.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh
+bash -n deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh
 bash deploy/install.sh --check
 ```
 

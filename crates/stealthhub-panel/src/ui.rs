@@ -324,16 +324,34 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                         display: inline-block;
                         margin: 0 6px 6px 0;
                     }
+                    .admin-stack {
+                        display: grid;
+                        gap: 8px;
+                        margin-bottom: 16px;
+                    }
                     .admin-bar {
                         display: flex;
                         align-items: center;
                         justify-content: space-between;
                         gap: 12px;
-                        margin-bottom: 16px;
                         padding: 10px 12px;
                         border: 1px solid var(--border);
                         border-radius: 4px;
                         background: var(--panel-strong);
+                    }
+                    .update-banner {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        gap: 12px;
+                        padding: 10px 12px;
+                        border: 1px solid #b9c98f;
+                        border-left: 4px solid var(--accent);
+                        border-radius: 4px;
+                        background: #f8fbef;
+                    }
+                    .update-banner span {
+                        color: var(--muted);
                     }
                     .status-strip {
                         display: flex;
