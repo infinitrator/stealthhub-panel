@@ -270,6 +270,12 @@ install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/module-requests"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/headscale-requests"
 install -d -o root -g root -m 0700 "$ROOT_STATE_DIR/headscale-processing"
 
+# Recover SQLite files that a previously interrupted root-run install may have
+# created before the unprivileged panel service was started.
+find "$STATE_DIR" -maxdepth 1 -type f -name 'infiproxy.sqlite*' \
+    -exec chown "$APP_USER:$APP_GROUP" {} + \
+    -exec chmod 0640 {} +
+
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
@@ -368,7 +374,8 @@ if [[ "$WITH_NGINX" -eq 1 ]]; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now infiproxy.service
+systemctl enable infiproxy.service
+systemctl restart infiproxy.service
 systemctl enable --now infiproxy-panel-update.timer
 systemctl enable --now infiproxy-panel-update.path
 systemctl enable --now infiproxy-module-update.timer
