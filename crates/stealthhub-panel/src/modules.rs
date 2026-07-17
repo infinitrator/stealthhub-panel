@@ -9,12 +9,16 @@ use chrono::Utc;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     time::Duration,
 };
-use stealthhub_core::storage::{get_setting, upsert_setting};
+pub(crate) use stealthhub_core::module_manifest::{ModuleSpec, UpstreamKind};
+use stealthhub_core::{
+    module_manifest::{load_registry, valid_id, ReadOptions},
+    storage::{get_setting, upsert_setting},
+};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
 const INITIAL_DELAY: Duration = Duration::from_secs(35);
@@ -23,34 +27,6 @@ const DEFAULT_AVAILABLE_DIR: &str = "/etc/infiproxy-modules.available.d";
 const DEFAULT_STATE_DIR: &str = "/var/lib/infiproxy/modules";
 const DEFAULT_REQUEST_DIR: &str = "/var/lib/infiproxy/module-requests";
 const DEFAULT_VERSION_DIR: &str = "/var/lib/infiproxy-maintenance/module-versions";
-const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
-
-/// Upstream version-discovery mechanism declared by a module manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum UpstreamKind {
-    Release,
-    Commit { git_ref: String },
-}
-
-/// Validated module metadata loaded from the manifest directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModuleSpec {
-    pub(crate) id: String,
-    pub(crate) name: String,
-    pub(crate) kind: String,
-    pub(crate) role: String,
-    pub(crate) repo: String,
-    pub(crate) upstream: UpstreamKind,
-    pub(crate) driver: String,
-    pub(crate) root: String,
-    pub(crate) binary: String,
-    pub(crate) binary_path: String,
-    pub(crate) service: String,
-    pub(crate) config_path: String,
-    pub(crate) asset_amd64: String,
-    pub(crate) asset_arm64: String,
-}
-
 /// Persisted and locally observed module update state.
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleStatus {
@@ -89,7 +65,8 @@ pub(crate) fn spawn_checker(pool: SqlitePool) {
 
 /// Loads every valid manifest in deterministic ID order.
 pub(crate) fn registry() -> anyhow::Result<Vec<ModuleSpec>> {
-    load_registry(&manifest_dir())
+    let directory = manifest_dir();
+    load_registry(&directory, registry_options(&directory))
 }
 
 /// Loads catalog entries that are not currently active.
@@ -98,42 +75,11 @@ pub(crate) fn available() -> anyhow::Result<Vec<ModuleSpec>> {
         .into_iter()
         .map(|spec| spec.id)
         .collect::<HashSet<_>>();
-    Ok(load_registry(&available_dir())?
+    let directory = available_dir();
+    Ok(load_registry(&directory, registry_options(&directory))?
         .into_iter()
         .filter(|spec| !active.contains(&spec.id))
         .collect())
-}
-
-fn load_registry(directory: &Path) -> anyhow::Result<Vec<ModuleSpec>> {
-    let mut specs = Vec::new();
-    let mut ids = HashSet::new();
-
-    if !directory.is_dir() {
-        return Ok(specs);
-    }
-
-    let mut paths = fs::read_dir(directory)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("module"))
-        .collect::<Vec<_>>();
-    paths.sort();
-
-    for path in paths {
-        let metadata = fs::symlink_metadata(&path)?;
-        if !metadata.file_type().is_file() || metadata.len() > MAX_MANIFEST_BYTES {
-            tracing::warn!(path = %path.display(), "ignoring unsafe module manifest");
-            continue;
-        }
-        let content = fs::read_to_string(&path)?;
-        let spec = parse_manifest(&content, &path)?;
-        if !ids.insert(spec.id.clone()) {
-            anyhow::bail!("duplicate module id: {}", spec.id);
-        }
-        specs.push(spec);
-    }
-    specs.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(specs)
 }
 
 /// Refreshes all upstream versions with one reusable, time-bounded client.
@@ -163,9 +109,27 @@ pub(crate) async fn refresh_one(
     refresh_with_client(pool, spec, &github_client()?).await
 }
 
-/// Loads all last-known states without making network requests.
-pub(crate) async fn load_all(pool: &SqlitePool) -> anyhow::Result<Vec<ModuleStatus>> {
+/// Loads module-page state with one scan of each manifest directory.
+pub(crate) async fn load_page(
+    pool: &SqlitePool,
+) -> anyhow::Result<(Vec<ModuleStatus>, Vec<ModuleSpec>)> {
     let specs = registry()?;
+    let active = specs
+        .iter()
+        .map(|spec| spec.id.as_str())
+        .collect::<HashSet<_>>();
+    let directory = available_dir();
+    let available = load_registry(&directory, registry_options(&directory))?
+        .into_iter()
+        .filter(|spec| !active.contains(spec.id.as_str()))
+        .collect();
+    Ok((load_statuses(pool, specs).await?, available))
+}
+
+async fn load_statuses(
+    pool: &SqlitePool,
+    specs: Vec<ModuleSpec>,
+) -> anyhow::Result<Vec<ModuleStatus>> {
     let mut statuses = Vec::with_capacity(specs.len());
     for spec in specs {
         let status = load_one(pool, spec).await?;
@@ -264,170 +228,6 @@ pub(crate) fn status_class(status: &ModuleStatus) -> &'static str {
     } else {
         "neutral"
     }
-}
-
-fn parse_manifest(content: &str, path: &Path) -> anyhow::Result<ModuleSpec> {
-    let mut values = HashMap::new();
-    for (index, raw_line) in content.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, value) = line.split_once('=').ok_or_else(|| {
-            anyhow::anyhow!("{}:{}: expected key=value", path.display(), index + 1)
-        })?;
-        let key = key.trim();
-        if !matches!(
-            key,
-            "id" | "name"
-                | "kind"
-                | "role"
-                | "repo"
-                | "upstream"
-                | "ref"
-                | "driver"
-                | "root"
-                | "binary"
-                | "service"
-                | "config"
-                | "asset_amd64"
-                | "asset_arm64"
-        ) {
-            anyhow::bail!("{}:{}: unknown key {key}", path.display(), index + 1);
-        }
-        if values
-            .insert(key.to_string(), value.trim().to_string())
-            .is_some()
-        {
-            anyhow::bail!("{}:{}: duplicate key {key}", path.display(), index + 1);
-        }
-    }
-
-    let value = |key: &str| -> anyhow::Result<String> {
-        values
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("{}: missing {key}", path.display()))
-    };
-    let upstream_name = value("upstream")?;
-    let git_ref = value("ref")?;
-    let upstream = match upstream_name.as_str() {
-        "release" => UpstreamKind::Release,
-        "commit" => UpstreamKind::Commit { git_ref },
-        _ => anyhow::bail!("{}: unsupported upstream", path.display()),
-    };
-    let mut spec = ModuleSpec {
-        id: value("id")?,
-        name: value("name")?,
-        kind: value("kind")?,
-        role: value("role")?,
-        repo: value("repo")?,
-        upstream,
-        driver: value("driver")?,
-        root: value("root")?,
-        binary: value("binary")?,
-        binary_path: String::new(),
-        service: value("service")?,
-        config_path: value("config")?,
-        asset_amd64: value("asset_amd64")?,
-        asset_arm64: value("asset_arm64")?,
-    };
-    let expected_id = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default();
-    if spec.id != expected_id {
-        anyhow::bail!("{}: id must match the file name", path.display());
-    }
-    spec = validate_spec(spec)?;
-    Ok(spec)
-}
-
-fn validate_spec(mut spec: ModuleSpec) -> anyhow::Result<ModuleSpec> {
-    if !valid_id(&spec.id) {
-        anyhow::bail!("invalid module id");
-    }
-    for (label, value, max) in [
-        ("name", spec.name.as_str(), 80),
-        ("kind", spec.kind.as_str(), 48),
-        ("role", spec.role.as_str(), 160),
-    ] {
-        if value.is_empty() || value.len() > max || !safe_text(value) {
-            anyhow::bail!("invalid module {label}");
-        }
-    }
-    if !valid_repo(&spec.repo) {
-        anyhow::bail!("invalid GitHub repository");
-    }
-    if let UpstreamKind::Commit { git_ref } = &spec.upstream {
-        if !valid_ref(git_ref) {
-            anyhow::bail!("invalid Git reference");
-        }
-    }
-    if !matches!(
-        spec.driver.as_str(),
-        "release" | "headscale" | "mtproto-source"
-    ) {
-        anyhow::bail!("unsupported module driver");
-    }
-    if !matches!(spec.root.as_str(), "cores" | "modules") {
-        anyhow::bail!("invalid runtime root");
-    }
-    if !safe_filename(&spec.binary) {
-        anyhow::bail!("invalid binary name");
-    }
-    if !safe_service(&spec.service) {
-        anyhow::bail!("invalid service name");
-    }
-    if !spec.config_path.starts_with("/etc/")
-        || spec.config_path.contains("..")
-        || !spec.config_path.chars().all(safe_path_char)
-    {
-        anyhow::bail!("invalid config path");
-    }
-    if matches!(spec.upstream, UpstreamKind::Release)
-        && (!safe_asset(&spec.asset_amd64) || !safe_asset(&spec.asset_arm64))
-    {
-        anyhow::bail!("invalid release asset template");
-    }
-    match spec.driver.as_str() {
-        "release" => {
-            if spec.root != "cores"
-                || spec.service != format!("infiproxy-{}.service", spec.id)
-                || !spec
-                    .config_path
-                    .starts_with(&format!("/etc/infiproxy-cores/{}/", spec.id))
-            {
-                anyhow::bail!("generic modules must use their own core service and config tree");
-            }
-        }
-        "headscale" => {
-            if spec.id != "headscale"
-                || spec.root != "modules"
-                || spec.service != "headscale.service"
-                || spec.config_path != "/etc/headscale/config.yaml"
-            {
-                anyhow::bail!("invalid Headscale module contract");
-            }
-        }
-        "mtproto-source" => {
-            if spec.id != "mtproto"
-                || spec.root != "cores"
-                || spec.service != "infiproxy-mtproto.service"
-                || !spec
-                    .config_path
-                    .starts_with("/etc/infiproxy-cores/mtproto/")
-            {
-                anyhow::bail!("invalid MTProto module contract");
-            }
-        }
-        _ => unreachable!("driver was validated above"),
-    }
-    spec.binary_path = format!(
-        "/opt/infiproxy/{}/{}/current/{}",
-        spec.root, spec.id, spec.binary
-    );
-    Ok(spec)
 }
 
 fn write_request(module_id: &str, extension: &str, content: &str) -> anyhow::Result<()> {
@@ -682,70 +482,11 @@ fn version_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(DEFAULT_VERSION_DIR))
 }
 
-fn valid_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 32
-        && value.as_bytes()[0].is_ascii_lowercase()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
-}
-
-fn valid_repo(value: &str) -> bool {
-    let mut parts = value.split('/');
-    matches!((parts.next(), parts.next(), parts.next()), (Some(owner), Some(repo), None) if safe_repo_part(owner) && safe_repo_part(repo))
-}
-
-fn safe_repo_part(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 100
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
-}
-
-fn valid_ref(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 120
-        && !value.starts_with('/')
-        && !value.contains("..")
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-'))
-}
-
-fn safe_text(value: &str) -> bool {
-    value
-        .chars()
-        .all(|ch| ch.is_ascii() && !ch.is_ascii_control() && !matches!(ch, '=' | '|'))
-}
-
-fn safe_filename(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 80
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-'))
-}
-
-fn safe_service(value: &str) -> bool {
-    value.ends_with(".service")
-        && value.len() <= 128
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '@' | '-'))
-}
-
-fn safe_asset(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 180
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-' | '{' | '}'))
-}
-
-fn safe_path_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-')
+fn registry_options(directory: &Path) -> ReadOptions {
+    ReadOptions {
+        root_owned: directory.starts_with("/etc/"),
+        registration: false,
+    }
 }
 
 fn setting_key(module_id: &str, suffix: &str) -> String {
@@ -788,23 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_filename_mismatch_and_unknown_keys() {
-        let valid = "id=demo\nname=Demo\nkind=core\nrole=Test\nrepo=owner/repo\nupstream=release\nref=\ndriver=release\nroot=cores\nbinary=demo\nservice=infiproxy-demo.service\nconfig=/etc/infiproxy-cores/demo/config.json\nasset_amd64=demo-{version}-amd64\nasset_arm64=demo-{version}-arm64\n";
-        assert!(parse_manifest(valid, Path::new("demo.module")).is_ok());
-        assert!(parse_manifest(valid, Path::new("other.module")).is_err());
-        assert!(parse_manifest(
-            &format!("{valid}command=rm -rf /\n"),
-            Path::new("demo.module")
-        )
-        .is_err());
-        assert!(parse_manifest(
-            &valid.replace("infiproxy-demo.service", "ssh.service"),
-            Path::new("demo.module")
-        )
-        .is_err());
-    }
-
-    #[test]
     fn version_normalization_handles_upstream_prefixes() {
         assert_eq!(normalize_version("v1.2.3"), "1.2.3");
         assert_eq!(normalize_version("app/v2.10.0"), "2.10.0");
@@ -814,8 +538,5 @@ mod tests {
     #[test]
     fn unsafe_module_inputs_are_rejected() {
         assert!(!valid_id("../root"));
-        assert!(!valid_repo("owner/repo/extra"));
-        assert!(!safe_asset("../../payload"));
-        assert!(!safe_service("demo;reboot.service"));
     }
 }

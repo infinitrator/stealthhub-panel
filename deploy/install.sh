@@ -14,6 +14,7 @@ MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
 UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
+HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
 CORE_INSTALL_BIN="${INFIPROXY_CORE_INSTALL_BIN:-/usr/local/sbin/infiproxy-core-install}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
@@ -38,6 +39,8 @@ NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.con
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
+RELEASE_MANIFEST_HELPER="${ROOT_DIR}/target/release/infiproxy-module-manifest"
+RELEASE_HEADSCALE_HELPER="${ROOT_DIR}/target/release/infiproxy-headscale-control"
 
 normalize_github_repo() {
     local value="$1"
@@ -124,7 +127,7 @@ need_cmd() {
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "Preflight commands:"
-    for cmd in getent groupadd id install python3 systemctl useradd; do
+    for cmd in getent groupadd id install systemctl useradd; do
         if command -v "$cmd" >/dev/null 2>&1; then
             echo "  $cmd: found"
         else
@@ -136,7 +139,6 @@ else
     need_cmd groupadd
     need_cmd id
     need_cmd install
-    need_cmd python3
     need_cmd systemctl
     need_cmd useradd
 fi
@@ -145,7 +147,6 @@ required_deploy_files=(
     deploy/infiproxy-manager.sh
     deploy/panel-update.sh
     deploy/module-update.sh
-    deploy/module-manifest.py
     deploy/cores/install-core.sh
     deploy/infiproxy-profile.sh
     deploy/infiproxy.service
@@ -163,6 +164,14 @@ for relative_path in "${required_deploy_files[@]}"; do
     fi
 done
 
+if [[ "$BUILD" -eq 1 ]]; then
+    if ! command -v cargo >/dev/null 2>&1; then
+        echo "cargo is required for --build" >&2
+        exit 1
+    fi
+    cargo build --release -p stealthhub-panel --manifest-path "${ROOT_DIR}/Cargo.toml"
+fi
+
 shopt -s nullglob
 bundled_manifests=("${ROOT_DIR}"/deploy/modules.d/*.module)
 shopt -u nullglob
@@ -170,16 +179,24 @@ if [[ "${#bundled_manifests[@]}" -eq 0 ]]; then
     echo "No bundled module manifests found in ${ROOT_DIR}/deploy/modules.d" >&2
     exit 1
 fi
-for manifest in "${bundled_manifests[@]}"; do
-    PYTHONDONTWRITEBYTECODE=1 python3 "${ROOT_DIR}/deploy/module-manifest.py" validate "$manifest"
-done
-
-if [[ "$BUILD" -eq 1 ]]; then
-    if ! command -v cargo >/dev/null 2>&1; then
-        echo "cargo is required for --build" >&2
-        exit 1
-    fi
-    cargo build --release -p stealthhub-panel --manifest-path "${ROOT_DIR}/Cargo.toml"
+SOURCE_MANIFEST_HELPER="$RELEASE_MANIFEST_HELPER"
+if [[ ! -x "$SOURCE_MANIFEST_HELPER" && -x "${ROOT_DIR}/target/debug/infiproxy-module-manifest" ]]; then
+    SOURCE_MANIFEST_HELPER="${ROOT_DIR}/target/debug/infiproxy-module-manifest"
+fi
+if [[ -x "$SOURCE_MANIFEST_HELPER" ]]; then
+    "$SOURCE_MANIFEST_HELPER" list "${ROOT_DIR}/deploy/modules.d" >/dev/null
+    echo "  module manifests: validated by $SOURCE_MANIFEST_HELPER"
+elif [[ "$CHECK_ONLY" -eq 1 ]]; then
+    echo "  module manifests: validation deferred until the Rust helper is built"
+else
+    echo "Release helper not found: $RELEASE_MANIFEST_HELPER" >&2
+    echo "Run: cargo build --release -p stealthhub-panel" >&2
+    exit 1
+fi
+if [[ ! -x "$RELEASE_HEADSCALE_HELPER" && "$CHECK_ONLY" -eq 0 ]]; then
+    echo "Release helper not found: $RELEASE_HEADSCALE_HELPER" >&2
+    echo "Run: cargo build --release -p stealthhub-panel" >&2
+    exit 1
 fi
 
 if [[ ! -x "$RELEASE_BIN" && "$CHECK_ONLY" -eq 0 ]]; then
@@ -195,8 +212,11 @@ Infiproxy install plan:
   updater:       $UPDATE_BIN
   module updater:$MODULE_UPDATE_BIN
   module helper: $MODULE_MANIFEST_HELPER
+  Headscale helper:$HEADSCALE_CONTROL_HELPER
   core installer:$CORE_INSTALL_BIN
   release bin:   $RELEASE_BIN
+  release helper:$RELEASE_MANIFEST_HELPER
+  Headscale release helper:$RELEASE_HEADSCALE_HELPER
   config:        $ENV_FILE
   state:         $STATE_DIR
   root state:    $ROOT_STATE_DIR
@@ -241,19 +261,30 @@ install -d -o root -g root -m 0755 "$(dirname "$MANAGER_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_MANIFEST_HELPER")"
+install -d -o root -g root -m 0755 "$(dirname "$HEADSCALE_CONTROL_HELPER")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/modules"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/module-requests"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/headscale-requests"
+install -d -o root -g root -m 0700 "$ROOT_STATE_DIR/headscale-processing"
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
-install -m 0755 "${ROOT_DIR}/deploy/module-manifest.py" "$MODULE_MANIFEST_HELPER"
+install -m 0755 "$RELEASE_MANIFEST_HELPER" "$MODULE_MANIFEST_HELPER"
+install -m 0755 "$RELEASE_HEADSCALE_HELPER" "$HEADSCALE_CONTROL_HELPER"
 install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
+if [[ ! -f "$STATE_DIR/headscale-state.json" ]]; then
+    printf '{"updated_at":"","status":"waiting for first maintenance refresh","users":"","nodes":"","last_result":"","result_is_secret":false}\n' \
+        | install -m 0640 -o root -g "$APP_GROUP" /dev/stdin "$STATE_DIR/headscale-state.json"
+else
+    chown root:"$APP_GROUP" "$STATE_DIR/headscale-state.json"
+    chmod 0640 "$STATE_DIR/headscale-state.json"
+fi
 install -m 0644 -o root -g root /dev/stdin "$UPDATE_CONFIG_FILE" <<EOF
 REPO=${UPDATE_REPO}
 REF=${UPDATE_REF}

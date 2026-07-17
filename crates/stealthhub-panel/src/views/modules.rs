@@ -119,6 +119,9 @@ pub(crate) fn render(
                                                         (csrf_field(&auth.csrf_token))
                                                         button class="compact secondary" type="submit" { "Check" }
                                                     }
+                                                    @if status.spec.id == "headscale" && status.installed {
+                                                        a class="button compact secondary" href="/admin/headscale" { "Manage" }
+                                                    }
                                                     @if status.latest_version != "unknown" && (!status.installed || status.update_available) {
                                                         form method="post" action=(format!("/admin/modules/{}/update", status.spec.id)) class="inline-form" {
                                                             (csrf_field(&auth.csrf_token))

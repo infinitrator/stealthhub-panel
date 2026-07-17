@@ -16,16 +16,12 @@ CORE_ROOT="${INFIPROXY_CORE_ROOT:-/opt/infiproxy/cores}"
 MODULE_ROOT="${INFIPROXY_MODULE_ROOT:-/opt/infiproxy/modules}"
 CORE_INSTALLER="${INFIPROXY_CORE_INSTALLER:-/usr/local/sbin/infiproxy-core-install}"
 MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
+HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
 PANEL_STATE="${STATE_DIR}/panel-update-state.env"
 RUN_LOG="${ROOT_STATE_DIR}/module-update.log"
 LOCK_DIR="${INFIPROXY_MODULE_UPDATE_LOCK:-/run/infiproxy-module-update.lock}"
 GITHUB_API="https://api.github.com/repos"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
-
-if [[ ! -x "$MANIFEST_HELPER" ]]; then
-  local_helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/module-manifest.py"
-  [[ -x "$local_helper" ]] && MANIFEST_HELPER="$local_helper"
-fi
 
 log() {
   local line
@@ -134,22 +130,7 @@ release_metadata() {
     pattern="$M_ASSET_ARM64"
   fi
   api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases/latest")"
-  python3 -c '
-import json, sys
-pattern = sys.argv[1]
-d = json.load(sys.stdin)
-tag = d["tag_name"]
-version = tag.removeprefix("app/v").removeprefix("tuic-server-").removeprefix("v")
-name = pattern.replace("{version}", version).replace("{tag}", tag)
-assets = {asset["name"]: asset for asset in d.get("assets", [])}
-asset = assets.get(name)
-if not asset:
-    raise SystemExit(f"release asset not found: {name}")
-digest = (asset.get("digest") or "").removeprefix("sha256:")
-sidecars = [name + ".dgst", name + ".sha256sum", "hashes.txt", "checksums.txt"]
-checksum_url = next((assets[item]["browser_download_url"] for item in sidecars if item in assets), "")
-print("|".join((tag, name, asset["browser_download_url"], digest, checksum_url)))
-' "$pattern" <<<"$api_json"
+  "$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json"
 }
 
 resolve_checksum() {
@@ -306,7 +287,7 @@ install_release_module() {
 
 latest_commit() {
   github_json "${GITHUB_API}/${M_REPO}/commits/${M_REF}" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["sha"])'
+    | "$MANIFEST_HELPER" commit-sha
 }
 
 install_source_module() {
@@ -493,10 +474,15 @@ run_automatic() {
 }
 
 run_due() {
+  local failed=0
+  if [[ -x "$HEADSCALE_CONTROL_HELPER" ]]; then
+    "$HEADSCALE_CONTROL_HELPER" --process || failed=1
+  fi
   register_requested || true
   remove_requested || true
   run_requested || true
-  run_automatic
+  run_automatic || failed=1
+  return "$failed"
 }
 
 with_lock() {
@@ -523,7 +509,6 @@ EOF
 main() {
   need_root
   need_cmd curl
-  need_cmd python3
   need_cmd sha256sum
   [[ -x "$MANIFEST_HELPER" ]] || die "module manifest helper is missing"
   "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned >/dev/null \

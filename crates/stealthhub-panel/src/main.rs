@@ -5,6 +5,7 @@
 //! host helpers and UI layout live in sibling modules to keep this file focused
 //! on request/response flow.
 
+mod headscale;
 mod health;
 mod ip;
 mod modules;
@@ -127,6 +128,32 @@ struct ModuleRemovalForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct HeadscaleUserForm {
+    #[serde(default)]
+    csrf_token: String,
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadscaleKeyForm {
+    #[serde(default)]
+    csrf_token: String,
+    user_id: u64,
+    expiration: String,
+    #[serde(default)]
+    reusable: String,
+    #[serde(default)]
+    ephemeral: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HeadscaleNodeForm {
+    #[serde(default)]
+    csrf_token: String,
+    node_id: u64,
+}
+
+#[derive(Debug, Deserialize)]
 struct ProtocolProfileForm {
     #[serde(default)]
     csrf_token: String,
@@ -220,6 +247,9 @@ pub(crate) struct AuthenticatedAdmin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("could not install the Ring TLS provider"))?;
     health::mark_started();
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,stealthhub_panel=info,tower_http=warn"));
@@ -312,6 +342,24 @@ async fn main() -> anyhow::Result<()> {
             post(uninstall_preview_action),
         )
         .route("/admin/cores", get(cores_page))
+        .route("/admin/headscale", get(headscale_page))
+        .route("/admin/headscale/refresh", post(headscale_refresh_action))
+        .route(
+            "/admin/headscale/clear-result",
+            post(headscale_clear_result_action),
+        )
+        .route(
+            "/admin/headscale/users/create",
+            post(headscale_create_user_action),
+        )
+        .route(
+            "/admin/headscale/keys/create",
+            post(headscale_create_key_action),
+        )
+        .route(
+            "/admin/headscale/nodes/expire",
+            post(headscale_expire_node_action),
+        )
         .route("/admin/ip", get(ip_check_page))
         .route("/admin/credits", get(credits_page))
         .route("/admin/users/create", post(create_user_action))
@@ -503,7 +551,7 @@ async fn setup_admin_action(
         }
     }
 
-    let username = form.username.trim();
+    let username = form.username.trim().to_string();
     if username.len() < 3 || username.len() > 64 {
         return html_error_response_with_back(
             StatusCode::BAD_REQUEST,
@@ -534,7 +582,7 @@ async fn setup_admin_action(
         );
     }
 
-    let password_hash = match hash_password(&form.password) {
+    let password_hash = match hash_password_async(form.password).await {
         Ok(value) => value,
         Err(err) => {
             return html_error_response_with_back(
@@ -547,7 +595,7 @@ async fn setup_admin_action(
         }
     };
 
-    let admin = match create_admin(&state.pool, username, &password_hash).await {
+    let admin = match create_admin(&state.pool, &username, &password_hash).await {
         Ok(value) => value,
         Err(err) => {
             return html_error_response_with_back(
@@ -593,7 +641,7 @@ async fn login_action(
     let admin = match get_admin_by_username(&state.pool, &form.username).await {
         Ok(Some(value)) => value,
         Ok(None) => {
-            let _ = verify_password(&form.password, DUMMY_PASSWORD_HASH);
+            let _ = verify_password_async(form.password, DUMMY_PASSWORD_HASH.to_string()).await;
             state.login_limiter.record_failure(&rate_limit_keys);
             return login_failed_response().await;
         }
@@ -608,7 +656,7 @@ async fn login_action(
         }
     };
 
-    match verify_password(&form.password, &admin.password_hash) {
+    match verify_password_async(form.password, admin.password_hash.clone()).await {
         Ok(true) => {
             state.login_limiter.record_success(&rate_limit_keys);
             create_session_redirect(&state, admin.id, "/admin").await
@@ -843,7 +891,7 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(value) => value,
         Err(response) => return response,
     };
-    let statuses = match modules::load_all(&state.pool).await {
+    let (statuses, available) = match modules::load_page(&state.pool).await {
         Ok(value) => value,
         Err(err) => {
             return html_error_response_with_back(
@@ -855,20 +903,161 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
             );
         }
     };
-    let available = match modules::available() {
+    views::modules::render(&auth, &statuses, &available)
+}
+
+async fn headscale_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
-        Err(err) => {
+        Err(response) => return response,
+    };
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let snapshot = match headscale::snapshot() {
+        Ok(value) => value,
+        Err(error) => {
             return html_error_response_with_back(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Module catalog unavailable",
-                err.to_string(),
+                "Headscale state unavailable",
+                error.to_string(),
                 "/admin",
                 "Back to Dashboard",
             );
         }
     };
+    let installed = modules::find("headscale")
+        .ok()
+        .flatten()
+        .is_some_and(|spec| std::path::Path::new(&spec.binary_path).is_file());
+    views::headscale::render(&auth, &snapshot, installed)
+}
 
-    views::modules::render(&auth, &statuses, &available)
+async fn headscale_refresh_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    queue_headscale_request(
+        &state,
+        &headers,
+        &form.csrf_token,
+        headscale::HeadscaleRequest::Refresh,
+    )
+    .await
+}
+
+async fn headscale_clear_result_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    queue_headscale_request(
+        &state,
+        &headers,
+        &form.csrf_token,
+        headscale::HeadscaleRequest::ClearResult,
+    )
+    .await
+}
+
+async fn headscale_create_user_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HeadscaleUserForm>,
+) -> Response {
+    if !stealthhub_core::headscale_control::valid_username(form.username.trim()) {
+        return headscale_input_error("Invalid Headscale username");
+    }
+    queue_headscale_request(
+        &state,
+        &headers,
+        &form.csrf_token,
+        headscale::HeadscaleRequest::CreateUser {
+            username: form.username.trim().to_string(),
+        },
+    )
+    .await
+}
+
+async fn headscale_create_key_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HeadscaleKeyForm>,
+) -> Response {
+    let expiration = form.expiration.trim();
+    if form.user_id == 0 || !stealthhub_core::headscale_control::valid_expiration(expiration) {
+        return headscale_input_error("Invalid Headscale user or key lifetime");
+    }
+    queue_headscale_request(
+        &state,
+        &headers,
+        &form.csrf_token,
+        headscale::HeadscaleRequest::CreatePreAuthKey {
+            user_id: form.user_id,
+            expiration: expiration.to_string(),
+            reusable: checkbox_enabled(&form.reusable),
+            ephemeral: checkbox_enabled(&form.ephemeral),
+        },
+    )
+    .await
+}
+
+async fn headscale_expire_node_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HeadscaleNodeForm>,
+) -> Response {
+    if form.node_id == 0 {
+        return headscale_input_error("Invalid Headscale node ID");
+    }
+    queue_headscale_request(
+        &state,
+        &headers,
+        &form.csrf_token,
+        headscale::HeadscaleRequest::ExpireNode {
+            node_id: form.node_id,
+        },
+    )
+    .await
+}
+
+async fn queue_headscale_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    csrf_token: &str,
+    request: headscale::HeadscaleRequest,
+) -> Response {
+    let auth = match require_admin(state, headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match headscale::request(&request) {
+        Ok(()) => Redirect::to("/admin/headscale").into_response(),
+        Err(error) => html_error_response_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Headscale operation not queued",
+            error.to_string(),
+            "/admin/headscale",
+            "Back to Headscale",
+        ),
+    }
+}
+
+fn headscale_input_error(message: &'static str) -> Response {
+    html_error_response_with_back(
+        StatusCode::BAD_REQUEST,
+        "Headscale request rejected",
+        message,
+        "/admin/headscale",
+        "Back to Headscale",
+    )
 }
 
 async fn check_all_modules_action(
@@ -1808,6 +1997,18 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> 
             "argon2 password verification failed: {err}"
         )),
     }
+}
+
+async fn hash_password_async(password: String) -> anyhow::Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|error| anyhow::anyhow!("password worker failed: {error}"))?
+}
+
+async fn verify_password_async(password: String, password_hash: String) -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &password_hash))
+        .await
+        .map_err(|error| anyhow::anyhow!("password worker failed: {error}"))?
 }
 
 fn generate_session_token() -> String {

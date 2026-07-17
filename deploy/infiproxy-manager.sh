@@ -75,23 +75,68 @@ invalid_choice() {
   pause
 }
 
-read_menu_choice() {
-  choice=""
-  read -r -p "> " choice || return 1
-}
-
 confirm_yes() {
   local prompt="$1"
   local default="${2:-N}"
   local answer
 
-  if [[ "$default" == "Y" ]]; then
+  if tui_available; then
+    if [[ "$default" == "Y" ]]; then
+      whiptail --title "Infiproxy Manager" --yesno "$prompt" 10 72
+    else
+      whiptail --title "Infiproxy Manager" --defaultno --yesno "$prompt" 10 72
+    fi
+    return
+  elif [[ "$default" == "Y" ]]; then
     read -r -p "${prompt} [Y/n]: " answer || return 1
     [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
   else
     read -r -p "${prompt} [y/N]: " answer || return 1
     [[ "$answer" =~ ^[Yy]$ ]]
   fi
+}
+
+tui_available() {
+  have_cmd whiptail && [[ -t 0 && -t 1 ]]
+}
+
+tui_menu() {
+  local title="$1" prompt="$2"
+  shift 2
+  if tui_available; then
+    whiptail --title "$title" --menu "$prompt" 25 78 15 "$@" 3>&1 1>&2 2>&3
+    return
+  fi
+
+  header >&2
+  echo "${bold}${title}${reset}" >&2
+  echo "${muted}${prompt}${reset}" >&2
+  echo >&2
+  while [[ $# -ge 2 ]]; do
+    printf '%s) %s\n' "$1" "$2" >&2
+    shift 2
+  done
+  local selected
+  read -r -p "> " selected || return 1
+  printf '%s' "$selected"
+}
+
+prompt_value() {
+  local variable="$1" title="$2" prompt="$3" default="${4:-}" secret="${5:-0}" value
+  if tui_available; then
+    if [[ "$secret" -eq 1 ]]; then
+      value="$(whiptail --title "$title" --passwordbox "$prompt" 11 72 "$default" 3>&1 1>&2 2>&3)" || return 1
+    else
+      value="$(whiptail --title "$title" --inputbox "$prompt" 11 72 "$default" 3>&1 1>&2 2>&3)" || return 1
+    fi
+  elif [[ "$secret" -eq 1 ]]; then
+    read -r -s -p "${prompt}: " value || return 1
+    echo
+  else
+    read -r -p "${prompt}${default:+ [$default]}: " value || return 1
+    value="${value:-$default}"
+  fi
+  printf -v "$variable" '%s' "$value"
 }
 
 registered_module_records() {
@@ -133,38 +178,19 @@ header() {
 }
 
 main_menu_choice() {
-  if have_cmd whiptail && [[ -t 0 && -t 1 ]]; then
-    whiptail --title "Infiproxy Manager" \
-      --menu "Host: $(hostname)\nSelect an operations area" 25 78 15 \
-      1 "Overview and service status" \
-      2 "Admin access and panel URL" \
-      3 "Runtime modules" \
-      4 "Restart and reload" \
-      5 "Logs and diagnostics" \
-      6 "HTTPS and Cloudflare" \
-      7 "Panel updates" \
-      8 "Panel environment" \
-      9 "Guided deployment" \
-      10 "Advanced tools" \
-      11 "Danger zone" \
-      0 "Exit to shell" 3>&1 1>&2 2>&3
-  else
-    header >&2
-    echo "1) Overview and service status" >&2
-    echo "2) Admin access and panel URL" >&2
-    echo "3) Runtime modules" >&2
-    echo "4) Restart and reload" >&2
-    echo "5) Logs and diagnostics" >&2
-    echo "6) HTTPS and Cloudflare" >&2
-    echo "7) Panel updates" >&2
-    echo "8) Panel environment" >&2
-    echo "9) Guided deployment" >&2
-    echo "10) Advanced tools" >&2
-    echo "${danger}11) Danger zone${reset}" >&2
-    echo "0) Exit to shell" >&2
-    read_menu_choice || return 1
-    printf '%s' "$choice"
-  fi
+  tui_menu "Infiproxy Manager" "Host: $(hostname)\nSelect an operations area" \
+    1 "Overview and service status" \
+    2 "Admin access and panel URL" \
+    3 "Runtime modules" \
+    4 "Restart and reload" \
+    5 "Logs and diagnostics" \
+    6 "HTTPS and Cloudflare" \
+    7 "Panel updates" \
+    8 "Panel environment" \
+    9 "Guided deployment" \
+    10 "Advanced tools" \
+    11 "Danger zone" \
+    0 "Exit to shell"
 }
 
 run_cmd() {
@@ -243,9 +269,9 @@ headscale_arch() {
 
 headscale_latest_version() {
   require_cmd curl || return 1
-  require_cmd python3 || return 1
   curl -fsSL --max-time 20 "$HEADSCALE_LATEST_API" \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"].lstrip("v"))'
+    | "$MODULE_MANIFEST_HELPER" release-tag \
+    | sed 's/^v//'
 }
 
 cloudflare_token_from_file() {
@@ -257,7 +283,7 @@ headscale_cmd() {
 }
 
 json_first_id() {
-  python3 -c 'import json,sys; data=json.load(sys.stdin); result=data.get("result") or []; print(result[0].get("id","") if result else "")'
+  "$MODULE_MANIFEST_HELPER" cloudflare-first-id
 }
 
 cloudflare_get() {
@@ -292,7 +318,7 @@ cloudflare_write_a_record() {
   local proxied="${5:-false}"
 
   require_cmd curl || return 1
-  require_cmd python3 || return 1
+  [[ -x "$MODULE_MANIFEST_HELPER" ]] || return 1
   [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
   valid_domain "$zone" || { echo "${danger}Invalid zone: $zone${reset}" >&2; return 1; }
   valid_domain "$record" || { echo "${danger}Invalid record: $record${reset}" >&2; return 1; }
@@ -367,15 +393,14 @@ service_status() {
 }
 
 restart_menu() {
-  header
-  echo "1) Restart panel"
-  echo "2) Reload nginx"
-  echo "3) Validate and reload SSH"
-  echo "4) Restart all enabled core services"
-  echo "5) Restart Headscale"
-  echo "6) Reboot server"
-  echo "0) Back"
-  read_menu_choice || return
+  choice="$(tui_menu "Restart and reload" "Validated service operations" \
+    1 "Restart panel" \
+    2 "Validate and reload nginx" \
+    3 "Validate and reload SSH" \
+    4 "Restart all enabled modules" \
+    5 "Validate and restart Headscale" \
+    6 "Reboot server" \
+    0 "Back")" || return
   case "$choice" in
     1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" || true ;;
     2)
@@ -445,11 +470,11 @@ install_or_repair() {
     pause
     return
   fi
-  echo "1) Install/repair from current source"
-  echo "2) Install/repair with nginx template"
-  echo "3) Force env template rewrite"
-  echo "0) Back"
-  read_menu_choice || return
+  choice="$(tui_menu "Install or repair" "Use the checked-out release source" \
+    1 "Install/repair from current source" \
+    2 "Install/repair with nginx template" \
+    3 "Force env template rewrite" \
+    0 "Back")" || return
   case "$choice" in
     1) run_panel_install_from_source 0 0 || true ;;
     2) run_panel_install_from_source 1 0 || true ;;
@@ -480,21 +505,21 @@ run_panel_install_from_source() {
 
 select_core_runtime() {
   local record id name root binary_name unit index selected
-  local -a ids=() binaries=() services=()
+  local -a ids=() binaries=() services=() menu_items=()
   while IFS= read -r record; do
     IFS='|' read -r id name _ _ _ _ _ _ root binary_name unit _ _ _ <<<"$record"
     [[ "$root" == "cores" ]] || continue
     ids+=("$id")
     binaries+=("$binary_name")
     services+=("$unit")
-    printf '%s) %s [%s]\n' "${#ids[@]}" "$name" "$id"
+    menu_items+=("${#ids[@]}" "$name [$id]")
   done < <(registered_module_records)
   if [[ "${#ids[@]}" -eq 0 ]]; then
     echo "No registered core modules."
     return 1
   fi
-  echo "0) Back"
-  read_menu_choice || return 1
+  menu_items+=(0 "Back")
+  choice="$(tui_menu "Select core runtime" "Choose a registered module" "${menu_items[@]}")" || return 1
   [[ "$choice" == "0" ]] && return 2
   [[ "$choice" =~ ^[0-9]+$ ]] || { invalid_choice; return 1; }
   index=$((choice - 1))
@@ -515,9 +540,9 @@ install_core_from_prompts() {
   fi
 
   select_core_runtime || return $?
-  read -r -p "Version: " version
-  read -r -p "Release archive URL: " url
-  read -r -p "SHA256: " sha256
+  prompt_value version "Manual core import" "Version" || return 1
+  prompt_value url "Manual core import" "Release archive URL" || return 1
+  prompt_value sha256 "Manual core import" "SHA-256 digest" || return 1
   if [[ -z "$version" || -z "$url" || -z "$sha256" ]]; then
     echo "${danger}Version, URL and SHA256 are required.${reset}"
     return 1
@@ -621,20 +646,17 @@ print_mtproto_link() {
 # values. The service is started only when the operator has already installed a
 # verified mtproto-proxy binary.
 guided_mtproto_setup() {
-  local host port stats_port workers secret custom_secret start_answer
+  local host port stats_port workers secret custom_secret
 
-  read -r -p "Public hostname or IPv4 [auto public IPv4]: " host
+  prompt_value host "Telegram MTProto" "Public hostname or IPv4 (blank: detect automatically)" || return
   if [[ -z "$host" ]]; then
     host="$(public_ip || true)"
   fi
-  read -r -p "Telegram MTProto port [8443]: " port
-  port="${port:-8443}"
-  read -r -p "Local stats port [8888]: " stats_port
-  stats_port="${stats_port:-8888}"
-  read -r -p "Workers [2]: " workers
-  workers="${workers:-2}"
+  prompt_value port "Telegram MTProto" "Public proxy port" "8443" || return
+  prompt_value stats_port "Telegram MTProto" "Local statistics port" "8888" || return
+  prompt_value workers "Telegram MTProto" "Worker processes" "2" || return
   secret="$(random_mtproto_secret)"
-  read -r -p "Custom 32-hex secret [generated]: " custom_secret
+  prompt_value custom_secret "Telegram MTProto" "Custom 32-hex secret (blank: generate securely)" "" 1 || return
   if [[ -n "$custom_secret" ]]; then
     secret="$custom_secret"
   fi
@@ -643,8 +665,7 @@ guided_mtproto_setup() {
   run_cmd systemctl daemon-reload
   print_mtproto_link "$host" "$port" "$secret" || return
   if [[ -x "$MTPROTO_BINARY" ]]; then
-    read -r -p "Enable and start infiproxy-mtproto.service now? [y/N]: " start_answer
-    if [[ "$start_answer" =~ ^[Yy]$ ]]; then
+    if confirm_yes "Enable and start infiproxy-mtproto.service now?" "N"; then
       run_cmd systemctl enable --now infiproxy-mtproto.service
       run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
     fi
@@ -656,14 +677,13 @@ guided_mtproto_setup() {
 
 mtproto_setup_menu() {
   need_root
-  header
-  echo "1) Guided initial MTProto setup"
-  echo "2) Refresh Telegram upstream config"
-  echo "3) Show Telegram import link"
-  echo "4) Enable and start MTProto service"
-  echo "5) Restart MTProto service"
-  echo "0) Back"
-  read_menu_choice || return
+  choice="$(tui_menu "Telegram MTProto" "Module configuration and service control" \
+    1 "Guided initial setup" \
+    2 "Refresh Telegram upstream config" \
+    3 "Show Telegram import link" \
+    4 "Enable and start service" \
+    5 "Restart service" \
+    0 "Back")" || return
   case "$choice" in
     1)
       guided_mtproto_setup || true
@@ -892,18 +912,16 @@ EOF
 guided_headscale_setup() {
   local zone domain magic_domain email ip token stored_token install_answer proxied=false
 
-  read -r -p "Headscale hostname (hs.example.com): " domain
-  read -r -p "MagicDNS base domain [tailnet.${domain}]: " magic_domain
-  magic_domain="${magic_domain:-tailnet.${domain}}"
-  read -r -p "Cloudflare zone (example.com): " zone
-  read -r -p "Let's Encrypt email: " email
-  read -r -p "IPv4 [auto]: " ip
+  prompt_value domain "Headscale setup" "Public Headscale hostname (hs.example.com)" || return
+  prompt_value magic_domain "Headscale setup" "MagicDNS base domain" "tailnet.${domain}" || return
+  prompt_value zone "Headscale setup" "Cloudflare zone (example.com)" || return
+  prompt_value email "Headscale setup" "Let's Encrypt email" || return
+  prompt_value ip "Headscale setup" "Public IPv4 (blank: detect automatically)" || return
   if [[ -z "$ip" ]]; then
     ip="$(public_ip || true)"
   fi
   stored_token="$(cloudflare_token_from_file)"
-  read -r -s -p "Cloudflare API token [stored if blank]: " token
-  echo
+  prompt_value token "Headscale setup" "Cloudflare API token (blank: use stored token)" "" 1 || return
   token="${token:-$stored_token}"
 
   echo "${muted}Headscale must not be proxied through Cloudflare; DNS-only A record will be used.${reset}"
@@ -935,16 +953,20 @@ guided_headscale_setup() {
 }
 
 headscale_create_preauth_key() {
-  local user expiration key
+  local user user_id expiration key created
 
   require_cmd headscale || return 1
-  read -r -p "Headscale user [admin]: " user
-  user="${user:-admin}"
+  prompt_value user "Headscale enrollment" "Headscale user ID or login" "admin" || return
   valid_headscale_user "$user" || { echo "${danger}Invalid Headscale user: $user${reset}" >&2; return 1; }
-  read -r -p "Key expiration [24h]: " expiration
-  expiration="${expiration:-24h}"
-  headscale_cmd users create "$user" 2>/dev/null || true
-  key="$(headscale_cmd preauthkeys create --user "$user" --expiration "$expiration")"
+  prompt_value expiration "Headscale enrollment" "Key expiration" "24h" || return
+  if created="$(headscale_cmd users create "$user" --output json 2>/dev/null)"; then
+    user_id="$("$MODULE_MANIFEST_HELPER" headscale-user-id <<<"$created")" || return 1
+  else
+    headscale_cmd users list || true
+    prompt_value user_id "Headscale enrollment" "Existing numeric user ID" || return
+  fi
+  [[ "$user_id" =~ ^[1-9][0-9]*$ ]] || { echo "${danger}Invalid Headscale user ID.${reset}" >&2; return 1; }
+  key="$(headscale_cmd preauthkeys create --user "$user_id" --expiration "$expiration")"
   echo
   echo "${green}${bold}Pre-auth key:${reset}"
   echo "$key"
@@ -955,16 +977,15 @@ headscale_create_preauth_key() {
 
 headscale_menu() {
   need_root
-  header
-  echo "1) Guided Headscale hub setup"
-  echo "2) Install/update Headscale release only"
-  echo "3) Write Headscale config only"
-  echo "4) Create user and pre-auth key"
-  echo "5) List Headscale users"
-  echo "6) Restart Headscale"
-  echo "7) Headscale logs"
-  echo "0) Back"
-  read_menu_choice || return
+  choice="$(tui_menu "Headscale mesh hub" "Coordination server configuration" \
+    1 "Guided Headscale hub setup" \
+    2 "Install/update verified release" \
+    3 "Write Headscale config" \
+    4 "Create user and pre-auth key" \
+    5 "List Headscale users" \
+    6 "Validate and restart Headscale" \
+    7 "Headscale logs" \
+    0 "Back")" || return
   case "$choice" in
     1) guided_headscale_setup || true ;;
     2) install_headscale_release || true ;;
@@ -1077,16 +1098,19 @@ EOF
 guided_https_setup() {
   local zone domain email ip proxy_answer token proxied
 
-  read -r -p "Cloudflare zone (example.com): " zone
-  read -r -p "Panel hostname (panel.example.com): " domain
-  read -r -p "Let's Encrypt email: " email
-  read -r -p "IPv4 [auto]: " ip
+  prompt_value zone "HTTPS setup" "Cloudflare zone (example.com)" || return
+  prompt_value domain "HTTPS setup" "Panel hostname (panel.example.com)" || return
+  prompt_value email "HTTPS setup" "Let's Encrypt email" || return
+  prompt_value ip "HTTPS setup" "Public IPv4 (blank: detect automatically)" || return
   if [[ -z "$ip" ]]; then
     ip="$(public_ip || true)"
   fi
-  read -r -p "Proxy through Cloudflare? [y/N]: " proxy_answer
-  read -r -s -p "Cloudflare API token: " token
-  echo
+  if confirm_yes "Proxy panel traffic through Cloudflare?" "N"; then
+    proxy_answer=y
+  else
+    proxy_answer=n
+  fi
+  prompt_value token "HTTPS setup" "Cloudflare API token" "" 1 || return
   proxied=false
   [[ "$proxy_answer" =~ ^[Yy]$ ]] && proxied=true
 
@@ -1101,14 +1125,13 @@ guided_https_setup() {
 
 https_setup_menu() {
   need_root
-  header
-  echo "1) Install HTTPS dependencies"
-  echo "2) Upsert Cloudflare A record"
-  echo "3) Issue certificate with Cloudflare DNS-01"
-  echo "4) Write nginx HTTPS config"
-  echo "5) Full guided setup"
-  echo "0) Back"
-  read_menu_choice || return
+  choice="$(tui_menu "HTTPS and Cloudflare" "DNS, certificate and reverse proxy" \
+    1 "Install HTTPS dependencies" \
+    2 "Upsert Cloudflare A record" \
+    3 "Issue certificate with DNS-01" \
+    4 "Write nginx HTTPS config" \
+    5 "Full guided setup" \
+    0 "Back")" || return
   case "$choice" in
     1)
       install_https_deps || true
@@ -1153,16 +1176,16 @@ https_setup_menu() {
 # offer every optional module in dependency order without hiding verification.
 guided_deployment() {
   need_root
-  header
-  echo "${bold}Guided deployment cycle${reset}"
-  echo "This path keeps everything inside one SSH TUI session:"
-  echo "  1. install or repair the panel"
-  echo "  2. optionally publish HTTPS through Cloudflare"
-  echo "  3. optionally install current verified runtime modules"
-  echo "  4. optionally configure Telegram MTProto"
-  echo "  5. optionally configure Headscale mesh hub"
-  echo "  6. show final service status"
-  echo
+  if tui_available; then
+    whiptail --title "Infiproxy guided deployment" --msgbox \
+      "One installation cycle will:\n\n1. Install or repair the panel\n2. Configure optional HTTPS\n3. Install verified runtime modules\n4. Configure optional MTProto\n5. Configure optional Headscale\n6. Verify final service state" \
+      18 72
+  else
+    header
+    echo "${bold}Guided deployment cycle${reset}"
+    echo "Panel, HTTPS, verified modules, MTProto, Headscale and final checks."
+    echo
+  fi
 
   if confirm_yes "Install or repair the panel from ${SOURCE_DIR} now?" "Y"; then
     local with_nginx=0 force_env=0
@@ -1237,14 +1260,13 @@ guided_deployment() {
 
 logs_menu() {
   while true; do
-    header
-    echo "1) Panel journal"
-    echo "2) Module updater log"
-    echo "3) Panel updater log"
-    echo "4) Nginx journal"
-    echo "5) Failed systemd units"
-    echo "0) Back"
-    read_menu_choice || return
+    choice="$(tui_menu "Logs and diagnostics" "Bounded local diagnostics" \
+      1 "Panel journal" \
+      2 "Module updater log" \
+      3 "Panel updater log" \
+      4 "Nginx journal" \
+      5 "Failed systemd units" \
+      0 "Back")" || return
     case "$choice" in
       1) run_cmd journalctl -u "$PANEL_SERVICE" -n 120 --no-pager || true; pause ;;
       2) run_cmd tail -n 160 "$MODULE_UPDATE_LOG" || true; pause ;;
@@ -1280,18 +1302,18 @@ admin_access() {
 
 select_module_runtime() {
   local record id name index selected
-  local -a ids=()
+  local -a ids=() menu_items=()
   while IFS= read -r record; do
     IFS='|' read -r id name _ <<<"$record"
     ids+=("$id")
-    printf '%s) %s [%s]\n' "${#ids[@]}" "$name" "$id"
+    menu_items+=("${#ids[@]}" "$name [$id]")
   done < <(registered_module_records)
   if [[ "${#ids[@]}" -eq 0 ]]; then
     echo "No registered modules."
     return 1
   fi
-  echo "0) Back"
-  read_menu_choice || return 1
+  menu_items+=(0 "Back")
+  choice="$(tui_menu "Select runtime module" "Choose a registered module" "${menu_items[@]}")" || return 1
   [[ "$choice" == "0" ]] && return 2
   [[ "$choice" =~ ^[0-9]+$ ]] || { invalid_choice; return 1; }
   index=$((choice - 1))
@@ -1372,18 +1394,15 @@ install_generic_module_unit() {
 module_update_menu() {
   need_root
   while true; do
-    header
-    echo "Runtime modules"
-    echo
-    echo "1) Show installed/latest status"
-    echo "2) Check one module"
-    echo "3) Install or update one module"
-    echo "4) Restart module updater"
-    echo "5) Show module updater log"
-    echo "6) Import a generic release manifest"
-    echo "7) Remove a registered module"
-    echo "0) Back"
-    read_menu_choice || return
+    choice="$(tui_menu "Runtime modules" "Independent verified module lifecycle" \
+      1 "Show installed/latest status" \
+      2 "Check one module" \
+      3 "Install or update one module" \
+      4 "Restart module updater" \
+      5 "Show module updater log" \
+      6 "Import generic release manifest" \
+      7 "Remove registered module" \
+      0 "Back")" || return
     case "$choice" in
       1) run_cmd "$MODULE_UPDATE_BIN" --check-all || true; pause ;;
       2)
@@ -1447,17 +1466,12 @@ panel_update_check() {
 
 panel_update_menu() {
   while true; do
-    header
-    echo "Panel updater"
-    echo
-    systemctl --no-pager --full status infiproxy-panel-update.timer infiproxy-panel-update.path 2>/dev/null || true
-    echo
-    echo "1) Check GitHub now"
-    echo "2) Update panel now"
-    echo "3) Show updater log"
-    echo "4) Restart update timer and path watcher"
-    echo "0) Back"
-    read_menu_choice || return
+    choice="$(tui_menu "Panel updater" "Git-backed control-plane lifecycle" \
+      1 "Check GitHub now" \
+      2 "Update panel now" \
+      3 "Show updater log" \
+      4 "Restart timer and path watcher" \
+      0 "Back")" || return
     case "$choice" in
       1) panel_update_check || true; pause ;;
       2)
@@ -1482,13 +1496,12 @@ panel_update_menu() {
 
 advanced_menu() {
   while true; do
-    header
-    echo "1) Install or repair panel"
-    echo "2) Telegram MTProto configuration"
-    echo "3) Headscale hub configuration"
-    echo "4) Manual verified archive import"
-    echo "0) Back"
-    read_menu_choice || return
+    choice="$(tui_menu "Advanced tools" "Installation and specialized modules" \
+      1 "Install or repair panel" \
+      2 "Telegram MTProto configuration" \
+      3 "Headscale hub configuration" \
+      4 "Manual verified archive import" \
+      0 "Back")" || return
     case "$choice" in
       1) install_or_repair ;;
       2) mtproto_setup_menu ;;
@@ -1511,7 +1524,7 @@ rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1536,7 +1549,7 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
+rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1569,7 +1582,7 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1598,12 +1611,11 @@ run_uninstall() {
     exit 2
   fi
   if [[ -z "$mode" ]]; then
-    header
-    echo "1) Panel-only removal"
-    echo "2) Full Infiproxy footprint removal"
-    echo "3) Factory footprint cleanup"
-    echo "0) Back"
-    read_menu_choice || return
+    choice="$(tui_menu "Danger zone" "Review the printed command plan before final confirmation" \
+      1 "Panel-only removal" \
+      2 "Full Infiproxy footprint removal" \
+      3 "Factory footprint cleanup" \
+      0 "Back")" || return
     case "$choice" in
       1) mode="panel" ;;
       2) mode="full" ;;

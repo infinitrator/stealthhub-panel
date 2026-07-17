@@ -81,6 +81,10 @@ The installed TUI is the main operations surface:
 sudo infiproxy-manager
 ```
 
+With `whiptail` available it uses a full-screen gray/white interface with green
+accents, nested menus, input boxes and protected secret prompts. The same
+operations retain a plain terminal fallback for rescue environments.
+
 It includes:
 
 - Guided deployment cycle.
@@ -141,6 +145,11 @@ runtime list is loaded from root-owned manifests rather than compiled into the
 panel. Each active module can be checked, installed, updated, disabled for
 automatic updates or removed independently. Removing a module preserves its
 configuration and places it back in the available catalog.
+
+Manifest parsing and GitHub metadata validation use the native
+`/usr/local/libexec/infiproxy-module-manifest` Rust helper. Python is not part
+of the base panel or module updater; it is installed only with the optional
+Certbot Cloudflare DNS plugin.
 
 The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC,
 Telegram MTProto and Headscale. A root operator can import another compatible
@@ -234,6 +243,11 @@ The guided setup:
 - Starts `headscale.service`.
 - Can create a Headscale user and pre-auth key for client onboarding.
 
+The owner-admin can also use `/admin/headscale` to inspect users and nodes,
+create users and pre-auth keys, expire a node, and clear the last protected
+result. The web process never executes Headscale: typed requests are consumed
+by the existing root maintenance worker.
+
 Headscale must use a **DNS-only** Cloudflare record. Do not enable Cloudflare
 proxying for the Headscale hostname.
 
@@ -312,6 +326,7 @@ cannot prove whether they existed before Infiproxy.
 /usr/local/sbin/infiproxy-manager
 /usr/local/sbin/infiproxy-module-update
 /usr/local/libexec/infiproxy-module-manifest
+/usr/local/libexec/infiproxy-headscale-control
 /etc/infiproxy/infiproxy.env
 /etc/infiproxy-update.conf
 /etc/infiproxy-modules.d

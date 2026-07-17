@@ -42,7 +42,8 @@ jobs:
         run: |
           set -euo pipefail
           for file in deploy/*.sh deploy/cores/*.sh; do bash -n "$file"; done
-          PYTHONDONTWRITEBYTECODE=1 python3 deploy/module-manifest.py list deploy/modules.d
+          cargo build -p stealthhub-panel --bins
+          target/debug/infiproxy-module-manifest list deploy/modules.d
           bash deploy/install.sh --check
           bash deploy/bootstrap.sh --check --src-dir "$PWD"
 

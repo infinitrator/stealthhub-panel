@@ -130,7 +130,6 @@ install_deps() {
             git
             libssl-dev
             pkg-config
-            python3
             sqlite3
             unzip
             whiptail
@@ -153,7 +152,6 @@ install_deps() {
             make
             openssl-devel
             pkgconf-pkg-config
-            python3
             sqlite
             unzip
             newt
