@@ -13,3 +13,4 @@ dist
 secrets
 *.pem
 *.key
+docs/OPERATIONS_DATASHEET_RU.md
