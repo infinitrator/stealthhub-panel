@@ -223,6 +223,16 @@ smoke_test_binary() {
             ("$binary_path" --help 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage' \
                 || ("$binary_path" -h 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage'
             ;;
+        sing-box|hysteria)
+            "$binary_path" version >/dev/null 2>&1
+            ;;
+        xray)
+            "$binary_path" version >/dev/null 2>&1 \
+                || "$binary_path" --version >/dev/null 2>&1
+            ;;
+        tuic)
+            "$binary_path" --version >/dev/null 2>&1
+            ;;
         *)
             "$binary_path" --version >/dev/null 2>&1
             ;;

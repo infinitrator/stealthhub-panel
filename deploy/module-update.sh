@@ -12,6 +12,8 @@ MODULE_VERSION_DIR="${INFIPROXY_MODULE_VERSION_DIR:-${ROOT_STATE_DIR}/module-ver
 REQUEST_DIR="${STATE_DIR}/module-requests"
 DISABLED_DIR="${ROOT_STATE_DIR}/module-disabled"
 BUILD_DIR="${ROOT_STATE_DIR}/module-build"
+MODULE_BACKUP_ROOT="${INFIPROXY_MODULE_BACKUP_ROOT:-${ROOT_STATE_DIR}/module-backups}"
+BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 CORE_ROOT="${INFIPROXY_CORE_ROOT:-/opt/infiproxy/cores}"
 MODULE_ROOT="${INFIPROXY_MODULE_ROOT:-/opt/infiproxy/modules}"
 CORE_INSTALLER="${INFIPROXY_CORE_INSTALLER:-/usr/local/sbin/infiproxy-core-install}"
@@ -121,6 +123,25 @@ github_json() {
     -H 'User-Agent: Infiproxy-module-updater' "$1"
 }
 
+download_release_asset() {
+  local output="$1" url="$2"
+  local -a args=(
+    --fail
+    --location
+    --show-error
+    --retry 3
+    --retry-all-errors
+    --connect-timeout 15
+    --max-time 600
+  )
+  [[ -n "${M_REPO:-}" && "$url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
+    || die "refusing untrusted release download URL"
+  if [[ "${INFIPROXY_FORCE_IPV4:-false}" == "true" ]]; then
+    args+=(--ipv4)
+  fi
+  curl "${args[@]}" --output "$output" "$url"
+}
+
 # Prints: tag|asset-name|asset-url|sha256-or-empty|checksum-url-or-empty
 release_metadata() {
   local arch="$1" pattern api_json
@@ -142,8 +163,10 @@ resolve_checksum() {
   [[ "$checksum_url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
     || die "no trusted checksum is available for ${expected_asset}"
   checksum_file="$(mktemp)"
-  curl --fail --silent --show-error --location --max-time 60 \
-    --output "$checksum_file" "$checksum_url"
+  if ! download_release_asset "$checksum_file" "$checksum_url"; then
+    rm -f "$checksum_file"
+    die "failed to download official checksum for ${expected_asset}"
+  fi
   checksum="$(awk -v name="$expected_asset" '
     length($1) == 64 {
       file = $2
@@ -162,6 +185,46 @@ remember_version() {
   printf '%s\n' "$2" >"${MODULE_VERSION_DIR}/$1.version"
   chown root:"$APP_GROUP" "${MODULE_VERSION_DIR}/$1.version" 2>/dev/null || true
   chmod 0640 "${MODULE_VERSION_DIR}/$1.version"
+}
+
+backup_module_config() {
+  local was_enabled="$1" was_active="$2"
+  local module_dir backup_dir current_target timestamp
+  [[ -e "$M_CONFIG" ]] || {
+    log "no existing config to back up for ${M_ID}: ${M_CONFIG}"
+    return
+  }
+  [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]] \
+    || die "refusing to back up unsafe module config: ${M_CONFIG}"
+  [[ "$BACKUP_RETENTION_DAYS" =~ ^[0-9]{1,3}$ ]] \
+    || die "invalid backup retention: ${BACKUP_RETENTION_DAYS}"
+
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  module_dir="${MODULE_BACKUP_ROOT}/${M_ID}"
+  backup_dir="${module_dir}/${timestamp}"
+  current_target="$(readlink -f "$(runtime_root)/current" 2>/dev/null || true)"
+  install -d -o root -g root -m 0700 "$backup_dir" \
+    || die "failed to create module backup directory"
+  if ! tar -C / -czf "${backup_dir}/config.tar.gz" -- "${M_CONFIG#/}"; then
+    rm -rf -- "$backup_dir"
+    die "failed to back up ${M_ID} config"
+  fi
+  chmod 0600 "${backup_dir}/config.tar.gz" \
+    || die "failed to protect ${M_ID} config backup"
+  {
+    printf 'module=%s\n' "$M_ID"
+    printf 'config=%s\n' "$M_CONFIG"
+    printf 'installed_version=%s\n' "$(installed_version "$M_ID")"
+    printf 'current_target=%s\n' "$current_target"
+    printf 'service_enabled=%s\n' "$was_enabled"
+    printf 'service_active=%s\n' "$was_active"
+  } >"${backup_dir}/metadata.env" || die "failed to write module backup metadata"
+  chmod 0600 "${backup_dir}/metadata.env" \
+    || die "failed to protect module backup metadata"
+  find "$module_dir" -mindepth 1 -maxdepth 1 -type d \
+    -mtime "+${BACKUP_RETENTION_DAYS}" -exec rm -rf -- {} + \
+    || die "failed to prune old module backups"
+  log "backed up ${M_ID} config to ${backup_dir}"
 }
 
 restore_service_state() {
@@ -262,10 +325,13 @@ install_release_module() {
 
   systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
   systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
+  backup_module_config "$was_enabled" "$was_active"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"; trap - RETURN' RETURN
-  curl --fail --location --show-error --max-time 300 --output "${tmp}/${asset}" "$url"
-  printf '%s  %s\n' "$checksum" "${tmp}/${asset}" | sha256sum -c -
+  download_release_asset "${tmp}/${asset}" "$url" \
+    || die "failed to download ${asset}"
+  printf '%s  %s\n' "$checksum" "${tmp}/${asset}" | sha256sum -c - \
+    || die "checksum verification failed for ${asset}"
 
   if [[ "$M_DRIVER" == "headscale" ]]; then
     install_headscale_binary "$tag" "${tmp}/${asset}" "$was_enabled" "$was_active"
@@ -318,6 +384,7 @@ install_source_module() {
   checksum="$(sha256sum "$binary" | awk '{print $1}')"
   systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
   systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
+  backup_module_config "$was_enabled" "$was_active"
   current_link="$(runtime_root)/current"
   previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
   "$CORE_INSTALLER" --core "$M_ID" --version "$commit" --archive "$binary" \
@@ -510,6 +577,7 @@ main() {
   need_root
   need_cmd curl
   need_cmd sha256sum
+  need_cmd tar
   [[ -x "$MANIFEST_HELPER" ]] || die "module manifest helper is missing"
   "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned >/dev/null \
     || die "module registry validation failed"

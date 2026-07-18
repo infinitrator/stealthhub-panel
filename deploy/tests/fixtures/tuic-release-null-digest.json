@@ -1,0 +1,15 @@
+{
+  "tag_name": "tuic-server-1.0.0",
+  "assets": [
+    {
+      "name": "tuic-server-1.0.0-x86_64-unknown-linux-gnu",
+      "browser_download_url": "https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/tuic-server-1.0.0-x86_64-unknown-linux-gnu",
+      "digest": null
+    },
+    {
+      "name": "checksums.txt",
+      "browser_download_url": "https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/checksums.txt",
+      "digest": null
+    }
+  ]
+}

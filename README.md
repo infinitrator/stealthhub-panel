@@ -127,9 +127,11 @@ Panel self-updates are split into two layers:
   `/var/lib/infiproxy/panel-update-now.request`; the owner-admin "Update Now"
   button creates this file for immediate update.
 - The root updater uses `/opt/infiproxy/source`, rebuilds the release binary and
-  reruns the idempotent installer. It creates a binary and SQLite backup first
-  and restores the previous binary if the update fails. Root-only logs, backups,
-  build files and applied-version markers live in
+  reruns the idempotent installer. Before changing the source revision it creates
+  fail-closed backups of the binary, SQLite database, panel/core/Headscale
+  settings, module manifests and Nginx configuration. A failed update restores
+  the previous database, configs, binary and source revision. Root-only logs,
+  backups, build files and applied-version markers live in
   `/var/lib/infiproxy-maintenance`, separate from web-writable state.
 
 Change automatic-update enablement and maintenance time in `/admin/settings`.
@@ -150,6 +152,14 @@ Manifest parsing and GitHub metadata validation use the native
 `/usr/local/libexec/infiproxy-module-manifest` Rust helper. Python is not part
 of the base panel or module updater; it is installed only with the optional
 Certbot Cloudflare DNS plugin.
+
+Release downloads use bounded retries and timeouts. Set
+`INFIPROXY_FORCE_IPV4=true` for the root updater only when a host has broken IPv6;
+the default keeps normal dual-stack behavior. Every module update preserves its
+config and creates a root-only backup under
+`/var/lib/infiproxy-maintenance/module-backups` before switching the verified
+binary. Core-specific smoke tests validate the executable, but a successful
+binary install does not replace final config and service readiness checks.
 
 The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC,
 Telegram MTProto and Headscale. A root operator can import another compatible

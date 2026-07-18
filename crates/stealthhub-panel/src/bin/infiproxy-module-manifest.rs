@@ -6,19 +6,28 @@ use stealthhub_core::module_manifest::{load_registry, pipe_record, read_manifest
 
 const MAX_GITHUB_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct Release {
     tag_name: String,
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ReleaseAsset {
     name: String,
     browser_download_url: String,
     #[serde(default)]
+    digest: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ReleaseMetadata {
+    tag: String,
+    asset_name: String,
+    asset_url: String,
     digest: String,
+    checksum_url: String,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +124,20 @@ fn run() -> anyhow::Result<()> {
 }
 
 fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
+    let release: Release = read_json_stdin()?;
+    let metadata = select_release_metadata(pattern, &release)?;
+    println!(
+        "{}|{}|{}|{}|{}",
+        metadata.tag,
+        metadata.asset_name,
+        metadata.asset_url,
+        metadata.digest,
+        metadata.checksum_url
+    );
+    Ok(())
+}
+
+fn select_release_metadata(pattern: &str, release: &Release) -> anyhow::Result<ReleaseMetadata> {
     if pattern.is_empty()
         || pattern.len() > 180
         || !pattern
@@ -123,7 +146,6 @@ fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
     {
         anyhow::bail!("invalid asset pattern");
     }
-    let release: Release = read_json_stdin()?;
     let version = release
         .tag_name
         .strip_prefix("app/v")
@@ -154,10 +176,8 @@ fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
                 .map(|candidate| candidate.browser_download_url.as_str())
         })
         .unwrap_or_default();
-    let digest = asset
-        .digest
-        .strip_prefix("sha256:")
-        .unwrap_or(&asset.digest);
+    let raw_digest = asset.digest.as_deref().unwrap_or_default();
+    let digest = raw_digest.strip_prefix("sha256:").unwrap_or(raw_digest);
     for url in [asset.browser_download_url.as_str(), checksum_url] {
         if !url.is_empty() && !url.starts_with("https://github.com/") {
             anyhow::bail!("release asset URL is outside GitHub");
@@ -177,11 +197,13 @@ fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
             anyhow::bail!("unsafe value in GitHub response");
         }
     }
-    println!(
-        "{}|{}|{}|{}|{}",
-        release.tag_name, expected, asset.browser_download_url, digest, checksum_url
-    );
-    Ok(())
+    Ok(ReleaseMetadata {
+        tag: release.tag_name.clone(),
+        asset_name: expected,
+        asset_url: asset.browser_download_url.clone(),
+        digest: digest.to_ascii_lowercase(),
+        checksum_url: checksum_url.to_string(),
+    })
 }
 
 fn print_commit_sha() -> anyhow::Result<()> {
@@ -234,4 +256,100 @@ fn usage() -> String {
         "< GitHub-response.json"
     )
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PATTERN: &str = "tuic-server-{version}-x86_64-unknown-linux-gnu";
+    const ASSET: &str = "tuic-server-1.0.0-x86_64-unknown-linux-gnu";
+    const ASSET_URL: &str = "https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/tuic-server-1.0.0-x86_64-unknown-linux-gnu";
+    const CHECKSUM_URL: &str =
+        "https://github.com/tuic-protocol/tuic/releases/download/tuic-server-1.0.0/checksums.txt";
+    const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn release_with(asset_digest: Option<serde_json::Value>, checksum: bool) -> Release {
+        let mut asset = serde_json::json!({
+            "name": ASSET,
+            "browser_download_url": ASSET_URL,
+        });
+        if let Some(digest) = asset_digest {
+            asset["digest"] = digest;
+        }
+        let mut assets = vec![asset];
+        if checksum {
+            assets.push(serde_json::json!({
+                "name": "checksums.txt",
+                "browser_download_url": CHECKSUM_URL,
+                "digest": null,
+            }));
+        }
+        serde_json::from_value(serde_json::json!({
+            "tag_name": "tuic-server-1.0.0",
+            "assets": assets,
+        }))
+        .expect("release fixture should deserialize")
+    }
+
+    #[test]
+    fn nullable_missing_and_empty_digests_use_checksum_sidecar() {
+        let null_fixture: Release = serde_json::from_str(include_str!(
+            "../../../../deploy/tests/fixtures/tuic-release-null-digest.json"
+        ))
+        .expect("TUIC release fixture should deserialize");
+        let metadata = select_release_metadata(PATTERN, &null_fixture)
+            .expect("null digest should use sidecar metadata");
+        assert_eq!(metadata.asset_name, ASSET);
+        assert_eq!(metadata.asset_url, ASSET_URL);
+        assert_eq!(metadata.digest, "");
+        assert_eq!(metadata.checksum_url, CHECKSUM_URL);
+
+        for digest in [None, Some(serde_json::json!(""))] {
+            let metadata = select_release_metadata(PATTERN, &release_with(digest, true))
+                .expect("empty digest should use sidecar metadata");
+            assert_eq!(metadata.asset_name, ASSET);
+            assert_eq!(metadata.asset_url, ASSET_URL);
+            assert_eq!(metadata.digest, "");
+            assert_eq!(metadata.checksum_url, CHECKSUM_URL);
+        }
+    }
+
+    #[test]
+    fn prefixed_and_plain_sha256_digests_are_normalized() {
+        for digest in [format!("sha256:{SHA256}"), SHA256.to_uppercase()] {
+            let metadata = select_release_metadata(
+                PATTERN,
+                &release_with(Some(serde_json::json!(digest)), false),
+            )
+            .expect("valid digest should be accepted");
+            assert_eq!(metadata.digest, SHA256);
+            assert_eq!(metadata.checksum_url, "");
+        }
+    }
+
+    #[test]
+    fn invalid_digest_asset_and_external_urls_are_rejected() {
+        let invalid_digest = release_with(Some(serde_json::json!("sha256:not-a-digest")), true);
+        assert!(select_release_metadata(PATTERN, &invalid_digest).is_err());
+
+        let missing_asset: Release = serde_json::from_value(serde_json::json!({
+            "tag_name": "tuic-server-1.0.0",
+            "assets": [],
+        }))
+        .unwrap();
+        assert!(select_release_metadata(PATTERN, &missing_asset).is_err());
+
+        let mut external = release_with(Some(serde_json::json!(SHA256)), false);
+        external.assets[0].browser_download_url = "https://example.com/tuic-server".to_string();
+        assert!(select_release_metadata(PATTERN, &external).is_err());
+    }
+
+    #[test]
+    fn missing_checksum_is_returned_empty_for_fail_closed_updater_resolution() {
+        let metadata = select_release_metadata(PATTERN, &release_with(None, false))
+            .expect("parser should leave checksum enforcement to updater");
+        assert_eq!(metadata.digest, "");
+        assert_eq!(metadata.checksum_url, "");
+    }
 }

@@ -299,7 +299,8 @@ EOF
 for manifest in "${bundled_manifests[@]}"; do
     module_id="$(basename "$manifest" .module)"
     install -m 0644 -o root -g root "$manifest" "$MODULE_AVAILABLE_DIR/${module_id}.module"
-    if [[ ! -e "$ROOT_STATE_DIR/module-disabled/${module_id}" ]]; then
+    if [[ ! -e "$ROOT_STATE_DIR/module-disabled/${module_id}" \
+        && ! -e "$MODULE_MANIFEST_DIR/${module_id}.module" ]]; then
         install -m 0644 -o root -g root "$manifest" "$MODULE_MANIFEST_DIR/${module_id}.module"
     fi
 done
@@ -363,7 +364,11 @@ done
 if [[ "$WITH_NGINX" -eq 1 ]]; then
     if command -v nginx >/dev/null 2>&1; then
         install -d -o root -g root -m 0755 "$(dirname "$NGINX_AVAILABLE")"
-        install -m 0644 "${ROOT_DIR}/deploy/nginx-infiproxy.conf.example" "$NGINX_AVAILABLE"
+        if [[ ! -e "$NGINX_AVAILABLE" ]]; then
+            install -m 0644 "${ROOT_DIR}/deploy/nginx-infiproxy.conf.example" "$NGINX_AVAILABLE"
+        else
+            echo "Keeping existing Nginx config: $NGINX_AVAILABLE"
+        fi
         if [[ -d "$(dirname "$NGINX_ENABLED")" && ! -e "$NGINX_ENABLED" ]]; then
             ln -s "$NGINX_AVAILABLE" "$NGINX_ENABLED"
         fi

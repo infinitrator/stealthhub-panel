@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -x deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/module-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh deploy/infiproxy-profile.sh
+          shellcheck -x deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/module-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh deploy/infiproxy-profile.sh deploy/tests/updater-regression.sh
 
       - name: Deployment contracts
         run: |
@@ -44,6 +44,7 @@ jobs:
           for file in deploy/*.sh deploy/cores/*.sh; do bash -n "$file"; done
           cargo build -p stealthhub-panel --bins
           target/debug/infiproxy-module-manifest list deploy/modules.d
+          bash deploy/tests/updater-regression.sh
           bash deploy/install.sh --check
           bash deploy/bootstrap.sh --check --src-dir "$PWD"
 
