@@ -185,7 +185,7 @@ sudo sed -n '1,120p' /etc/infiproxy/infiproxy.env
 
 Секретов в штатном panel env нет, но перед отправкой вывода третьей стороне все
 равно просмотрите файл. Верните минимальный template из
-[раздела конфигурации](11-CONFIGURATION.md#3-окружение-панели) и рестартуйте.
+[раздела конфигурации](11-CONFIGURATION#3-окружение-панели) и рестартуйте.
 
 ### 4.3. Binary не той архитектуры
 
@@ -309,7 +309,7 @@ uncommitted files внутри managed checkout.
 ### 6.4. Ручное восстановление из pre-update backup
 
 Если automatic rollback неполон, следуйте
-[процедуре восстановления](12-BACKUP-RESTORE-UNINSTALL.md#4-восстановление-панели).
+[процедуре восстановления](12-BACKUP-RESTORE-UNINSTALL#4-восстановление-панели).
 Сначала остановите updater timers/path, чтобы они не начали новый цикл во время
 restore.
 
@@ -961,10 +961,10 @@ sudo /usr/local/sbin/infiproxy-module-update --check-all \
 
 ## 30. Связанные разделы
 
-- [Быстрый старт](01-QUICK-START.md)
-- [Веб-интерфейс](03-WEB-INTERFACE.md)
-- [Модули и обновления](08-MODULES-AND-UPDATES.md)
-- [System и TUI](10-SYSTEM-AND-TUI.md)
-- [Конфигурация](11-CONFIGURATION.md)
-- [Backup и restore](12-BACKUP-RESTORE-UNINSTALL.md)
-- [Безопасная эксплуатация](13-SECURITY-OPERATIONS.md)
+- [Быстрый старт](01-QUICK-START)
+- [Веб-интерфейс](03-WEB-INTERFACE)
+- [Модули и обновления](08-MODULES-AND-UPDATES)
+- [System и TUI](10-SYSTEM-AND-TUI)
+- [Конфигурация](11-CONFIGURATION)
+- [Backup и restore](12-BACKUP-RESTORE-UNINSTALL)
+- [Безопасная эксплуатация](13-SECURITY-OPERATIONS)

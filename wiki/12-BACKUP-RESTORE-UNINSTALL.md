@@ -490,8 +490,8 @@ RPO — сколько данных допустимо потерять по в�
 
 ## 12. Связанные разделы
 
-- [Модули и обновления](08-MODULES-AND-UPDATES.md)
-- [Headscale](09-HEADSCALE.md)
-- [Конфигурация](11-CONFIGURATION.md)
-- [Безопасная эксплуатация](13-SECURITY-OPERATIONS.md)
-- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE.md)
+- [Модули и обновления](08-MODULES-AND-UPDATES)
+- [Headscale](09-HEADSCALE)
+- [Конфигурация](11-CONFIGURATION)
+- [Безопасная эксплуатация](13-SECURITY-OPERATIONS)
+- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE)

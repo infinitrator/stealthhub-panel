@@ -1,6 +1,6 @@
 # Headscale mesh hub
 
-[Назад: модули](08-MODULES-AND-UPDATES.md) | [К оглавлению](Home.md) | [Далее: система и TUI](10-SYSTEM-AND-TUI.md)
+[Назад: модули](08-MODULES-AND-UPDATES) | [К оглавлению](Home) | [Далее: система и TUI](10-SYSTEM-AND-TUI)
 
 ## Что такое Headscale
 

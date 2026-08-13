@@ -1,6 +1,6 @@
 # Профили Mihomo
 
-[Назад: пользователи](04-USERS-AND-SUBSCRIPTIONS.md) | [К оглавлению](Home.md) | [Далее: proxy-протоколы](06-PROXY-PROTOCOLS.md)
+[Назад: пользователи](04-USERS-AND-SUBSCRIPTIONS) | [К оглавлению](Home) | [Далее: proxy-протоколы](06-PROXY-PROTOCOLS)
 
 ## Назначение вкладки Protocols
 

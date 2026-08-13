@@ -16,22 +16,22 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 
 Для первого развертывания пройдите документы в таком порядке:
 
-1. [Быстрый старт и первая настройка](01-QUICK-START.md).
-2. [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING.md).
-3. [Веб-интерфейс: все страницы и кнопки](03-WEB-INTERFACE.md).
-4. [Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS.md).
-5. [Профили Mihomo](05-MIHOMO-PROFILES.md).
-6. [Proxy-протоколы и серверные ядра](06-PROXY-PROTOCOLS.md).
-7. [Маршрутизация Mihomo](07-ROUTING.md).
-8. [Модули и обновления](08-MODULES-AND-UPDATES.md).
-9. [Headscale mesh hub](09-HEADSCALE.md).
-10. [Система и SSH-TUI](10-SYSTEM-AND-TUI.md).
-11. [Конфигурационные файлы](11-CONFIGURATION.md).
-12. [Бэкапы, восстановление и удаление](12-BACKUP-RESTORE-UNINSTALL.md).
-13. [Безопасная эксплуатация](13-SECURITY-OPERATIONS.md).
-14. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE.md).
-15. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA.md).
-16. [Публикация GitHub Wiki](00-WIKI-PUBLISHING.md).
+1. [Быстрый старт и первая настройка](01-QUICK-START).
+2. [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING).
+3. [Веб-интерфейс: все страницы и кнопки](03-WEB-INTERFACE).
+4. [Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS).
+5. [Профили Mihomo](05-MIHOMO-PROFILES).
+6. [Proxy-протоколы и серверные ядра](06-PROXY-PROTOCOLS).
+7. [Маршрутизация Mihomo](07-ROUTING).
+8. [Модули и обновления](08-MODULES-AND-UPDATES).
+9. [Headscale mesh hub](09-HEADSCALE).
+10. [Система и SSH-TUI](10-SYSTEM-AND-TUI).
+11. [Конфигурационные файлы](11-CONFIGURATION).
+12. [Бэкапы, восстановление и удаление](12-BACKUP-RESTORE-UNINSTALL).
+13. [Безопасная эксплуатация](13-SECURITY-OPERATIONS).
+14. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE).
+15. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
+16. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
 
 ## Уровни готовности операций
 
@@ -120,4 +120,4 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 `<binary> --version`, локальный конфиг и документация именно этой версии.
 
 Текущая линия проекта: `0.1.0-beta.1`. Границы готовности и доказательства
-проверок перечислены в [milestone-аудите](15-RELEASE-0.1-BETA.md).
+проверок перечислены в [milestone-аудите](15-RELEASE-0.1-BETA).

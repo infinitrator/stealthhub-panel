@@ -1,7 +1,7 @@
 # Безопасная эксплуатация
 
 Этот документ описывает реализованные механизмы и остаточные риски ревизии,
-указанной в [индексе wiki](Home.md). Он не является сертификатом, результатом
+указанной в [индексе wiki](Home). Он не является сертификатом, результатом
 внешнего penetration test или гарантией отсутствия уязвимостей.
 
 ## 1. Модель угроз
@@ -495,8 +495,8 @@ access logs полезны, но не считаются tamper-proof после
 
 ## 18. Связанные разделы
 
-- [Архитектура](02-ARCHITECTURE-AND-NETWORKING.md)
-- [Модули и обновления](08-MODULES-AND-UPDATES.md)
-- [System и TUI](10-SYSTEM-AND-TUI.md)
-- [Backup и удаление](12-BACKUP-RESTORE-UNINSTALL.md)
-- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE.md)
+- [Архитектура](02-ARCHITECTURE-AND-NETWORKING)
+- [Модули и обновления](08-MODULES-AND-UPDATES)
+- [System и TUI](10-SYSTEM-AND-TUI)
+- [Backup и удаление](12-BACKUP-RESTORE-UNINSTALL)
+- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE)

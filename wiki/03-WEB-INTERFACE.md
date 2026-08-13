@@ -1,6 +1,6 @@
 # Веб-интерфейс: все страницы и кнопки
 
-[Назад: архитектура](02-ARCHITECTURE-AND-NETWORKING.md) | [К оглавлению](Home.md) | [Далее: пользователи](04-USERS-AND-SUBSCRIPTIONS.md)
+[Назад: архитектура](02-ARCHITECTURE-AND-NETWORKING) | [К оглавлению](Home) | [Далее: пользователи](04-USERS-AND-SUBSCRIPTIONS)
 
 ## Общие правила интерфейса
 
@@ -136,7 +136,7 @@ update settings также обновляет state, который читает
 ## Users
 
 Полный жизненный цикл описан в
-[Пользователях и подписках](04-USERS-AND-SUBSCRIPTIONS.md).
+[Пользователях и подписках](04-USERS-AND-SUBSCRIPTIONS).
 
 | Кнопка/ссылка | Тип | Результат |
 |---|---|---|
@@ -169,7 +169,7 @@ Status strip показывает число профилей, enabled, числ
 | **Save profile** | Обновляет существующую запись в SQLite; не валидирует/перезапускает серверный core. |
 
 Kind и role профиля в GUI read-only. Создания/удаления профилей через текущий
-веб-интерфейс нет. Подробно: [Профили Mihomo](05-MIHOMO-PROFILES.md).
+веб-интерфейс нет. Подробно: [Профили Mihomo](05-MIHOMO-PROFILES).
 
 ## Secrets
 
@@ -199,7 +199,7 @@ subscription generation в fail-closed `503`, а не публикует имя/
 | **Save rule set** | Валидирует payload и сохраняет этот set в SQLite. |
 
 Нельзя создать произвольный slug или вложить `RULE-SET`/`SUB-RULE` внутрь
-payload. Подробно: [Маршрутизация](07-ROUTING.md).
+payload. Подробно: [Маршрутизация](07-ROUTING).
 
 ## Modules
 
@@ -226,7 +226,7 @@ payload. Подробно: [Маршрутизация](07-ROUTING.md).
 в `/etc/infiproxy-modules.available.d`. Браузер не передает URL, repo, shell
 command или systemd unit.
 
-Подробно: [Модули и обновления](08-MODULES-AND-UPDATES.md).
+Подробно: [Модули и обновления](08-MODULES-AND-UPDATES).
 
 ## Headscale
 
@@ -246,7 +246,7 @@ command или systemd unit.
 | Node ID + **Expire node** | в очередь | Expire key выбранного node; ему нужна повторная регистрация. |
 
 Headscale CLI запускает root helper с фиксированным набором argv, timeout 20 с и
-лимитом output 64 КиБ. Подробно: [Headscale](09-HEADSCALE.md).
+лимитом output 64 КиБ. Подробно: [Headscale](09-HEADSCALE).
 
 ## IP Check
 
@@ -299,7 +299,7 @@ Save не запускает native core configtest и не перезапуск
 parser проверяет JSON/YAML/TOML/dotenv; Nginx/SSH остаются read-only и должны
 проверяться родными утилитами из TUI. Symlink path, NUL и превышение размера
 отвергаются. Подробно:
-[Конфигурационные файлы](11-CONFIGURATION.md).
+[Конфигурационные файлы](11-CONFIGURATION).
 
 ## Health и Ready
 

@@ -92,7 +92,7 @@ badge. Она не вызывает mutating `systemctl`, `sudo`, shell или �
 
 Таблица на странице **System** только показывает пути и команды. Полный
 allowlist-редактор находится во вкладке **Configs** и описан в
-[разделе 11](11-CONFIGURATION.md).
+[разделе 11](11-CONFIGURATION).
 
 ### 2.6. Uninstall planner
 
@@ -106,7 +106,7 @@ allowlist-редактор находится во вкладке **Configs** и
 
 Исполнение доступно только в **Danger zone** TUI. Перед ним обязательны backup и
 проверка списка путей. Подробности приведены в
-[разделе 12](12-BACKUP-RESTORE-UNINSTALL.md).
+[разделе 12](12-BACKUP-RESTORE-UNINSTALL).
 
 ## 3. Запуск SSH-TUI
 
@@ -181,7 +181,7 @@ ssh -L 8080:127.0.0.1:8080 root@SERVER
 ### 4.3. Runtime modules
 
 Этот пункт управляет независимыми runtime-модулями. Все семь кнопок подробно
-описаны в [разделе 8](08-MODULES-AND-UPDATES.md#tui-runtime-modules).
+описаны в [разделе 8](08-MODULES-AND-UPDATES#tui-runtime-modules).
 
 ### 4.4. Restart and reload
 
@@ -252,7 +252,7 @@ Headscale нужен отдельный DNS-only hostname: обычный Cloudf
 
 Если installed и latest commit совпадают, root updater завершает operation до
 backup/build/install. Полная модель обновления описана в
-[разделе 8](08-MODULES-AND-UPDATES.md#обновление-панели).
+[разделе 8](08-MODULES-AND-UPDATES#обновление-панели).
 
 ### 4.8. Panel environment
 
@@ -264,7 +264,7 @@ backup/build/install. Полная модель обновления описа�
 > В этом пункте нет автоматической проверки dotenv. Оставьте вторую SSH-сессию,
 > после сохранения проверьте status и при ошибке исправьте файл из нее.
 
-Поля перечислены в [разделе 11](11-CONFIGURATION.md#3-окружение-панели).
+Поля перечислены в [разделе 11](11-CONFIGURATION#3-окружение-панели).
 
 ### 4.9. Guided deployment
 
@@ -313,7 +313,7 @@ service. Сначала обновите module `mtproto`, затем повто
 #### Headscale hub configuration
 
 Все пункты этого подменю разобраны в
-[разделе 9](09-HEADSCALE.md#headscale-в-ssh-tui).
+[разделе 9](09-HEADSCALE#headscale-в-ssh-tui).
 
 ### 4.11. Danger zone
 
@@ -416,8 +416,8 @@ sudo infiproxy-manager --guided
 
 ## 8. Связанные разделы
 
-- [Конфигурационные файлы](11-CONFIGURATION.md)
-- [Модули и обновления](08-MODULES-AND-UPDATES.md)
-- [Headscale](09-HEADSCALE.md)
-- [Бэкапы и удаление](12-BACKUP-RESTORE-UNINSTALL.md)
-- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE.md)
+- [Конфигурационные файлы](11-CONFIGURATION)
+- [Модули и обновления](08-MODULES-AND-UPDATES)
+- [Headscale](09-HEADSCALE)
+- [Бэкапы и удаление](12-BACKUP-RESTORE-UNINSTALL)
+- [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE)

@@ -1,6 +1,6 @@
 # Пользователи и подписки
 
-[Назад: веб-интерфейс](03-WEB-INTERFACE.md) | [К оглавлению](Home.md) | [Далее: профили Mihomo](05-MIHOMO-PROFILES.md)
+[Назад: веб-интерфейс](03-WEB-INTERFACE) | [К оглавлению](Home) | [Далее: профили Mihomo](05-MIHOMO-PROFILES)
 
 ## Что означает пользователь Infiproxy
 
@@ -235,4 +235,4 @@ Users, UUID, tokens, settings, routing и secret values находятся в SQ
 
 Копируйте ее согласованно через SQLite `.backup`, а не обычным `cp` работающего
 WAL-файла. Процедура приведена в
-[Бэкапах и восстановлении](12-BACKUP-RESTORE-UNINSTALL.md).
+[Бэкапах и восстановлении](12-BACKUP-RESTORE-UNINSTALL).

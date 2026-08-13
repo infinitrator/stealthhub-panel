@@ -327,7 +327,7 @@ sudo systemctl restart infiproxy-sing-box.service
 
 Не копируйте конфиг от другой major/minor версии без `sing-box check`: поля
 могут быть deprecated или удалены. Ссылки на схемы протоколов есть в
-[разделе 6](06-PROXY-PROTOCOLS.md).
+[разделе 6](06-PROXY-PROTOCOLS).
 
 ## 8. Hysteria 2 server config
 
@@ -408,7 +408,7 @@ Template secret из нулей является placeholder. Не запуск�
 
 Файл: `/etc/headscale/config.yaml`.
 
-Он подробно разобран в [разделе 9](09-HEADSCALE.md). Критичные группы:
+Он подробно разобран в [разделе 9](09-HEADSCALE). Критичные группы:
 
 | Группа | За что отвечает |
 |---|---|
@@ -470,7 +470,7 @@ Starter Hysteria и TUIC ожидают:
 
 При отсутствии или пустом значении enabled profile делает generation
 fail-closed с HTTP 503. Процедура внесения и сверки описана в
-[профилях Mihomo](05-MIHOMO-PROFILES.md#как-безопасно-добавить-secret-value).
+[профилях Mihomo](05-MIHOMO-PROFILES#как-безопасно-добавить-secret-value).
 
 ## 14. Права на файлы
 
@@ -524,8 +524,8 @@ sudo chmod 0640 /var/lib/infiproxy/infiproxy.sqlite*
 
 ## 16. Связанные разделы
 
-- [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING.md)
-- [Профили Mihomo](05-MIHOMO-PROFILES.md)
-- [Proxy-протоколы](06-PROXY-PROTOCOLS.md)
-- [Система и TUI](10-SYSTEM-AND-TUI.md)
-- [Backup и восстановление](12-BACKUP-RESTORE-UNINSTALL.md)
+- [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING)
+- [Профили Mihomo](05-MIHOMO-PROFILES)
+- [Proxy-протоколы](06-PROXY-PROTOCOLS)
+- [Система и TUI](10-SYSTEM-AND-TUI)
+- [Backup и восстановление](12-BACKUP-RESTORE-UNINSTALL)

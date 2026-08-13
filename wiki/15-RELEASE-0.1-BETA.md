@@ -1,6 +1,6 @@
 # Milestone-аудит Infiproxy 0.1 beta
 
-[Назад: диагностика](14-TROUBLESHOOTING-AND-REFERENCE.md) | [К оглавлению](Home.md) | [Публикация Wiki](00-WIKI-PUBLISHING.md)
+[Назад: диагностика](14-TROUBLESHOOTING-AND-REFERENCE) | [К оглавлению](Home) | [Публикация Wiki](00-WIKI-PUBLISHING)
 
 ## 1. Статус
 

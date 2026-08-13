@@ -1,6 +1,6 @@
 # Маршрутизация Mihomo
 
-[Назад: proxy-протоколы](06-PROXY-PROTOCOLS.md) | [К оглавлению](Home.md) | [Далее: модули](08-MODULES-AND-UPDATES.md)
+[Назад: proxy-протоколы](06-PROXY-PROTOCOLS) | [К оглавлению](Home) | [Далее: модули](08-MODULES-AND-UPDATES)
 
 ## Что маршрутизируется
 
