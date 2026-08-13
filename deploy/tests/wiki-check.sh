@@ -79,7 +79,7 @@ wiki_prefix='https://github.com/infinitrator/stealthhub-panel/wiki/'
 while IFS=: read -r source line match; do
   target="${match#*](}"
   target="${target%)}"
-  slug="${target#${wiki_prefix}}"
+  slug="${target#"${wiki_prefix}"}"
   slug="${slug%%#*}"
   if [[ ! -f "wiki/${slug}.md" ]]; then
     printf 'wiki check failed: %s:%s links to missing Wiki page %s\n' \
