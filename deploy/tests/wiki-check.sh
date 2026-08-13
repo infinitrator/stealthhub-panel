@@ -75,4 +75,26 @@ done < <(grep -Hn -o -E '\[[^]]+\]\([^)]+\.md(#[^)]+)?\)' README.md wiki/*.md ||
 
 ((link_failure == 0)) || exit 1
 
+wiki_prefix='https://github.com/infinitrator/stealthhub-panel/wiki/'
+while IFS=: read -r source line match; do
+  target="${match#*](}"
+  target="${target%)}"
+  slug="${target#${wiki_prefix}}"
+  slug="${slug%%#*}"
+  if [[ ! -f "wiki/${slug}.md" ]]; then
+    printf 'wiki check failed: %s:%s links to missing Wiki page %s\n' \
+      "$source" "$line" "$slug" >&2
+    link_failure=1
+  fi
+done < <(grep -Hn -o -E \
+  '\[[^]]+\]\(https://github\.com/infinitrator/stealthhub-panel/wiki/[^)#]+(#[^)]+)?\)' \
+  wiki/*.md || true)
+
+if grep -Hn -E '\[[^]]+\]\([A-Za-z0-9._-]+\.md(#[^)]+)?\)' wiki/*.md; then
+  echo 'wiki check failed: internal Wiki links must use canonical page URLs without .md' >&2
+  link_failure=1
+fi
+
+((link_failure == 0)) || exit 1
+
 echo "Wiki contracts passed (${#required_pages[@]} required pages)."

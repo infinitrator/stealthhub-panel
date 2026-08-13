@@ -39,6 +39,7 @@ Workflow `.github/workflows/wiki.yml`:
 - клонирует отдельный wiki repository;
 - удаляет из working tree только старые Markdown pages Wiki;
 - копирует текущие `.md` из `wiki/`;
+- публикует внутренние ссылки как канонические Wiki URL без суффикса `.md`;
 - проверяет наличие `Home.md`, `_Sidebar.md`, `_Footer.md`;
 - создает commit только при реальном diff;
 - выполняет обычный push без force.
@@ -90,6 +91,11 @@ bash deploy/tests/wiki-check.sh
 3. Проверьте sidebar и footer на desktop/mobile ширине.
 4. Перейдите по каждой внутренней ссылке.
 5. Откройте history Wiki и сравните source commit в сообщении публикации.
+
+Адрес опубликованной страницы не содержит расширение файла. Например,
+`01-QUICK-START.md` хранится в Git-репозитории Wiki, но открывается как
+`https://github.com/infinitrator/stealthhub-panel/wiki/01-QUICK-START`.
+Ссылка с `.md` может открыть исходный Markdown вместо оформленной Wiki-страницы.
 6. Убедитесь, что в pages нет subscription URLs, passwords, tokens и private
    infrastructure data.
 
