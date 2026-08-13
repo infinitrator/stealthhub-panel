@@ -6,13 +6,19 @@
 #![cfg(test)]
 
 use super::*;
-use crate::{health, ip, modules};
-use axum::http::{header, HeaderMap};
+use crate::{
+    health, ip, modules,
+    ops::{
+        format_duration, percent, trim_command_output, CONFIG_FILES, IP_REPUTATION_SOURCES,
+        SYSTEM_TARGETS,
+    },
+};
+use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use std::collections::HashSet;
 use stealthhub_core::storage::{AdminRecord, UserRecord};
 
-fn test_user() -> UserRecord {
+fn fixture_user() -> UserRecord {
     let now = Utc::now();
 
     UserRecord {
@@ -58,11 +64,13 @@ fn csrf_token_is_derived_from_session_token() {
 fn owner_admin_is_first_created_admin() {
     let owner = AuthenticatedAdmin {
         admin: test_admin(1),
+        is_owner: true,
         csrf_token: "csrf".to_string(),
         update_notice: None,
     };
     let regular = AuthenticatedAdmin {
         admin: test_admin(2),
+        is_owner: false,
         csrf_token: "csrf".to_string(),
         update_notice: None,
     };
@@ -89,18 +97,15 @@ fn login_rate_limiter_blocks_after_failures_and_clears_on_success() {
 #[test]
 fn login_rate_limit_keys_normalize_username_and_source() {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "x-forwarded-for",
-        " 203.0.113.10, 10.0.0.1".parse().unwrap(),
-    );
+    headers.insert("x-real-ip", "203.0.113.10".parse().unwrap());
 
     let peer_addr = "127.0.0.1:42300".parse().unwrap();
 
     assert_eq!(
         login_rate_limit_keys(&headers, peer_addr, " Admin "),
         vec![
-            "username:admin".to_string(),
-            "source:203.0.113.10".to_string()
+            "source:203.0.113.10".to_string(),
+            "account-source:admin@203.0.113.10".to_string()
         ]
     );
 }
@@ -114,8 +119,8 @@ fn login_rate_limit_keys_ignore_forwarded_source_from_non_loopback_peer() {
     assert_eq!(
         login_rate_limit_keys(&headers, peer_addr, "admin"),
         vec![
-            "username:admin".to_string(),
-            "source:198.51.100.20".to_string()
+            "source:198.51.100.20".to_string(),
+            "account-source:admin@198.51.100.20".to_string()
         ]
     );
 }
@@ -128,13 +133,102 @@ fn login_rate_limit_keys_ignore_invalid_forwarded_source() {
 
     assert_eq!(
         login_rate_limit_keys(&headers, peer_addr, "admin"),
-        vec!["username:admin".to_string(), "source:127.0.0.1".to_string()]
+        vec![
+            "source:127.0.0.1".to_string(),
+            "account-source:admin@127.0.0.1".to_string()
+        ]
     );
 }
 
 #[test]
+fn login_rate_limit_keys_never_trust_x_forwarded_for() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-forwarded-for", "203.0.113.10".parse().unwrap());
+    let peer_addr = "127.0.0.1:42300".parse().unwrap();
+
+    assert_eq!(
+        login_rate_limit_keys(&headers, peer_addr, "admin"),
+        vec![
+            "source:127.0.0.1".to_string(),
+            "account-source:admin@127.0.0.1".to_string()
+        ]
+    );
+}
+
+#[test]
+fn account_names_are_bounded_and_shell_safe() {
+    assert!(valid_account_name("owner.admin-1", 3));
+    assert!(valid_account_name("a", 1));
+    assert!(!valid_account_name("-admin", 3));
+    assert!(!valid_account_name("admin name", 3));
+    assert!(!valid_account_name("админ", 3));
+    assert!(!valid_account_name(&"a".repeat(65), 1));
+}
+
+#[test]
+fn public_hosts_accept_urls_without_ambiguous_authority() {
+    assert_eq!(
+        normalize_public_host("Panel.Example.COM."),
+        Ok("panel.example.com".to_string())
+    );
+    assert_eq!(
+        normalize_public_host("127.0.0.1:8443"),
+        Ok("127.0.0.1:8443".to_string())
+    );
+    assert_eq!(
+        normalize_public_host("[2001:db8::1]:443"),
+        Ok("[2001:db8::1]:443".to_string())
+    );
+    assert!(normalize_public_host("https://example.com").is_err());
+    assert!(normalize_public_host("_service.example.com").is_err());
+    assert!(normalize_public_host("-bad.example.com").is_err());
+    assert!(normalize_public_host("example.com:0").is_err());
+    assert!(normalize_public_host("2001:db8::1").is_err());
+}
+
+#[test]
+fn protocol_servers_are_host_only_and_accept_bare_ipv6() {
+    assert_eq!(
+        normalize_profile_server("Node.Example.COM."),
+        Ok("node.example.com".to_string())
+    );
+    assert_eq!(
+        normalize_profile_server("2001:db8::1"),
+        Ok("2001:db8::1".to_string())
+    );
+    assert!(normalize_profile_server("node.example.com:443").is_err());
+    assert!(normalize_profile_server("https://node.example.com").is_err());
+}
+
+#[test]
+fn protocol_secret_references_and_paths_fail_closed() {
+    assert_eq!(
+        required_secret_reference("xray.reality.public_key", "secret").unwrap(),
+        "xray.reality.public_key"
+    );
+    assert!(required_secret_reference("../secret", "secret").is_err());
+    assert_eq!(required_http_path("/api/v1").unwrap(), "/api/v1");
+    assert!(required_http_path("api/v1").is_err());
+    assert!(required_http_path("/api path").is_err());
+    assert_eq!(
+        required_tls_name("WWW.Example.COM.", "TLS SNI").unwrap(),
+        "www.example.com"
+    );
+    assert!(required_tls_name("example.com:443", "TLS SNI").is_err());
+    assert!(required_tls_name("example com", "TLS SNI").is_err());
+}
+
+#[test]
+fn secret_names_are_bounded_and_path_independent() {
+    assert!(valid_secret_name("xray.reality.private_key"));
+    assert!(!valid_secret_name(""));
+    assert!(!valid_secret_name("../secret"));
+    assert!(!valid_secret_name("secret/name"));
+}
+
+#[test]
 fn subscription_block_reason_enforces_user_state() {
-    let mut user = test_user();
+    let mut user = fixture_user();
     assert!(subscription_block_reason(&user).is_none());
 
     user.enabled = false;
@@ -196,21 +290,6 @@ fn command_output_trimming_preserves_utf8() {
 
     assert!(output.ends_with("... <truncated>"));
     assert!(output.is_char_boundary(output.len()));
-}
-
-#[test]
-fn health_content_negotiation_only_html_for_browsers() {
-    let mut headers = HeaderMap::new();
-    assert!(!health::wants_html(&headers));
-
-    headers.insert(header::ACCEPT, "*/*".parse().unwrap());
-    assert!(!health::wants_html(&headers));
-
-    headers.insert(
-        header::ACCEPT,
-        "text/html,application/xhtml+xml".parse().unwrap(),
-    );
-    assert!(health::wants_html(&headers));
 }
 
 #[test]
@@ -277,8 +356,9 @@ fn mtproto_runtime_is_wired_into_panel_contracts() {
         .iter()
         .any(|module| module.service == "infiproxy-mtproto.service"
             && module.binary_path.ends_with("/mtproto-proxy")));
-    assert!(SYSTEM_TARGETS.iter().any(|target| target.slug == "mtproto"
-        && target.units == ["infiproxy-mtproto.service"].as_slice()));
+    assert!(SYSTEM_TARGETS
+        .iter()
+        .any(|target| target.units == ["infiproxy-mtproto.service"].as_slice()));
     assert!(CONFIG_FILES.iter().any(|spec| spec.slug == "mtproto-core"
         && spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env"));
 }
@@ -291,9 +371,9 @@ fn headscale_module_is_wired_into_panel_contracts() {
         .any(|module| module.id == "headscale"
             && module.service == "headscale.service"
             && module.binary_path.ends_with("/headscale")));
-    assert!(SYSTEM_TARGETS.iter().any(
-        |target| target.slug == "headscale" && target.units == ["headscale.service"].as_slice()
-    ));
+    assert!(SYSTEM_TARGETS
+        .iter()
+        .any(|target| target.units == ["headscale.service"].as_slice()));
     assert!(CONFIG_FILES
         .iter()
         .any(|spec| spec.slug == "headscale-config" && spec.path == "/etc/headscale/config.yaml"));
@@ -309,4 +389,12 @@ fn config_editor_rejects_unknown_targets() {
 
     assert!(!report.success);
     assert_eq!(report.message, "unknown config target");
+}
+
+#[test]
+fn config_editor_rejects_root_only_targets() {
+    let report = write_config_file("ssh-daemon", "Port 22\n");
+
+    assert!(!report.success);
+    assert!(report.message.contains("read-only"));
 }

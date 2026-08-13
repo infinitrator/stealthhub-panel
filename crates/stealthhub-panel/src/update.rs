@@ -4,14 +4,14 @@
 //! GitHub, stores update state in SQLite and writes a request file for the
 //! root-owned systemd updater when the owner asks to apply an update now.
 
-use crate::ui::APP_NAME;
+use crate::{atomic_file, ui::APP_NAME};
 use chrono::{Local, Timelike, Utc};
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::{fs, path::PathBuf, process::Command, time::Duration as StdDuration};
-use stealthhub_core::storage::{get_setting, upsert_setting};
+use stealthhub_core::storage::{get_setting, upsert_settings};
 
-const CHECK_INTERVAL: StdDuration = StdDuration::from_secs(2 * 60 * 60);
+const CHECK_INTERVAL: StdDuration = StdDuration::from_hours(2);
 const INITIAL_DELAY: StdDuration = StdDuration::from_secs(20);
 const DEFAULT_STATE_PATH: &str = "/var/lib/infiproxy/panel-update-state.env";
 const DEFAULT_REQUEST_PATH: &str = "/var/lib/infiproxy/panel-update-now.request";
@@ -153,12 +153,11 @@ pub(crate) fn request_now() -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, format!("requested_at={}\n", Utc::now().to_rfc3339()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o640))?;
-    }
+    atomic_file::replace(
+        &path,
+        format!("requested_at={}\n", Utc::now().to_rfc3339()).as_bytes(),
+        0o640,
+    )?;
     Ok(())
 }
 
@@ -225,6 +224,7 @@ pub(crate) fn validate_repo(repo: &str) -> Result<(), &'static str> {
 pub(crate) fn validate_ref(git_ref: &str) -> Result<(), &'static str> {
     if git_ref.is_empty()
         || git_ref.starts_with('/')
+        || git_ref.starts_with('-')
         || git_ref.contains("..")
         || !git_ref.chars().all(is_safe_git_ref_char)
     {
@@ -292,26 +292,37 @@ async fn setting_or_default(
 ) -> anyhow::Result<String> {
     Ok(get_setting(pool, key)
         .await?
-        .map(|setting| setting.value)
-        .unwrap_or_else(|| default_value.to_string()))
+        .map_or_else(|| default_value.to_string(), |setting| setting.value))
 }
 
 async fn persist_status(pool: &SqlitePool, status: &Status) -> anyhow::Result<()> {
-    for (key, value) in [
-        ("panel_update_current_sha", status.current_sha.as_str()),
-        ("panel_update_latest_sha", status.latest_sha.as_str()),
-        (
-            "panel_update_available",
-            if status.available { "true" } else { "false" },
-        ),
-        ("panel_update_checked_at", status.checked_at.as_str()),
-        ("panel_update_planned_for", status.planned_for.as_str()),
-        ("panel_update_status", status.status.as_str()),
-    ] {
-        upsert_setting(pool, key, value).await?;
-    }
-
-    Ok(())
+    upsert_settings(
+        pool,
+        &[
+            (
+                "panel_update_current_sha".to_string(),
+                status.current_sha.clone(),
+            ),
+            (
+                "panel_update_latest_sha".to_string(),
+                status.latest_sha.clone(),
+            ),
+            (
+                "panel_update_available".to_string(),
+                status.available.to_string(),
+            ),
+            (
+                "panel_update_checked_at".to_string(),
+                status.checked_at.clone(),
+            ),
+            (
+                "panel_update_planned_for".to_string(),
+                status.planned_for.clone(),
+            ),
+            ("panel_update_status".to_string(), status.status.clone()),
+        ],
+    )
+    .await
 }
 
 async fn github_latest_commit(repo: &str, git_ref: &str) -> anyhow::Result<String> {
@@ -362,11 +373,11 @@ fn git_rev_parse(path: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn is_safe_git_segment(ch: char) -> bool {
+const fn is_safe_git_segment(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
 
-fn is_safe_git_ref_char(ch: char) -> bool {
+const fn is_safe_git_ref_char(ch: char) -> bool {
     is_safe_git_segment(ch) || ch == '/'
 }
 
@@ -417,22 +428,16 @@ fn write_state_file(status: &Status) {
         shell_env_value(&status.planned_for),
     );
 
-    if fs::write(&path, content).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o640));
-        }
+    if let Err(error) = atomic_file::replace(&path, content.as_bytes(), 0o640) {
+        tracing::warn!("could not mirror panel update state: {error}");
     }
 }
 
 fn configured_path(variable: &str, default_path: &str) -> PathBuf {
-    std::env::var_os(variable)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(default_path))
+    std::env::var_os(variable).map_or_else(|| PathBuf::from(default_path), PathBuf::from)
 }
 
-fn env_bool(value: bool) -> &'static str {
+const fn env_bool(value: bool) -> &'static str {
     if value {
         "true"
     } else {

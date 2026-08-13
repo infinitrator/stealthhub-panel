@@ -110,6 +110,7 @@ pub fn read_manifest(path: &Path, options: ReadOptions) -> anyhow::Result<Module
 }
 
 /// Serializes one validated manifest for the legacy-safe shell protocol.
+#[must_use]
 pub fn pipe_record(spec: &ModuleSpec) -> String {
     let (upstream, git_ref) = match &spec.upstream {
         UpstreamKind::Release => ("release", ""),
@@ -222,12 +223,6 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
             anyhow::bail!("invalid Git reference");
         }
     }
-    if !matches!(
-        spec.driver.as_str(),
-        "release" | "headscale" | "mtproto-source"
-    ) {
-        anyhow::bail!("unsupported module driver");
-    }
     if !matches!(spec.root.as_str(), "cores" | "modules") {
         anyhow::bail!("invalid runtime root");
     }
@@ -279,7 +274,7 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
                 anyhow::bail!("invalid MTProto module contract");
             }
         }
-        _ => unreachable!("driver was validated above"),
+        _ => anyhow::bail!("unsupported module driver"),
     }
     if registration
         && (!matches!(spec.upstream, UpstreamKind::Release)
@@ -312,6 +307,7 @@ fn validate_installed_metadata(metadata: &fs::Metadata) -> anyhow::Result<()> {
 }
 
 /// Returns whether a value is a safe module identifier.
+#[must_use]
 pub fn valid_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 32
@@ -374,7 +370,7 @@ fn safe_asset(value: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '+' | '-' | '{' | '}'))
 }
 
-fn safe_path_char(ch: char) -> bool {
+const fn safe_path_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '+' | '-')
 }
 

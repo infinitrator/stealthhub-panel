@@ -1,0 +1,69 @@
+name: Publish Wiki
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "wiki/**"
+      - ".github/workflows/wiki.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-wiki
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out documentation source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Validate documentation contracts
+        run: bash deploy/tests/wiki-check.sh
+
+      - name: Publish Markdown pages
+        env:
+          WIKI_TOKEN: ${{ secrets.WIKI_DEPLOY_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+
+          test -n "$WIKI_TOKEN"
+          test -f wiki/Home.md
+          test -f wiki/_Sidebar.md
+          test -f wiki/_Footer.md
+
+          wiki_dir="$(mktemp -d)"
+          trap 'rm -rf "$wiki_dir"' EXIT
+          auth="$(printf 'x-access-token:%s' "$WIKI_TOKEN" | base64 | tr -d '\n')"
+          header="AUTHORIZATION: basic ${auth}"
+
+          if ! git -c http.extraheader="$header" clone \
+            "https://github.com/${GITHUB_REPOSITORY}.wiki.git" "$wiki_dir/repository"; then
+            echo "GitHub Wiki is not initialized or the workflow token cannot write it." >&2
+            echo "Enable Wikis and create the initial Home page, then rerun this workflow." >&2
+            exit 1
+          fi
+
+          find "$wiki_dir/repository" -maxdepth 1 -type f -name '*.md' -delete
+          cp wiki/*.md "$wiki_dir/repository/"
+
+          git -C "$wiki_dir/repository" config user.name github-actions[bot]
+          git -C "$wiki_dir/repository" config user.email \
+            41898282+github-actions[bot]@users.noreply.github.com
+          git -C "$wiki_dir/repository" add --all
+
+          if git -C "$wiki_dir/repository" diff --cached --quiet; then
+            echo "Wiki is already synchronized."
+            exit 0
+          fi
+
+          git -C "$wiki_dir/repository" commit \
+            -m "docs: sync wiki from ${GITHUB_SHA}"
+          git -C "$wiki_dir/repository" -c http.extraheader="$header" \
+            push origin HEAD

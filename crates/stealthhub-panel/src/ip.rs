@@ -44,21 +44,18 @@ pub(crate) async fn ip_check_page(
     let result = if trimmed_ip.is_empty() {
         None
     } else {
-        Some(
-            trimmed_ip
-                .parse::<IpAddr>()
-                .map(|ip| Diagnostics {
-                    ip,
-                    ptr: reverse_lookup_step(ip),
-                    route: route_lookup_step(ip),
-                })
-                .map_err(|_| ()),
-        )
+        Some(match trimmed_ip.parse::<IpAddr>() {
+            Ok(ip) => {
+                let (ptr, route) = tokio::join!(reverse_lookup_step(ip), route_lookup_step(ip));
+                Ok(Diagnostics { ip, ptr, route })
+            }
+            Err(_) => Err(()),
+        })
     };
     views::ip::render(&auth, trimmed_ip, result)
 }
 
-fn reverse_lookup_step(ip: IpAddr) -> CommandStep {
+async fn reverse_lookup_step(ip: IpAddr) -> CommandStep {
     run_first_success_owned(&[
         ("host", vec![ip.to_string()]),
         (
@@ -66,9 +63,10 @@ fn reverse_lookup_step(ip: IpAddr) -> CommandStep {
             vec!["+short".to_string(), "-x".to_string(), ip.to_string()],
         ),
     ])
+    .await
 }
 
-fn route_lookup_step(ip: IpAddr) -> CommandStep {
+async fn route_lookup_step(ip: IpAddr) -> CommandStep {
     run_first_success_owned(&[
         (
             "ip",
@@ -79,16 +77,17 @@ fn route_lookup_step(ip: IpAddr) -> CommandStep {
             vec!["-n".to_string(), "get".to_string(), ip.to_string()],
         ),
     ])
+    .await
 }
 
-pub(crate) fn ip_version(ip: IpAddr) -> &'static str {
+pub(crate) const fn ip_version(ip: IpAddr) -> &'static str {
     match ip {
         IpAddr::V4(_) => "IPv4",
         IpAddr::V6(_) => "IPv6",
     }
 }
 
-pub(crate) fn ip_scope(ip: IpAddr) -> &'static str {
+pub(crate) const fn ip_scope(ip: IpAddr) -> &'static str {
     match ip {
         IpAddr::V4(value) if value.is_private() => "private",
         IpAddr::V4(value) if value.is_loopback() => "loopback",

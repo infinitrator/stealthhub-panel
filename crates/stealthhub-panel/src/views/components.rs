@@ -33,9 +33,8 @@ pub(crate) fn service_state_badge(state: &ServiceState) -> Markup {
 pub(crate) fn meter_bar(percent: Option<u8>) -> Markup {
     let value = percent.unwrap_or(0);
     html! {
-        div class="meter" title=(percent.map(|value| format!("{value}%")).unwrap_or_else(|| "unknown".to_string())) {
-            div class="meter-fill" style=(format!("width: {value}%")) {}
-        }
+        progress class="meter" max="100" value=(value)
+            title=(percent.map_or_else(|| "unknown".to_string(), |value| format!("{value}%"))) {}
     }
 }
 

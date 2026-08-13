@@ -59,7 +59,8 @@ UPDATE_REPO="$(normalize_github_repo "$source_origin")" || {
 }
 UPDATE_REF="${INFIPROXY_UPDATE_REF:-$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || true)}"
 UPDATE_REF="${UPDATE_REF:-main}"
-if [[ ! "$UPDATE_REF" =~ ^[A-Za-z0-9_./-]+$ || "$UPDATE_REF" == /* || "$UPDATE_REF" == *..* ]]; then
+if [[ ! "$UPDATE_REF" =~ ^[A-Za-z0-9_./-]+$ || "$UPDATE_REF" == /* \
+    || "$UPDATE_REF" == -* || "$UPDATE_REF" == *..* ]]; then
     echo "Invalid update reference: $UPDATE_REF" >&2
     exit 2
 fi
@@ -125,6 +126,66 @@ need_cmd() {
     fi
 }
 
+random_setup_token() {
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    else
+        od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
+    fi
+}
+
+ensure_setup_token() {
+    local current token temporary
+    current="$(awk -F= '$1 == "INFIPROXY_SETUP_TOKEN" { sub("^[^=]*=", ""); print; exit }' "$ENV_FILE")"
+    if [[ "${#current}" -ge 32 ]]; then
+        return
+    fi
+    token="$(random_setup_token)"
+    [[ "${#token}" -ge 32 ]] || {
+        echo "Failed to generate the initial setup token" >&2
+        exit 1
+    }
+    temporary="${ENV_FILE}.tmp.$$"
+    awk -v token="$token" '
+        BEGIN { found = 0 }
+        /^INFIPROXY_SETUP_TOKEN=/ {
+            print "INFIPROXY_SETUP_TOKEN=" token
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) print "INFIPROXY_SETUP_TOKEN=" token
+        }
+    ' "$ENV_FILE" >"$temporary"
+    install -m 0660 -o root -g "$APP_GROUP" "$temporary" "$ENV_FILE"
+    rm -f "$temporary"
+}
+
+record_current_commit() {
+    local commit temporary
+    commit="${INFIPROXY_INSTALL_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)}"
+    if [[ ! "$commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+        echo "Warning: current Git commit is unavailable; update status will show unknown." >&2
+        return
+    fi
+    temporary="${ENV_FILE}.tmp.$$"
+    awk -v commit="$commit" '
+        BEGIN { found = 0 }
+        /^INFIPROXY_CURRENT_COMMIT=/ {
+            print "INFIPROXY_CURRENT_COMMIT=" commit
+            found = 1
+            next
+        }
+        { print }
+        END {
+            if (!found) print "INFIPROXY_CURRENT_COMMIT=" commit
+        }
+    ' "$ENV_FILE" >"$temporary"
+    install -m 0660 -o root -g "$APP_GROUP" "$temporary" "$ENV_FILE"
+    rm -f "$temporary"
+}
+
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "Preflight commands:"
     for cmd in getent groupadd id install systemctl useradd; do
@@ -136,6 +197,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
     done
 else
     need_cmd getent
+    need_cmd flock
     need_cmd groupadd
     need_cmd id
     need_cmd install
@@ -169,7 +231,9 @@ if [[ "$BUILD" -eq 1 ]]; then
         echo "cargo is required for --build" >&2
         exit 1
     fi
-    cargo build --release -p stealthhub-panel --manifest-path "${ROOT_DIR}/Cargo.toml"
+    cargo build --locked --release -p stealthhub-panel \
+        --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
+        --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi
 
 shopt -s nullglob
@@ -252,6 +316,7 @@ install -d -o root -g "$APP_GROUP" -m 0770 "$CONFIG_DIR"
 install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
+install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/headscale"
 install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/module-versions"
 install -d -o root -g root -m 0750 "$ROOT_STATE_DIR/module-disabled"
 install -d -o root -g root -m 0755 "$MODULE_MANIFEST_DIR"
@@ -284,12 +349,20 @@ install -m 0755 "$RELEASE_MANIFEST_HELPER" "$MODULE_MANIFEST_HELPER"
 install -m 0755 "$RELEASE_HEADSCALE_HELPER" "$HEADSCALE_CONTROL_HELPER"
 install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
-if [[ ! -f "$STATE_DIR/headscale-state.json" ]]; then
-    printf '{"updated_at":"","status":"waiting for first maintenance refresh","users":"","nodes":"","last_result":"","result_is_secret":false}\n' \
-        | install -m 0640 -o root -g "$APP_GROUP" /dev/stdin "$STATE_DIR/headscale-state.json"
+HEADSCALE_STATE_FILE="$ROOT_STATE_DIR/headscale/state.json"
+LEGACY_HEADSCALE_STATE_FILE="$STATE_DIR/headscale-state.json"
+if [[ ! -f "$HEADSCALE_STATE_FILE" ]]; then
+    if [[ -f "$LEGACY_HEADSCALE_STATE_FILE" && ! -L "$LEGACY_HEADSCALE_STATE_FILE" ]]; then
+        install -m 0640 -o root -g "$APP_GROUP" \
+            "$LEGACY_HEADSCALE_STATE_FILE" "$HEADSCALE_STATE_FILE"
+        rm -f "$LEGACY_HEADSCALE_STATE_FILE"
+    else
+        printf '{"updated_at":"","status":"waiting for first maintenance refresh","users":"","nodes":"","last_result":"","result_is_secret":false}\n' \
+            | install -m 0640 -o root -g "$APP_GROUP" /dev/stdin "$HEADSCALE_STATE_FILE"
+    fi
 else
-    chown root:"$APP_GROUP" "$STATE_DIR/headscale-state.json"
-    chmod 0640 "$STATE_DIR/headscale-state.json"
+    chown root:"$APP_GROUP" "$HEADSCALE_STATE_FILE"
+    chmod 0640 "$HEADSCALE_STATE_FILE"
 fi
 install -m 0644 -o root -g root /dev/stdin "$UPDATE_CONFIG_FILE" <<EOF
 REPO=${UPDATE_REPO}
@@ -313,6 +386,8 @@ if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
 else
     echo "Keeping existing env file: $ENV_FILE"
 fi
+ensure_setup_token
+record_current_commit
 chown root:"$APP_GROUP" "$ENV_FILE"
 chmod 0660 "$ENV_FILE"
 
@@ -394,6 +469,8 @@ echo "Manager: sudo infiproxy-manager"
 echo "HTTPS:  sudo infiproxy-manager  # choose HTTPS / Cloudflare setup"
 echo "Health: curl http://127.0.0.1:8080/health"
 echo "Ready:  curl http://127.0.0.1:8080/ready"
+setup_token="$(awk -F= '$1 == "INFIPROXY_SETUP_TOKEN" { sub("^[^=]*=", ""); print; exit }' "$ENV_FILE")"
+echo "Setup token: $setup_token"
 echo "Config: $ENV_FILE"
 if [[ "$WITH_NGINX" -eq 1 ]]; then
     echo "Nginx:  $NGINX_AVAILABLE"

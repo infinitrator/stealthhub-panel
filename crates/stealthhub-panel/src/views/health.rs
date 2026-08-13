@@ -1,7 +1,8 @@
 //! Health dashboard presentation.
 
 use crate::{
-    ops::{service_state, HostSnapshot, SYSTEM_TARGETS},
+    admin_bar,
+    ops::{HostSnapshot, ServiceState, SYSTEM_TARGETS},
     ui::layout,
     views::components::{meter_bar, service_state_badge},
     DEPLOYMENT_MODE,
@@ -18,55 +19,59 @@ pub(crate) struct Component {
     pub(crate) detail: &'static str,
 }
 
-pub(crate) fn render(
-    status: StatusCode,
-    state_label: &'static str,
-    summary: &'static str,
-    components: &[Component],
-    host: &HostSnapshot,
-    uptime: &str,
-) -> Response {
+pub(crate) struct Report<'a> {
+    pub(crate) status: StatusCode,
+    pub(crate) state_label: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) components: &'a [Component],
+    pub(crate) host: &'a HostSnapshot,
+    pub(crate) service_states: &'a [ServiceState],
+    pub(crate) uptime: String,
+}
+
+pub(crate) fn render(auth: &crate::AuthenticatedAdmin, report: Report<'_>) -> Response {
     (
-        status,
+        report.status,
         Html(
             layout(
                 "Health",
                 html! {
+                    (admin_bar(auth))
                     h1 { "Health" }
-                    section class=(format!("health-hero {}", state_class(state_label))) {
+                    section class=(format!("health-hero {}", state_class(report.state_label))) {
                         div {
                             span class="eyebrow" { "Infiproxy control plane" }
-                            h2 { (state_label) }
-                            p { (summary) }
+                            h2 { (report.state_label) }
+                            p { (report.summary) }
                         }
                         div class="health-ring" {
-                            span class=(format!("health-led {}", state_class(state_label))) {}
-                            strong { (status.as_u16()) }
-                            small { (status.canonical_reason().unwrap_or("status")) }
+                            span class=(format!("health-led {}", state_class(report.state_label))) {}
+                            strong { (report.status.as_u16()) }
+                            small { (report.status.canonical_reason().unwrap_or("status")) }
                         }
                     }
                     section {
                         h2 { "Component status" }
                         div class="health-grid" {
-                            @for component in components { (component_card(component)) }
+                            @for component in report.components { (component_card(component)) }
                         }
                     }
                     section {
                         h2 { "Runtime statistics" }
                         div class="status-strip compact-status" {
                             div class="metric" { span { "Version" } strong { (env!("CARGO_PKG_VERSION")) } }
-                            div class="metric" { span { "Uptime" } strong { (uptime) } }
+                            div class="metric" { span { "Uptime" } strong { (&report.uptime) } }
                             div class="metric" { span { "Deployment" } strong { (DEPLOYMENT_MODE) } }
-                            div class="metric" { span { "Probe mode" } strong { "html + plain text" } }
+                            div class="metric" { span { "Probe mode" } strong { "private dashboard" } }
                         }
                     }
                     section {
                         h2 { "Host sensors" }
                         div class="sys-grid" {
-                            div class="sys-card" { span { "OS" } strong { (&host.os_name) } small { "Kernel " (&host.kernel) } }
-                            div class="sys-card" { span { "Load" } strong { (&host.load_average) } small { "Uptime " (&host.uptime) } }
-                            div class="sys-card" { span { "Memory" } strong { (&host.memory_label) } (meter_bar(host.memory_used_percent)) }
-                            div class="sys-card" { span { "Root disk" } strong { (&host.disk_label) } (meter_bar(host.disk_used_percent)) }
+                            div class="sys-card" { span { "OS" } strong { (&report.host.os_name) } small { "Kernel " (&report.host.kernel) } }
+                            div class="sys-card" { span { "Load" } strong { (&report.host.load_average) } small { "Uptime " (&report.host.uptime) } }
+                            div class="sys-card" { span { "Memory" } strong { (&report.host.memory_label) } (meter_bar(report.host.memory_used_percent)) }
+                            div class="sys-card" { span { "Root disk" } strong { (&report.host.disk_label) } (meter_bar(report.host.disk_used_percent)) }
                         }
                     }
                     section {
@@ -75,11 +80,10 @@ pub(crate) fn render(
                             table {
                                 thead { tr { th { "Target" } th { "State" } th { "Config" } } }
                                 tbody {
-                                    @for target in SYSTEM_TARGETS {
-                                        @let state = service_state(target.units);
+                                    @for (target, state) in SYSTEM_TARGETS.iter().zip(report.service_states) {
                                         tr {
                                             td { strong { (target.name) } }
-                                            td { (service_state_badge(&state)) }
+                                            td { (service_state_badge(state)) }
                                             td { code { (target.config) } }
                                         }
                                     }
@@ -90,8 +94,8 @@ pub(crate) fn render(
                     section {
                         h2 { "Probe contract" }
                         dl class="details" {
-                            dt { "Browser" } dd { "HTML health dashboard with component status." }
-                            dt { "Automation" } dd { code { "curl -H 'Accept: */*' /health" } " returns " code { "ok" } "." }
+                            dt { "Browser" } dd { code { "/admin/health" } " requires an authenticated admin session." }
+                            dt { "Automation" } dd { code { "curl /health" } " returns only " code { "ok" } "." }
                             dt { "Readiness" } dd { code { "/ready" } " includes SQLite connectivity and preserves HTTP status semantics." }
                         }
                     }

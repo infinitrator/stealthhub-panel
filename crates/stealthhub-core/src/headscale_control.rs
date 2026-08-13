@@ -35,6 +35,7 @@ pub struct HeadscaleSnapshot {
 }
 
 /// Validates a local Headscale username accepted by the guided installer.
+#[must_use]
 pub fn valid_username(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 63
@@ -45,6 +46,7 @@ pub fn valid_username(value: &str) -> bool {
 }
 
 /// Accepts bounded Go-style durations such as `30m`, `24h`, or `168h`.
+#[must_use]
 pub fn valid_expiration(value: &str) -> bool {
     let split = value
         .bytes()

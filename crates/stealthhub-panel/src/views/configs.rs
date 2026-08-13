@@ -1,6 +1,11 @@
 //! Configuration-workbench presentation.
 
-use crate::{admin_bar, csrf_field, ops::*, ui::layout, AuthenticatedAdmin};
+use crate::{
+    admin_bar, csrf_field,
+    ops::{ConfigFileSnapshot, ConfigWriteReport},
+    ui::layout,
+    AuthenticatedAdmin,
+};
 use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Response},
@@ -28,8 +33,8 @@ pub(crate) fn render_index(
                             strong { (snapshots.iter().filter(|item| item.status == "ready").count()) }
                         }
                         div class="metric" {
-                            span { "Editor model" }
-                            strong { "backup-first" }
+                            span { "Editable" }
+                            strong { (snapshots.iter().filter(|item| item.spec.editable).count()) }
                         }
                         div class="metric" {
                             span { "Shell access" }
@@ -40,7 +45,9 @@ pub(crate) fn render_index(
                     section {
                         h2 { "Config workbench" }
                         div class="notice" {
-                            "Only allowlisted files are editable. Every save creates a sibling backup before writing. Validation and reload stay explicit so one bad edit does not silently restart services."
+                            "Only allowlisted panel-managed files are editable. Root-owned SSH and Nginx files stay read-only and must be changed through "
+                            code { "sudo infiproxy-manager" }
+                            ". Every web save creates a sibling backup before an atomic write."
                         }
                         div class="config-list" {
                             @for snapshot in snapshots {
@@ -97,6 +104,11 @@ fn config_editor_card(snapshot: &ConfigFileSnapshot, auth: &AuthenticatedAdmin) 
                     span class=(format!("badge {status_class}")) { (&snapshot.status) }
                     span class="badge neutral" { (snapshot.spec.category) }
                     span class="badge neutral" { (snapshot.spec.syntax) }
+                    @if snapshot.spec.editable {
+                        span class="badge ok" { "editable" }
+                    } @else {
+                        span class="badge neutral" { "root read-only" }
+                    }
                 }
             }
             form method="post" action="/admin/configs" class="config-form wide" {
@@ -114,7 +126,7 @@ fn config_editor_card(snapshot: &ConfigFileSnapshot, auth: &AuthenticatedAdmin) 
                 }
                 label class="full-span" {
                     span { "Content" }
-                    textarea class="code-editor" name="content" rows="18" spellcheck="false" {
+                    textarea class="code-editor" name="content" rows="18" spellcheck="false" readonly[!snapshot.spec.editable] {
                         (&snapshot.content)
                     }
                     small {
@@ -122,7 +134,11 @@ fn config_editor_card(snapshot: &ConfigFileSnapshot, auth: &AuthenticatedAdmin) 
                         " | Apply: " code { (snapshot.spec.reload_hint) }
                     }
                 }
-                button type="submit" { "Save with backup" }
+                @if snapshot.spec.editable {
+                    button type="submit" { "Save with backup" }
+                } @else {
+                    small { "Web saving is disabled for this root-owned target." }
+                }
             }
         }
     }

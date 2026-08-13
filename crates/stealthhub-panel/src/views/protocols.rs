@@ -339,7 +339,7 @@ fn missing_secret_names(profile: &ProtocolProfile, present_secret_names: &[Strin
         .collect()
 }
 
-fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
+const fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
     match kind {
         ProxyKind::VlessRealityXhttp => "VLESS + REALITY + XHTTP",
         ProxyKind::VlessRealityTcp => "VLESS + REALITY + TCP",
@@ -350,7 +350,7 @@ fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
     }
 }
 
-fn proxy_role_label(role: &ProxyRole) -> &'static str {
+const fn proxy_role_label(role: &ProxyRole) -> &'static str {
     match role {
         ProxyRole::AutoSafe => "AUTO-SAFE",
         ProxyRole::Speed => "SPEED",

@@ -1,0 +1,10 @@
+{
+  "rust-analyzer.cargo.allFeatures": true,
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": [
+    "--locked"
+  ],
+  "rust-analyzer.imports.granularity.group": "module",
+  "rust-analyzer.imports.group.enable": true
+}

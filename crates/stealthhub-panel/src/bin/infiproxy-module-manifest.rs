@@ -11,6 +11,10 @@ struct Release {
     tag_name: String,
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +34,13 @@ struct ReleaseMetadata {
     checksum_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct StableVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+}
+
 #[derive(Deserialize)]
 struct Commit {
     sha: String,
@@ -37,6 +48,8 @@ struct Commit {
 
 #[derive(Deserialize)]
 struct CloudflareEnvelope {
+    #[serde(default)]
+    success: bool,
     #[serde(default)]
     result: Vec<CloudflareObject>,
 }
@@ -64,6 +77,12 @@ fn run() -> anyhow::Result<()> {
         ensure_no_extra_args(args)?;
         return print_release_metadata(&pattern);
     }
+    if command == "headscale-step-metadata" {
+        let pattern = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
+        let current = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
+        ensure_no_extra_args(args)?;
+        return print_headscale_step_metadata(&pattern, &current);
+    }
     if command == "commit-sha" {
         ensure_no_extra_args(args)?;
         return print_commit_sha();
@@ -77,9 +96,19 @@ fn run() -> anyhow::Result<()> {
     if command == "cloudflare-first-id" {
         ensure_no_extra_args(args)?;
         let response: CloudflareEnvelope = read_json_stdin()?;
+        anyhow::ensure!(response.success, "Cloudflare API reported failure");
         if let Some(item) = response.result.first() {
             println!("{}", safe_single_line(&item.id)?);
         }
+        return Ok(());
+    }
+    if command == "cloudflare-success" {
+        ensure_no_extra_args(args)?;
+        let response: serde_json::Value = read_json_stdin()?;
+        anyhow::ensure!(
+            response.get("success").and_then(serde_json::Value::as_bool) == Some(true),
+            "Cloudflare API reported failure"
+        );
         return Ok(());
     }
     if command == "headscale-user-id" {
@@ -126,6 +155,18 @@ fn run() -> anyhow::Result<()> {
 fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
     let release: Release = read_json_stdin()?;
     let metadata = select_release_metadata(pattern, &release)?;
+    print_metadata(&metadata);
+    Ok(())
+}
+
+fn print_headscale_step_metadata(pattern: &str, current: &str) -> anyhow::Result<()> {
+    let releases: Vec<Release> = read_json_stdin()?;
+    let metadata = select_headscale_step_metadata(pattern, current, &releases)?;
+    print_metadata(&metadata);
+    Ok(())
+}
+
+fn print_metadata(metadata: &ReleaseMetadata) {
     println!(
         "{}|{}|{}|{}|{}",
         metadata.tag,
@@ -134,7 +175,66 @@ fn print_release_metadata(pattern: &str) -> anyhow::Result<()> {
         metadata.digest,
         metadata.checksum_url
     );
-    Ok(())
+}
+
+fn select_headscale_step_metadata(
+    pattern: &str,
+    current: &str,
+    releases: &[Release],
+) -> anyhow::Result<ReleaseMetadata> {
+    let current = parse_stable_version(current)
+        .ok_or_else(|| anyhow::anyhow!("installed Headscale version is not stable semver"))?;
+    let stable = releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            parse_stable_version(&release.tag_name).map(|version| (version, release))
+        })
+        .collect::<Vec<_>>();
+    let (latest, _) = stable
+        .iter()
+        .max_by_key(|(version, _)| *version)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("GitHub returned no stable Headscale releases"))?;
+    anyhow::ensure!(
+        current <= latest,
+        "installed Headscale version is newer than upstream"
+    );
+    anyhow::ensure!(
+        current.major == latest.major,
+        "Headscale major-version upgrades require an explicit migration"
+    );
+
+    let target_minor = if current.minor < latest.minor {
+        current.minor + 1
+    } else {
+        current.minor
+    };
+    let (_, release) = stable
+        .into_iter()
+        .filter(|(version, _)| {
+            version.major == current.major && version.minor == target_minor && *version >= current
+        })
+        .max_by_key(|(version, _)| *version)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no stable Headscale release found for required minor {}.{}",
+                current.major,
+                target_minor
+            )
+        })?;
+    select_release_metadata(pattern, release)
+}
+
+fn parse_stable_version(value: &str) -> Option<StableVersion> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let mut parts = value.split('.');
+    let version = StableVersion {
+        major: parts.next()?.parse().ok()?,
+        minor: parts.next()?.parse().ok()?,
+        patch: parts.next()?.parse().ok()?,
+    };
+    parts.next().is_none().then_some(version)
 }
 
 fn select_release_metadata(pattern: &str, release: &Release) -> anyhow::Result<ReleaseMetadata> {
@@ -252,7 +352,7 @@ fn usage() -> String {
     concat!(
         "usage: infiproxy-module-manifest <read|validate|list> <path> ",
         "[--root-owned] [--registration]\n       ",
-        "infiproxy-module-manifest <release-metadata PATTERN|commit-sha|release-tag|cloudflare-first-id|headscale-user-id> ",
+        "infiproxy-module-manifest <release-metadata PATTERN|headscale-step-metadata PATTERN CURRENT|commit-sha|release-tag|cloudflare-first-id|cloudflare-success|headscale-user-id> ",
         "< GitHub-response.json"
     )
     .to_string()
@@ -290,6 +390,46 @@ mod tests {
             "assets": assets,
         }))
         .expect("release fixture should deserialize")
+    }
+
+    fn headscale_release(version: &str, prerelease: bool) -> Release {
+        let tag = format!("v{version}");
+        serde_json::from_value(serde_json::json!({
+            "tag_name": tag,
+            "draft": false,
+            "prerelease": prerelease,
+            "assets": [{
+                "name": format!("headscale_{version}_linux_amd64"),
+                "browser_download_url": format!(
+                    "https://github.com/juanfont/headscale/releases/download/v{version}/headscale_{version}_linux_amd64"
+                ),
+                "digest": format!("sha256:{SHA256}")
+            }]
+        }))
+        .expect("Headscale release fixture should deserialize")
+    }
+
+    #[test]
+    fn headscale_updates_one_minor_at_a_time() {
+        let releases = vec![
+            headscale_release("0.29.3", false),
+            headscale_release("0.29.0-beta.1", true),
+            headscale_release("0.28.1", false),
+            headscale_release("0.27.1", false),
+            headscale_release("0.27.0", false),
+            headscale_release("0.26.1", false),
+        ];
+        let pattern = "headscale_{version}_linux_amd64";
+
+        let first = select_headscale_step_metadata(pattern, "v0.26.1", &releases)
+            .expect("first safe step should resolve");
+        assert_eq!(first.tag, "v0.27.1");
+        let second = select_headscale_step_metadata(pattern, "0.27.1", &releases)
+            .expect("second safe step should resolve");
+        assert_eq!(second.tag, "v0.28.1");
+        let latest = select_headscale_step_metadata(pattern, "v0.29.0", &releases)
+            .expect("same-minor patch should resolve");
+        assert_eq!(latest.tag, "v0.29.3");
     }
 
     #[test]

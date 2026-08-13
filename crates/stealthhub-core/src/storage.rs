@@ -1,4 +1,4 @@
-//! SQLite persistence layer for Infiproxy.
+//! `SQLite` persistence layer for Infiproxy.
 //!
 //! This module owns schema creation, migrations-by-idempotent-DDL and CRUD
 //! helpers for users, admins, sessions, settings, secrets, protocol profiles and
@@ -8,7 +8,9 @@ use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
+    sqlite::{
+        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+    },
     Row, SqlitePool,
 };
 use std::{str::FromStr, time::Duration as StdDuration};
@@ -202,9 +204,15 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ProtocolProfileRecord {
 }
 
 pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
-    let options = SqliteConnectOptions::from_str(database_url)?
+    let mut options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(StdDuration::from_secs(10));
+    if !database_url.contains(":memory:") {
+        options = options
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal);
+    }
     let max_connections = std::env::var("INFIPROXY_DB_MAX_CONNECTIONS")
         .ok()
         .or_else(|| std::env::var("STEALTHHUB_DB_MAX_CONNECTIONS").ok())
@@ -222,7 +230,7 @@ pub async fn open_pool(database_url: &str) -> Result<SqlitePool> {
 
 pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -235,31 +243,31 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_users_subscription_token
         ON users(subscription_token);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_users_enabled
         ON users(enabled);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS admins (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -267,13 +275,13 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS admin_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             admin_id INTEGER NOT NULL,
@@ -283,56 +291,56 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             last_seen_at TEXT NOT NULL,
             FOREIGN KEY(admin_id) REFERENCES admins(id) ON DELETE CASCADE
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_admin_sessions_token_hash
         ON admin_sessions(token_hash);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at
         ON admin_sessions(expires_at);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS secret_values (
             name TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE TABLE IF NOT EXISTS protocol_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
@@ -345,25 +353,25 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_protocol_profiles_role
         ON protocol_profiles(role);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
 
     sqlx::query(
-        r#"
+        r"
         CREATE INDEX IF NOT EXISTS idx_protocol_profiles_enabled
         ON protocol_profiles(enabled);
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
@@ -415,68 +423,13 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-pub async fn ensure_demo_user(pool: &SqlitePool) -> Result<()> {
-    let exists: Option<(i64,)> = sqlx::query_as(
-        r#"
-        SELECT id
-        FROM users
-        WHERE username = ? OR uuid = ?
-        LIMIT 1
-        "#,
-    )
-    .bind("demo")
-    .bind("11111111-1111-4111-8111-111111111111")
-    .fetch_optional(pool)
-    .await?;
-
-    if exists.is_some() {
-        return Ok(());
-    }
-
-    let now = Utc::now();
-
-    sqlx::query(
-        r#"
-        INSERT INTO users (
-            username,
-            uuid,
-            subscription_token,
-            enabled,
-            traffic_limit_bytes,
-            traffic_used_bytes,
-            expires_at,
-            created_at,
-            updated_at
-        )
-        VALUES (?, ?, ?, 1, NULL, 0, NULL, ?, ?)
-        "#,
-    )
-    .bind("demo")
-    .bind("11111111-1111-4111-8111-111111111111")
-    .bind("demo")
-    .bind(now)
-    .bind(now)
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
 pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
-    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM protocol_profiles")
-        .fetch_one(pool)
-        .await?;
-
-    if count > 0 {
-        return Ok(());
-    }
-
     let defaults = vec![
         NewProtocolProfile {
             name: "VLESS-XHTTP-SAFE".to_string(),
             kind: ProxyKind::VlessRealityXhttp,
             role: ProxyRole::AutoSafe,
-            enabled: true,
+            enabled: false,
             server: "node.infiproxy.local".to_string(),
             port: 8443,
             config: ProtocolConfig::VlessRealityXhttp {
@@ -488,10 +441,24 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
             },
         },
         NewProtocolProfile {
+            name: "VLESS-REALITY-TCP-FALLBACK".to_string(),
+            kind: ProxyKind::VlessRealityTcp,
+            role: ProxyRole::Compatibility,
+            enabled: false,
+            server: "node.infiproxy.local".to_string(),
+            port: 7443,
+            config: ProtocolConfig::VlessRealityTcp {
+                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                server_name: "www.microsoft.com".to_string(),
+                public_key_secret: "xray.reality.public_key".to_string(),
+                short_id_secret: "xray.reality.short_id".to_string(),
+            },
+        },
+        NewProtocolProfile {
             name: "SS2022-SHADOWTLS-FALLBACK".to_string(),
             kind: ProxyKind::Shadowsocks2022ShadowTls,
             role: ProxyRole::Compatibility,
-            enabled: true,
+            enabled: false,
             server: "node.infiproxy.local".to_string(),
             port: 9443,
             config: ProtocolConfig::Shadowsocks2022ShadowTls {
@@ -541,9 +508,38 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
     ];
 
     for profile in defaults {
-        create_protocol_profile(pool, profile).await?;
+        ensure_protocol_profile(pool, &profile).await?;
     }
 
+    Ok(())
+}
+
+async fn ensure_protocol_profile(pool: &SqlitePool, input: &NewProtocolProfile) -> Result<()> {
+    let now = Utc::now();
+    let kind = storage_string(&input.kind)?;
+    let role = storage_string(&input.role)?;
+    let config_json = serde_json::to_string(&input.config)?;
+
+    sqlx::query(
+        r"
+        INSERT INTO protocol_profiles (
+            name, kind, role, enabled, server, port, config_json, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO NOTHING
+        ",
+    )
+    .bind(input.name.trim())
+    .bind(kind)
+    .bind(role)
+    .bind(input.enabled)
+    .bind(input.server.trim())
+    .bind(i64::from(input.port))
+    .bind(config_json)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -564,7 +560,7 @@ pub async fn create_admin(
     let username = username.trim();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO admins (
             username,
             password_hash,
@@ -572,7 +568,7 @@ pub async fn create_admin(
             updated_at
         )
         VALUES (?, ?, ?, ?)
-        "#,
+        ",
     )
     .bind(username)
     .bind(password_hash)
@@ -586,12 +582,54 @@ pub async fn create_admin(
         .ok_or_else(|| anyhow::anyhow!("admin was not created"))
 }
 
+/// Creates the first administrator with one atomic conditional insert.
+///
+/// This closes the initial-setup race where two concurrent requests could both
+/// observe an empty table before inserting separate privileged accounts.
+pub async fn create_first_admin(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+) -> Result<AdminRecord> {
+    let now = Utc::now();
+    let username = username.trim();
+    let result = sqlx::query(
+        r"
+        INSERT INTO admins (username, password_hash, created_at, updated_at)
+        SELECT ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM admins)
+        ",
+    )
+    .bind(username)
+    .bind(password_hash)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        bail!("initial administrator already exists");
+    }
+
+    get_admin_by_username(pool, username)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("initial administrator was not created"))
+}
+
+pub async fn is_owner_admin_id(pool: &SqlitePool, admin_id: i64) -> Result<bool> {
+    let owner_id = sqlx::query_scalar::<_, Option<i64>>("SELECT MIN(id) FROM admins")
+        .fetch_one(pool)
+        .await?;
+
+    Ok(owner_id == Some(admin_id))
+}
+
 pub async fn get_admin_by_username(
     pool: &SqlitePool,
     username: &str,
 ) -> Result<Option<AdminRecord>> {
     let admin = sqlx::query_as::<_, AdminRecord>(
-        r#"
+        r"
         SELECT
             id,
             username,
@@ -600,7 +638,7 @@ pub async fn get_admin_by_username(
             updated_at
         FROM admins
         WHERE username = ?
-        "#,
+        ",
     )
     .bind(username.trim())
     .fetch_optional(pool)
@@ -611,7 +649,7 @@ pub async fn get_admin_by_username(
 
 pub async fn get_admin_by_id(pool: &SqlitePool, id: i64) -> Result<Option<AdminRecord>> {
     let admin = sqlx::query_as::<_, AdminRecord>(
-        r#"
+        r"
         SELECT
             id,
             username,
@@ -620,7 +658,7 @@ pub async fn get_admin_by_id(pool: &SqlitePool, id: i64) -> Result<Option<AdminR
             updated_at
         FROM admins
         WHERE id = ?
-        "#,
+        ",
     )
     .bind(id)
     .fetch_optional(pool)
@@ -638,7 +676,7 @@ pub async fn create_admin_session(
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO admin_sessions (
             admin_id,
             token_hash,
@@ -647,7 +685,7 @@ pub async fn create_admin_session(
             last_seen_at
         )
         VALUES (?, ?, ?, ?, ?)
-        "#,
+        ",
     )
     .bind(admin_id)
     .bind(token_hash)
@@ -666,7 +704,7 @@ pub async fn get_valid_admin_session(
 ) -> Result<Option<AdminSessionRecord>> {
     let now = Utc::now();
     let session = sqlx::query_as::<_, AdminSessionRecord>(
-        r#"
+        r"
         SELECT
             id,
             admin_id,
@@ -676,7 +714,7 @@ pub async fn get_valid_admin_session(
             last_seen_at
         FROM admin_sessions
         WHERE token_hash = ? AND expires_at > ?
-        "#,
+        ",
     )
     .bind(token_hash)
     .bind(now)
@@ -690,11 +728,11 @@ pub async fn touch_admin_session(pool: &SqlitePool, token_hash: &str) -> Result<
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         UPDATE admin_sessions
         SET last_seen_at = ?
         WHERE token_hash = ?
-        "#,
+        ",
     )
     .bind(now)
     .bind(token_hash)
@@ -706,10 +744,10 @@ pub async fn touch_admin_session(pool: &SqlitePool, token_hash: &str) -> Result<
 
 pub async fn delete_admin_session(pool: &SqlitePool, token_hash: &str) -> Result<()> {
     sqlx::query(
-        r#"
+        r"
         DELETE FROM admin_sessions
         WHERE token_hash = ?
-        "#,
+        ",
     )
     .bind(token_hash)
     .execute(pool)
@@ -718,14 +756,49 @@ pub async fn delete_admin_session(pool: &SqlitePool, token_hash: &str) -> Result
     Ok(())
 }
 
+/// Replaces one administrator password and revokes every existing session in a
+/// single transaction so no old session survives a successful credential
+/// rotation.
+pub async fn update_admin_password_and_revoke_sessions(
+    pool: &SqlitePool,
+    admin_id: i64,
+    password_hash: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query(
+        r"
+        UPDATE admins
+        SET password_hash = ?, updated_at = ?
+        WHERE id = ?
+        ",
+    )
+    .bind(password_hash)
+    .bind(now)
+    .bind(admin_id)
+    .execute(&mut *transaction)
+    .await?;
+
+    if result.rows_affected() != 1 {
+        bail!("administrator not found");
+    }
+
+    sqlx::query("DELETE FROM admin_sessions WHERE admin_id = ?")
+        .bind(admin_id)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn delete_expired_admin_sessions(pool: &SqlitePool) -> Result<()> {
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         DELETE FROM admin_sessions
         WHERE expires_at <= ?
-        "#,
+        ",
     )
     .bind(now)
     .execute(pool)
@@ -738,13 +811,13 @@ pub async fn upsert_setting(pool: &SqlitePool, key: &str, value: &str) -> Result
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET
             value = excluded.value,
             updated_at = excluded.updated_at
-        "#,
+        ",
     )
     .bind(key.trim())
     .bind(value)
@@ -755,15 +828,41 @@ pub async fn upsert_setting(pool: &SqlitePool, key: &str, value: &str) -> Result
     Ok(())
 }
 
+/// Atomically writes a related group of settings with one timestamp.
+pub async fn upsert_settings(pool: &SqlitePool, values: &[(String, String)]) -> Result<()> {
+    let now = Utc::now();
+    let mut transaction = pool.begin().await?;
+
+    for (key, value) in values {
+        sqlx::query(
+            r"
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            ",
+        )
+        .bind(key.trim())
+        .bind(value)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    }
+
+    transaction.commit().await?;
+    Ok(())
+}
+
 async fn upsert_setting_if_missing(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO settings (key, value, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(key) DO NOTHING
-        "#,
+        ",
     )
     .bind(key.trim())
     .bind(value)
@@ -776,11 +875,11 @@ async fn upsert_setting_if_missing(pool: &SqlitePool, key: &str, value: &str) ->
 
 pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<SettingRecord>> {
     let setting = sqlx::query_as::<_, SettingRecord>(
-        r#"
+        r"
         SELECT key, value, updated_at
         FROM settings
         WHERE key = ?
-        "#,
+        ",
     )
     .bind(key.trim())
     .fetch_optional(pool)
@@ -791,11 +890,11 @@ pub async fn get_setting(pool: &SqlitePool, key: &str) -> Result<Option<SettingR
 
 pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingRecord>> {
     let settings = sqlx::query_as::<_, SettingRecord>(
-        r#"
+        r"
         SELECT key, value, updated_at
         FROM settings
         ORDER BY key ASC
-        "#,
+        ",
     )
     .fetch_all(pool)
     .await?;
@@ -807,13 +906,13 @@ pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result
     let now = Utc::now();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO secret_values (name, value, created_at, updated_at)
         VALUES (?, ?, ?, ?)
         ON CONFLICT(name) DO UPDATE SET
             value = excluded.value,
             updated_at = excluded.updated_at
-        "#,
+        ",
     )
     .bind(name.trim())
     .bind(value)
@@ -827,11 +926,11 @@ pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result
 
 pub async fn get_secret(pool: &SqlitePool, name: &str) -> Result<Option<SecretRecord>> {
     let secret = sqlx::query_as::<_, SecretRecord>(
-        r#"
+        r"
         SELECT name, value, created_at, updated_at
         FROM secret_values
         WHERE name = ?
-        "#,
+        ",
     )
     .bind(name.trim())
     .fetch_optional(pool)
@@ -842,16 +941,28 @@ pub async fn get_secret(pool: &SqlitePool, name: &str) -> Result<Option<SecretRe
 
 pub async fn list_secret_names(pool: &SqlitePool) -> Result<Vec<String>> {
     let rows = sqlx::query_as::<_, (String,)>(
-        r#"
+        r"
         SELECT name
         FROM secret_values
         ORDER BY name ASC
-        "#,
+        ",
     )
     .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().map(|(name,)| name).collect())
+}
+
+pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<()> {
+    let result = sqlx::query("DELETE FROM secret_values WHERE name = ?")
+        .bind(name.trim())
+        .execute(pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        bail!("secret not found");
+    }
+    Ok(())
 }
 
 pub async fn create_protocol_profile(
@@ -864,7 +975,7 @@ pub async fn create_protocol_profile(
     let config_json = serde_json::to_string(&input.config)?;
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO protocol_profiles (
             name,
             kind,
@@ -877,7 +988,7 @@ pub async fn create_protocol_profile(
             updated_at
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#,
+        ",
     )
     .bind(input.name.trim())
     .bind(kind)
@@ -901,7 +1012,7 @@ pub async fn get_protocol_profile_by_name(
     name: &str,
 ) -> Result<Option<ProtocolProfileRecord>> {
     let profile = sqlx::query_as::<_, ProtocolProfileRecord>(
-        r#"
+        r"
         SELECT
             id,
             name,
@@ -915,7 +1026,7 @@ pub async fn get_protocol_profile_by_name(
             updated_at
         FROM protocol_profiles
         WHERE name = ?
-        "#,
+        ",
     )
     .bind(name.trim())
     .fetch_optional(pool)
@@ -926,7 +1037,7 @@ pub async fn get_protocol_profile_by_name(
 
 pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolProfileRecord>> {
     let profiles = sqlx::query_as::<_, ProtocolProfileRecord>(
-        r#"
+        r"
         SELECT
             id,
             name,
@@ -940,7 +1051,7 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
             updated_at
         FROM protocol_profiles
         ORDER BY role ASC, name ASC
-        "#,
+        ",
     )
     .fetch_all(pool)
     .await?;
@@ -984,11 +1095,11 @@ pub async fn update_protocol_profile(
     let config_json = serde_json::to_string(&input.config)?;
 
     sqlx::query(
-        r#"
+        r"
         UPDATE protocol_profiles
         SET enabled = ?, server = ?, port = ?, config_json = ?, updated_at = ?
         WHERE name = ?
-        "#,
+        ",
     )
     .bind(input.enabled)
     .bind(input.server.trim())
@@ -1078,7 +1189,7 @@ fn routing_setting_key(slug: &str, field: &str) -> String {
     format!("routing.ruleset.{}.{}", slug.trim(), field)
 }
 
-fn bool_setting(value: bool) -> &'static str {
+const fn bool_setting(value: bool) -> &'static str {
     if value {
         "true"
     } else {
@@ -1107,7 +1218,7 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
     let subscription_token = Uuid::new_v4().simple().to_string();
 
     sqlx::query(
-        r#"
+        r"
         INSERT INTO users (
             username,
             uuid,
@@ -1120,7 +1231,7 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
             updated_at
         )
         VALUES (?, ?, ?, 1, ?, 0, ?, ?, ?)
-        "#,
+        ",
     )
     .bind(input.username.trim())
     .bind(uuid)
@@ -1137,7 +1248,7 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
 
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>> {
     let users = sqlx::query_as::<_, UserRecord>(
-        r#"
+        r"
         SELECT
             id,
             username,
@@ -1151,7 +1262,7 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>> {
             updated_at
         FROM users
         ORDER BY id DESC
-        "#,
+        ",
     )
     .fetch_all(pool)
     .await?;
@@ -1161,7 +1272,7 @@ pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>> {
 
 pub async fn get_user_by_token(pool: &SqlitePool, token: &str) -> Result<UserRecord> {
     let user = sqlx::query_as::<_, UserRecord>(
-        r#"
+        r"
         SELECT
             id,
             username,
@@ -1175,7 +1286,7 @@ pub async fn get_user_by_token(pool: &SqlitePool, token: &str) -> Result<UserRec
             updated_at
         FROM users
         WHERE subscription_token = ?
-        "#,
+        ",
     )
     .bind(token)
     .fetch_one(pool)
@@ -1185,7 +1296,7 @@ pub async fn get_user_by_token(pool: &SqlitePool, token: &str) -> Result<UserRec
 }
 pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
     let user = sqlx::query_as::<_, UserRecord>(
-        r#"
+        r"
         SELECT
             id,
             username,
@@ -1199,7 +1310,7 @@ pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
             updated_at
         FROM users
         WHERE id = ?
-        "#,
+        ",
     )
     .bind(id)
     .fetch_one(pool)
@@ -1212,11 +1323,11 @@ pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Resu
     let now = Utc::now();
 
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE users
         SET enabled = ?, updated_at = ?
         WHERE id = ?
-        "#,
+        ",
     )
     .bind(enabled)
     .bind(now)
@@ -1236,11 +1347,11 @@ pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result
     let new_token = Uuid::new_v4().simple().to_string();
 
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE users
         SET subscription_token = ?, updated_at = ?
         WHERE id = ?
-        "#,
+        ",
     )
     .bind(&new_token)
     .bind(now)
@@ -1257,10 +1368,10 @@ pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result
 
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
     let result = sqlx::query(
-        r#"
+        r"
         DELETE FROM users
         WHERE id = ?
-        "#,
+        ",
     )
     .bind(id)
     .execute(pool)
@@ -1298,52 +1409,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn demo_user_is_idempotent_after_token_reset() -> Result<()> {
+    async fn first_admin_creation_is_atomic() -> Result<()> {
         let (pool, path) = test_pool().await?;
+        let first_pool = pool.clone();
+        let second_pool = pool.clone();
 
-        ensure_demo_user(&pool).await?;
-        let demo = get_user_by_token(&pool, "demo").await?;
+        let (first, second) = tokio::join!(
+            create_first_admin(&first_pool, "owner-a", "hash-a"),
+            create_first_admin(&second_pool, "owner-b", "hash-b")
+        );
 
-        let new_token = reset_user_subscription_token(&pool, demo.id).await?;
-        ensure_demo_user(&pool).await?;
-
-        assert!(get_user_by_token(&pool, "demo").await.is_err());
-
-        let users = list_users(&pool).await?;
-        let demo_users: Vec<_> = users
-            .iter()
-            .filter(|user| {
-                user.username == "demo" || user.uuid == "11111111-1111-4111-8111-111111111111"
-            })
-            .collect();
-
-        assert_eq!(demo_users.len(), 1);
-        assert_eq!(demo_users[0].subscription_token.as_str(), new_token);
+        assert_ne!(first.is_ok(), second.is_ok());
+        assert_eq!(admin_count(&pool).await?, 1);
+        let owner = first
+            .ok()
+            .or_else(|| second.ok())
+            .expect("one owner exists");
+        assert!(is_owner_admin_id(&pool, owner.id).await?);
 
         close_and_remove(pool, &path).await;
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn demo_user_is_recreated_after_delete() -> Result<()> {
-        let (pool, path) = test_pool().await?;
-
-        ensure_demo_user(&pool).await?;
-        let demo = get_user_by_token(&pool, "demo").await?;
-
-        delete_user(&pool, demo.id).await?;
-        assert!(get_user_by_token(&pool, "demo").await.is_err());
-
-        ensure_demo_user(&pool).await?;
-        let recreated = get_user_by_token(&pool, "demo").await?;
-
-        assert_eq!(recreated.username, "demo");
-        assert_eq!(recreated.uuid, "11111111-1111-4111-8111-111111111111");
-        assert!(recreated.enabled);
-
-        close_and_remove(pool, &path).await;
-
         Ok(())
     }
 
@@ -1423,11 +1507,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn password_rotation_revokes_all_admin_sessions() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let admin = create_admin(&pool, "admin", "old-hash").await?;
+        create_admin_session(
+            &pool,
+            admin.id,
+            "session-token-hash",
+            Utc::now() + chrono::Duration::days(1),
+        )
+        .await?;
+
+        update_admin_password_and_revoke_sessions(&pool, admin.id, "new-hash").await?;
+
+        let updated = get_admin_by_id(&pool, admin.id)
+            .await?
+            .expect("administrator should still exist");
+        assert_eq!(updated.password_hash, "new-hash");
+        assert!(get_valid_admin_session(&pool, "session-token-hash")
+            .await?
+            .is_none());
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn settings_and_secrets_round_trip() -> Result<()> {
         let (pool, path) = test_pool().await?;
 
         upsert_setting(&pool, "subscription_domain", "atlas.example.test").await?;
         upsert_setting(&pool, "subscription_domain", "edge.example.test").await?;
+        upsert_settings(
+            &pool,
+            &[
+                ("panel_update_time".to_string(), "05:00".to_string()),
+                ("panel_update_enabled".to_string(), "true".to_string()),
+            ],
+        )
+        .await?;
 
         let setting = get_setting(&pool, "subscription_domain")
             .await?
@@ -1435,7 +1553,14 @@ mod tests {
         assert_eq!(setting.value, "edge.example.test");
 
         let settings = list_settings(&pool).await?;
-        assert_eq!(settings.len(), 1);
+        assert_eq!(settings.len(), 3);
+        let update_time = get_setting(&pool, "panel_update_time")
+            .await?
+            .expect("batched setting should exist");
+        let update_enabled = get_setting(&pool, "panel_update_enabled")
+            .await?
+            .expect("batched setting should exist");
+        assert_eq!(update_time.updated_at, update_enabled.updated_at);
 
         upsert_secret(&pool, "xray.reality.public_key", "public-key").await?;
         upsert_secret(&pool, "xray.reality.short_id", "short-id").await?;
@@ -1556,6 +1681,51 @@ mod tests {
 
         close_and_remove(pool, &path).await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_protocol_profiles_are_added_without_overwriting_existing_profiles(
+    ) -> Result<()> {
+        let (pool, path) = test_pool().await?;
+
+        ensure_default_protocol_profiles(&pool).await?;
+        let profiles = list_protocol_profiles_decoded(&pool).await?;
+        assert_eq!(profiles.len(), 6);
+        assert!(profiles
+            .iter()
+            .any(|profile| profile.kind == ProxyKind::VlessRealityTcp));
+
+        update_protocol_profile(
+            &pool,
+            UpdateProtocolProfile {
+                name: "VLESS-XHTTP-SAFE".to_string(),
+                enabled: true,
+                server: "custom.example.test".to_string(),
+                port: 9443,
+                config: ProtocolConfig::VlessRealityXhttp {
+                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
+                    server_name: "www.apple.com".to_string(),
+                    path: "/custom".to_string(),
+                    public_key_secret: "xray.reality.public_key".to_string(),
+                    short_id_secret: "xray.reality.short_id".to_string(),
+                },
+            },
+        )
+        .await?;
+
+        ensure_default_protocol_profiles(&pool).await?;
+        let profiles = list_protocol_profiles_decoded(&pool).await?;
+        assert_eq!(profiles.len(), 6);
+        let customized = profiles
+            .iter()
+            .find(|profile| profile.name == "VLESS-XHTTP-SAFE")
+            .expect("built-in profile should remain available");
+        assert!(customized.enabled);
+        assert_eq!(customized.server, "custom.example.test");
+        assert_eq!(customized.port, 9443);
+
+        close_and_remove(pool, &path).await;
         Ok(())
     }
 

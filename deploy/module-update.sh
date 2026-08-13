@@ -13,7 +13,11 @@ REQUEST_DIR="${STATE_DIR}/module-requests"
 DISABLED_DIR="${ROOT_STATE_DIR}/module-disabled"
 BUILD_DIR="${ROOT_STATE_DIR}/module-build"
 MODULE_BACKUP_ROOT="${INFIPROXY_MODULE_BACKUP_ROOT:-${ROOT_STATE_DIR}/module-backups}"
+HEADSCALE_DATA_DIR="${INFIPROXY_HEADSCALE_DATA_DIR:-/var/lib/headscale}"
+HEADSCALE_LINK="${INFIPROXY_HEADSCALE_LINK:-/usr/local/bin/headscale}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
+MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
+MAX_DOWNLOAD_BYTES="${INFIPROXY_MODULE_MAX_DOWNLOAD_BYTES:-536870912}"
 CORE_ROOT="${INFIPROXY_CORE_ROOT:-/opt/infiproxy/cores}"
 MODULE_ROOT="${INFIPROXY_MODULE_ROOT:-/opt/infiproxy/modules}"
 CORE_INSTALLER="${INFIPROXY_CORE_INSTALLER:-/usr/local/sbin/infiproxy-core-install}"
@@ -21,15 +25,21 @@ MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiprox
 HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
 PANEL_STATE="${STATE_DIR}/panel-update-state.env"
 RUN_LOG="${ROOT_STATE_DIR}/module-update.log"
-LOCK_DIR="${INFIPROXY_MODULE_UPDATE_LOCK:-/run/infiproxy-module-update.lock}"
+LOCK_FILE="${INFIPROXY_MODULE_UPDATE_LOCK_FILE:-/run/lock/infiproxy-module-update.lock}"
 GITHUB_API="https://api.github.com/repos"
+APP_USER="${INFIPROXY_USER:-infiproxy}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
+LAST_MODULE_BACKUP=""
 
 log() {
   local line
   line="$(date '+%Y-%m-%dT%H:%M:%S%z') $*"
   printf '%s\n' "$line"
   install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
+  if [[ "$MAX_LOG_BYTES" =~ ^[0-9]{4,9}$ && -f "$RUN_LOG" ]] \
+    && [[ "$(wc -c <"$RUN_LOG")" -ge "$MAX_LOG_BYTES" ]]; then
+    mv -f "$RUN_LOG" "${RUN_LOG}.1"
+  fi
   printf '%s\n' "$line" >>"$RUN_LOG"
 }
 
@@ -47,6 +57,38 @@ need_root() {
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+prepare_request_dir() {
+  local expected_uid actual_uid mode
+  expected_uid="$(id -u "$APP_USER")" || die "missing service user: ${APP_USER}"
+  if [[ ! -e "$REQUEST_DIR" && ! -L "$REQUEST_DIR" ]]; then
+    install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$REQUEST_DIR"
+  fi
+  [[ -d "$REQUEST_DIR" && ! -L "$REQUEST_DIR" ]] \
+    || die "module request path must be a real directory"
+  actual_uid="$(stat -c '%u' "$REQUEST_DIR")"
+  mode="$(stat -c '%a' "$REQUEST_DIR")"
+  [[ "$actual_uid" == "$expected_uid" ]] \
+    || die "module request directory must be owned by ${APP_USER}"
+  (( (8#$mode & 0022) == 0 )) \
+    || die "module request directory must not be group/world-writable"
+}
+
+safe_request_file() {
+  local request="$1" directory_uid request_uid mode size
+  [[ -f "$request" && ! -L "$request" ]] || return 1
+  directory_uid="$(stat -c '%u' "$REQUEST_DIR")" || return 1
+  request_uid="$(stat -c '%u' "$request")" || return 1
+  mode="$(stat -c '%a' "$request")" || return 1
+  size="$(stat -c '%s' "$request")" || return 1
+  [[ "$request_uid" == "$directory_uid" && "$size" -le 4096 ]] || return 1
+  (( (8#$mode & 0022) == 0 ))
+}
+
+discard_unsafe_request() {
+  log "discarding unsafe module request: $(basename "$1")"
+  rm -f -- "$1"
 }
 
 valid_id() {
@@ -100,9 +142,13 @@ state_value() {
 }
 
 installed_version() {
-  local file="${MODULE_VERSION_DIR}/$1.version"
+  local file="${MODULE_VERSION_DIR}/$1.version" detected
   if [[ -s "$file" ]]; then
     tr -d '[:space:]' <"$file"
+  elif [[ "$1" == "headscale" && -x "$(module_binary)" ]]; then
+    detected="$("$(module_binary)" version 2>/dev/null \
+      | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
+    [[ -n "$detected" ]] && printf '%s\n' "$detected" || echo "unknown"
   else
     echo "unknown"
   fi
@@ -117,7 +163,9 @@ normalize_version() {
 }
 
 github_json() {
-  curl --fail --silent --show-error --location --max-time 30 \
+  curl --fail --silent --show-error --location \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --connect-timeout 15 --max-time 30 --retry 3 --retry-all-errors \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     -H 'User-Agent: Infiproxy-module-updater' "$1"
@@ -129,11 +177,17 @@ download_release_asset() {
     --fail
     --location
     --show-error
+    --proto '=https'
+    --proto-redir '=https'
+    --tlsv1.2
     --retry 3
     --retry-all-errors
     --connect-timeout 15
     --max-time 600
+    --max-filesize "$MAX_DOWNLOAD_BYTES"
   )
+  [[ "$MAX_DOWNLOAD_BYTES" =~ ^[0-9]{6,10}$ ]] \
+    || die "invalid module download limit"
   [[ -n "${M_REPO:-}" && "$url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
     || die "refusing untrusted release download URL"
   if [[ "${INFIPROXY_FORCE_IPV4:-false}" == "true" ]]; then
@@ -143,15 +197,27 @@ download_release_asset() {
 }
 
 # Prints: tag|asset-name|asset-url|sha256-or-empty|checksum-url-or-empty
+asset_pattern() {
+  local arch="$1"
+  if [[ "$arch" == "amd64" ]]; then
+    printf '%s' "$M_ASSET_AMD64"
+  else
+    printf '%s' "$M_ASSET_ARM64"
+  fi
+}
+
 release_metadata() {
   local arch="$1" pattern api_json
-  if [[ "$arch" == "amd64" ]]; then
-    pattern="$M_ASSET_AMD64"
-  else
-    pattern="$M_ASSET_ARM64"
-  fi
+  pattern="$(asset_pattern "$arch")"
   api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases/latest")"
   "$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json"
+}
+
+headscale_step_metadata() {
+  local arch="$1" current="$2" pattern api_json
+  pattern="$(asset_pattern "$arch")"
+  api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases?per_page=100")"
+  "$MANIFEST_HELPER" headscale-step-metadata "$pattern" "$current" <<<"$api_json"
 }
 
 resolve_checksum() {
@@ -181,31 +247,71 @@ resolve_checksum() {
 }
 
 remember_version() {
+  local target temporary
   install -d -o root -g "$APP_GROUP" -m 0750 "$MODULE_VERSION_DIR"
-  printf '%s\n' "$2" >"${MODULE_VERSION_DIR}/$1.version"
-  chown root:"$APP_GROUP" "${MODULE_VERSION_DIR}/$1.version" 2>/dev/null || true
-  chmod 0640 "${MODULE_VERSION_DIR}/$1.version"
+  target="${MODULE_VERSION_DIR}/$1.version"
+  temporary="$(mktemp "${MODULE_VERSION_DIR}/.$1.version.XXXXXX")"
+  printf '%s\n' "$2" >"$temporary"
+  chown root:"$APP_GROUP" "$temporary" 2>/dev/null || true
+  chmod 0640 "$temporary"
+  mv -f -- "$temporary" "$target"
 }
 
 backup_module_config() {
   local was_enabled="$1" was_active="$2"
-  local module_dir backup_dir current_target timestamp
-  [[ -e "$M_CONFIG" ]] || {
+  local module_dir backup_dir current_target timestamp staging sqlite_source sqlite_target
+  local -a backup_paths=()
+  LAST_MODULE_BACKUP=""
+  if [[ -e "$M_CONFIG" || -L "$M_CONFIG" ]]; then
+    [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]] \
+      || die "refusing to back up unsafe module config: ${M_CONFIG}"
+    backup_paths+=("${M_CONFIG#/}")
+  fi
+  if [[ "${M_DRIVER:-}" == "headscale" && ( -e "$HEADSCALE_DATA_DIR" || -L "$HEADSCALE_DATA_DIR" ) ]]; then
+    [[ -d "$HEADSCALE_DATA_DIR" && ! -L "$HEADSCALE_DATA_DIR" ]] \
+      || die "refusing to back up unsafe Headscale data path: ${HEADSCALE_DATA_DIR}"
+    backup_paths+=("${HEADSCALE_DATA_DIR#/}")
+  fi
+  [[ "${#backup_paths[@]}" -gt 0 ]] || {
     log "no existing config to back up for ${M_ID}: ${M_CONFIG}"
     return
   }
-  [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]] \
-    || die "refusing to back up unsafe module config: ${M_CONFIG}"
   [[ "$BACKUP_RETENTION_DAYS" =~ ^[0-9]{1,3}$ ]] \
     || die "invalid backup retention: ${BACKUP_RETENTION_DAYS}"
 
-  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  timestamp="$(date '+%Y%m%d-%H%M%S')-$$"
   module_dir="${MODULE_BACKUP_ROOT}/${M_ID}"
   backup_dir="${module_dir}/${timestamp}"
   current_target="$(readlink -f "$(runtime_root)/current" 2>/dev/null || true)"
   install -d -o root -g root -m 0700 "$backup_dir" \
     || die "failed to create module backup directory"
-  if ! tar -C / -czf "${backup_dir}/config.tar.gz" -- "${M_CONFIG#/}"; then
+  if [[ "${M_DRIVER:-}" == "headscale" ]]; then
+    staging="${backup_dir}/root"
+    install -d -o root -g root -m 0700 "$staging"
+    if [[ -f "$M_CONFIG" ]]; then
+      install -d -o root -g root -m 0700 "${staging}/$(dirname "${M_CONFIG#/}")"
+      cp -a -- "$M_CONFIG" "${staging}/${M_CONFIG#/}"
+    fi
+    if [[ -d "$HEADSCALE_DATA_DIR" ]]; then
+      install -d -o root -g root -m 0700 "${staging}/${HEADSCALE_DATA_DIR#/}"
+      cp -a -- "$HEADSCALE_DATA_DIR"/. "${staging}/${HEADSCALE_DATA_DIR#/}/"
+      sqlite_source="${HEADSCALE_DATA_DIR}/db.sqlite"
+      sqlite_target="${staging}/${HEADSCALE_DATA_DIR#/}/db.sqlite"
+      if [[ -e "$sqlite_source" || -L "$sqlite_source" ]]; then
+        [[ -f "$sqlite_source" && ! -L "$sqlite_source" ]] \
+          || die "refusing unsafe Headscale SQLite path: ${sqlite_source}"
+        need_cmd sqlite3
+        rm -f -- "$sqlite_target" "${sqlite_target}-wal" "${sqlite_target}-shm"
+        sqlite3 "$sqlite_source" ".backup '${sqlite_target}'" \
+          || die "failed to create a consistent Headscale SQLite backup"
+      fi
+    fi
+    if ! tar -C "$staging" -czf "${backup_dir}/config.tar.gz" -- "${backup_paths[@]}"; then
+      rm -rf -- "$backup_dir"
+      die "failed to back up ${M_ID} config and state"
+    fi
+    rm -rf -- "$staging"
+  elif ! tar -C / -czf "${backup_dir}/config.tar.gz" -- "${backup_paths[@]}"; then
     rm -rf -- "$backup_dir"
     die "failed to back up ${M_ID} config"
   fi
@@ -224,7 +330,35 @@ backup_module_config() {
   find "$module_dir" -mindepth 1 -maxdepth 1 -type d \
     -mtime "+${BACKUP_RETENTION_DAYS}" -exec rm -rf -- {} + \
     || die "failed to prune old module backups"
-  log "backed up ${M_ID} config to ${backup_dir}"
+  LAST_MODULE_BACKUP="$backup_dir"
+  log "backed up ${M_ID} config and state to ${backup_dir}"
+}
+
+restore_headscale_backup() {
+  local backup_dir="$1" entry listing unsafe=0
+  [[ -n "$backup_dir" && -f "${backup_dir}/config.tar.gz" ]] \
+    || return 1
+  listing="$(mktemp)" || return 1
+  if ! tar -tzf "${backup_dir}/config.tar.gz" >"$listing"; then
+    rm -f -- "$listing"
+    return 1
+  fi
+  while IFS= read -r entry; do
+    case "$entry" in
+      "${M_CONFIG#/}"|"${HEADSCALE_DATA_DIR#/}"|"${HEADSCALE_DATA_DIR#/}/"*) ;;
+      *)
+        log "unsafe path in Headscale backup: ${entry}"
+        unsafe=1
+        break
+        ;;
+    esac
+  done <"$listing"
+  rm -f -- "$listing"
+  [[ "$unsafe" -eq 0 ]] || return 1
+  systemctl stop "$M_SERVICE" 2>/dev/null || true
+  rm -rf -- "$HEADSCALE_DATA_DIR" || return 1
+  tar -C / -xzf "${backup_dir}/config.tar.gz" || return 1
+  log "restored Headscale config and state from ${backup_dir}"
 }
 
 restore_service_state() {
@@ -235,18 +369,40 @@ restore_service_state() {
   fi
   if [[ "$was_active" -eq 1 ]]; then
     systemctl restart "$service" || return 1
+    sleep 2
     systemctl is-active --quiet "$service" || return 1
   fi
 }
 
 rollback_symlink() {
-  local current_link="$1" previous_target="$2" service="$3" was_active="$4"
+  local current_link="$1" previous_target="$2" service="$3" was_active="$4" next
   [[ -n "$previous_target" && -d "$previous_target" ]] || return 1
-  ln -sfn "$previous_target" "$current_link"
+  next="${current_link}.rollback.$$"
+  ln -s "$previous_target" "$next" || return 1
+  mv -Tf "$next" "$current_link" || {
+    rm -f "$next"
+    return 1
+  }
   if [[ "$was_active" -eq 1 ]]; then
-    systemctl restart "$service" || true
+    systemctl restart "$service" || return 1
+    sleep 2
+    systemctl is-active --quiet "$service" || return 1
   fi
   log "rolled back ${service} to ${previous_target}"
+}
+
+rollback_headscale_install() {
+  local current_link="$1" previous_target="$2" was_enabled="$3" was_active="$4"
+  systemctl stop "$M_SERVICE" 2>/dev/null || true
+  if [[ -n "$previous_target" ]]; then
+    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" 0 || return 1
+  else
+    rm -f -- "$current_link" "$HEADSCALE_LINK"
+  fi
+  if [[ -n "$LAST_MODULE_BACKUP" ]]; then
+    restore_headscale_backup "$LAST_MODULE_BACKUP" || return 1
+  fi
+  restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"
 }
 
 ensure_headscale_unit() {
@@ -276,8 +432,24 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/etc/headscale /var/lib/headscale
+ReadOnlyPaths=/etc/headscale /opt/infiproxy/modules/headscale
+ReadWritePaths=/var/lib/headscale
 RuntimeDirectory=headscale
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RemoveIPC=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
@@ -296,20 +468,48 @@ install_headscale_binary() {
   install -d -m 0755 "$target"
   install -m 0755 "$archive" "${target}/${M_BINARY}"
   "${target}/${M_BINARY}" version >/dev/null
-  ln -sfn "$target" "$next"
-  mv -Tf "$next" "$current_link"
-  ln -sfn "${current_link}/${M_BINARY}" /usr/local/bin/headscale
   ensure_headscale_unit
+  if [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]]; then
+    if [[ "$was_active" -eq 1 ]]; then
+      systemctl stop "$M_SERVICE" \
+        || die "could not stop ${M_SERVICE} before its database migration canary"
+    fi
+    if ! "${target}/${M_BINARY}" -c "$M_CONFIG" configtest >/dev/null; then
+      if rollback_headscale_install \
+          "$current_link" "$previous_target" "$was_enabled" "$was_active"; then
+        die "Headscale ${version} rejected the current configuration; previous state was restored"
+      fi
+      die "Headscale ${version} config canary failed and automatic rollback was incomplete"
+    fi
+  fi
+  if ! ln -sfn "$target" "$next" \
+    || ! mv -Tf "$next" "$current_link" \
+    || ! ln -sfn "${current_link}/${M_BINARY}" "$HEADSCALE_LINK"; then
+    rm -f -- "$next"
+    rollback_headscale_install \
+      "$current_link" "$previous_target" "$was_enabled" "$was_active" || true
+    die "could not activate Headscale ${version}; previous state was restored where possible"
+  fi
   if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
-    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
-    die "${M_SERVICE} failed after update; previous binary was restored"
+    if rollback_headscale_install \
+        "$current_link" "$previous_target" "$was_enabled" "$was_active"; then
+      die "${M_SERVICE} failed after update; previous binary and state were restored"
+    fi
+    die "${M_SERVICE} failed after update and automatic rollback was incomplete; service was stopped"
   fi
 }
 
 install_release_module() {
-  local metadata tag asset url digest checksum_url checksum tmp normalized
+  local metadata tag asset url digest checksum_url checksum tmp normalized current
   local was_enabled=0 was_active=0 current_link previous_target
-  metadata="$(release_metadata "$(host_arch)")"
+  if [[ "$M_DRIVER" == "headscale" && -x "$(module_binary)" ]]; then
+    current="$(installed_version "$M_ID")"
+    [[ "$current" != "unknown" ]] \
+      || die "cannot determine installed Headscale version; refusing an unsafe version jump"
+    metadata="$(headscale_step_metadata "$(host_arch)" "$current")"
+  else
+    metadata="$(release_metadata "$(host_arch)")"
+  fi
   IFS='|' read -r tag asset url digest checksum_url <<<"$metadata"
   [[ "$url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
     || die "refusing unexpected release URL for ${M_ID}"
@@ -323,15 +523,15 @@ install_release_module() {
     return
   fi
 
-  systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
-  systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
-  backup_module_config "$was_enabled" "$was_active"
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"; trap - RETURN' RETURN
   download_release_asset "${tmp}/${asset}" "$url" \
     || die "failed to download ${asset}"
   printf '%s  %s\n' "$checksum" "${tmp}/${asset}" | sha256sum -c - \
     || die "checksum verification failed for ${asset}"
+  systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
+  systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
+  backup_module_config "$was_enabled" "$was_active"
 
   if [[ "$M_DRIVER" == "headscale" ]]; then
     install_headscale_binary "$tag" "${tmp}/${asset}" "$was_enabled" "$was_active"
@@ -343,8 +543,10 @@ install_release_module() {
     "$CORE_INSTALLER" --core "$M_ID" --version "$normalized" \
       --archive "${tmp}/${asset}" --sha256 "$checksum" --binary "$M_BINARY"
     if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
-      rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
-      die "${M_SERVICE} failed after update; previous binary was restored"
+      if rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active"; then
+        die "${M_SERVICE} failed after update; previous binary and service were restored"
+      fi
+      die "${M_SERVICE} failed after update and automatic rollback was incomplete"
     fi
   fi
   remember_version "$M_ID" "$tag"
@@ -358,6 +560,7 @@ latest_commit() {
 
 install_source_module() {
   local commit source binary checksum current_link previous_target
+  local build_jobs="${INFIPROXY_BUILD_JOBS:-2}"
   local was_enabled=0 was_active=0
   [[ "$M_DRIVER" == "mtproto-source" ]] || die "unsupported source driver"
   commit="$(latest_commit)"
@@ -378,7 +581,9 @@ install_source_module() {
   fi
   git -C "$source" checkout --force --detach "$commit"
   git -C "$source" clean -fdx
-  make -C "$source" -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  [[ "$build_jobs" =~ ^[1-9][0-9]?$ && "$build_jobs" -le 16 ]] \
+    || die "INFIPROXY_BUILD_JOBS must be between 1 and 16"
+  make -C "$source" -j"$build_jobs"
   binary="${source}/objs/bin/${M_BINARY}"
   [[ -x "$binary" ]] || die "source build did not produce ${binary}"
   checksum="$(sha256sum "$binary" | awk '{print $1}')"
@@ -390,8 +595,10 @@ install_source_module() {
   "$CORE_INSTALLER" --core "$M_ID" --version "$commit" --archive "$binary" \
     --sha256 "$checksum" --binary "$M_BINARY"
   if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
-    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active" || true
-    die "${M_SERVICE} failed after update; previous binary was restored"
+    if rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active"; then
+      die "${M_SERVICE} failed after update; previous binary and service were restored"
+    fi
+    die "${M_SERVICE} failed after update and automatic rollback was incomplete"
   fi
   remember_version "$M_ID" "$commit"
   log "updated ${M_ID}: ${commit:0:12}"
@@ -435,6 +642,11 @@ register_requested() {
   install -d -o root -g root -m 0750 "$DISABLED_DIR"
   shopt -s nullglob
   for request in "$REQUEST_DIR"/*.register; do
+    if ! safe_request_file "$request"; then
+      discard_unsafe_request "$request"
+      failed=1
+      continue
+    fi
     id="$(basename "$request" .register)"
     source="${AVAILABLE_DIR}/${id}.module"
     target="$(manifest_file "$id")"
@@ -469,6 +681,11 @@ remove_requested() {
   install -d -o root -g root -m 0755 "$AVAILABLE_DIR"
   shopt -s nullglob
   for request in "$REQUEST_DIR"/*.remove; do
+    if ! safe_request_file "$request"; then
+      discard_unsafe_request "$request"
+      failed=1
+      continue
+    fi
     id="$(basename "$request" .remove)"
     if load_module "$id"; then
       if [[ ! -e "${AVAILABLE_DIR}/${id}.module" ]]; then
@@ -492,10 +709,14 @@ remove_requested() {
 
 run_requested() {
   local module request failed=0
-  install -d -m 0750 "$REQUEST_DIR"
   while IFS= read -r module; do
     request="${REQUEST_DIR}/${module}.request"
     [[ -f "$request" ]] || continue
+    if ! safe_request_file "$request"; then
+      discard_unsafe_request "$request"
+      failed=1
+      continue
+    fi
     if (update_module "$module"); then
       rm -f "$request" "${request}.failed"
     else
@@ -509,7 +730,7 @@ run_requested() {
 
 run_automatic() {
   local schedule_time hour minute current_hour current_minute schedule_total current_total
-  local today marker module state_file enabled installed failed=0
+  local today marker marker_tmp module state_file enabled installed failed=0
   schedule_time="$(state_value "$PANEL_STATE" SCHEDULE_TIME || true)"
   schedule_time="${schedule_time:-05:00}"
   [[ "$schedule_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
@@ -536,8 +757,11 @@ run_automatic() {
     fi
   done < <(module_ids)
   [[ "$failed" -eq 0 ]] || return 1
-  printf '%s\n' "$today" >"$marker"
-  chmod 0640 "$marker"
+  install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
+  marker_tmp="$(mktemp "${ROOT_STATE_DIR}/.module-last-auto-date.XXXXXX")"
+  printf '%s\n' "$today" >"$marker_tmp"
+  chmod 0640 "$marker_tmp"
+  mv -f -- "$marker_tmp" "$marker"
 }
 
 run_due() {
@@ -545,19 +769,20 @@ run_due() {
   if [[ -x "$HEADSCALE_CONTROL_HELPER" ]]; then
     "$HEADSCALE_CONTROL_HELPER" --process || failed=1
   fi
-  register_requested || true
-  remove_requested || true
-  run_requested || true
+  register_requested || failed=1
+  remove_requested || failed=1
+  run_requested || failed=1
   run_automatic || failed=1
   return "$failed"
 }
 
 with_lock() {
-  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  install -d -o root -g root -m 0755 "$(dirname "$LOCK_FILE")"
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
     log "another module updater is already running"
     return 0
   fi
-  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
   "$@"
 }
 
@@ -576,8 +801,10 @@ EOF
 main() {
   need_root
   need_cmd curl
+  need_cmd flock
   need_cmd sha256sum
   need_cmd tar
+  prepare_request_dir
   [[ -x "$MANIFEST_HELPER" ]] || die "module manifest helper is missing"
   "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned >/dev/null \
     || die "module registry validation failed"

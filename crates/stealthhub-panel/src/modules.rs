@@ -4,7 +4,7 @@
 //! the registry, discover upstream versions and create fixed-format requests,
 //! but it never downloads binaries or executes package-management commands.
 
-use crate::ui::APP_NAME;
+use crate::{atomic_file, ui::APP_NAME};
 use chrono::Utc;
 use serde::Deserialize;
 use sqlx::SqlitePool;
@@ -17,10 +17,10 @@ use std::{
 pub(crate) use stealthhub_core::module_manifest::{ModuleSpec, UpstreamKind};
 use stealthhub_core::{
     module_manifest::{load_registry, valid_id, ReadOptions},
-    storage::{get_setting, upsert_setting},
+    storage::{get_setting, upsert_setting, upsert_settings},
 };
 
-const CHECK_INTERVAL: Duration = Duration::from_secs(2 * 60 * 60);
+const CHECK_INTERVAL: Duration = Duration::from_hours(2);
 const INITIAL_DELAY: Duration = Duration::from_secs(35);
 const DEFAULT_MANIFEST_DIR: &str = "/etc/infiproxy-modules.d";
 const DEFAULT_AVAILABLE_DIR: &str = "/etc/infiproxy-modules.available.d";
@@ -92,7 +92,7 @@ pub(crate) async fn refresh_all(pool: &SqlitePool) -> anyhow::Result<Vec<ModuleS
             Ok(status) => statuses.push(status),
             Err(err) => {
                 tracing::warn!(module = spec.id, "upstream check failed: {err}");
-                persist_check_error(pool, &spec, &err.to_string()).await?;
+                persist_check_error(pool, &spec).await?;
                 statuses.push(load_one(pool, spec).await?);
             }
         }
@@ -236,9 +236,9 @@ fn write_request(module_id: &str, extension: &str, content: &str) -> anyhow::Res
     }
     let directory = request_dir();
     fs::create_dir_all(&directory)?;
+    secure_private_directory(&directory)?;
     let path = directory.join(format!("{module_id}.{extension}"));
-    fs::write(&path, content)?;
-    set_private_permissions(&directory, &path);
+    atomic_file::replace(&path, content.as_bytes(), 0o640)?;
     Ok(())
 }
 
@@ -343,33 +343,34 @@ async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleS
 }
 
 async fn persist_status(pool: &SqlitePool, status: &ModuleStatus) -> anyhow::Result<()> {
-    for (suffix, value) in [
-        ("latest_version", status.latest_version.as_str()),
-        ("checked_at", status.checked_at.as_str()),
-        ("status", status.status.as_str()),
-    ] {
-        upsert_setting(pool, &setting_key(&status.spec.id, suffix), value).await?;
-    }
-    Ok(())
+    upsert_settings(
+        pool,
+        &[
+            (
+                setting_key(&status.spec.id, "latest_version"),
+                status.latest_version.clone(),
+            ),
+            (
+                setting_key(&status.spec.id, "checked_at"),
+                status.checked_at.clone(),
+            ),
+            (
+                setting_key(&status.spec.id, "status"),
+                status.status.clone(),
+            ),
+        ],
+    )
+    .await
 }
 
-async fn persist_check_error(
-    pool: &SqlitePool,
-    spec: &ModuleSpec,
-    error: &str,
-) -> anyhow::Result<()> {
-    let message = format!(
-        "check failed: {}",
-        error.chars().take(120).collect::<String>()
-    );
-    upsert_setting(pool, &setting_key(&spec.id, "status"), &message).await
+async fn persist_check_error(pool: &SqlitePool, spec: &ModuleSpec) -> anyhow::Result<()> {
+    upsert_setting(pool, &setting_key(&spec.id, "status"), "check failed").await
 }
 
 async fn load_auto_update(pool: &SqlitePool, module_id: &str) -> anyhow::Result<bool> {
     Ok(get_setting(pool, &setting_key(module_id, "auto_update"))
         .await?
-        .map(|setting| crate::update::parse_bool_setting(&setting.value))
-        .unwrap_or(true))
+        .is_none_or(|setting| crate::update::parse_bool_setting(&setting.value)))
 }
 
 async fn setting_or_default(
@@ -380,8 +381,7 @@ async fn setting_or_default(
 ) -> anyhow::Result<String> {
     Ok(get_setting(pool, &setting_key(module_id, suffix))
         .await?
-        .map(|setting| setting.value)
-        .unwrap_or_else(|| default_value.to_string()))
+        .map_or_else(|| default_value.to_string(), |setting| setting.value))
 }
 
 fn installed_version(spec: &ModuleSpec) -> String {
@@ -413,6 +413,7 @@ fn github_client() -> anyhow::Result<reqwest::Client> {
 fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
     let directory = state_dir();
     fs::create_dir_all(&directory)?;
+    secure_private_directory(&directory)?;
     let content = format!(
         concat!(
             "AUTO_ENABLED={}\nINSTALLED={}\nUPDATE_AVAILABLE={}\n",
@@ -426,18 +427,21 @@ fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
         safe_state_value(&status.checked_at),
     );
     let path = directory.join(format!("{}.env", status.spec.id));
-    fs::write(&path, content)?;
-    set_private_permissions(&directory, &path);
+    atomic_file::replace(&path, content.as_bytes(), 0o640)?;
     Ok(())
 }
 
-fn set_private_permissions(directory: &Path, file: &Path) {
+fn secure_private_directory(directory: &Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!("module state path must be a real directory");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o750));
-        let _ = fs::set_permissions(file, fs::Permissions::from_mode(0o640));
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o750))?;
     }
+    Ok(())
 }
 
 fn manifest_dir() -> PathBuf {
@@ -466,20 +470,17 @@ fn available_dir() -> PathBuf {
 
 fn state_dir() -> PathBuf {
     std::env::var_os("INFIPROXY_MODULE_STATE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR))
+        .map_or_else(|| PathBuf::from(DEFAULT_STATE_DIR), PathBuf::from)
 }
 
 fn request_dir() -> PathBuf {
     std::env::var_os("INFIPROXY_MODULE_REQUEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_REQUEST_DIR))
+        .map_or_else(|| PathBuf::from(DEFAULT_REQUEST_DIR), PathBuf::from)
 }
 
 fn version_dir() -> PathBuf {
     std::env::var_os("INFIPROXY_MODULE_VERSION_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_VERSION_DIR))
+        .map_or_else(|| PathBuf::from(DEFAULT_VERSION_DIR), PathBuf::from)
 }
 
 fn registry_options(directory: &Path) -> ReadOptions {
@@ -501,7 +502,7 @@ fn normalize_version(value: &str) -> &str {
         .unwrap_or(value)
 }
 
-fn bool_str(value: bool) -> &'static str {
+const fn bool_str(value: bool) -> &'static str {
     if value {
         "true"
     } else {
@@ -538,5 +539,29 @@ mod tests {
     #[test]
     fn unsafe_module_inputs_are_rejected() {
         assert!(!valid_id("../root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_module_directories_reject_symlinks() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let root = std::env::temp_dir().join(format!(
+            "infiproxy-module-dir-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let target = root.join("target");
+        let link = root.join("state");
+        fs::create_dir_all(&target).expect("test directory should be created");
+        symlink(&target, &link).expect("test symlink should be created");
+
+        assert!(secure_private_directory(&link).is_err());
+
+        fs::remove_dir_all(root).expect("test directory should be removed");
     }
 }

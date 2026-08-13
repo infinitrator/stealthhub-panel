@@ -8,9 +8,19 @@ SQLite + one SSH TUI**. The panel does not implement proxy protocols itself.
 Network traffic is handled by external cores such as Xray, sing-box, Hysteria,
 TUIC and Telegram MTProxy.
 
+Full Russian operator and networking documentation is available in the
+[`wiki/`](./wiki/Home.md): installation, every web/TUI control, protocols,
+routing, modules, Headscale, backups, security and troubleshooting.
+After the one-time GitHub Wiki initialization, the same versioned pages are
+published at the [Infiproxy GitHub Wiki](https://github.com/infinitrator/stealthhub-panel/wiki).
+
+Current release line: `0.1.0-beta.1`.
+
 ## Quick Install
 
-Recommended target: a fresh Ubuntu 22.04/24.04 or Debian 12 VPS.
+Primary target: a fresh Ubuntu 24.04 LTS or Debian 12 VPS. Ubuntu 22.04 LTS is
+kept as a compatibility target, but the release gate is centered on the newer
+base systems.
 
 One command for the full guided install:
 
@@ -128,10 +138,10 @@ Panel self-updates are split into two layers:
   button creates this file for immediate update.
 - The root updater uses `/opt/infiproxy/source`, rebuilds the release binary and
   reruns the idempotent installer. Before changing the source revision it creates
-  fail-closed backups of the binary, SQLite database, panel/core/Headscale
-  settings, module manifests and Nginx configuration. A failed update restores
-  the previous database, configs, binary and source revision. Root-only logs,
-  backups, build files and applied-version markers live in
+  fail-closed backups of the panel and control-helper binaries, SQLite database,
+  panel/core/Headscale settings, module manifests and Nginx configuration. A
+  failed update restores the previous database, configs, binaries and source
+  revision. Root-only logs, backups, build files and applied-version markers live in
   `/var/lib/infiproxy-maintenance`, separate from web-writable state.
 
 Change automatic-update enablement and maintenance time in `/admin/settings`.
@@ -153,7 +163,8 @@ Manifest parsing and GitHub metadata validation use the native
 of the base panel or module updater; it is installed only with the optional
 Certbot Cloudflare DNS plugin.
 
-Release downloads use bounded retries and timeouts. Set
+Release downloads use HTTPS-only redirects, bounded retries/timeouts and archive
+size/extraction limits. Set
 `INFIPROXY_FORCE_IPV4=true` for the root updater only when a host has broken IPv6;
 the default keeps normal dual-stack behavior. Every module update preserves its
 config and creates a root-only backup under
@@ -277,7 +288,7 @@ TCP 127.0.0.1:8080      Infiproxy panel
 TCP 127.0.0.1:8088      Headscale control server
 TCP 127.0.0.1:9098      Headscale metrics/debug
 TCP 127.0.0.1:50443     Headscale local gRPC
-TCP/UDP 8443            Telegram MTProto proxy
+TCP 8444                Telegram MTProto proxy
 UDP 443                 Hysteria2 starter config
 UDP 11443               TUIC starter config
 ```
@@ -357,7 +368,8 @@ INFIPROXY_BIND=127.0.0.1:8080
 INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
 INFIPROXY_DB_MAX_CONNECTIONS=2
 INFIPROXY_COOKIE_SECURE=true
-INFIPROXY_ENABLE_DEMO_USER=false
+INFIPROXY_SETUP_TOKEN=<installer-generated-64-hex-token>
+INFIPROXY_CURRENT_COMMIT=<installed-git-commit>
 ```
 
 Shell and terminal execution are intentionally unavailable in the web panel.
@@ -397,9 +409,10 @@ through the normal in-place panel update without a reinstall.
 ## Local Development
 
 ```bash
+export INFIPROXY_SETUP_TOKEN="$(openssl rand -hex 32)"
 INFIPROXY_BIND=127.0.0.1:8080 \
 INFIPROXY_DB='sqlite://./infiproxy.local.sqlite?mode=rwc' \
-INFIPROXY_ENABLE_DEMO_USER=true \
+INFIPROXY_COOKIE_SECURE=false \
 cargo run -p stealthhub-panel
 ```
 
@@ -409,23 +422,46 @@ Open:
 http://127.0.0.1:8080/admin/setup
 ```
 
-Create a test user:
+## Publishing A Beta Release
+
+Run the checks below, commit the complete release state, push `main`, and wait
+for the **Rust** workflow to succeed. Then create the annotated beta tag:
 
 ```bash
-cargo run -p stealthhub-cli -- create-user --username test-local --traffic-limit-gb 10
-cargo run -p stealthhub-cli -- list-users
+git tag -a v0.1.0-beta.1 -m 'Infiproxy 0.1.0 beta 1'
+git push origin v0.1.0-beta.1
 ```
+
+The **Release** workflow builds the Linux x86_64 package with Rust 1.96.0,
+publishes `infiproxy-linux-x86_64.tar.gz` and its SHA-256 file, and marks tags
+containing `-` as prereleases. Do not move or reuse a published tag. The normal
+one-command installer follows the reviewed `main` update channel; for an exact
+immutable beta installation use the tagged bootstrap:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/v0.1.0-beta.1/deploy/bootstrap.sh \
+  | sudo bash -s -- --ref v0.1.0-beta.1 --guided --with-nginx
+```
+
+An installation pinned to a tag does not discover later commits on `main`.
+Rerun bootstrap with `--ref main` only when you intentionally switch that host
+to the rolling update channel.
 
 ## Project Checks
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check --locked --workspace --all-targets --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
 cargo audit
-bash -n deploy/bootstrap.sh deploy/install.sh deploy/panel-update.sh deploy/module-update.sh deploy/cores/install-core.sh deploy/infiproxy-manager.sh deploy/infiproxy-profile.sh
+cargo deny check
+bash deploy/tests/wiki-check.sh
+cargo build --locked -p stealthhub-panel --bins
+bash deploy/tests/updater-regression.sh
+bash deploy/tests/http-smoke.sh
 bash deploy/install.sh --check
+bash deploy/bootstrap.sh --check --src-dir "$PWD"
 ```
 
 ## License

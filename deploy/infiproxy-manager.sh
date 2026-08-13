@@ -2,8 +2,8 @@
 # Minimal SSH control surface for Infiproxy VPS installs.
 #
 # The manager intentionally stays dependency-light: plain Bash, systemd, curl,
-# certbot and Python for tiny JSON parsing. Destructive actions require root and
-# explicit confirmation; Cloudflare tokens are never echoed back to the terminal.
+# certbot and small Rust helpers. Destructive actions require root and explicit
+# confirmation; Cloudflare tokens are never echoed back to the terminal.
 set -Eeuo pipefail
 
 APP="Infiproxy"
@@ -38,6 +38,7 @@ HEADSCALE_LISTEN_ADDR="${INFIPROXY_HEADSCALE_LISTEN_ADDR:-127.0.0.1:8088}"
 HEADSCALE_METRICS_ADDR="${INFIPROXY_HEADSCALE_METRICS_ADDR:-127.0.0.1:9098}"
 HEADSCALE_GRPC_ADDR="${INFIPROXY_HEADSCALE_GRPC_ADDR:-127.0.0.1:50443}"
 HEADSCALE_LATEST_API="https://api.github.com/repos/juanfont/headscale/releases/latest"
+MAX_MTPROTO_CONFIG_BYTES=8388608
 
 green=$'\033[38;5;71m'
 soft=$'\033[38;5;250m'
@@ -209,6 +210,14 @@ require_cmd() {
   fi
 }
 
+https_curl() {
+  require_cmd curl || return 1
+  curl --proto '=https' --proto-redir '=https' --tlsv1.2 \
+    --fail --silent --show-error --location \
+    --connect-timeout 10 --max-time 30 \
+    --retry 3 --retry-all-errors "$@"
+}
+
 valid_domain() {
   [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
@@ -230,8 +239,31 @@ valid_port() {
   [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
 }
 
+# Publish root-helper requests only after their owner, mode and content are
+# complete. The systemd path watcher ignores the hidden staging filename.
+write_module_request() {
+  local id="$1" suffix="$2" target temp
+
+  [[ "$id" =~ ^[a-z][a-z0-9-]{0,31}$ ]] || return 1
+  [[ "$suffix" == "register" || "$suffix" == "remove" ]] || return 1
+  install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$MODULE_REQUEST_DIR"
+  target="${MODULE_REQUEST_DIR}/${id}.${suffix}"
+  temp="$(mktemp "${MODULE_REQUEST_DIR}/.${id}.${suffix}.XXXXXX")"
+  if ! printf 'requested_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$temp" \
+    || ! chown "$APP_USER":"$APP_GROUP" "$temp" \
+    || ! chmod 0640 "$temp" \
+    || ! mv -f -- "$temp" "$target"; then
+    rm -f -- "$temp"
+    return 1
+  fi
+}
+
 valid_mtproto_secret() {
   [[ "$1" =~ ^[A-Fa-f0-9]{32}$ ]]
+}
+
+valid_cloudflare_token() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]{20,200}$ ]]
 }
 
 valid_headscale_user() {
@@ -239,7 +271,7 @@ valid_headscale_user() {
 }
 
 public_ip() {
-  curl -fsSL --max-time 10 https://api.ipify.org
+  https_curl --max-time 10 https://api.ipify.org
 }
 
 random_mtproto_secret() {
@@ -268,8 +300,7 @@ headscale_arch() {
 }
 
 headscale_latest_version() {
-  require_cmd curl || return 1
-  curl -fsSL --max-time 20 "$HEADSCALE_LATEST_API" \
+  https_curl --max-time 20 "$HEADSCALE_LATEST_API" \
     | "$MODULE_MANIFEST_HELPER" release-tag \
     | sed 's/^v//'
 }
@@ -282,6 +313,17 @@ headscale_cmd() {
   headscale -c "$HEADSCALE_CONFIG" "$@"
 }
 
+headscale_configtest() {
+  headscale -c "$1" configtest
+}
+
+publish_staged_file() {
+  local staged="$1" target="$2" owner="$3" group="$4" mode="$5"
+  chown "$owner":"$group" "$staged"
+  chmod "$mode" "$staged"
+  mv -f -- "$staged" "$target"
+}
+
 json_first_id() {
   "$MODULE_MANIFEST_HELPER" cloudflare-first-id
 }
@@ -290,7 +332,9 @@ cloudflare_get() {
   local token="$1"
   local url="$2"
   shift 2
-  curl -fsS \
+  valid_cloudflare_token "$token" \
+    || { echo "${danger}Invalid Cloudflare API token format.${reset}" >&2; return 1; }
+  https_curl \
     --config <(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$token") \
     --get "$@" "$url"
 }
@@ -319,12 +363,15 @@ cloudflare_write_a_record() {
 
   require_cmd curl || return 1
   [[ -x "$MODULE_MANIFEST_HELPER" ]] || return 1
-  [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
+  valid_cloudflare_token "$token" \
+    || { echo "${danger}Invalid Cloudflare API token format.${reset}" >&2; return 1; }
   valid_domain "$zone" || { echo "${danger}Invalid zone: $zone${reset}" >&2; return 1; }
   valid_domain "$record" || { echo "${danger}Invalid record: $record${reset}" >&2; return 1; }
   valid_ipv4 "$ip" || { echo "${danger}Invalid IPv4: $ip${reset}" >&2; return 1; }
+  [[ "$proxied" == "true" || "$proxied" == "false" ]] \
+    || { echo "${danger}Invalid Cloudflare proxy mode.${reset}" >&2; return 1; }
 
-  local zone_id record_id payload method url
+  local zone_id record_id payload method url response
   zone_id="$(cloudflare_zone_id "$token" "$zone")"
   if [[ -z "$zone_id" ]]; then
     echo "${danger}Cloudflare zone not found: $zone${reset}" >&2
@@ -341,10 +388,11 @@ cloudflare_write_a_record() {
     url="${CF_API}/zones/${zone_id}/dns_records"
   fi
 
-  curl -fsS -X "$method" \
+  response="$(https_curl -X "$method" \
     --config <(printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$token") \
     --data "$payload" \
-    "$url" >/dev/null
+    "$url")" || return 1
+  printf '%s' "$response" | "$MODULE_MANIFEST_HELPER" cloudflare-success || return 1
   echo "${green}Cloudflare A record ready: ${record} -> ${ip}${reset}"
 }
 
@@ -433,10 +481,13 @@ restart_menu() {
       ;;
     5)
       need_root
-      if have_cmd headscale; then
-        headscale_cmd configtest || true
+      if ! have_cmd headscale; then
+        echo "${danger}headscale is not installed.${reset}" >&2
+      elif headscale_cmd configtest; then
+        run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+      else
+        echo "${danger}Headscale config validation failed; service was not restarted.${reset}" >&2
       fi
-      run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
       ;;
     6)
       need_root
@@ -581,14 +632,26 @@ download_mtproto_upstream_config() {
   secret_tmp="$(mktemp)"
   config_tmp="$(mktemp)"
 
-  if ! curl -fsSL --max-time 30 "$MTPROTO_SECRET_URL" -o "$secret_tmp"; then
+  if ! https_curl --max-filesize "$MAX_MTPROTO_CONFIG_BYTES" \
+    "$MTPROTO_SECRET_URL" -o "$secret_tmp"; then
     rm -f "$secret_tmp" "$config_tmp"
     echo "${danger}Failed to download Telegram proxy-secret.${reset}" >&2
     return 1
   fi
-  if ! curl -fsSL --max-time 30 "$MTPROTO_CONFIG_URL" -o "$config_tmp"; then
+  if ! https_curl --max-filesize "$MAX_MTPROTO_CONFIG_BYTES" \
+    "$MTPROTO_CONFIG_URL" -o "$config_tmp"; then
     rm -f "$secret_tmp" "$config_tmp"
     echo "${danger}Failed to download Telegram proxy-multi.conf.${reset}" >&2
+    return 1
+  fi
+  local secret_size config_size
+  secret_size="$(wc -c <"$secret_tmp" | tr -d '[:space:]')"
+  config_size="$(wc -c <"$config_tmp" | tr -d '[:space:]')"
+  if [[ ! "$secret_size" =~ ^[0-9]+$ || ! "$config_size" =~ ^[0-9]+$ ]] \
+    || ((secret_size < 1 || secret_size > MAX_MTPROTO_CONFIG_BYTES)) \
+    || ((config_size < 1 || config_size > MAX_MTPROTO_CONFIG_BYTES)); then
+    rm -f "$secret_tmp" "$config_tmp"
+    echo "${danger}Telegram upstream config is empty or exceeds the safety limit.${reset}" >&2
     return 1
   fi
   install -m 0640 -o root -g "$APP_GROUP" "$secret_tmp" "$MTPROTO_DIR/proxy-secret"
@@ -652,7 +715,7 @@ guided_mtproto_setup() {
   if [[ -z "$host" ]]; then
     host="$(public_ip || true)"
   fi
-  prompt_value port "Telegram MTProto" "Public proxy port" "8443" || return
+  prompt_value port "Telegram MTProto" "Public proxy port" "8444" || return
   prompt_value stats_port "Telegram MTProto" "Local statistics port" "8888" || return
   prompt_value workers "Telegram MTProto" "Worker processes" "2" || return
   secret="$(random_mtproto_secret)"
@@ -739,18 +802,29 @@ secure_headscale_paths() {
 write_headscale_config() {
   local server_url="$1"
   local base_domain="$2"
+  local backup="" temp="" restore_temp="" authority host port="" was_active=0
 
+  require_cmd headscale || return 1
   [[ "$server_url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || {
     echo "${danger}Headscale server URL must look like https://hs.example.com${reset}" >&2
+    return 1
+  }
+  authority="${server_url#https://}"
+  host="${authority%%:*}"
+  [[ "$authority" == "$host" ]] || port="${authority##*:}"
+  valid_domain "$host" || {
+    echo "${danger}Headscale server URL contains an invalid domain.${reset}" >&2
+    return 1
+  }
+  [[ -z "$port" ]] || valid_port "$port" || {
+    echo "${danger}Headscale server URL contains an invalid port.${reset}" >&2
     return 1
   }
   valid_domain "$base_domain" || { echo "${danger}Invalid MagicDNS base domain: $base_domain${reset}" >&2; return 1; }
 
   secure_headscale_paths
-  if [[ -f "$HEADSCALE_CONFIG" ]]; then
-    cp -a "$HEADSCALE_CONFIG" "${HEADSCALE_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-  cat >"$HEADSCALE_CONFIG" <<EOF
+  temp="$(mktemp "${HEADSCALE_CONFIG}.tmp.XXXXXX")"
+  cat >"$temp" <<EOF
 server_url: ${server_url}
 listen_addr: ${HEADSCALE_LISTEN_ADDR}
 metrics_listen_addr: ${HEADSCALE_METRICS_ADDR}
@@ -766,7 +840,7 @@ noise:
 prefixes:
   v4: 100.64.0.0/10
   v6: fd7a:115c:a1e0::/48
-allocation: sequential
+  allocation: sequential
 
 derp:
   server:
@@ -830,11 +904,50 @@ taildrop:
 auto_update:
   enabled: false
 EOF
-  chown root:"$APP_GROUP" "$HEADSCALE_CONFIG" 2>/dev/null || true
-  chmod 0660 "$HEADSCALE_CONFIG" 2>/dev/null || true
 
-  if have_cmd headscale; then
-    headscale_cmd configtest
+  if [[ -f "$HEADSCALE_CONFIG" && ! -L "$HEADSCALE_CONFIG" ]]; then
+    backup="${HEADSCALE_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$HEADSCALE_CONFIG" "$backup"
+  elif [[ -e "$HEADSCALE_CONFIG" || -L "$HEADSCALE_CONFIG" ]]; then
+    rm -f -- "$temp"
+    echo "${danger}Refusing to replace a non-regular Headscale config.${reset}" >&2
+    return 1
+  fi
+
+  if systemctl is-active --quiet "$HEADSCALE_SERVICE" 2>/dev/null; then
+    was_active=1
+    if ! systemctl stop "$HEADSCALE_SERVICE"; then
+      rm -f -- "$temp"
+      echo "${danger}Could not stop Headscale for a safe config test.${reset}" >&2
+      return 1
+    fi
+  fi
+
+  if ! headscale_configtest "$temp"; then
+    rm -f -- "$temp"
+    [[ "$was_active" -eq 0 ]] || systemctl start "$HEADSCALE_SERVICE" || true
+    echo "${danger}Headscale rejected the generated config; the active file was not changed.${reset}" >&2
+    return 1
+  fi
+
+  if ! publish_staged_file "$temp" "$HEADSCALE_CONFIG" root "$APP_GROUP" 0660; then
+    rm -f -- "$temp"
+    [[ "$was_active" -eq 0 ]] || systemctl start "$HEADSCALE_SERVICE" || true
+    echo "${danger}Could not atomically publish the Headscale config.${reset}" >&2
+    return 1
+  fi
+
+  if [[ "$was_active" -eq 1 ]] && ! systemctl start "$HEADSCALE_SERVICE"; then
+    if [[ -n "$backup" ]]; then
+      restore_temp="$(mktemp "${HEADSCALE_CONFIG}.restore.XXXXXX")"
+      cp -a "$backup" "$restore_temp"
+      publish_staged_file "$restore_temp" "$HEADSCALE_CONFIG" root "$APP_GROUP" 0660
+    else
+      rm -f -- "$HEADSCALE_CONFIG"
+    fi
+    systemctl start "$HEADSCALE_SERVICE" || true
+    echo "${danger}Headscale failed with the new config; the previous file was restored.${reset}" >&2
+    return 1
   fi
   echo "${green}Headscale config written: ${HEADSCALE_CONFIG}${reset}"
 }
@@ -844,13 +957,18 @@ EOF
 # proxy rules explicit instead of sharing the simpler panel reverse proxy block.
 write_headscale_nginx_config() {
   local domain="$1"
+  local backup="" link_created=0
 
   need_root
   valid_domain "$domain" || { echo "${danger}Invalid Headscale domain: $domain${reset}" >&2; return 1; }
   install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_SITE")"
+  if [[ -f "$HEADSCALE_NGINX_SITE" ]]; then
+    backup="${HEADSCALE_NGINX_SITE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$HEADSCALE_NGINX_SITE" "$backup"
+  fi
   cat >"$HEADSCALE_NGINX_SITE" <<EOF
 map \$http_upgrade \$headscale_connection_upgrade {
-    default upgrade;
+    default keep-alive;
     '' close;
 }
 
@@ -880,10 +998,14 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    server_tokens off;
 
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
 
     location / {
         proxy_http_version 1.1;
@@ -892,7 +1014,7 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header True-Client-IP \$remote_addr;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
         proxy_pass http://infiproxy_headscale;
@@ -902,9 +1024,19 @@ EOF
   install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_ENABLED")"
   if [[ ! -e "$HEADSCALE_NGINX_ENABLED" ]]; then
     ln -s "$HEADSCALE_NGINX_SITE" "$HEADSCALE_NGINX_ENABLED"
+    link_created=1
   fi
-  run_cmd nginx -t
-  run_cmd systemctl reload nginx.service
+  if ! run_cmd nginx -t; then
+    if [[ -n "$backup" ]]; then
+      cp -a "$backup" "$HEADSCALE_NGINX_SITE"
+    else
+      rm -f "$HEADSCALE_NGINX_SITE"
+    fi
+    [[ "$link_created" -eq 0 ]] || rm -f "$HEADSCALE_NGINX_ENABLED"
+    echo "${danger}Nginx rejected the Headscale site; the previous file was restored.${reset}" >&2
+    return 1
+  fi
+  run_cmd systemctl reload nginx.service || return 1
 }
 
 # Full Headscale hub flow: DNS-only Cloudflare record, DNS-01 certificate,
@@ -997,8 +1129,11 @@ headscale_menu() {
     4) headscale_create_preauth_key || true ;;
     5) run_cmd headscale -c "$HEADSCALE_CONFIG" users list || true ;;
     6)
-      headscale_cmd configtest || true
-      run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+      if headscale_cmd configtest; then
+        run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
+      else
+        echo "${danger}Headscale config validation failed; service was not restarted.${reset}" >&2
+      fi
       ;;
     7) run_cmd journalctl -u "$HEADSCALE_SERVICE" -n 120 --no-pager || true ;;
     0) return ;;
@@ -1025,7 +1160,8 @@ install_https_deps() {
 
 save_cloudflare_credentials() {
   local token="$1"
-  [[ -n "$token" ]] || { echo "${danger}Cloudflare API token is required.${reset}" >&2; return 1; }
+  valid_cloudflare_token "$token" \
+    || { echo "${danger}Invalid Cloudflare API token format.${reset}" >&2; return 1; }
   install -d -m 0700 -o root -g root "$(dirname "$CLOUDFLARE_CREDENTIALS")"
   printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CLOUDFLARE_CREDENTIALS"
   chown root:root "$CLOUDFLARE_CREDENTIALS"
@@ -1055,10 +1191,15 @@ issue_cloudflare_certificate() {
 
 write_nginx_https_config() {
   local domain="$1"
+  local backup="" link_created=0
 
   need_root
   valid_domain "$domain" || { echo "${danger}Invalid domain: $domain${reset}" >&2; return 1; }
   install -d -m 0755 "$(dirname "$NGINX_SITE")"
+  if [[ -f "$NGINX_SITE" ]]; then
+    backup="${NGINX_SITE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$NGINX_SITE" "$backup"
+  fi
   cat >"$NGINX_SITE" <<EOF
 server {
     listen 443 ssl http2;
@@ -1066,17 +1207,39 @@ server {
 
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_tickets off;
+    server_tokens off;
+    client_max_body_size 1m;
+    client_header_timeout 15s;
+    client_body_timeout 15s;
+    keepalive_timeout 30s;
+    send_timeout 60s;
+    proxy_connect_timeout 5s;
+    proxy_send_timeout 30s;
+    proxy_read_timeout 60s;
 
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
     add_header Referrer-Policy no-referrer always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location ^~ /sub/ {
+        access_log off;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
 
     location / {
         proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
 }
@@ -1090,9 +1253,19 @@ EOF
   install -d -m 0755 "$(dirname "$NGINX_ENABLED")"
   if [[ ! -e "$NGINX_ENABLED" ]]; then
     ln -s "$NGINX_SITE" "$NGINX_ENABLED"
+    link_created=1
   fi
-  run_cmd nginx -t
-  run_cmd systemctl reload nginx.service
+  if ! run_cmd nginx -t; then
+    if [[ -n "$backup" ]]; then
+      cp -a "$backup" "$NGINX_SITE"
+    else
+      rm -f "$NGINX_SITE"
+    fi
+    [[ "$link_created" -eq 0 ]] || rm -f "$NGINX_ENABLED"
+    echo "${danger}Nginx rejected the panel site; the previous file was restored.${reset}" >&2
+    return 1
+  fi
+  run_cmd systemctl reload nginx.service || return 1
 }
 
 guided_https_setup() {
@@ -1247,6 +1420,7 @@ guided_deployment() {
   echo "Open the panel:"
   echo "  HTTPS:      https://<your-domain>/admin/setup"
   echo "  SSH tunnel: http://127.0.0.1:8080/admin/setup"
+  echo "  Setup token: $(env_value "$ENV_FILE" INFIPROXY_SETUP_TOKEN)"
   echo
   echo "${bold}Service summary${reset}"
   printf "%-34s %-12s %-12s\n" "unit" "active" "enabled"
@@ -1280,7 +1454,7 @@ logs_menu() {
 }
 
 admin_access() {
-  local domain
+  local domain setup_token
   header
   domain="$(awk '$1 == "server_name" { gsub(";", "", $2); if ($2 != "_") { print $2; exit } }' "$NGINX_SITE" 2>/dev/null || true)"
   echo "${bold}Web panel${reset}"
@@ -1292,6 +1466,13 @@ admin_access() {
     echo "  local URL:  http://127.0.0.1:8080/admin"
   fi
   echo
+  setup_token="$(env_value "$ENV_FILE" INFIPROXY_SETUP_TOKEN)"
+  if [[ -n "$setup_token" ]]; then
+    echo "${bold}First-owner setup token${reset}"
+    echo "  $setup_token"
+    echo "  The token is required only until the first administrator is created."
+    echo
+  fi
   echo "${bold}Local probes${reset}"
   curl -fsS --max-time 3 http://127.0.0.1:8080/health || true
   echo
@@ -1323,7 +1504,7 @@ select_module_runtime() {
 }
 
 import_module_manifest() {
-  local source id target request record root binary service config
+  local source id target record root binary service config
   read -r -p "Manifest path: " source
   [[ -f "$source" ]] || { echo "${danger}Manifest not found.${reset}"; return 1; }
   id="$(basename "$source" .module)"
@@ -1332,14 +1513,10 @@ import_module_manifest() {
   IFS='|' read -r _ _ _ _ _ _ _ _ root binary service config _ _ <<<"$record"
   install_generic_module_unit "$source" "$id" "$root" "$binary" "$service" || return 1
   target="${MODULE_AVAILABLE_DIR}/${id}.module"
-  request="${MODULE_REQUEST_DIR}/${id}.register"
   install -d -o root -g root -m 0755 "$MODULE_AVAILABLE_DIR"
   install -d -o root -g "$APP_GROUP" -m 0770 "$(dirname "$config")"
-  install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$MODULE_REQUEST_DIR"
   install -o root -g root -m 0644 "$source" "$target"
-  printf 'requested_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"$request"
-  chown "$APP_USER":"$APP_GROUP" "$request"
-  chmod 0640 "$request"
+  write_module_request "$id" register || return 1
   run_cmd systemctl start infiproxy-module-update.service || true
 }
 
@@ -1429,10 +1606,7 @@ module_update_menu() {
         select_module_runtime || continue
         read -r -p "Type ${module} to remove its runtime and preserve config: " confirm
         if [[ "$confirm" == "$module" ]]; then
-          install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$MODULE_REQUEST_DIR"
-          printf 'requested_at=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >"${MODULE_REQUEST_DIR}/${module}.remove"
-          chown "$APP_USER":"$APP_GROUP" "${MODULE_REQUEST_DIR}/${module}.remove"
-          chmod 0640 "${MODULE_REQUEST_DIR}/${module}.remove"
+          write_module_request "$module" remove || return 1
           run_cmd systemctl start infiproxy-module-update.service || true
         fi
         pause
@@ -1519,17 +1693,19 @@ uninstall_commands() {
       cat <<'EOF'
 systemctl disable --now infiproxy.service || true
 systemctl disable --now infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service || true
-systemctl disable --now infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
-rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
-rm -f /etc/profile.d/infiproxy-manager.sh
-rm -f /etc/infiproxy-update.conf
-rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
-userdel infiproxy 2>/dev/null || true
-groupdel infiproxy 2>/dev/null || true
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update /etc/infiproxy-update.conf
+rm -rf /etc/infiproxy /opt/infiproxy/source
+rm -f /var/lib/infiproxy/infiproxy.sqlite /var/lib/infiproxy/infiproxy.sqlite-wal /var/lib/infiproxy/infiproxy.sqlite-shm
+rm -f /var/lib/infiproxy/panel-update-state.env /var/lib/infiproxy/panel-update-now.request
+rm -rf /var/lib/infiproxy-maintenance/update-backups
+rm -f /var/lib/infiproxy-maintenance/panel-update-run.log /var/lib/infiproxy-maintenance/panel-last-applied.sha
+rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+if command -v nginx >/dev/null 2>&1 && nginx -t; then
+  systemctl reload nginx.service || true
+fi
 EOF
       ;;
     full)
@@ -1655,17 +1831,19 @@ main_menu() {
   done
 }
 
-case "${1:-}" in
-  --guided)
-    guided_deployment
-    ;;
-  --uninstall)
-    run_uninstall "${2:-}"
-    ;;
-  --help|-h)
-    echo "Usage: sudo infiproxy-manager [--guided] [--uninstall panel|full|factory]"
-    ;;
-  *)
-    main_menu
-    ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-}" in
+    --guided)
+      guided_deployment
+      ;;
+    --uninstall)
+      run_uninstall "${2:-}"
+      ;;
+    --help|-h)
+      echo "Usage: sudo infiproxy-manager [--guided] [--uninstall panel|full|factory]"
+      ;;
+    *)
+      main_menu
+      ;;
+  esac
+fi

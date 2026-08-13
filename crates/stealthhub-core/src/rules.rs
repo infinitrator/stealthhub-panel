@@ -5,6 +5,40 @@
 //! rejected before they reach generated subscriptions.
 
 use anyhow::{bail, Result};
+use serde::Serialize;
+
+const CLASSICAL_CONDITION_TYPES: &[&str] = &[
+    "DOMAIN",
+    "DOMAIN-SUFFIX",
+    "DOMAIN-KEYWORD",
+    "DOMAIN-WILDCARD",
+    "DOMAIN-REGEX",
+    "GEOSITE",
+    "IP-CIDR",
+    "IP-CIDR6",
+    "IP-SUFFIX",
+    "IP-ASN",
+    "GEOIP",
+    "SRC-GEOIP",
+    "SRC-IP-ASN",
+    "SRC-IP-CIDR",
+    "SRC-IP-SUFFIX",
+    "DST-PORT",
+    "SRC-PORT",
+    "IN-PORT",
+    "IN-TYPE",
+    "IN-USER",
+    "IN-NAME",
+    "PROCESS-PATH",
+    "PROCESS-PATH-WILDCARD",
+    "PROCESS-PATH-REGEX",
+    "PROCESS-NAME",
+    "PROCESS-NAME-WILDCARD",
+    "PROCESS-NAME-REGEX",
+    "UID",
+    "NETWORK",
+    "DSCP",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingRuleSet {
@@ -14,6 +48,11 @@ pub struct RoutingRuleSet {
     pub target: String,
     pub enabled: bool,
     pub payload: String,
+}
+
+#[derive(Serialize)]
+struct ProviderPayload {
+    payload: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +136,7 @@ const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[
     },
 ];
 
+#[must_use]
 pub fn default_routing_rule_sets() -> Vec<RoutingRuleSet> {
     DEFAULT_RULE_SETS
         .iter()
@@ -111,6 +151,7 @@ pub fn default_routing_rule_sets() -> Vec<RoutingRuleSet> {
         .collect()
 }
 
+#[must_use]
 pub fn default_routing_rule_set(slug: &str) -> Option<DefaultRoutingRuleSet> {
     DEFAULT_RULE_SETS
         .iter()
@@ -118,6 +159,7 @@ pub fn default_routing_rule_set(slug: &str) -> Option<DefaultRoutingRuleSet> {
         .find(|rule_set| rule_set.slug == slug)
 }
 
+#[must_use]
 pub fn is_valid_routing_target(target: &str) -> bool {
     ROUTING_TARGETS.contains(&target)
 }
@@ -143,6 +185,32 @@ pub fn validate_classical_rule_payload(payload: &str) -> Result<Vec<String>> {
         if matches!(kind, "RULE-SET" | "SUB-RULE") {
             bail!("line {} cannot reference another rule set", index + 1);
         }
+        if matches!(kind, "AND" | "OR" | "NOT" | "MATCH") {
+            bail!(
+                "line {} cannot contain a logical or catch-all rule",
+                index + 1
+            );
+        }
+        if !CLASSICAL_CONDITION_TYPES.contains(&kind) {
+            bail!("line {} uses an unsupported rule type", index + 1);
+        }
+        if line.len() > 1024 || line.chars().any(char::is_control) {
+            bail!(
+                "line {} is too long or contains control characters",
+                index + 1
+            );
+        }
+        if rest
+            .split(',')
+            .skip(1)
+            .map(str::trim)
+            .any(|value| ROUTING_TARGETS.contains(&value))
+        {
+            bail!(
+                "line {} must not override the rule-set routing target",
+                index + 1
+            );
+        }
 
         rules.push(line.to_string());
     }
@@ -156,15 +224,9 @@ pub fn validate_classical_rule_payload(payload: &str) -> Result<Vec<String>> {
 
 pub fn routing_rule_payload_yaml(payload: &str) -> Result<String> {
     let rules = validate_classical_rule_payload(payload)?;
-    let mut yaml = String::from("payload:\n");
-
-    for rule in rules {
-        yaml.push_str("  - ");
-        yaml.push_str(&rule);
-        yaml.push('\n');
-    }
-
-    Ok(yaml)
+    Ok(serde_norway::to_string(&ProviderPayload {
+        payload: rules,
+    })?)
 }
 
 #[cfg(test)]
@@ -174,11 +236,11 @@ mod tests {
     #[test]
     fn classical_payload_validation_trims_comments_and_rejects_nested_sets() {
         let rules = validate_classical_rule_payload(
-            r#"
+            r"
             # comment
             DOMAIN-SUFFIX,example.com
             IP-CIDR,10.0.0.0/8,no-resolve
-            "#,
+            ",
         )
         .expect("payload should be valid");
 
@@ -194,12 +256,15 @@ mod tests {
         assert!(err
             .to_string()
             .contains("cannot reference another rule set"));
+        assert!(validate_classical_rule_payload("UNKNOWN,value").is_err());
+        assert!(validate_classical_rule_payload("DOMAIN,example.com,REJECT").is_err());
+        assert!(validate_classical_rule_payload("AND,((DOMAIN,a),(DOMAIN,b))").is_err());
     }
 
     #[test]
     fn routing_rule_payload_yaml_outputs_mihomo_payload_document() {
         let yaml = routing_rule_payload_yaml("DOMAIN-SUFFIX,example.com").unwrap();
 
-        assert_eq!(yaml, "payload:\n  - DOMAIN-SUFFIX,example.com\n");
+        assert_eq!(yaml, "payload:\n- DOMAIN-SUFFIX,example.com\n");
     }
 }

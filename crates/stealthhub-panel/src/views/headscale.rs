@@ -97,7 +97,7 @@ pub(crate) fn render(
                         div { h2 { "Nodes" } p { "Expire forces the selected client to authenticate again." } }
                         form method="post" action="/admin/headscale/nodes/expire" class="inline-form" {
                             (csrf_field(&auth.csrf_token))
-                            input type="number" min="1" name="node_id" placeholder="Node ID" required;
+                            input type="number" min="1" name="node_id" aria-label="Node ID" placeholder="Node ID" required;
                             button class="compact danger" type="submit" { "Expire node" }
                         }
                     }

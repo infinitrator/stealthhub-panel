@@ -2,7 +2,7 @@
 
 use crate::{
     admin_bar, csrf_field,
-    ops::*,
+    ops::{HostSnapshot, ServiceState, UninstallPlan, SYSTEM_TARGETS},
     ui::layout,
     views::components::{meter_bar, service_state_badge},
     AuthenticatedAdmin, DEPLOYMENT_MODE,
@@ -15,6 +15,7 @@ pub(crate) fn render(
     db_ready: bool,
     cookie_secure: bool,
     host: &HostSnapshot,
+    service_states: &[ServiceState],
 ) -> Response {
     Html(
             layout(
@@ -111,7 +112,9 @@ pub(crate) fn render(
                     section {
                         h2 { "Service control" }
                         div class="notice" {
-                            "Only built-in allowlisted commands are available here. Actions require OS-level permission for the panel service user."
+                            "Runtime state is read-only in HTTP. Execute the listed root operation through "
+                            code { "sudo infiproxy-manager" }
+                            " so the web process never receives systemd privileges."
                         }
                         div class="table-wrap" {
                             table {
@@ -127,22 +130,15 @@ pub(crate) fn render(
                                     }
                                 }
                                 tbody {
-                                    @for target in SYSTEM_TARGETS {
-                                        @let state = service_state(target.units);
+                                    @for (target, state) in SYSTEM_TARGETS.iter().zip(service_states) {
                                         tr {
                                             td { strong { (target.name) } }
-                                            td { (service_state_badge(&state)) }
+                                            td { (service_state_badge(state)) }
                                             td { span class="badge neutral" { (target.kind) } }
                                             td { code { (target.unit) } }
                                             td { code { (target.config) } }
                                             td { code { (target.check) } }
                                             td {
-                                                form method="post" action="/admin/system/action" class="inline-form" {
-                                                    (csrf_field(&auth.csrf_token))
-                                                    input type="hidden" name="target" value=(target.slug);
-                                                    button class=(if target.slug == "panel" { "danger" } else { "" }) type="submit" { (target.action_label) }
-                                                }
-                                                br;
                                                 code { (target.reload) }
                                             }
                                         }
@@ -254,35 +250,6 @@ pub(crate) fn render(
         .into_response()
 }
 
-pub(crate) fn render_action(
-    auth: &AuthenticatedAdmin,
-    target: &SystemTarget,
-    report: &SystemActionReport,
-) -> Response {
-    let ok = report.steps.iter().all(|step| step.success);
-    Html(
-        layout(
-            "System action",
-            html! {
-                (admin_bar(auth))
-                h1 { "System action" }
-                section {
-                    h2 { (target.name) }
-                    div class=(if ok { "notice" } else { "notice error" }) {
-                        @if ok { "Action completed." } @else { "Action failed. Review command output below." }
-                    }
-                    div class="config-list" {
-                        @for step in &report.steps { (command_result(step)) }
-                    }
-                    a class="button" href="/admin/system" { "Back to System" }
-                }
-            },
-        )
-        .into_string(),
-    )
-    .into_response()
-}
-
 pub(crate) fn render_uninstall(auth: &AuthenticatedAdmin, plan: &UninstallPlan) -> Response {
     Html(
         layout(
@@ -304,21 +271,4 @@ pub(crate) fn render_uninstall(auth: &AuthenticatedAdmin, plan: &UninstallPlan) 
         .into_string(),
     )
     .into_response()
-}
-
-fn command_result(step: &CommandStep) -> maud::Markup {
-    html! {
-        div class="config-row" {
-            div class="config-row-head" {
-                h3 { code { (&step.command) } }
-                @if step.success { span class="badge ok" { "ok" } }
-                @else { span class="badge off" { "failed" } }
-            }
-            div class="command-output" {
-                @if !step.stdout.is_empty() { strong { "stdout" } pre { (&step.stdout) } }
-                @if !step.stderr.is_empty() { strong { "stderr" } pre { (&step.stderr) } }
-                @if step.stdout.is_empty() && step.stderr.is_empty() { small { "No output." } }
-            }
-        }
-    }
 }

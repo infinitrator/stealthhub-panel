@@ -12,15 +12,20 @@ permissions:
 jobs:
   linux-x86_64:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: Install Rust 1.96.0
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # master
+        with:
+          toolchain: 1.96.0
 
       - name: Build panel
-        run: cargo build --release -p stealthhub-panel
+        run: cargo build --locked --release -p stealthhub-panel
 
       - name: Package
         run: |
@@ -29,11 +34,37 @@ jobs:
           cp target/release/stealthhub-panel dist/infiproxy-linux-x86_64/infiproxy
           cp target/release/infiproxy-module-manifest dist/infiproxy-linux-x86_64/
           cp target/release/infiproxy-headscale-control dist/infiproxy-linux-x86_64/
-          cp -R deploy README.md LICENSE LICENSE.ru.md dist/infiproxy-linux-x86_64/
+          cp -R deploy wiki README.md LICENSE LICENSE.ru.md dist/infiproxy-linux-x86_64/
           tar -C dist -czf infiproxy-linux-x86_64.tar.gz infiproxy-linux-x86_64
+          sha256sum infiproxy-linux-x86_64.tar.gz > infiproxy-linux-x86_64.tar.gz.sha256
 
       - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: infiproxy-linux-x86_64
-          path: infiproxy-linux-x86_64.tar.gz
+          path: |
+            infiproxy-linux-x86_64.tar.gz
+            infiproxy-linux-x86_64.tar.gz.sha256
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease+=(--prerelease)
+          fi
+
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              infiproxy-linux-x86_64.tar.gz \
+              infiproxy-linux-x86_64.tar.gz.sha256 \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              infiproxy-linux-x86_64.tar.gz \
+              infiproxy-linux-x86_64.tar.gz.sha256 \
+              --verify-tag --generate-notes "${prerelease[@]}"
+          fi

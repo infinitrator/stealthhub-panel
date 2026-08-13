@@ -108,11 +108,16 @@ pub enum UserUuidSource {
 
 impl Default for PanelSettings {
     fn default() -> Self {
-        demo_settings()
+        Self {
+            panel_name: "Infiproxy".to_string(),
+            subscription_domain: "sub.infiproxy.local".to_string(),
+            node_domain: "node.infiproxy.local".to_string(),
+        }
     }
 }
 
 impl ProtocolProfile {
+    #[must_use]
     pub fn required_secret_names(&self) -> Vec<&str> {
         match &self.config {
             ProtocolConfig::VlessRealityXhttp {
@@ -161,21 +166,5 @@ impl From<UserRecord> for SubscriptionUser {
             uuid: value.uuid,
             subscription_token: value.subscription_token,
         }
-    }
-}
-
-pub fn demo_settings() -> PanelSettings {
-    PanelSettings {
-        panel_name: "Infiproxy".to_string(),
-        subscription_domain: "sub.infiproxy.local".to_string(),
-        node_domain: "node.infiproxy.local".to_string(),
-    }
-}
-
-pub fn demo_user() -> SubscriptionUser {
-    SubscriptionUser {
-        username: "demo".to_string(),
-        uuid: "11111111-1111-4111-8111-111111111111".to_string(),
-        subscription_token: "demo".to_string(),
     }
 }

@@ -1,10 +1,10 @@
 //! Unprivileged side of the typed Headscale maintenance bridge.
 
-use rand_core::{OsRng, RngCore};
-use std::{fs, io::Write, path::PathBuf};
+use crate::atomic_file;
+use std::{fmt::Write as _, fs, path::PathBuf};
 pub(crate) use stealthhub_core::headscale_control::{HeadscaleRequest, HeadscaleSnapshot};
 
-const DEFAULT_STATE_FILE: &str = "/var/lib/infiproxy/headscale-state.json";
+const DEFAULT_STATE_FILE: &str = "/var/lib/infiproxy-maintenance/headscale/state.json";
 const DEFAULT_REQUEST_DIR: &str = "/var/lib/infiproxy/headscale-requests";
 const MAX_STATE_BYTES: u64 = 256 * 1024;
 
@@ -23,9 +23,9 @@ pub(crate) fn snapshot() -> anyhow::Result<HeadscaleSnapshot> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o022 != 0 {
-            anyhow::bail!("Headscale state file is writable by an unsafe principal");
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+            anyhow::bail!("Headscale state file is not protected by root ownership");
         }
     }
     Ok(serde_json::from_slice(&fs::read(path)?)?)
@@ -35,44 +35,37 @@ pub(crate) fn snapshot() -> anyhow::Result<HeadscaleSnapshot> {
 pub(crate) fn request(request: &HeadscaleRequest) -> anyhow::Result<()> {
     let directory = request_dir();
     fs::create_dir_all(&directory)?;
+    secure_private_directory(&directory)?;
     let mut nonce = [0_u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let name = nonce
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let path = directory.join(format!("{name}.request"));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    getrandom::fill(&mut nonce)?;
+    let mut name = String::with_capacity(nonce.len() * 2);
+    for byte in nonce {
+        write!(&mut name, "{byte:02x}")?;
     }
-    let mut file = options.open(&path)?;
-    file.write_all(&serde_json::to_vec(request)?)?;
-    file.sync_all()?;
-    set_private_permissions(&directory, &path);
+    let path = directory.join(format!("{name}.request"));
+    atomic_file::replace(&path, &serde_json::to_vec(request)?, 0o640)?;
     Ok(())
 }
 
 fn state_file() -> PathBuf {
     std::env::var_os("INFIPROXY_HEADSCALE_STATE_FILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_FILE))
+        .map_or_else(|| PathBuf::from(DEFAULT_STATE_FILE), PathBuf::from)
 }
 
 fn request_dir() -> PathBuf {
     std::env::var_os("INFIPROXY_HEADSCALE_REQUEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_REQUEST_DIR))
+        .map_or_else(|| PathBuf::from(DEFAULT_REQUEST_DIR), PathBuf::from)
 }
 
-fn set_private_permissions(directory: &std::path::Path, file: &std::path::Path) {
+fn secure_private_directory(directory: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = fs::symlink_metadata(directory)?;
+    if !metadata.file_type().is_dir() {
+        anyhow::bail!("Headscale request path must be a real directory");
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(directory, fs::Permissions::from_mode(0o750));
-        let _ = fs::set_permissions(file, fs::Permissions::from_mode(0o640));
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o750))?;
     }
+    Ok(())
 }

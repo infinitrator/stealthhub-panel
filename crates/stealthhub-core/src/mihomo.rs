@@ -4,28 +4,35 @@
 //! profiles, secrets and routing rule sets into client-importable Mihomo config.
 //! Inputs are explicit so generation can be tested without a database.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::models::{
     PanelSettings, ProtocolConfig, ProtocolProfile, ProxyRole, SubscriptionUser, UserUuidSource,
 };
-use crate::rules::{default_routing_rule_sets, RoutingRuleSet};
+use crate::rules::RoutingRuleSet;
 
-fn secret_or_placeholder<'a>(
+fn secret_value<'a>(
     secrets: &'a std::collections::HashMap<String, String>,
     secret_name: &'a str,
-) -> &'a str {
-    secrets
+) -> Result<&'a str> {
+    let value = secrets
         .get(secret_name)
         .map(String::as_str)
-        .unwrap_or(secret_name)
+        .ok_or_else(|| anyhow::anyhow!("required secret is missing: {secret_name}"))?
+        .trim();
+    if value.is_empty() || value == secret_name || value.starts_with("REPLACE_WITH_") {
+        bail!("required secret is not configured: {secret_name}");
+    }
+    Ok(value)
 }
 
-fn user_uuid(user: &SubscriptionUser, uuid_source: &UserUuidSource) -> String {
+fn user_uuid<'a>(user: &'a SubscriptionUser, uuid_source: &UserUuidSource) -> Result<&'a str> {
     match uuid_source {
-        UserUuidSource::SubscriptionUser => user.uuid.clone(),
-        UserUuidSource::StaticSecret => user.uuid.clone(),
+        UserUuidSource::SubscriptionUser => Ok(user.uuid.as_str()),
+        UserUuidSource::StaticSecret => {
+            bail!("static UUID profiles are unsupported without an explicit secret reference")
+        }
     }
 }
 
@@ -38,132 +45,138 @@ pub fn generate_mihomo_yaml(
 ) -> Result<String> {
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
     if enabled_profiles.is_empty() {
-        return generate_demo_mihomo_yaml(settings, user);
+        bail!("no protocol profiles are enabled");
+    }
+    if user.subscription_token.trim().is_empty() {
+        bail!("subscription token is empty");
     }
 
     let proxies: Vec<_> = enabled_profiles
         .iter()
-        .map(|profile| match &profile.config {
-            ProtocolConfig::VlessRealityXhttp {
-                uuid_source,
-                server_name,
-                path,
-                public_key_secret,
-                short_id_secret,
-            } => json!({
-                "name": profile.name,
-                "type": "vless",
-                "server": profile.server,
-                "port": profile.port,
-                "udp": true,
-                "uuid": user_uuid(user, uuid_source),
-                "tls": true,
-                "servername": server_name,
-                "client-fingerprint": "chrome",
-                "reality-opts": {
-                    "public-key": secret_or_placeholder(secrets, public_key_secret),
-                    "short-id": secret_or_placeholder(secrets, short_id_secret)
-                },
-                "network": "xhttp",
-                "xhttp-opts": {
-                    "path": path,
-                    "host": [server_name]
-                }
-            }),
-            ProtocolConfig::VlessRealityTcp {
-                uuid_source,
-                server_name,
-                public_key_secret,
-                short_id_secret,
-            } => json!({
-                "name": profile.name,
-                "type": "vless",
-                "server": profile.server,
-                "port": profile.port,
-                "udp": true,
-                "uuid": user_uuid(user, uuid_source),
-                "tls": true,
-                "servername": server_name,
-                "client-fingerprint": "chrome",
-                "reality-opts": {
-                    "public-key": secret_or_placeholder(secrets, public_key_secret),
-                    "short-id": secret_or_placeholder(secrets, short_id_secret)
-                }
-            }),
-            ProtocolConfig::Shadowsocks2022ShadowTls {
-                server_name,
-                password_secret,
-                shadow_tls_password_secret,
-            } => json!({
-                "name": profile.name,
-                "type": "ss",
-                "server": profile.server,
-                "port": profile.port,
-                "cipher": "2022-blake3-aes-256-gcm",
-                "password": secret_or_placeholder(secrets, password_secret),
-                "udp": true,
-                "plugin": "shadow-tls",
-                "client-fingerprint": "chrome",
-                "plugin-opts": {
-                    "host": server_name,
-                    "password": secret_or_placeholder(secrets, shadow_tls_password_secret),
-                    "version": 3
-                }
-            }),
-            ProtocolConfig::Hysteria2 {
-                password_secret,
-                sni,
-                obfs_password_secret,
-            } => {
-                let mut proxy = json!({
+        .map(|profile| -> Result<_> {
+            let proxy = match &profile.config {
+                ProtocolConfig::VlessRealityXhttp {
+                    uuid_source,
+                    server_name,
+                    path,
+                    public_key_secret,
+                    short_id_secret,
+                } => json!({
                     "name": profile.name,
-                    "type": "hysteria2",
+                    "type": "vless",
                     "server": profile.server,
                     "port": profile.port,
-                    "password": secret_or_placeholder(secrets, password_secret),
+                    "udp": true,
+                    "uuid": user_uuid(user, uuid_source)?,
+                    "encryption": "",
+                    "tls": true,
+                    "servername": server_name,
+                    "client-fingerprint": "chrome",
+                    "reality-opts": {
+                        "public-key": secret_value(secrets, public_key_secret)?,
+                        "short-id": secret_value(secrets, short_id_secret)?
+                    },
+                    "network": "xhttp",
+                    "xhttp-opts": {
+                        "path": path,
+                        "host": server_name
+                    }
+                }),
+                ProtocolConfig::VlessRealityTcp {
+                    uuid_source,
+                    server_name,
+                    public_key_secret,
+                    short_id_secret,
+                } => json!({
+                    "name": profile.name,
+                    "type": "vless",
+                    "server": profile.server,
+                    "port": profile.port,
+                    "udp": true,
+                    "uuid": user_uuid(user, uuid_source)?,
+                    "encryption": "",
+                    "tls": true,
+                    "servername": server_name,
+                    "client-fingerprint": "chrome",
+                    "reality-opts": {
+                        "public-key": secret_value(secrets, public_key_secret)?,
+                        "short-id": secret_value(secrets, short_id_secret)?
+                    }
+                }),
+                ProtocolConfig::Shadowsocks2022ShadowTls {
+                    server_name,
+                    password_secret,
+                    shadow_tls_password_secret,
+                } => json!({
+                    "name": profile.name,
+                    "type": "ss",
+                    "server": profile.server,
+                    "port": profile.port,
+                    "cipher": "2022-blake3-aes-256-gcm",
+                    "password": secret_value(secrets, password_secret)?,
+                    "udp": true,
+                    "plugin": "shadow-tls",
+                    "client-fingerprint": "chrome",
+                    "plugin-opts": {
+                        "host": server_name,
+                        "password": secret_value(secrets, shadow_tls_password_secret)?,
+                        "version": 3
+                    }
+                }),
+                ProtocolConfig::Hysteria2 {
+                    password_secret,
+                    sni,
+                    obfs_password_secret,
+                } => {
+                    let mut proxy = json!({
+                        "name": profile.name,
+                        "type": "hysteria2",
+                        "server": profile.server,
+                        "port": profile.port,
+                        "password": secret_value(secrets, password_secret)?,
+                        "sni": sni,
+                        "alpn": ["h3"]
+                    });
+
+                    if let Some(obfs_secret) = obfs_password_secret {
+                        proxy["obfs"] = json!("salamander");
+                        proxy["obfs-password"] = json!(secret_value(secrets, obfs_secret)?);
+                    }
+
+                    proxy
+                }
+                ProtocolConfig::AnyTls {
+                    password_secret,
+                    sni,
+                } => json!({
+                    "name": profile.name,
+                    "type": "anytls",
+                    "server": profile.server,
+                    "port": profile.port,
+                    "password": secret_value(secrets, password_secret)?,
+                    "client-fingerprint": "chrome",
+                    "udp": true,
+                    "sni": sni
+                }),
+                ProtocolConfig::Tuic {
+                    uuid_source,
+                    password_secret,
+                    sni,
+                } => json!({
+                    "name": profile.name,
+                    "type": "tuic",
+                    "server": profile.server,
+                    "port": profile.port,
+                    "uuid": user_uuid(user, uuid_source)?,
+                    "password": secret_value(secrets, password_secret)?,
+                    "udp": true,
                     "sni": sni,
                     "alpn": ["h3"]
-                });
-
-                if let Some(obfs_secret) = obfs_password_secret {
-                    proxy["obfs"] = json!({
-                        "type": "salamander",
-                        "password": secret_or_placeholder(secrets, obfs_secret)
-                    });
-                }
-
-                proxy
-            }
-            ProtocolConfig::AnyTls {
-                password_secret,
-                sni,
-            } => json!({
-                "name": profile.name,
-                "type": "anytls",
-                "server": profile.server,
-                "port": profile.port,
-                "password": secret_or_placeholder(secrets, password_secret),
-                "client-fingerprint": "chrome",
-                "udp": true,
-                "sni": sni
-            }),
-            ProtocolConfig::Tuic {
-                uuid_source,
-                password_secret,
-                sni,
-            } => json!({
-                "name": profile.name,
-                "type": "tuic",
-                "server": profile.server,
-                "port": profile.port,
-                "uuid": user_uuid(user, uuid_source),
-                "password": secret_or_placeholder(secrets, password_secret),
-                "udp": true,
-                "sni": sni,
-                "alpn": ["h3"]
-            }),
+                }),
+            };
+            Ok(proxy)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
     let proxy_names: Vec<_> = enabled_profiles
         .iter()
@@ -185,6 +198,7 @@ pub fn generate_mihomo_yaml(
         "log-level": "info",
         "ipv6": false,
         "external-controller": "127.0.0.1:9090",
+        "secret": user.subscription_token,
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
         "proxy-groups": [
@@ -230,7 +244,7 @@ pub fn generate_mihomo_yaml(
         "rules": routing_rules(&active_rule_sets)
     });
 
-    Ok(serde_yaml::to_string(&doc)?)
+    Ok(serde_norway::to_string(&doc)?)
 }
 
 fn names_for_roles<'a>(
@@ -269,177 +283,12 @@ fn manual_group<'a>(proxy_names: &'a [&'a str]) -> Vec<&'a str> {
     names
 }
 
-pub fn generate_demo_mihomo_yaml(
-    settings: &PanelSettings,
-    user: &SubscriptionUser,
-) -> Result<String> {
-    let node = &settings.node_domain;
-    let rule_sets = default_routing_rule_sets();
-    let active_rule_sets = active_routing_rule_sets(&rule_sets);
-
-    // На этом этапе это демонстрационный config contract.
-    // Реальные secrets, public-key, short-id, passwords будут браться из SQLite/secret store.
-    let doc = json!({
-        "mixed-port": 7890,
-        "allow-lan": false,
-        "mode": "rule",
-        "log-level": "info",
-        "ipv6": false,
-
-        "external-controller": "127.0.0.1:9090",
-
-        "rule-providers": rule_provider_map(settings, &active_rule_sets),
-
-        "proxies": [
-            {
-                "name": "VLESS-XHTTP-SAFE",
-                "type": "vless",
-                "server": node,
-                "port": 8443,
-                "udp": true,
-                "uuid": user.uuid,
-                "tls": true,
-                "servername": "www.microsoft.com",
-                "client-fingerprint": "chrome",
-                "reality-opts": {
-                    "public-key": "REPLACE_WITH_REALITY_PUBLIC_KEY",
-                    "short-id": "REPLACE_WITH_SHORT_ID"
-                },
-                "network": "xhttp",
-                "xhttp-opts": {
-                    "path": "/api/v1",
-                    "host": ["www.microsoft.com"]
-                }
-            },
-            {
-                "name": "SS2022-SHADOWTLS-FALLBACK",
-                "type": "ss",
-                "server": node,
-                "port": 9443,
-                "cipher": "2022-blake3-aes-256-gcm",
-                "password": "REPLACE_WITH_SS2022_PASSWORD",
-                "udp": true,
-                "plugin": "shadow-tls",
-                "client-fingerprint": "chrome",
-                "plugin-opts": {
-                    "host": "www.apple.com",
-                    "password": "REPLACE_WITH_SHADOWTLS_PASSWORD",
-                    "version": 3
-                }
-            },
-            {
-                "name": "ANYTLS-EXPERIMENTAL",
-                "type": "anytls",
-                "server": node,
-                "port": 10443,
-                "password": "REPLACE_WITH_ANYTLS_PASSWORD",
-                "client-fingerprint": "chrome",
-                "udp": true,
-                "sni": "www.apple.com"
-            },
-            {
-                "name": "HYSTERIA2-SPEED",
-                "type": "hysteria2",
-                "server": node,
-                "port": 443,
-                "password": "REPLACE_WITH_HY2_PASSWORD",
-                "sni": "www.bing.com",
-                "alpn": ["h3"]
-            },
-            {
-                "name": "TUIC-SPEED",
-                "type": "tuic",
-                "server": node,
-                "port": 11443,
-                "uuid": user.uuid,
-                "password": "REPLACE_WITH_TUIC_PASSWORD",
-                "udp": true,
-                "sni": "www.github.com",
-                "alpn": ["h3"]
-            }
-        ],
-
-        "proxy-groups": [
-            {
-                "name": "MANUAL",
-                "type": "select",
-                "proxies": [
-                    "AUTO-SAFE",
-                    "FAILOVER",
-                    "BALANCE",
-                    "SPEED",
-                    "VLESS-XHTTP-SAFE",
-                    "SS2022-SHADOWTLS-FALLBACK",
-                    "ANYTLS-EXPERIMENTAL",
-                    "HYSTERIA2-SPEED",
-                    "TUIC-SPEED",
-                    "DIRECT"
-                ]
-            },
-            {
-                "name": "AUTO-SAFE",
-                "type": "url-test",
-                "proxies": [
-                    "VLESS-XHTTP-SAFE",
-                    "SS2022-SHADOWTLS-FALLBACK",
-                    "ANYTLS-EXPERIMENTAL"
-                ],
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 300,
-                "tolerance": 50
-            },
-            {
-                "name": "FAILOVER",
-                "type": "fallback",
-                "proxies": [
-                    "VLESS-XHTTP-SAFE",
-                    "ANYTLS-EXPERIMENTAL",
-                    "SS2022-SHADOWTLS-FALLBACK"
-                ],
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 120
-            },
-            {
-                "name": "BALANCE",
-                "type": "load-balance",
-                "strategy": "round-robin",
-                "proxies": [
-                    "VLESS-XHTTP-SAFE",
-                    "SS2022-SHADOWTLS-FALLBACK",
-                    "ANYTLS-EXPERIMENTAL"
-                ],
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 180
-            },
-            {
-                "name": "SPEED",
-                "type": "select",
-                "proxies": [
-                    "HYSTERIA2-SPEED",
-                    "TUIC-SPEED",
-                    "VLESS-XHTTP-SAFE"
-                ]
-            }
-        ],
-
-        "rules": routing_rules(&active_rule_sets)
-    });
-
-    Ok(serde_yaml::to_string(&doc)?)
-}
-
 fn active_routing_rule_sets(rule_sets: &[RoutingRuleSet]) -> Vec<RoutingRuleSet> {
-    let active: Vec<_> = rule_sets
+    rule_sets
         .iter()
         .filter(|rule_set| rule_set.enabled)
         .cloned()
-        .collect();
-
-    if active.is_empty() {
-        default_routing_rule_sets()
-    } else {
-        active
-    }
+        .collect()
 }
 
 fn rule_provider_map(
@@ -482,13 +331,26 @@ fn routing_rules(rule_sets: &[RoutingRuleSet]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{demo_settings, demo_user, ProxyKind};
+    use crate::{models::ProxyKind, rules::default_routing_rule_sets};
 
-    #[test]
-    fn generated_yaml_uses_profiles_and_secret_names() {
-        let settings = demo_settings();
-        let user = demo_user();
-        let profiles = vec![ProtocolProfile {
+    fn fixture_settings() -> PanelSettings {
+        PanelSettings {
+            panel_name: "Infiproxy test".to_string(),
+            subscription_domain: "sub.example.test".to_string(),
+            node_domain: "node.example.test".to_string(),
+        }
+    }
+
+    fn fixture_user() -> SubscriptionUser {
+        SubscriptionUser {
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "fixture-subscription-token".to_string(),
+        }
+    }
+
+    fn fixture_profile() -> ProtocolProfile {
+        ProtocolProfile {
             name: "VLESS-XHTTP-SAFE".to_string(),
             kind: ProxyKind::VlessRealityXhttp,
             role: ProxyRole::AutoSafe,
@@ -502,21 +364,82 @@ mod tests {
                 public_key_secret: "xray.reality.public_key".to_string(),
                 short_id_secret: "xray.reality.short_id".to_string(),
             },
-        }];
+        }
+    }
+
+    #[test]
+    fn generated_yaml_uses_profiles_and_configured_secrets() {
+        let settings = fixture_settings();
+        let user = fixture_user();
+        let profiles = vec![fixture_profile()];
 
         let mut secrets = std::collections::HashMap::new();
         secrets.insert(
             "xray.reality.public_key".to_string(),
             "public-key-value".to_string(),
         );
+        secrets.insert(
+            "xray.reality.short_id".to_string(),
+            "0123456789abcdef".to_string(),
+        );
 
-        let rules = crate::rules::default_routing_rule_sets();
+        let rules = default_routing_rule_sets();
         let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &rules).unwrap();
+        let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
 
         assert!(yaml.contains("node.example.test"));
         assert!(yaml.contains("public-key-value"));
-        assert!(yaml.contains("xray.reality.short_id"));
+        assert!(!yaml.contains("xray.reality.short_id"));
+        assert!(!yaml.contains("REPLACE_WITH_"));
         assert!(yaml.contains("AUTO-SAFE"));
         assert!(yaml.contains("RULE-SET,proxy-ai,AUTO-SAFE"));
+        assert_eq!(
+            parsed["proxies"][0]["xhttp-opts"]["host"],
+            "www.microsoft.com"
+        );
+    }
+
+    #[test]
+    fn generation_rejects_missing_secrets_and_empty_profiles() {
+        let settings = fixture_settings();
+        let user = fixture_user();
+        let profiles = vec![fixture_profile()];
+
+        let error = generate_mihomo_yaml(
+            &settings,
+            &user,
+            &profiles,
+            &std::collections::HashMap::new(),
+            &default_routing_rule_sets(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("required secret is missing"));
+
+        let error = generate_mihomo_yaml(
+            &settings,
+            &user,
+            &[],
+            &std::collections::HashMap::new(),
+            &[],
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("no protocol profiles are enabled"));
+    }
+
+    #[test]
+    fn disabled_rule_sets_are_not_reintroduced() {
+        let settings = fixture_settings();
+        let user = fixture_user();
+        let profiles = vec![fixture_profile()];
+        let secrets = std::collections::HashMap::from([
+            ("xray.reality.public_key".to_string(), "key".to_string()),
+            ("xray.reality.short_id".to_string(), "id".to_string()),
+        ]);
+
+        let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &[]).unwrap();
+        assert!(!yaml.contains("RULE-SET,"));
+        assert!(!yaml.contains("/rules/"));
     }
 }

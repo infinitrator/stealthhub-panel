@@ -16,6 +16,9 @@ SHA256=""
 BINARY=""
 ARCHIVE=""
 RESTART_SERVICE=""
+MAX_ARCHIVE_BYTES=536870912
+MAX_EXTRACTED_BYTES=1073741824
+MAX_ARCHIVE_MEMBERS=4096
 
 usage() {
     cat <<'USAGE'
@@ -126,6 +129,11 @@ if [[ -z "$URL" && -z "$ARCHIVE" ]]; then
     exit 2
 fi
 
+if [[ -n "$URL" && ! "$URL" =~ ^https:// ]]; then
+    echo "Release URL must use HTTPS: $URL" >&2
+    exit 2
+fi
+
 need_cmd() {
     if ! command -v "$1" >/dev/null 2>&1; then
         echo "Missing command: $1" >&2
@@ -141,6 +149,16 @@ STAGING_DIR="${STAGING_ROOT}/${CORE}/${VERSION}"
 TARGET_DIR="${CORE_ROOT}/${CORE}/${VERSION}"
 CURRENT_LINK="${CORE_ROOT}/${CORE}/current"
 NEXT_LINK="${CORE_ROOT}/${CORE}/.current.${VERSION}.next"
+PREVIOUS_TARGET="$(readlink -f "$CURRENT_LINK" 2>/dev/null || true)"
+WAS_ENABLED=0
+WAS_ACTIVE=0
+ACTIVATION_FAILED=0
+
+if [[ -n "$RESTART_SERVICE" ]]; then
+    need_cmd systemctl
+    systemctl is-enabled --quiet "$RESTART_SERVICE" 2>/dev/null && WAS_ENABLED=1
+    systemctl is-active --quiet "$RESTART_SERVICE" 2>/dev/null && WAS_ACTIVE=1
+fi
 
 rm -rf "$STAGING_DIR"
 install -d -m 0750 "$STAGING_DIR"
@@ -150,10 +168,21 @@ if [[ -n "$URL" ]]; then
     need_cmd curl
     ARCHIVE_NAME="${URL##*/}"
     ARCHIVE_PATH="${STAGING_DIR}/${ARCHIVE_NAME}"
-    curl --fail --location --show-error --output "$ARCHIVE_PATH" "$URL"
+    curl --fail --location --show-error \
+        --proto '=https' --proto-redir '=https' --tlsv1.2 \
+        --connect-timeout 15 --max-time 900 \
+        --max-filesize "$MAX_ARCHIVE_BYTES" \
+        --retry 3 --retry-delay 2 --retry-connrefused \
+        --output "$ARCHIVE_PATH" "$URL"
 else
     ARCHIVE_PATH="${STAGING_DIR}/${ARCHIVE##*/}"
     install -m 0644 "$ARCHIVE" "$ARCHIVE_PATH"
+fi
+
+ARCHIVE_SIZE="$(wc -c <"$ARCHIVE_PATH" | tr -d '[:space:]')"
+if [[ ! "$ARCHIVE_SIZE" =~ ^[0-9]+$ ]] || ((ARCHIVE_SIZE > MAX_ARCHIVE_BYTES)); then
+    echo "Release archive exceeds the ${MAX_ARCHIVE_BYTES}-byte safety limit" >&2
+    exit 1
 fi
 
 printf '%s  %s\n' "$SHA256" "$ARCHIVE_PATH" | sha256sum -c -
@@ -173,27 +202,76 @@ validate_member_names() {
     done
 }
 
+validate_tar_limits() {
+    local archive="$1" compression="$2"
+    LC_ALL=C tar --numeric-owner "-${compression}tvf" "$archive" | awk \
+        -v max_bytes="$MAX_EXTRACTED_BYTES" -v max_members="$MAX_ARCHIVE_MEMBERS" '
+        function is_date(value) {
+            return value ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ \
+                || value ~ /^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$/
+        }
+        {
+            size = ""
+            for (field_no = 2; field_no <= NF; field_no++) {
+                if (is_date($field_no) && field_no > 2) {
+                    size = $(field_no - 1)
+                    break
+                }
+            }
+            if (size !~ /^[0-9]+$/) exit 2
+            total += size
+            members += 1
+            if (total > max_bytes || members > max_members) exit 1
+        }
+        END {
+            if (members == 0) exit 3
+        }
+    '
+}
+
+validate_zip_limits() {
+    local archive="$1"
+    LC_ALL=C zipinfo -l "$archive" | awk \
+        -v max_bytes="$MAX_EXTRACTED_BYTES" -v max_members="$MAX_ARCHIVE_MEMBERS" '
+        $1 ~ /^[-d]/ {
+            if ($4 !~ /^[0-9]+$/) exit 2
+            total += $4
+            members += 1
+            if (total > max_bytes || members > max_members) exit 1
+        }
+        END {
+            if (members == 0) exit 3
+        }
+    '
+}
+
 case "$ARCHIVE_PATH" in
     *.tar.gz|*.tgz)
         need_cmd tar
         tar -tzf "$ARCHIVE_PATH" | validate_member_names
-        tar -tvzf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) ~ /[lh]/ { exit 1 }' \
-            || { echo "Archive links are not allowed" >&2; exit 1; }
+        validate_tar_limits "$ARCHIVE_PATH" z \
+            || { echo "Archive exceeds extraction safety limits" >&2; exit 1; }
+        tar -tvzf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) !~ /[-d]/ { exit 1 }' \
+            || { echo "Only regular files and directories are allowed in archives" >&2; exit 1; }
         tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
         ;;
     *.tar.xz|*.txz)
         need_cmd tar
         tar -tJf "$ARCHIVE_PATH" | validate_member_names
-        tar -tvJf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) ~ /[lh]/ { exit 1 }' \
-            || { echo "Archive links are not allowed" >&2; exit 1; }
+        validate_tar_limits "$ARCHIVE_PATH" J \
+            || { echo "Archive exceeds extraction safety limits" >&2; exit 1; }
+        tar -tvJf "$ARCHIVE_PATH" | awk 'substr($1, 1, 1) !~ /[-d]/ { exit 1 }' \
+            || { echo "Only regular files and directories are allowed in archives" >&2; exit 1; }
         tar --no-same-owner --no-same-permissions -xJf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
         ;;
     *.zip)
         need_cmd unzip
         need_cmd zipinfo
         unzip -Z -1 "$ARCHIVE_PATH" | validate_member_names
-        zipinfo -l "$ARCHIVE_PATH" | awk '$1 ~ /^l/ { exit 1 }' \
-            || { echo "Archive links are not allowed" >&2; exit 1; }
+        validate_zip_limits "$ARCHIVE_PATH" \
+            || { echo "Archive exceeds extraction safety limits" >&2; exit 1; }
+        zipinfo -l "$ARCHIVE_PATH" | awk 'NR > 3 && $1 ~ /^[bclps]/ { exit 1 }' \
+            || { echo "Archive links and special files are not allowed" >&2; exit 1; }
         unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR"
         ;;
     *)
@@ -248,8 +326,39 @@ ln -sfn "$TARGET_DIR" "$NEXT_LINK"
 mv -Tf "$NEXT_LINK" "$CURRENT_LINK"
 
 if [[ -n "$RESTART_SERVICE" ]]; then
-    systemctl enable "$RESTART_SERVICE"
-    systemctl restart "$RESTART_SERVICE"
+    if ! systemctl enable "$RESTART_SERVICE" \
+        || ! systemctl restart "$RESTART_SERVICE"; then
+        ACTIVATION_FAILED=1
+    fi
+    if [[ "$ACTIVATION_FAILED" -eq 0 ]]; then
+        sleep 2
+        systemctl is-active --quiet "$RESTART_SERVICE" || ACTIVATION_FAILED=1
+    fi
+    if [[ "$ACTIVATION_FAILED" -eq 1 ]]; then
+        if [[ -n "$PREVIOUS_TARGET" && -d "$PREVIOUS_TARGET" ]]; then
+            ROLLBACK_LINK="${CORE_ROOT}/${CORE}/.current.rollback.$$"
+            rm -f -- "$ROLLBACK_LINK"
+            if ! ln -s "$PREVIOUS_TARGET" "$ROLLBACK_LINK" \
+                || ! mv -Tf "$ROLLBACK_LINK" "$CURRENT_LINK"; then
+                rm -f -- "$ROLLBACK_LINK"
+                echo "Failed to restore previous runtime link: ${PREVIOUS_TARGET}" >&2
+            fi
+        else
+            rm -f -- "$CURRENT_LINK"
+        fi
+        if [[ "$WAS_ENABLED" -eq 1 ]]; then
+            systemctl enable "$RESTART_SERVICE" >/dev/null 2>&1 || true
+        else
+            systemctl disable "$RESTART_SERVICE" >/dev/null 2>&1 || true
+        fi
+        if [[ "$WAS_ACTIVE" -eq 1 && -n "$PREVIOUS_TARGET" ]]; then
+            systemctl restart "$RESTART_SERVICE" >/dev/null 2>&1 || true
+        else
+            systemctl stop "$RESTART_SERVICE" >/dev/null 2>&1 || true
+        fi
+        echo "${RESTART_SERVICE} failed after activation; previous runtime state was restored." >&2
+        exit 1
+    fi
     systemctl --no-pager --full status "$RESTART_SERVICE"
 fi
 

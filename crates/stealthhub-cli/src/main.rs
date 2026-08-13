@@ -1,17 +1,12 @@
 //! Command-line maintenance utilities for local Infiproxy development.
 //!
-//! The CLI intentionally stays small: it initializes SQLite state, creates test
-//! users, lists users and prints sample Mihomo YAML without starting the web
-//! control plane.
+//! The CLI intentionally stays small: it initializes `SQLite` state and performs
+//! explicit user maintenance without starting the web control plane.
 
 use clap::{Parser, Subcommand};
-use stealthhub_core::{
-    mihomo::generate_demo_mihomo_yaml,
-    models::{demo_settings, demo_user},
-    storage::{
-        create_user, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
-        ensure_default_settings, init_db, list_users, open_pool, DbPool, NewUser,
-    },
+use stealthhub_core::storage::{
+    create_user, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
+    ensure_default_settings, init_db, list_users, open_pool, DbPool, NewUser,
 };
 
 #[derive(Parser)]
@@ -24,7 +19,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    GenerateMihomo,
     CreateUser {
         #[arg(long, default_value = "sqlite://./infiproxy.local.sqlite?mode=rwc")]
         db: String,
@@ -44,10 +38,6 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::GenerateMihomo => {
-            let yaml = generate_demo_mihomo_yaml(&demo_settings(), &demo_user())?;
-            println!("{yaml}");
-        }
         Command::CreateUser {
             db,
             username,
@@ -80,8 +70,7 @@ async fn main() -> anyhow::Result<()> {
                 for user in users {
                     let limit = user
                         .traffic_limit_bytes
-                        .map(format_bytes)
-                        .unwrap_or_else(|| "unlimited".to_string());
+                        .map_or_else(|| "unlimited".to_string(), format_bytes);
                     let status = if user.enabled { "enabled" } else { "disabled" };
                     println!(
                         "{}\t{}\t{}\t/sub/{}/mihomo.yaml",

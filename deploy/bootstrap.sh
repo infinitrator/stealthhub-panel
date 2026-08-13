@@ -84,6 +84,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ ! "$REF" =~ ^[A-Za-z0-9_./-]+$ || "$REF" == /* || "$REF" == -* || "$REF" == *..* ]]; then
+    echo "Invalid Git reference: $REF" >&2
+    exit 2
+fi
+repo_path="${REPO_URL#https://github.com/}"
+repo_path="${repo_path%.git}"
+if [[ "$REPO_URL" != https://github.com/* \
+    || ! "$repo_path" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "Repository must be an HTTPS GitHub URL: $REPO_URL" >&2
+    exit 2
+fi
+REPO_URL="https://github.com/${repo_path}.git"
+
 if [[ "$(id -u)" -ne 0 && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Run as root: curl -fsSL <bootstrap-url> | sudo bash" >&2
     exit 1
@@ -106,7 +119,7 @@ need_cmd() {
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "Preflight:"
-    for cmd in git cargo systemctl; do
+    for cmd in git cargo flock systemctl; do
         if command -v "$cmd" >/dev/null 2>&1; then
             echo "  $cmd: found"
         else
@@ -132,6 +145,7 @@ install_deps() {
             pkg-config
             sqlite3
             unzip
+            util-linux
             whiptail
             xz-utils
             zlib1g-dev
@@ -154,6 +168,7 @@ install_deps() {
             pkgconf-pkg-config
             sqlite
             unzip
+            util-linux
             newt
             xz
             zlib-devel
@@ -185,31 +200,52 @@ ensure_rust() {
 }
 
 sync_source() {
+    local target candidate
     install -d -m 0755 "$(dirname "$SRC_DIR")"
 
     if [[ -d "${SRC_DIR}/.git" ]]; then
         git -C "$SRC_DIR" remote set-url origin "$REPO_URL"
-        git -C "$SRC_DIR" fetch --tags --prune origin
     elif [[ -e "$SRC_DIR" ]]; then
         echo "Source directory exists but is not a git checkout: $SRC_DIR" >&2
         exit 1
     else
-        git clone "$REPO_URL" "$SRC_DIR"
+        git clone --no-checkout "$REPO_URL" "$SRC_DIR"
     fi
 
-    git -C "$SRC_DIR" checkout --force "$REF" 2>/dev/null \
-        || git -C "$SRC_DIR" checkout --force "origin/$REF"
+    git -C "$SRC_DIR" fetch --force --prune --tags origin \
+        '+refs/heads/*:refs/remotes/origin/*'
+    target=""
+    for candidate in "refs/remotes/origin/${REF}" "refs/tags/${REF}" "$REF"; do
+        if target="$(git -C "$SRC_DIR" rev-parse --verify "${candidate}^{commit}" 2>/dev/null)"; then
+            break
+        fi
+    done
+    if [[ ! "$target" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+        git -C "$SRC_DIR" fetch --force origin "$REF"
+        target="$(git -C "$SRC_DIR" rev-parse --verify 'FETCH_HEAD^{commit}')"
+    fi
+    [[ "$target" =~ ^[A-Fa-f0-9]{40}$ ]] || {
+        echo "Unable to resolve Git reference: $REF" >&2
+        exit 1
+    }
+
+    git -C "$SRC_DIR" checkout --force --detach "$target"
+    git -C "$SRC_DIR" clean -fdx -e target/
+    echo "  commit:   $target"
 }
 
 install_deps
 ensure_rust
 need_cmd cargo
+need_cmd flock
 need_cmd git
 need_cmd systemctl
 
 sync_source
 
-cargo build --release -p stealthhub-panel --manifest-path "${SRC_DIR}/Cargo.toml"
+cargo build --locked --release -p stealthhub-panel \
+    --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
+    --manifest-path "${SRC_DIR}/Cargo.toml"
 
 install_args=()
 if [[ "$FORCE_ENV" -eq 1 ]]; then
@@ -250,6 +286,7 @@ Local health checks:
 First admin setup:
   Open https://<your-domain>/admin/setup after configuring HTTPS reverse proxy.
   Or use an SSH tunnel first: ssh -L 8080:127.0.0.1:8080 root@<server>
+  Setup token: $(awk -F= '$1 == "INFIPROXY_SETUP_TOKEN" { sub("^[^=]*=", ""); print; exit }' /etc/infiproxy/infiproxy.env)
 
 Source:
   ${SRC_DIR}

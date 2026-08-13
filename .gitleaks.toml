@@ -1,0 +1,11 @@
+title = "Infiproxy secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated build artifacts and locally downloaded module runtimes"
+paths = [
+  '''^target/''',
+  '''^\.runtime/''',
+]

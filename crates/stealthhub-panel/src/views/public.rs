@@ -2,7 +2,7 @@
 
 use crate::{
     ui::{layout, APP_NAME},
-    MIN_ADMIN_PASSWORD_LEN,
+    MAX_ADMIN_PASSWORD_LEN, MIN_ADMIN_PASSWORD_LEN,
 };
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
@@ -45,22 +45,26 @@ pub(crate) fn render_setup() -> Response {
                     html! {
                         h1 { "Initial admin setup" }
                         div class="notice" {
-                            "Create the first local administrator account. This page disappears after setup."
+                            "Create the first local administrator account. Use the one-time setup token printed by the installer or SSH manager."
                         }
                         section {
                             h2 { "Admin account" }
                             form method="post" action="/admin/setup" class="form" {
+                                label {
+                                    span { "Setup token" }
+                                    input type="password" name="setup_token" minlength=(crate::MIN_SETUP_TOKEN_LEN) required autocomplete="one-time-code";
+                                }
                                 label {
                                     span { "Username" }
                                     input type="text" name="username" minlength="3" maxlength="64" required autocomplete="username";
                                 }
                                 label {
                                     span { "Password" }
-                                    input type="password" name="password" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
+                                    input type="password" name="password" minlength=(MIN_ADMIN_PASSWORD_LEN) maxlength=(MAX_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
                                 }
                                 label {
                                     span { "Confirm password" }
-                                    input type="password" name="password_confirm" minlength=(MIN_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
+                                    input type="password" name="password_confirm" minlength=(MIN_ADMIN_PASSWORD_LEN) maxlength=(MAX_ADMIN_PASSWORD_LEN) required autocomplete="new-password";
                                 }
                                 button type="submit" { "Create admin" }
                             }
@@ -83,11 +87,11 @@ pub(crate) fn render_login() -> Response {
                         form method="post" action="/admin/login" class="form" {
                             label {
                                 span { "Username" }
-                                input type="text" name="username" required autocomplete="username";
+                                input type="text" name="username" maxlength="64" required autocomplete="username";
                             }
                             label {
                                 span { "Password" }
-                                input type="password" name="password" required autocomplete="current-password";
+                                input type="password" name="password" maxlength=(MAX_ADMIN_PASSWORD_LEN) required autocomplete="current-password";
                             }
                             button type="submit" { "Login" }
                         }
