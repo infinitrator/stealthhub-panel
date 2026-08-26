@@ -163,9 +163,17 @@ normalize_version() {
 }
 
 github_json() {
-  curl --fail --silent --show-error --location \
+  local curl_config="${INFIPROXY_GITHUB_CURL_CONFIG:-/root/.config/infiproxy/github-api.curl}"
+  local -a auth_args=()
+
+  if [[ -r "$curl_config" ]]; then
+    auth_args=(--config "$curl_config")
+  fi
+
+  curl "${auth_args[@]}" \
+    --fail --silent --show-error --location \
     --proto '=https' --proto-redir '=https' --tlsv1.2 \
-    --connect-timeout 15 --max-time 30 --retry 3 --retry-all-errors \
+    --connect-timeout 15 --max-time 30 --retry 2 \
     -H 'Accept: application/vnd.github+json' \
     -H 'X-GitHub-Api-Version: 2022-11-28' \
     -H 'User-Agent: Infiproxy-module-updater' "$1"
