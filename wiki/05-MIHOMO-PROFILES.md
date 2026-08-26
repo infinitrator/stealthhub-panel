@@ -76,8 +76,9 @@ Protocol profiles + secret_values + routing sets + subscription user UUID
 
 ### Enabled
 
-Определяет только включение объекта в generated YAML. Switch не проверяет
-secret badge, runtime или firewall.
+Включает объект в desired client/server state и создает новое поколение.
+Сохранение switch не гарантирует успех: дождитесь `Applied`; missing secret,
+native validation, health или listener error приводят к fail-closed/rollback.
 
 ### Server address
 
@@ -246,10 +247,10 @@ Generated object:
 - при непустом optional secret name добавляется Salamander obfs.
 
 Default profile содержит имя `hysteria2.obfs_password`, поэтому после включения
-generator добавит obfs. Starter Hysteria server config obfs не содержит. Выберите
-один согласованный вариант:
+adapter добавит obfs и в client, и в generated server config. Выберите один
+согласованный вариант:
 
-1. добавьте Salamander с тем же password в server config и secret store;
+1. сохраните Salamander password в secret store;
 2. очистите **Salamander obfs secret** в profile и не используйте obfs.
 
 Неверный obfs password обычно выглядит как timeout, а не явная auth error.

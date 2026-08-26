@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=infiproxy
-Group=infiproxy
+User=infiproxy-runtime
+Group=infiproxy-runtime
 ExecStart=/opt/infiproxy/cores/tuic/current/tuic-server -c /etc/infiproxy-cores/tuic/config.json
 Restart=on-failure
 RestartSec=3

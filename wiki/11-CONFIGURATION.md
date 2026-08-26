@@ -8,9 +8,10 @@ Infiproxy хранит состояние в трех разных местах,
 | Конфигурация процессов | Файлы ОС | `infiproxy.env`, Xray JSON, Headscale YAML, Nginx и SSH. |
 | Исполняемые версии | Versioned runtime directories | `/opt/infiproxy/cores/xray/<version>/xray` и symlink `current`. |
 
-Изменение одного слоя не синхронизирует другие автоматически. Например,
-изменение VLESS UUID в Xray не обновит `user.uuid` в SQLite, а изменение порта
-во вкладке **Protocols** не перепишет Xray inbound.
+Для поддержанных protocol/core adapters SQLite является desired state, а
+root-reconciler генерирует runtime config. Ручное изменение managed Xray,
+sing-box, Hysteria или TUIC config не обновляет SQLite и будет заменено следующим
+поколением. Nginx, SSH, Headscale и MTProto имеют отдельные контракты управления.
 
 ## 1. Вкладка Configs
 
@@ -196,9 +197,11 @@ Bootstrap генерирует token через CSPRNG и печатает ег�
 INFIPROXY_CURRENT_COMMIT=<40-hex-installed-sha>
 ```
 
-Idempotent installer записывает exact Git commit установленного binary. Checker
-использует его вместо неоднозначного состояния checkout, а root updater меняет
-значение только после успешной сборки, установки и readiness-проверки.
+Idempotent installer записывает exact Git commit установленного binary как
+compatibility/diagnostic fallback. Источник истины для updater — root-owned
+`/var/lib/infiproxy-maintenance/panel-last-applied.sha`; stale env не может
+переопределить его. Marker меняется только после успешной сборки, установки и
+readiness-проверки.
 
 ### `RUST_LOG`
 
@@ -286,17 +289,17 @@ authorized_keys. Web-editor предоставляет доступ к файл�
 
 Файл: `/etc/infiproxy-cores/xray/config.json`.
 
-Starter template намеренно содержит:
+До первого reconcile starter template содержит:
 
 - `log.loglevel: warning`;
 - пустой массив `inbounds`;
 - outbound `freedom` с tag `direct`;
 - outbound `blackhole` с tag `blocked`.
 
-Пустой `inbounds` означает, что сразу после установки Xray не принимает
-клиентов. Для VLESS + REALITY/XHTTP нужно явно создать inbound, UUID/flow,
-transport и REALITY keys в синтаксисе установленной версии Xray. Затем те же
-клиентские значения внесите в Infiproxy/Mihomo.
+Пустой `inbounds` означает, что одна установка module еще не принимает
+клиентов. Настройте профиль и client/public secrets в web, private REALITY key
+через root-TUI, затем дождитесь `Applied`. Не поддерживайте параллельную ручную
+версию этого managed файла.
 
 Проверка:
 
@@ -314,8 +317,8 @@ sudo systemctl restart infiproxy-xray.service
 Файл: `/etc/infiproxy-cores/sing-box/config.json`.
 
 Starter template содержит log level `warn`, пустые `inbounds`, outbound
-`direct` и `block`. Он безопасно не открывает proxy listener, но не готов
-обслуживать Shadowsocks 2022, ShadowTLS или AnyTLS без ручного inbound.
+`direct` и `block`. Первый успешный reconcile заменяет его server config,
+собранным из enabled Shadowsocks/ShadowTLS/AnyTLS profiles.
 
 Проверка:
 

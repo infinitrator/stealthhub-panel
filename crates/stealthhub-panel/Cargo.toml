@@ -31,5 +31,6 @@ serde.workspace = true
 serde_norway.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+uuid.workspace = true
 stealthhub-core = { version = "=0.1.0-beta.1", path = "../stealthhub-core" }
 subtle.workspace = true

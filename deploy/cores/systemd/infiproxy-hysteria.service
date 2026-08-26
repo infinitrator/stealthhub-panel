@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=infiproxy
-Group=infiproxy
+User=infiproxy-runtime
+Group=infiproxy-runtime
 ExecStart=/opt/infiproxy/cores/hysteria/current/hysteria server -c /etc/infiproxy-cores/hysteria/config.yaml
 Restart=on-failure
 RestartSec=3

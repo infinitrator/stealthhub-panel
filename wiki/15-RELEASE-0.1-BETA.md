@@ -7,7 +7,7 @@
 | Поле | Значение |
 |---|---|
 | Версия workspace | `0.1.0-beta.1` |
-| Дата контрольного прохода | 13 августа 2026 |
+| Дата контрольного прохода | 26 августа 2026 |
 | Целевой deployment | Bare-metal Linux, systemd, Nginx, SQLite |
 | Основные ОС | Ubuntu 24.04 LTS, Debian 12 |
 | Решение | Готово к ограниченному полевому beta-тесту после успешного CI на release commit |
@@ -31,6 +31,9 @@ end-to-end сценарии сведены в одну проверяемую т
 - owner-only allowlist Configs с backup, parser check и atomic replace;
 - SSH-TUI, Cloudflare DNS-01/Nginx, MTProxy и Headscale guided setup;
 - panel/module backup, rollback, update schedule и uninstall modes;
+- generic protocol/core adapters, desired/applied generations и root reconciler;
+- durable operation journal, verified rollback и crash recovery;
+- root-only private server secrets и sanitized reconciliation observability;
 - source-controlled GitHub Wiki с автоматической публикацией.
 
 ## 3. Метод аудита
@@ -149,7 +152,9 @@ bash deploy/tests/wiki-check.sh
 Workspace запрещает `unsafe` через inherited Cargo lint. Compatible dependency
 update dry-run не должен показывать доступных обновлений на дату release gate.
 
-Контроль актуальности 13 августа 2026:
+Контроль Rust dependencies повторен 26 августа 2026; версии внешних runtimes в
+таблице последний раз сверялись 13 августа и при установке заново разрешаются
+из upstream manifest:
 
 | Компонент | Проверенная stable/latest версия |
 |---|---|
@@ -203,8 +208,10 @@ End-to-end harness проверяет:
 - password rotation, old-password rejection и session revocation;
 - login rate limit и `Retry-After`.
 
-Контрольный запуск дал 56 успешных Rust tests: 18 core, 5 manifest-helper и 33
-panel. HTTP harness и updater regression harness завершились без ошибок.
+Контрольный запуск дал 93 успешных Rust tests: 53 core, 5 manifest-helper и 35
+panel. В это число входят mandatory failure-injection, migration, stale-SHA,
+domain/frontend, generation и redaction tests. HTTP harness и updater regression
+harness завершились без ошибок.
 
 Nu HTML Checker `26.8.6` не обнаружил HTML/CSS structural errors на 19
 документах широкого прохода; финальный release rerun повторно проверил 16

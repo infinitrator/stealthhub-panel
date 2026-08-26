@@ -1,0 +1,9 @@
+[Unit]
+Description=Infiproxy desired-state reconcile trigger
+
+[Path]
+PathExists=/var/lib/infiproxy/reconcile-requests/reconcile.request
+Unit=infiproxy-reconcile.service
+
+[Install]
+WantedBy=multi-user.target

@@ -3,8 +3,9 @@
 use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
-use stealthhub_core::models::{
-    PanelSettings, ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole,
+use stealthhub_core::{
+    adapter::{ConfigField, ConfigFieldKind, ProtocolRegistry},
+    models::{PanelSettings, ProtocolProfile, ProxyRole},
 };
 
 pub(crate) fn render(
@@ -12,6 +13,7 @@ pub(crate) fn render(
     settings: &PanelSettings,
     profiles: &[ProtocolProfile],
     secret_names: &[String],
+    registry: &ProtocolRegistry,
 ) -> Response {
     Html(
             layout(
@@ -50,41 +52,18 @@ pub(crate) fn render(
                     }
 
                     section {
-                        h2 { "Transport matrix" }
+                        h2 { "Installed protocol adapters" }
                         div class="table-wrap" {
                             table {
-                                thead {
-                                    tr {
-                                        th { "Profile" }
-                                        th { "Purpose" }
-                                        th { "Masking knobs" }
-                                        th { "Client impact" }
-                                    }
-                                }
+                                thead { tr { th { "Adapter" } th { "Schema" } th { "Runtime capabilities" } th { "Per-user auth" } } }
                                 tbody {
-                                    tr {
-                                        td { code { "vless-reality-xhttp" } }
-                                        td { "Primary TLS-like profile for modern Mihomo clients." }
-                                        td { code { "server_name" } " + " code { "path" } " + REALITY public key/short ID." }
-                                        td { "Best default when client supports XHTTP." }
-                                    }
-                                    tr {
-                                        td { code { "vless-reality-tcp" } }
-                                        td { "Lean fallback with fewer moving parts." }
-                                        td { code { "server_name" } " + REALITY public key/short ID." }
-                                        td { "Useful for conservative client profiles." }
-                                    }
-                                    tr {
-                                        td { code { "ss2022-shadowtls" } }
-                                        td { "Compatibility transport with ShadowTLS front." }
-                                        td { code { "server_name" } " + independent SS/ShadowTLS secrets." }
-                                        td { "Good fallback when VLESS is undesirable." }
-                                    }
-                                    tr {
-                                        td { code { "hysteria2" } " / " code { "tuic" } }
-                                        td { "QUIC speed fallback for high-latency routes." }
-                                        td { code { "sni" } " + password/obfs secrets." }
-                                        td { "Enable only when UDP path is healthy." }
+                                    @for manifest in registry.manifests() {
+                                        tr {
+                                            td { strong { (&manifest.display_name) } br; code { (&manifest.id) } }
+                                            td { (manifest.schema_version) }
+                                            td { @for capability in &manifest.required_core_capabilities { code { (capability) } " " } }
+                                            td { @if manifest.user_participates { "yes" } @else { "shared credentials" } }
+                                        }
                                     }
                                 }
                             }
@@ -112,7 +91,7 @@ pub(crate) fn render(
                                         @for profile in profiles {
                                             tr {
                                                 td { code { (&profile.name) } }
-                                                td { (proxy_kind_label(&profile.kind)) }
+                                                td { (protocol_label(profile, registry)) }
                                                 td { (proxy_role_label(&profile.role)) }
                                                 td {
                                                     @if profile.enabled {
@@ -123,13 +102,14 @@ pub(crate) fn render(
                                                 }
                                                 td { code { (format!("{}:{}", profile.server, profile.port)) } }
                                                 td {
-                                                    @let missing = missing_secret_names(profile, secret_names);
-                                                    @if profile.required_secret_names().is_empty() {
+                                                    @let required = required_secret_names(profile, registry);
+                                                    @let missing = missing_secret_names(&required, secret_names);
+                                                    @if required.is_empty() {
                                                         span class="badge ok" { "none" }
                                                     } @else if missing.is_empty() {
                                                         span class="badge ok" { "ready" }
                                                         br;
-                                                        @for secret in profile.required_secret_names() {
+                                                        @for secret in required {
                                                             code { (secret) }
                                                             " "
                                                         }
@@ -159,7 +139,7 @@ pub(crate) fn render(
                         }
                         div class="config-list" {
                             @for profile in profiles {
-                                (protocol_profile_editor(profile, auth, secret_names))
+                                (protocol_profile_editor(profile, auth, secret_names, registry))
                             }
                         }
                     }
@@ -174,6 +154,7 @@ fn protocol_profile_editor(
     profile: &ProtocolProfile,
     auth: &AuthenticatedAdmin,
     secret_names: &[String],
+    registry: &ProtocolRegistry,
 ) -> Markup {
     html! {
         section class="config-row" {
@@ -183,7 +164,7 @@ fn protocol_profile_editor(
                     span class=(format!("badge {}", if profile.enabled { "ok" } else { "off" })) {
                         @if profile.enabled { "enabled" } @else { "disabled" }
                     }
-                    span class="badge neutral" { (proxy_kind_label(&profile.kind)) }
+                    span class="badge neutral" { (protocol_label(profile, registry)) }
                     span class="badge neutral" { (proxy_role_label(&profile.role)) }
                 }
             }
@@ -207,147 +188,84 @@ fn protocol_profile_editor(
                     input type="number" name="port" min="1" max="65535" value=(profile.port) required;
                     small { "Remote port used by the client." }
                 }
-                (protocol_specific_fields(profile, secret_names))
+                (protocol_specific_fields(profile, secret_names, registry))
                 button type="submit" { "Save profile" }
             }
         }
     }
 }
 
-fn protocol_specific_fields(profile: &ProtocolProfile, secret_names: &[String]) -> Markup {
-    match &profile.config {
-        ProtocolConfig::VlessRealityXhttp {
-            server_name,
-            path,
-            public_key_secret,
-            short_id_secret,
-            ..
-        } => html! {
-            (text_input("server_name", "TLS server name", server_name, "SNI and XHTTP Host value used by Mihomo."))
-            (text_input("path", "XHTTP path", path, "HTTP path sent by the xhttp transport."))
-            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
-            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
-        },
-        ProtocolConfig::VlessRealityTcp {
-            server_name,
-            public_key_secret,
-            short_id_secret,
-            ..
-        } => html! {
-            (text_input("server_name", "TLS server name", server_name, "SNI value for REALITY verification."))
-            (secret_input("public_key_secret", "REALITY public key secret", public_key_secret, secret_names))
-            (secret_input("short_id_secret", "REALITY short ID secret", short_id_secret, secret_names))
-        },
-        ProtocolConfig::Shadowsocks2022ShadowTls {
-            server_name,
-            password_secret,
-            shadow_tls_password_secret,
-        } => html! {
-            (text_input("server_name", "ShadowTLS server name", server_name, "TLS host presented by ShadowTLS v3."))
-            (secret_input("password_secret", "Shadowsocks password secret", password_secret, secret_names))
-            (secret_input(
-                "shadow_tls_password_secret",
-                "ShadowTLS password secret",
-                shadow_tls_password_secret,
-                secret_names
-            ))
-        },
-        ProtocolConfig::Hysteria2 {
-            password_secret,
-            sni,
-            obfs_password_secret,
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by the TLS handshake."))
-            (secret_input("password_secret", "Hysteria2 password secret", password_secret, secret_names))
-            (optional_secret_input(
-                "obfs_password_secret",
-                "Salamander obfs secret",
-                obfs_password_secret.as_deref().unwrap_or(""),
-                secret_names
-            ))
-        },
-        ProtocolConfig::AnyTls {
-            password_secret,
-            sni,
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by AnyTLS."))
-            (secret_input("password_secret", "AnyTLS password secret", password_secret, secret_names))
-        },
-        ProtocolConfig::Tuic {
-            password_secret,
-            sni,
-            ..
-        } => html! {
-            (text_input("sni", "TLS SNI", sni, "Server name used by TUIC."))
-            (secret_input("password_secret", "TUIC password secret", password_secret, secret_names))
-        },
-    }
-}
-
-fn text_input(name: &str, label: &str, value: &str, help: &str) -> Markup {
+fn protocol_specific_fields(
+    profile: &ProtocolProfile,
+    secret_names: &[String],
+    registry: &ProtocolRegistry,
+) -> Markup {
+    let Some(adapter) = registry.get(&profile.protocol_id) else {
+        return html! { p class="inline-warn" { "The required protocol adapter is not installed." } };
+    };
     html! {
-        label {
-            span { (label) }
-            input type="text" name=(name) value=(value) required;
-            small { (help) }
+        @for field in adapter.fields() {
+            (adapter_field(profile, field, secret_names))
         }
     }
 }
 
-fn secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
+fn adapter_field(
+    profile: &ProtocolProfile,
+    field: &ConfigField,
+    secret_names: &[String],
+) -> Markup {
+    let value = profile
+        .config
+        .get(&field.name)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     html! {
         label {
-            span { (label) }
-            input type="text" name=(name) value=(value) list="secret-names" required;
+            span { (&field.label) }
+            @if field.kind == ConfigFieldKind::SecretRef {
+                input type="text" name=(&field.name) value=(value) list="secret-names" required[field.required];
+            } @else {
+                input type="text" name=(&field.name) value=(value) required[field.required];
+            }
             small {
-                "SQLite secret name. "
-                @if secret_names.iter().any(|secret| secret == value) {
-                    span class="inline-ok" { "present" }
-                } @else {
-                    span class="inline-warn" { "missing" }
+                (&field.help)
+                @if field.kind == ConfigFieldKind::SecretRef && !value.is_empty() {
+                    " "
+                    @if secret_names.iter().any(|secret| secret == value) {
+                        span class="inline-ok" { "present" }
+                    } @else {
+                        span class="inline-warn" { "missing" }
+                    }
                 }
             }
         }
     }
 }
 
-fn optional_secret_input(name: &str, label: &str, value: &str, secret_names: &[String]) -> Markup {
-    html! {
-        label {
-            span { (label) }
-            input type="text" name=(name) value=(value) list="secret-names";
-            small {
-                "Optional SQLite secret name."
-                @if !value.is_empty() && secret_names.iter().any(|secret| secret == value) {
-                    " "
-                    span class="inline-ok" { "present" }
-                } @else if !value.is_empty() {
-                    " "
-                    span class="inline-warn" { "missing" }
-                }
-            }
-        }
-    }
-}
-
-fn missing_secret_names(profile: &ProtocolProfile, present_secret_names: &[String]) -> Vec<String> {
-    profile
-        .required_secret_names()
+fn required_secret_names(profile: &ProtocolProfile, registry: &ProtocolRegistry) -> Vec<String> {
+    registry
+        .get(&profile.protocol_id)
+        .and_then(|adapter| adapter.secret_references(&profile.config).ok())
+        .unwrap_or_default()
         .into_iter()
-        .filter(|name| !present_secret_names.iter().any(|present| present == name))
-        .map(str::to_string)
+        .map(|reference| reference.as_str().to_string())
         .collect()
 }
 
-const fn proxy_kind_label(kind: &ProxyKind) -> &'static str {
-    match kind {
-        ProxyKind::VlessRealityXhttp => "VLESS + REALITY + XHTTP",
-        ProxyKind::VlessRealityTcp => "VLESS + REALITY + TCP",
-        ProxyKind::Shadowsocks2022ShadowTls => "SS2022 + ShadowTLS",
-        ProxyKind::Hysteria2 => "Hysteria2",
-        ProxyKind::AnyTls => "AnyTLS",
-        ProxyKind::Tuic => "TUIC",
-    }
+fn missing_secret_names(required: &[String], present_secret_names: &[String]) -> Vec<String> {
+    required
+        .iter()
+        .filter(|name| !present_secret_names.iter().any(|present| present == *name))
+        .cloned()
+        .collect()
+}
+
+fn protocol_label(profile: &ProtocolProfile, registry: &ProtocolRegistry) -> String {
+    registry
+        .get(&profile.protocol_id)
+        .map(|adapter| adapter.manifest().display_name.clone())
+        .unwrap_or_else(|| format!("Unavailable: {}", profile.protocol_id))
 }
 
 const fn proxy_role_label(role: &ProxyRole) -> &'static str {

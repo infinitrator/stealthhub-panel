@@ -9,12 +9,15 @@ umask 027
 
 APP_USER="${INFIPROXY_USER:-${STEALTHHUB_USER:-infiproxy}}"
 APP_GROUP="${INFIPROXY_GROUP:-${STEALTHHUB_GROUP:-$APP_USER}}"
+RUNTIME_USER="${INFIPROXY_RUNTIME_USER:-infiproxy-runtime}"
+RUNTIME_GROUP="${INFIPROXY_RUNTIME_GROUP:-$RUNTIME_USER}"
 INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
 MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
 UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
 HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
+RECONCILE_HELPER="${INFIPROXY_RECONCILE_HELPER:-/usr/local/libexec/infiproxy-reconcile}"
 CORE_INSTALL_BIN="${INFIPROXY_CORE_INSTALL_BIN:-/usr/local/sbin/infiproxy-core-install}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
@@ -31,6 +34,9 @@ UPDATE_PATH_FILE="${INFIPROXY_UPDATE_PATH_FILE:-/etc/systemd/system/infiproxy-pa
 MODULE_UPDATE_SERVICE_FILE="${INFIPROXY_MODULE_UPDATE_SERVICE_FILE:-/etc/systemd/system/infiproxy-module-update.service}"
 MODULE_UPDATE_TIMER_FILE="${INFIPROXY_MODULE_UPDATE_TIMER_FILE:-/etc/systemd/system/infiproxy-module-update.timer}"
 MODULE_UPDATE_PATH_FILE="${INFIPROXY_MODULE_UPDATE_PATH_FILE:-/etc/systemd/system/infiproxy-module-update.path}"
+RECONCILE_SERVICE_FILE="${INFIPROXY_RECONCILE_SERVICE_FILE:-/etc/systemd/system/infiproxy-reconcile.service}"
+RECONCILE_TIMER_FILE="${INFIPROXY_RECONCILE_TIMER_FILE:-/etc/systemd/system/infiproxy-reconcile.timer}"
+RECONCILE_PATH_FILE="${INFIPROXY_RECONCILE_PATH_FILE:-/etc/systemd/system/infiproxy-reconcile.path}"
 PROFILE_FILE="${INFIPROXY_PROFILE_FILE:-/etc/profile.d/infiproxy-manager.sh}"
 UPDATE_CONFIG_FILE="${INFIPROXY_UPDATE_CONFIG_FILE:-/etc/infiproxy-update.conf}"
 ENV_FILE="${CONFIG_DIR}/infiproxy.env"
@@ -41,6 +47,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
 RELEASE_MANIFEST_HELPER="${ROOT_DIR}/target/release/infiproxy-module-manifest"
 RELEASE_HEADSCALE_HELPER="${ROOT_DIR}/target/release/infiproxy-headscale-control"
+RELEASE_RECONCILE_HELPER="${ROOT_DIR}/target/release/infiproxy-reconcile"
 
 normalize_github_repo() {
     local value="$1"
@@ -160,6 +167,9 @@ ensure_setup_token() {
     ' "$ENV_FILE" >"$temporary"
     install -m 0660 -o root -g "$APP_GROUP" "$temporary" "$ENV_FILE"
     rm -f "$temporary"
+    printf '%s\n' "$commit" \
+        | install -m 0640 -o root -g "$APP_GROUP" /dev/stdin \
+            "$ROOT_STATE_DIR/panel-last-applied.sha"
 }
 
 record_current_commit() {
@@ -218,6 +228,9 @@ required_deploy_files=(
     deploy/infiproxy-module-update.service
     deploy/infiproxy-module-update.timer
     deploy/infiproxy-module-update.path
+    deploy/infiproxy-reconcile.service
+    deploy/infiproxy-reconcile.timer
+    deploy/infiproxy-reconcile.path
 )
 for relative_path in "${required_deploy_files[@]}"; do
     if [[ ! -f "${ROOT_DIR}/${relative_path}" ]]; then
@@ -262,6 +275,11 @@ if [[ ! -x "$RELEASE_HEADSCALE_HELPER" && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Run: cargo build --release -p stealthhub-panel" >&2
     exit 1
 fi
+if [[ ! -x "$RELEASE_RECONCILE_HELPER" && "$CHECK_ONLY" -eq 0 ]]; then
+    echo "Release helper not found: $RELEASE_RECONCILE_HELPER" >&2
+    echo "Run: cargo build --release -p stealthhub-panel" >&2
+    exit 1
+fi
 
 if [[ ! -x "$RELEASE_BIN" && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Release binary not found: $RELEASE_BIN" >&2
@@ -277,10 +295,12 @@ Infiproxy install plan:
   module updater:$MODULE_UPDATE_BIN
   module helper: $MODULE_MANIFEST_HELPER
   Headscale helper:$HEADSCALE_CONTROL_HELPER
+  reconcile helper:$RECONCILE_HELPER
   core installer:$CORE_INSTALL_BIN
   release bin:   $RELEASE_BIN
   release helper:$RELEASE_MANIFEST_HELPER
   Headscale release helper:$RELEASE_HEADSCALE_HELPER
+  reconcile release helper:$RELEASE_RECONCILE_HELPER
   config:        $ENV_FILE
   state:         $STATE_DIR
   root state:    $ROOT_STATE_DIR
@@ -293,10 +313,11 @@ Infiproxy install plan:
   service:       $SERVICE_FILE
   updater units: $UPDATE_SERVICE_FILE, $UPDATE_TIMER_FILE, $UPDATE_PATH_FILE
   module units:  $MODULE_UPDATE_SERVICE_FILE, $MODULE_UPDATE_TIMER_FILE, $MODULE_UPDATE_PATH_FILE
+  reconcile units:$RECONCILE_SERVICE_FILE, $RECONCILE_TIMER_FILE, $RECONCILE_PATH_FILE
   SSH launcher:  $PROFILE_FILE
   update source: $UPDATE_REPO @ $UPDATE_REF ($UPDATE_CONFIG_FILE)
   nginx:         $WITH_NGINX
-  web config:    /etc/infiproxy and /etc/infiproxy-cores are group-writable by $APP_GROUP
+  privilege:     panel=$APP_USER, runtimes=$RUNTIME_USER, root reconciler owns config changes
 EOF
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
@@ -312,10 +333,18 @@ if ! id -u "$APP_USER" >/dev/null 2>&1; then
     useradd --system --home "$STATE_DIR" --shell /usr/sbin/nologin --gid "$APP_GROUP" "$APP_USER"
 fi
 
-install -d -o root -g "$APP_GROUP" -m 0770 "$CONFIG_DIR"
-install -d -o root -g "$APP_GROUP" -m 0770 /etc/headscale
+if ! getent group "$RUNTIME_GROUP" >/dev/null 2>&1; then
+    groupadd --system "$RUNTIME_GROUP"
+fi
+if ! id -u "$RUNTIME_USER" >/dev/null 2>&1; then
+    useradd --system --home /nonexistent --shell /usr/sbin/nologin --gid "$RUNTIME_GROUP" "$RUNTIME_USER"
+fi
+
+install -d -o root -g "$APP_GROUP" -m 0750 "$CONFIG_DIR"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 /etc/headscale
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR"
 install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
+install -d -o root -g root -m 0700 "$ROOT_STATE_DIR/reconcile" "$ROOT_STATE_DIR/reconcile/transactions"
 install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/headscale"
 install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/module-versions"
 install -d -o root -g root -m 0750 "$ROOT_STATE_DIR/module-disabled"
@@ -327,12 +356,15 @@ install -d -o root -g root -m 0755 "$(dirname "$UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_MANIFEST_HELPER")"
 install -d -o root -g root -m 0755 "$(dirname "$HEADSCALE_CONTROL_HELPER")"
+install -d -o root -g root -m 0755 "$(dirname "$RECONCILE_HELPER")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR"
-install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$CORE_LOG_DIR"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR"
+install -d -o "$RUNTIME_USER" -g "$RUNTIME_GROUP" -m 0750 "$CORE_LOG_DIR"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/modules"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/module-requests"
 install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/headscale-requests"
+install -d -o "$APP_USER" -g "$APP_GROUP" -m 0750 "$STATE_DIR/reconcile-requests"
+install -d -o root -g root -m 0700 "$CONFIG_DIR/secrets.d"
 install -d -o root -g root -m 0700 "$ROOT_STATE_DIR/headscale-processing"
 
 # Recover SQLite files that a previously interrupted root-run install may have
@@ -347,6 +379,7 @@ install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
 install -m 0755 "$RELEASE_MANIFEST_HELPER" "$MODULE_MANIFEST_HELPER"
 install -m 0755 "$RELEASE_HEADSCALE_HELPER" "$HEADSCALE_CONTROL_HELPER"
+install -m 0755 "$RELEASE_RECONCILE_HELPER" "$RECONCILE_HELPER"
 install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
 HEADSCALE_STATE_FILE="$ROOT_STATE_DIR/headscale/state.json"
@@ -398,32 +431,35 @@ install -m 0644 "${ROOT_DIR}/deploy/infiproxy-panel-update.path" "$UPDATE_PATH_F
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.service" "$MODULE_UPDATE_SERVICE_FILE"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.timer" "$MODULE_UPDATE_TIMER_FILE"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-module-update.path" "$MODULE_UPDATE_PATH_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-reconcile.service" "$RECONCILE_SERVICE_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-reconcile.timer" "$RECONCILE_TIMER_FILE"
+install -m 0644 "${ROOT_DIR}/deploy/infiproxy-reconcile.path" "$RECONCILE_PATH_FILE"
 
 for service in "${ROOT_DIR}"/deploy/cores/systemd/*.service; do
     install -m 0644 "$service" "/etc/systemd/system/$(basename "$service")"
 done
 
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/xray"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/sing-box"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/hysteria"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tuic"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/mtproto"
-install -d -o root -g "$APP_GROUP" -m 0770 "$CORE_CONFIG_DIR/tls"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/xray"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/sing-box"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/hysteria"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tuic"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mtproto"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
-    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/sing-box/config.json" ]]; then
-    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/sing-box.config.example.json" "$CORE_CONFIG_DIR/sing-box/config.json"
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/sing-box.config.example.json" "$CORE_CONFIG_DIR/sing-box/config.json"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/hysteria/config.yaml" ]]; then
-    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/hysteria.config.example.yaml" "$CORE_CONFIG_DIR/hysteria/config.yaml"
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/hysteria.config.example.yaml" "$CORE_CONFIG_DIR/hysteria/config.yaml"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
-    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
 fi
 if [[ ! -f "$CORE_CONFIG_DIR/mtproto/mtproto.env" ]]; then
-    install -m 0660 -o root -g "$APP_GROUP" "${ROOT_DIR}/deploy/cores/configs/mtproto.env.example" "$CORE_CONFIG_DIR/mtproto/mtproto.env"
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/mtproto.env.example" "$CORE_CONFIG_DIR/mtproto/mtproto.env"
 fi
 for config in \
     "$CORE_CONFIG_DIR/xray/config.json" \
@@ -432,8 +468,8 @@ for config in \
     "$CORE_CONFIG_DIR/tuic/config.json" \
     "$CORE_CONFIG_DIR/mtproto/mtproto.env"
 do
-    chown root:"$APP_GROUP" "$config"
-    chmod 0660 "$config"
+    chown root:"$RUNTIME_GROUP" "$config"
+    chmod 0640 "$config"
 done
 
 if [[ "$WITH_NGINX" -eq 1 ]]; then
@@ -460,11 +496,14 @@ systemctl enable --now infiproxy-panel-update.timer
 systemctl enable --now infiproxy-panel-update.path
 systemctl enable --now infiproxy-module-update.timer
 systemctl enable --now infiproxy-module-update.path
+systemctl enable --now infiproxy-reconcile.timer
+systemctl enable --now infiproxy-reconcile.path
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
 echo "Updater: systemctl list-timers infiproxy-panel-update.timer"
 echo "Modules: systemctl list-timers infiproxy-module-update.timer"
+echo "Reconcile: systemctl status infiproxy-reconcile.service"
 echo "Manager: sudo infiproxy-manager"
 echo "HTTPS:  sudo infiproxy-manager  # choose HTTPS / Cloudflare setup"
 echo "Health: curl http://127.0.0.1:8080/health"

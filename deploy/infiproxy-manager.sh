@@ -11,6 +11,7 @@ ENV_FILE="${INFIPROXY_ENV_FILE:-/etc/infiproxy/infiproxy.env}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 APP_USER="${INFIPROXY_USER:-infiproxy}"
+PRIVILEGED_SECRET_DIR="${INFIPROXY_SECRET_DIR:-/etc/infiproxy/secrets.d}"
 PANEL_SERVICE="infiproxy.service"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
@@ -19,7 +20,7 @@ MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.a
 MODULE_REQUEST_DIR="${INFIPROXY_MODULE_REQUEST_DIR:-/var/lib/infiproxy/module-requests}"
 MODULE_UPDATE_LOG="${INFIPROXY_MODULE_UPDATE_LOG:-/var/lib/infiproxy-maintenance/module-update.log}"
 PANEL_UPDATE_REQUEST="${INFIPROXY_PANEL_UPDATE_REQUEST:-/var/lib/infiproxy/panel-update-now.request}"
-UPDATE_CONFIG_FILE="${INFIPROXY_UPDATE_CONFIG_FILE:-/etc/infiproxy-update.conf}"
+PANEL_UPDATE_STATUS="${INFIPROXY_PANEL_UPDATE_STATUS:-/var/lib/infiproxy-maintenance/panel-update-status.env}"
 NGINX_SITE="${INFIPROXY_NGINX_SITE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 CLOUDFLARE_CREDENTIALS="${INFIPROXY_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
@@ -189,8 +190,9 @@ main_menu_choice() {
     7 "Panel updates" \
     8 "Panel environment" \
     9 "Guided deployment" \
-    10 "Advanced tools" \
-    11 "Danger zone" \
+    10 "Privileged runtime secrets" \
+    11 "Advanced tools" \
+    12 "Danger zone" \
     0 "Exit to shell"
 }
 
@@ -201,6 +203,80 @@ run_cmd() {
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+valid_secret_reference() {
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+}
+
+store_privileged_secret() {
+  local reference value temporary
+  prompt_value reference "Privileged secret" "Reference name" "" 0 || return
+  valid_secret_reference "$reference" || {
+    echo "${danger}Invalid reference. Use 1-128 letters, digits, dot, underscore or dash.${reset}" >&2
+    pause
+    return
+  }
+  prompt_value value "Privileged secret" "Secret value (input is hidden)" "" 1 || return
+  if [[ -z "$value" || "${#value}" -gt 8192 ]]; then
+    echo "${danger}Secret must contain 1-8192 bytes.${reset}" >&2
+    pause
+    return
+  fi
+  install -d -o root -g root -m 0700 "$PRIVILEGED_SECRET_DIR"
+  temporary="$(mktemp "${PRIVILEGED_SECRET_DIR}/.secret.XXXXXX")"
+  chmod 0600 "$temporary"
+  printf '%s' "$value" >"$temporary"
+  sync "$temporary" 2>/dev/null || true
+  mv -f "$temporary" "${PRIVILEGED_SECRET_DIR}/${reference}"
+  chown root:root "${PRIVILEGED_SECRET_DIR}/${reference}"
+  chmod 0600 "${PRIVILEGED_SECRET_DIR}/${reference}"
+  unset value
+  echo "${green}Stored root-only reference ${reference}.${reset}"
+  systemctl start infiproxy-reconcile.service || true
+  pause
+}
+
+delete_privileged_secret() {
+  local reference
+  prompt_value reference "Privileged secret" "Reference name to delete" "" 0 || return
+  valid_secret_reference "$reference" || { invalid_choice; return; }
+  [[ -f "${PRIVILEGED_SECRET_DIR}/${reference}" \
+      && ! -L "${PRIVILEGED_SECRET_DIR}/${reference}" ]] || {
+    echo "${muted}Reference is not present.${reset}"
+    pause
+    return
+  }
+  confirm_yes "Delete root-only reference ${reference}? The next reconcile may fail closed." "N" \
+    || return
+  rm -f -- "${PRIVILEGED_SECRET_DIR:?}/${reference}"
+  systemctl start infiproxy-reconcile.service || true
+  pause
+}
+
+privileged_secrets_menu() {
+  local choice
+  while true; do
+    choice="$(tui_menu "Privileged runtime secrets" \
+      "Values remain root-only and are never displayed" \
+      1 "List configured reference names" \
+      2 "Create or rotate a reference" \
+      3 "Delete a reference" \
+      0 "Back")" || return
+    case "$choice" in
+      1)
+        header
+        echo "${bold}Configured root-only references${reset}"
+        find "$PRIVILEGED_SECRET_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null \
+          | grep -E '^[A-Za-z0-9._-]{1,128}$' | sort || true
+        pause
+        ;;
+      2) store_privileged_secret ;;
+      3) delete_privileged_secret ;;
+      0) return ;;
+      *) invalid_choice ;;
+    esac
+  done
 }
 
 require_cmd() {
@@ -1618,24 +1694,15 @@ module_update_menu() {
 }
 
 panel_update_check() {
-  local repo ref current latest
-  repo="$(env_value "$UPDATE_CONFIG_FILE" REPO)"
-  ref="$(env_value "$UPDATE_CONFIG_FILE" REF)"
-  repo="${repo:-infinitrator/stealthhub-panel}"
-  ref="${ref:-main}"
-  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || return 1
-  [[ "$ref" =~ ^[A-Za-z0-9_./-]+$ && "$ref" != *..* ]] || return 1
-  current="$(git -C "$SOURCE_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
-  latest="$(git ls-remote "https://github.com/${repo}.git" "$ref" | awk 'NR == 1 {print $1}')"
-  echo "repository  ${repo}"
-  echo "reference   ${ref}"
-  echo "installed   ${current:0:12}"
-  echo "latest      ${latest:0:12}"
-  if [[ -n "$latest" && "$current" == "$latest" ]]; then
-    echo "status      current"
-  else
-    echo "status      update available"
-  fi
+  run_cmd /usr/local/sbin/infiproxy-panel-update --check || return 1
+  [[ -f "$PANEL_UPDATE_STATUS" ]] || return 1
+  awk -F= '
+    $1 == "REPO" { print "repository  " $2 }
+    $1 == "REF" { print "reference   " $2 }
+    $1 == "CURRENT_SHA" { print "installed   " substr($2, 1, 12) }
+    $1 == "LATEST_SHA" { print "latest      " substr($2, 1, 12) }
+    $1 == "STATUS" { print "status      " $2 }
+  ' "$PANEL_UPDATE_STATUS"
 }
 
 panel_update_menu() {
@@ -1693,10 +1760,12 @@ uninstall_commands() {
       cat <<'EOF'
 systemctl disable --now infiproxy.service || true
 systemctl disable --now infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service || true
+systemctl disable --now infiproxy-reconcile.timer infiproxy-reconcile.path infiproxy-reconcile.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
+rm -f /etc/systemd/system/infiproxy-reconcile.service /etc/systemd/system/infiproxy-reconcile.timer /etc/systemd/system/infiproxy-reconcile.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update /etc/infiproxy-update.conf
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update /usr/local/libexec/infiproxy-reconcile /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /opt/infiproxy/source
 rm -f /var/lib/infiproxy/infiproxy.sqlite /var/lib/infiproxy/infiproxy.sqlite-wal /var/lib/infiproxy/infiproxy.sqlite-shm
 rm -f /var/lib/infiproxy/panel-update-state.env /var/lib/infiproxy/panel-update-now.request
@@ -1716,16 +1785,16 @@ for manifest in /etc/infiproxy-modules.d/*.module; do
   systemctl disable --now "$service" || true
   rm -f "/etc/systemd/system/$service"
 done
-systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-reconcile.timer infiproxy-reconcile.path infiproxy-reconcile.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
-rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
+rm -f /etc/systemd/system/infiproxy-reconcile.service /etc/systemd/system/infiproxy-reconcile.timer /etc/systemd/system/infiproxy-reconcile.path
 rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
+rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1738,7 +1807,9 @@ if nginx -t; then
   systemctl reload nginx.service || true
 fi
 userdel infiproxy 2>/dev/null || true
+userdel infiproxy-runtime 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
+groupdel infiproxy-runtime 2>/dev/null || true
 EOF
       ;;
     factory)
@@ -1749,16 +1820,16 @@ for manifest in /etc/infiproxy-modules.d/*.module; do
   systemctl disable --now "$service" || true
   rm -f "/etc/systemd/system/$service"
 done
-systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-xray.service infiproxy-sing-box.service infiproxy-hysteria.service infiproxy-tuic.service infiproxy-mtproto.service headscale.service || true
+systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-panel-update.service infiproxy-module-update.timer infiproxy-module-update.path infiproxy-module-update.service infiproxy-reconcile.timer infiproxy-reconcile.path infiproxy-reconcile.service || true
 rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-module-update.service /etc/systemd/system/infiproxy-module-update.timer /etc/systemd/system/infiproxy-module-update.path
-rm -f /etc/systemd/system/infiproxy-xray.service /etc/systemd/system/infiproxy-sing-box.service /etc/systemd/system/infiproxy-hysteria.service /etc/systemd/system/infiproxy-tuic.service /etc/systemd/system/infiproxy-mtproto.service
+rm -f /etc/systemd/system/infiproxy-reconcile.service /etc/systemd/system/infiproxy-reconcile.timer /etc/systemd/system/infiproxy-reconcile.path
 rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1771,7 +1842,9 @@ if nginx -t; then
   systemctl reload nginx.service || true
 fi
 userdel infiproxy 2>/dev/null || true
+userdel infiproxy-runtime 2>/dev/null || true
 groupdel infiproxy 2>/dev/null || true
+groupdel infiproxy-runtime 2>/dev/null || true
 EOF
       ;;
     *) return 1 ;;
@@ -1823,8 +1896,9 @@ main_menu() {
       7) panel_update_menu ;;
       8) edit_env ;;
       9) guided_deployment ;;
-      10) advanced_menu ;;
-      11) run_uninstall ;;
+      10) privileged_secrets_menu ;;
+      11) advanced_menu ;;
+      12) run_uninstall ;;
       0) exit 0 ;;
       *) invalid_choice ;;
     esac

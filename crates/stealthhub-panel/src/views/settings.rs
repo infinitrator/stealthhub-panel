@@ -65,7 +65,7 @@ pub(crate) fn render(
                                     option value="true" selected[update_status.enabled] { "Enabled" }
                                     option value="false" selected[!update_status.enabled] { "Disabled" }
                                 }
-                                small { "Owner-only. GitHub is checked every two hours; a pending update is applied in the maintenance window." }
+                                small { "Owner-only. The root updater checks the pinned source; a pending update is applied in the maintenance window." }
                             }
                             label {
                                 span { "Maintenance time (server time)" }

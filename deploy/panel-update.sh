@@ -11,6 +11,7 @@ STATE_DIR="${INFIPROXY_STATE_DIR:-/var/lib/infiproxy}"
 ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
 SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 STATE_FILE="${INFIPROXY_PANEL_UPDATE_STATE:-${STATE_DIR}/panel-update-state.env}"
+STATUS_FILE="${INFIPROXY_PANEL_UPDATE_STATUS:-${ROOT_STATE_DIR}/panel-update-status.env}"
 REQUEST_FILE="${INFIPROXY_PANEL_UPDATE_REQUEST:-${STATE_DIR}/panel-update-now.request}"
 RUN_LOG="${INFIPROXY_PANEL_UPDATE_LOG:-${ROOT_STATE_DIR}/panel-update-run.log}"
 LOCK_FILE="${INFIPROXY_PANEL_UPDATE_LOCK_FILE:-/run/lock/infiproxy-panel-update.lock}"
@@ -29,6 +30,7 @@ NGINX_HEADSCALE_AVAILABLE="${INFIPROXY_NGINX_HEADSCALE_AVAILABLE:-/etc/nginx/sit
 PANEL_BINARY="${INFIPROXY_PANEL_BINARY:-/usr/local/bin/infiproxy}"
 MANIFEST_HELPER_BINARY="${INFIPROXY_MANIFEST_HELPER_BINARY:-/usr/local/libexec/infiproxy-module-manifest}"
 HEADSCALE_HELPER_BINARY="${INFIPROXY_HEADSCALE_HELPER_BINARY:-/usr/local/libexec/infiproxy-headscale-control}"
+RECONCILE_HELPER_BINARY="${INFIPROXY_RECONCILE_HELPER_BINARY:-/usr/local/libexec/infiproxy-reconcile}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
 
@@ -59,6 +61,27 @@ read_config() {
     local key="$1"
     [[ -f "$CONFIG_FILE" ]] || return 1
     awk -F= -v key="$key" '$1 == key { sub("^[^=]*=", ""); print; exit }' "$CONFIG_FILE"
+}
+
+write_status() {
+    local repo="$1" ref="$2" current="$3" latest="$4" status="$5" temporary
+    [[ "$repo" != *$'\n'* && "$ref" != *$'\n'* ]] || return 1
+    [[ "$current" =~ ^[A-Fa-f0-9]{40}$ && "$latest" =~ ^[A-Fa-f0-9]{40}$ ]] || return 1
+    [[ "$status" == "current" || "$status" == "available" || "$status" == "failed" ]] \
+        || return 1
+    install -d -o root -g root -m 0751 "$(dirname "$STATUS_FILE")"
+    temporary="${STATUS_FILE}.tmp.$$"
+    {
+        printf 'REPO=%s\n' "$repo"
+        printf 'REF=%s\n' "$ref"
+        printf 'CURRENT_SHA=%s\n' "${current,,}"
+        printf 'LATEST_SHA=%s\n' "${latest,,}"
+        printf 'CHECKED_AT=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf 'STATUS=%s\n' "$status"
+    } >"$temporary"
+    chown root:"$APP_GROUP" "$temporary"
+    chmod 0640 "$temporary"
+    mv -f "$temporary" "$STATUS_FILE"
 }
 
 valid_repo() {
@@ -136,6 +159,7 @@ backup_control_binaries() {
         "infiproxy:${PANEL_BINARY}"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}"
         "infiproxy-headscale-control:${HEADSCALE_HELPER_BINARY}"
+        "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}"
     )
     install -d -o root -g root -m 0700 "${backup_dir}/control-binaries"
     for entry in "${binaries[@]}"; do
@@ -161,6 +185,7 @@ restore_control_binaries() {
         "infiproxy:${PANEL_BINARY}:stealthhub-panel"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}:infiproxy-module-manifest"
         "infiproxy-headscale-control:${HEADSCALE_HELPER_BINARY}:infiproxy-headscale-control"
+        "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}:infiproxy-reconcile"
     )
     install -d -m 0755 "${SOURCE_DIR}/target/release"
     for entry in "${binaries[@]}"; do
@@ -234,24 +259,21 @@ wait_panel_ready() {
 }
 
 should_update_now() {
+    local latest_sha="$1" applied_sha="$2"
     if [[ -f "$REQUEST_FILE" ]]; then
         return 0
     fi
 
-    local enabled available latest_sha applied_sha scheduled_time scheduled_hour scheduled_minute
+    local enabled scheduled_time scheduled_hour scheduled_minute
     local current_hour current_minute scheduled_total current_total
     enabled="$(read_state AUTO_ENABLED || true)"
-    available="$(read_state UPDATE_AVAILABLE || true)"
-    latest_sha="$(read_state LATEST_SHA || true)"
-    applied_sha="$(cat "$APPLIED_SHA_FILE" 2>/dev/null || true)"
     scheduled_time="$(read_state SCHEDULE_TIME || true)"
     scheduled_time="${scheduled_time:-05:00}"
     current_hour="$(date '+%-H')"
     current_minute="$(date '+%-M')"
 
     [[ "$enabled" == "true" ]] || return 1
-    [[ "$available" == "true" ]] || return 1
-    [[ -z "$latest_sha" || "$latest_sha" != "$applied_sha" ]] || return 1
+    [[ "$latest_sha" != "$applied_sha" ]] || return 1
     [[ "$scheduled_time" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || return 1
     scheduled_hour="${scheduled_time%%:*}"
     scheduled_minute="${scheduled_time##*:}"
@@ -274,14 +296,13 @@ main() {
         exit 0
     fi
 
-    if ! should_update_now; then
-        log "no panel update due"
-        exit 0
-    fi
-
-    local repo ref repo_url previous_commit target_commit installed_commit applied_commit
+    local mode="${1:-}" repo ref repo_url previous_commit target_commit installed_commit applied_commit
     local backup_dir applied_tmp
     local database_was_present=0
+    [[ -z "$mode" || "$mode" == "--check" ]] || {
+        echo "Usage: infiproxy-panel-update [--check]" >&2
+        exit 2
+    }
     repo="$(read_config REPO || true)"
     ref="$(read_config REF || true)"
     repo="${repo:-infinitrator/stealthhub-panel}"
@@ -291,8 +312,6 @@ main() {
     valid_ref "$ref" || { log "invalid git ref in state: $ref"; exit 1; }
 
     repo_url="https://github.com/${repo}.git"
-    log "starting panel update from ${repo}@${ref}"
-
     if [[ ! -d "${SOURCE_DIR}/.git" ]]; then
         install -d -m 0755 "$(dirname "$SOURCE_DIR")"
         git clone "$repo_url" "$SOURCE_DIR"
@@ -313,11 +332,30 @@ main() {
     installed_commit="$(awk -F= '$1 == "INFIPROXY_CURRENT_COMMIT" { sub("^[^=]*=", ""); print; exit }' \
         "${CONFIG_DIR}/infiproxy.env" 2>/dev/null || true)"
     applied_commit="$(cat "$APPLIED_SHA_FILE" 2>/dev/null || true)"
-    if [[ "$target_commit" == "$installed_commit" || "$target_commit" == "$applied_commit" ]]; then
+    if [[ ! "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+        applied_commit="$installed_commit"
+    fi
+    if [[ ! "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+        applied_commit="$previous_commit"
+    fi
+    [[ "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]] \
+        || { log "unable to determine applied panel commit"; exit 1; }
+    if [[ "$target_commit" == "$applied_commit" ]]; then
+        write_status "$repo" "$ref" "$applied_commit" "$target_commit" current
         rm -f "$REQUEST_FILE"
         log "panel is already current at ${target_commit:0:12}"
         exit 0
     fi
+    write_status "$repo" "$ref" "$applied_commit" "$target_commit" available
+    if [[ "$mode" == "--check" ]]; then
+        log "panel update check completed; ${target_commit:0:12} is available"
+        exit 0
+    fi
+    if ! should_update_now "$target_commit" "$applied_commit"; then
+        log "panel update available but not due"
+        exit 0
+    fi
+    log "starting panel update from ${repo}@${ref}"
     backup_dir="${ROOT_STATE_DIR}/update-backups/$(date '+%Y%m%d-%H%M%S')-$$"
     [[ "$BACKUP_RETENTION_DAYS" =~ ^[0-9]{1,3}$ ]] \
         || { log "invalid backup retention: $BACKUP_RETENTION_DAYS"; exit 1; }
@@ -363,13 +401,16 @@ main() {
         else
             log "warning: previous control binaries could not be fully restored"
         fi
+        write_status "$repo" "$ref" "$applied_commit" "$target_commit" failed || true
         exit 1
     fi
     rm -f "$REQUEST_FILE"
     applied_tmp="${APPLIED_SHA_FILE}.tmp.$$"
     printf '%s\n' "$target_commit" >"$applied_tmp"
     chmod 0640 "$applied_tmp"
+    chown root:"$APP_GROUP" "$applied_tmp"
     mv -f "$applied_tmp" "$APPLIED_SHA_FILE"
+    write_status "$repo" "$ref" "$target_commit" "$target_commit" current
     log "panel update completed at ${target_commit:0:12}"
 }
 

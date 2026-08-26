@@ -112,31 +112,24 @@ It includes:
 ## Updates And Autostart
 
 The panel and every runtime are installed as systemd-managed components.
-`infiproxy.service` starts the Rust panel after boot. Every configured module
-keeps its own systemd unit and returns to its previous enabled/active state after
-a verified binary update:
-
-```text
-infiproxy-xray.service
-infiproxy-sing-box.service
-infiproxy-hysteria.service
-infiproxy-tuic.service
-infiproxy-mtproto.service
-headscale.service
-```
+`infiproxy.service` starts the Rust panel after boot. Runtime units are loaded
+from root-approved manifests rather than a compiled list. The privileged
+`infiproxy-reconcile` worker stages, validates, applies and verifies generated
+runtime candidates; an installed but unused module remains inactive.
 
 Panel self-updates are split into two layers:
 
-- The web panel checks GitHub every two hours and stores update state in
-  `/var/lib/infiproxy/panel-update-state.env`.
-- `infiproxy-panel-update.timer` runs the root updater every 15 minutes and applies a
+- `infiproxy-panel-update.timer` runs the root checker/updater every 15 minutes,
+  writes a sanitized status mirror, and applies a
   pending update at the server-local maintenance hour configured in Settings.
   A fresh install defaults to `05:00`; custom `HH:MM` values run in the first
   15-minute scheduler window at or after that time.
 - `infiproxy-panel-update.path` watches for
   `/var/lib/infiproxy/panel-update-now.request`; the owner-admin "Update Now"
   button creates this file for immediate update.
-- The root updater uses `/opt/infiproxy/source`, rebuilds the release binary and
+- The unprivileged web process reads that mirror and never queries GitHub or
+  chooses a repository/ref.
+- The root updater uses `/opt/infiproxy/source`, rebuilds all panel helper binaries and
   reruns the idempotent installer. Before changing the source revision it creates
   fail-closed backups of the panel and control-helper binaries, SQLite database,
   panel/core/Headscale settings, module manifests and Nginx configuration. A
@@ -371,6 +364,11 @@ INFIPROXY_COOKIE_SECURE=true
 INFIPROXY_SETUP_TOKEN=<installer-generated-64-hex-token>
 INFIPROXY_CURRENT_COMMIT=<installed-git-commit>
 ```
+
+`INFIPROXY_CURRENT_COMMIT` is a compatibility/diagnostic value. The
+authoritative deployed revision is
+`/var/lib/infiproxy-maintenance/panel-last-applied.sha`, written by root only
+after installation and readiness verification.
 
 Shell and terminal execution are intentionally unavailable in the web panel.
 Use the structured controls, config editors or `sudo infiproxy-manager` over SSH.

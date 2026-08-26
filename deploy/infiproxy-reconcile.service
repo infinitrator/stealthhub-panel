@@ -1,25 +1,22 @@
 [Unit]
-Description=Infiproxy Panel
+Description=Infiproxy privileged desired-state reconciler
 Documentation=https://github.com/infinitrator/stealthhub-panel
+After=network-online.target infiproxy.service
 Wants=network-online.target
-After=network-online.target
 
 [Service]
-Type=simple
-User=infiproxy
-Group=infiproxy
+Type=oneshot
+User=root
+Group=root
 EnvironmentFile=/etc/infiproxy/infiproxy.env
-WorkingDirectory=/var/lib/infiproxy
-ExecStart=/usr/local/bin/infiproxy
-Restart=on-failure
-RestartSec=3
-
+ExecStart=/usr/local/libexec/infiproxy-reconcile
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/infiproxy
+ReadWritePaths=/etc/infiproxy-cores /etc/infiproxy/secrets.d /etc/nginx/sites-available /etc/nginx/sites-enabled /var/lib/infiproxy /var/lib/infiproxy-maintenance
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -29,12 +26,7 @@ ProtectHostname=true
 RestrictSUIDSGID=true
 RestrictRealtime=true
 RestrictNamespaces=true
-RemoveIPC=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 LockPersonality=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
-UMask=0027
-
-[Install]
-WantedBy=multi-user.target

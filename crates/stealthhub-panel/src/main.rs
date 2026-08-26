@@ -11,6 +11,7 @@ mod health;
 mod ip;
 mod modules;
 mod ops;
+mod reconcile_request;
 mod ui;
 mod update;
 mod views;
@@ -51,20 +52,23 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 use stealthhub_core::{
-    mihomo::generate_mihomo_yaml,
-    models::{ProtocolConfig, ProtocolProfile, SubscriptionUser},
+    adapter::{ConfigFieldKind, ProtocolRegistry, SecretRef},
+    adapters::protocol_registry,
+    mihomo::generate_mihomo_yaml_with_registry,
+    models::{ProtocolProfile, SubscriptionUser},
     rules::{default_routing_rule_set, is_valid_routing_target, routing_rule_payload_yaml},
     storage::{
         admin_count, create_admin_session, create_first_admin, create_user, delete_admin_session,
         delete_expired_admin_sessions, delete_secret, delete_user,
         ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
-        ensure_default_settings, get_admin_by_id, get_admin_by_username, get_secret,
-        get_user_by_id, get_user_by_token, get_valid_admin_session, init_db, is_owner_admin_id,
-        list_protocol_profiles_decoded, list_secret_names, list_users, load_panel_settings,
-        load_routing_rule_sets, open_pool, reset_user_subscription_token, set_user_enabled,
-        touch_admin_session, update_admin_password_and_revoke_sessions, update_protocol_profile,
-        update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings, AdminRecord,
-        NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
+        ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
+        get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
+        is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
+        load_panel_settings, load_routing_rule_sets, migrate_protocol_adapter_configs, open_pool,
+        reset_user_subscription_token, set_user_enabled, touch_admin_session,
+        update_admin_password_and_revoke_sessions, update_protocol_profile,
+        update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
+        AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -91,6 +95,7 @@ const PASSWORD_WORKER_LIMIT: usize = 2;
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
+    pub(crate) protocol_registry: Arc<ProtocolRegistry>,
     cookie_secure: bool,
     setup_token: Arc<str>,
     login_limiter: Arc<LoginRateLimiter>,
@@ -164,32 +169,6 @@ struct HeadscaleNodeForm {
     #[serde(default)]
     csrf_token: String,
     node_id: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct ProtocolProfileForm {
-    #[serde(default)]
-    csrf_token: String,
-    #[serde(default)]
-    enabled: String,
-    server: String,
-    port: u16,
-    #[serde(default)]
-    server_name: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    sni: String,
-    #[serde(default)]
-    public_key_secret: String,
-    #[serde(default)]
-    short_id_secret: String,
-    #[serde(default)]
-    password_secret: String,
-    #[serde(default)]
-    shadow_tls_password_secret: String,
-    #[serde(default)]
-    obfs_password_secret: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,9 +280,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let pool = open_pool(&db_url).await?;
+    let protocol_registry = Arc::new(protocol_registry()?);
     init_db(&pool).await?;
     ensure_default_settings(&pool).await?;
     ensure_default_protocol_profiles(&pool).await?;
+    migrate_protocol_adapter_configs(&pool, &protocol_registry).await?;
     ensure_default_routing_rule_sets(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
     let admin_total = admin_count(&pool).await?;
@@ -322,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         pool,
+        protocol_registry,
         cookie_secure,
         setup_token: Arc::from(setup_token),
         login_limiter: Arc::new(LoginRateLimiter::default()),
@@ -480,21 +462,23 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         Ok(value) => value,
         Err(error) => return subscription_internal_error("load profiles", error),
     };
-    let secrets = match load_secret_values_map(&state.pool, &profiles).await {
-        Ok(value) => value,
-        Err(error) => return subscription_internal_error("load secrets", error),
-    };
+    let secrets =
+        match load_secret_values_map(&state.pool, &profiles, &state.protocol_registry).await {
+            Ok(value) => value,
+            Err(error) => return subscription_internal_error("load secrets", error),
+        };
     let routing_rule_sets = match load_routing_rule_sets(&state.pool).await {
         Ok(value) => value,
         Err(error) => return subscription_internal_error("load routing", error),
     };
 
-    let yaml = match generate_mihomo_yaml(
+    let yaml = match generate_mihomo_yaml_with_registry(
         &settings,
         &subscription_user,
         &profiles,
         &secrets,
         &routing_rule_sets,
+        &state.protocol_registry,
     ) {
         Ok(value) => value,
         Err(error) => {
@@ -852,7 +836,11 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         Err(response) => return response,
     };
 
-    views::dashboard::render(&auth)
+    let reconcile = match get_reconcile_state(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load reconciliation state", error),
+    };
+    views::dashboard::render(&auth, &reconcile)
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -987,16 +975,28 @@ async fn update_settings_action(
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
         .collect::<Vec<_>>();
-    if let Err(error) = upsert_settings(&state.pool, &settings_to_save).await {
-        return logged_error_with_back(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "save panel settings",
-            error,
-            "Settings not saved",
-            "The settings transaction failed. Review the server journal.",
-            "/admin/settings",
-            "Back to Settings",
-        );
+    let runtime_changed = match upsert_settings_with_runtime_keys(
+        &state.pool,
+        &settings_to_save,
+        &["subscription_domain", "node_domain"],
+    )
+    .await
+    {
+        Ok(generation) => generation.is_some(),
+        Err(error) => {
+            return logged_error_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "save panel settings",
+                error,
+                "Settings not saved",
+                "The settings transaction failed. Review the server journal.",
+                "/admin/settings",
+                "Back to Settings",
+            )
+        }
+    };
+    if runtime_changed {
+        queue_latest_reconcile(&state).await;
     }
     if is_owner_admin(&auth) {
         let pool = state.pool.clone();
@@ -1653,7 +1653,7 @@ async fn secrets_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Err(error) => return internal_error("load protocol profiles", error),
     };
 
-    views::secrets::render(&auth, &secret_names, &profiles)
+    views::secrets::render(&auth, &secret_names, &profiles, &state.protocol_registry)
 }
 
 async fn secret_save_action(
@@ -1690,9 +1690,23 @@ async fn secret_save_action(
             "Back to Secrets",
         );
     }
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(profiles) => profiles,
+        Err(error) => return internal_error("classify protocol secret", error),
+    };
+    if is_server_only_secret_reference(name, &profiles, &state.protocol_registry) {
+        return html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "Secret not saved",
+            "This reference is server-only. Store it with sudo infiproxy-manager so the web process never receives the value.",
+            "/admin/secrets",
+            "Back to Secrets",
+        );
+    }
     if let Err(error) = upsert_secret(&state.pool, name, &form.value).await {
         return internal_error("store protocol secret", error);
     }
+    queue_latest_reconcile(&state).await;
 
     Redirect::to("/admin/secrets").into_response()
 }
@@ -1732,6 +1746,7 @@ async fn secret_delete_action(
             "Back to Secrets",
         );
     }
+    queue_latest_reconcile(&state).await;
 
     Redirect::to("/admin/secrets").into_response()
 }
@@ -1741,6 +1756,37 @@ fn valid_secret_name(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn is_server_only_secret_reference(
+    name: &str,
+    profiles: &[ProtocolProfile],
+    registry: &ProtocolRegistry,
+) -> bool {
+    let mut used_by_server = false;
+    let mut used_by_client = false;
+    for profile in profiles {
+        let Some(adapter) = registry.get(&profile.protocol_id) else {
+            continue;
+        };
+        used_by_server |=
+            adapter
+                .server_secret_references(&profile.config)
+                .is_ok_and(|references| {
+                    references
+                        .iter()
+                        .any(|reference| reference.as_str() == name)
+                });
+        used_by_client |=
+            adapter
+                .client_secret_references(&profile.config)
+                .is_ok_and(|references| {
+                    references
+                        .iter()
+                        .any(|reference| reference.as_str() == name)
+                });
+    }
+    used_by_server && !used_by_client
 }
 
 async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1794,21 +1840,29 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     };
 
-    views::protocols::render(&auth, &settings, &profiles, &secret_names)
+    views::protocols::render(
+        &auth,
+        &settings,
+        &profiles,
+        &secret_names,
+        &state.protocol_registry,
+    )
 }
 
 async fn update_protocol_action(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
-    Form(form): Form<ProtocolProfileForm>,
+    Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
     };
 
-    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+    if let Some(response) =
+        csrf_error_response(&auth, form.get("csrf_token").map_or("", String::as_str))
+    {
         return response;
     }
     if !is_owner_admin(&auth) {
@@ -1837,21 +1891,24 @@ async fn update_protocol_action(
         );
     };
 
-    let server = match normalize_profile_server(&form.server) {
+    let server = match normalize_profile_server(form.get("server").map_or("", String::as_str)) {
         Ok(value) => value,
         Err(message) => {
             return html_error_response(StatusCode::BAD_REQUEST, "Protocol update failed", message)
         }
     };
-    if form.port == 0 {
-        return html_error_response(
-            StatusCode::BAD_REQUEST,
-            "Protocol update failed",
-            "Server port must be between 1 and 65535.",
-        );
-    }
+    let port = match form.get("port").and_then(|value| value.parse::<u16>().ok()) {
+        Some(port) if port > 0 => port,
+        _ => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Protocol update failed",
+                "Server port must be between 1 and 65535.",
+            )
+        }
+    };
 
-    let config = match protocol_config_from_form(&existing, &form) {
+    let config = match protocol_config_from_form(&existing, &form, &state.protocol_registry) {
         Ok(value) => value,
         Err(err) => {
             return html_error_response(
@@ -1864,14 +1921,21 @@ async fn update_protocol_action(
 
     let input = UpdateProtocolProfile {
         name: existing.name,
-        enabled: checkbox_enabled(&form.enabled),
+        enabled: form
+            .get("enabled")
+            .is_some_and(|value| checkbox_enabled(value)),
         server,
-        port: form.port,
+        port,
+        preferred_core_id: existing.preferred_core_id,
+        managed_resource_id: existing.managed_resource_id,
         config,
     };
 
     match update_protocol_profile(&state.pool, input).await {
-        Ok(_) => Redirect::to("/admin/protocols").into_response(),
+        Ok(_) => {
+            queue_latest_reconcile(&state).await;
+            Redirect::to("/admin/protocols").into_response()
+        }
         Err(error) => logged_error_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
             "update protocol profile",
@@ -1886,75 +1950,35 @@ async fn update_protocol_action(
 
 fn protocol_config_from_form(
     existing: &ProtocolProfile,
-    form: &ProtocolProfileForm,
-) -> anyhow::Result<ProtocolConfig> {
-    match &existing.config {
-        ProtocolConfig::VlessRealityXhttp { uuid_source, .. } => {
-            Ok(ProtocolConfig::VlessRealityXhttp {
-                uuid_source: uuid_source.clone(),
-                server_name: required_tls_name(&form.server_name, "TLS server name")?,
-                path: required_http_path(&form.path)?,
-                public_key_secret: required_secret_reference(
-                    &form.public_key_secret,
-                    "REALITY public key secret",
-                )?,
-                short_id_secret: required_secret_reference(
-                    &form.short_id_secret,
-                    "REALITY short ID secret",
-                )?,
-            })
+    form: &HashMap<String, String>,
+    registry: &ProtocolRegistry,
+) -> anyhow::Result<serde_json::Value> {
+    let adapter = registry
+        .get(&existing.protocol_id)
+        .ok_or_else(|| anyhow::anyhow!("protocol adapter is not installed"))?;
+    let mut config = existing
+        .config
+        .as_object()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("stored adapter configuration is invalid"))?;
+    for field in adapter.fields() {
+        let value = form.get(&field.name).map_or("", String::as_str).trim();
+        if value.is_empty() {
+            if field.required {
+                return Err(anyhow::anyhow!("{} is required", field.label));
+            }
+            config.remove(&field.name);
+            continue;
         }
-        ProtocolConfig::VlessRealityTcp { uuid_source, .. } => {
-            Ok(ProtocolConfig::VlessRealityTcp {
-                uuid_source: uuid_source.clone(),
-                server_name: required_tls_name(&form.server_name, "TLS server name")?,
-                public_key_secret: required_secret_reference(
-                    &form.public_key_secret,
-                    "REALITY public key secret",
-                )?,
-                short_id_secret: required_secret_reference(
-                    &form.short_id_secret,
-                    "REALITY short ID secret",
-                )?,
-            })
+        let value = required_profile_field(value, &field.label, 2_048)?;
+        if field.kind == ConfigFieldKind::SecretRef {
+            SecretRef::parse(&value)?;
         }
-        ProtocolConfig::Shadowsocks2022ShadowTls { .. } => {
-            Ok(ProtocolConfig::Shadowsocks2022ShadowTls {
-                server_name: required_tls_name(&form.server_name, "ShadowTLS server name")?,
-                password_secret: required_secret_reference(
-                    &form.password_secret,
-                    "Shadowsocks password secret",
-                )?,
-                shadow_tls_password_secret: required_secret_reference(
-                    &form.shadow_tls_password_secret,
-                    "ShadowTLS password secret",
-                )?,
-            })
-        }
-        ProtocolConfig::Hysteria2 { .. } => Ok(ProtocolConfig::Hysteria2 {
-            password_secret: required_secret_reference(
-                &form.password_secret,
-                "Hysteria2 password secret",
-            )?,
-            sni: required_tls_name(&form.sni, "TLS SNI")?,
-            obfs_password_secret: optional_secret_reference(&form.obfs_password_secret)?,
-        }),
-        ProtocolConfig::AnyTls { .. } => Ok(ProtocolConfig::AnyTls {
-            password_secret: required_secret_reference(
-                &form.password_secret,
-                "AnyTLS password secret",
-            )?,
-            sni: required_tls_name(&form.sni, "TLS SNI")?,
-        }),
-        ProtocolConfig::Tuic { uuid_source, .. } => Ok(ProtocolConfig::Tuic {
-            uuid_source: uuid_source.clone(),
-            password_secret: required_secret_reference(
-                &form.password_secret,
-                "TUIC password secret",
-            )?,
-            sni: required_tls_name(&form.sni, "TLS SNI")?,
-        }),
+        config.insert(field.name.clone(), serde_json::Value::String(value));
     }
+    let config = serde_json::Value::Object(config);
+    adapter.validate_config(existing.schema_version, &config)?;
+    Ok(config)
 }
 
 fn required_profile_field(value: &str, label: &str, maximum: usize) -> anyhow::Result<String> {
@@ -1966,43 +1990,6 @@ fn required_profile_field(value: &str, label: &str, maximum: usize) -> anyhow::R
         return Err(anyhow::anyhow!("{label} is invalid or too long"));
     }
     Ok(value.to_string())
-}
-
-fn required_tls_name(value: &str, label: &str) -> anyhow::Result<String> {
-    let value = required_profile_field(value, label, 253)?;
-    normalize_profile_server(&value)
-        .map_err(|_| anyhow::anyhow!("{label} must be a valid DNS name or IP address"))
-}
-
-fn required_secret_reference(value: &str, label: &str) -> anyhow::Result<String> {
-    let value = required_profile_field(value, label, 128)?;
-    if !valid_secret_name(&value) {
-        return Err(anyhow::anyhow!("{label} must be a valid secret name"));
-    }
-    Ok(value)
-}
-
-fn optional_secret_reference(value: &str) -> anyhow::Result<Option<String>> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    if !valid_secret_name(value) {
-        return Err(anyhow::anyhow!(
-            "Optional password secret must be a valid secret name"
-        ));
-    }
-    Ok(Some(value.to_string()))
-}
-
-fn required_http_path(value: &str) -> anyhow::Result<String> {
-    let value = required_profile_field(value, "XHTTP path", 2048)?;
-    if !value.starts_with('/') || value.chars().any(char::is_whitespace) {
-        return Err(anyhow::anyhow!(
-            "XHTTP path must begin with / and contain no whitespace"
-        ));
-    }
-    Ok(value)
 }
 
 fn normalize_profile_server(value: &str) -> Result<String, &'static str> {
@@ -2243,7 +2230,10 @@ async fn create_user_action(
     };
 
     match create_user(&state.pool, input).await {
-        Ok(_) => Redirect::to("/admin/users").into_response(),
+        Ok(_) => {
+            queue_latest_reconcile(&state).await;
+            Redirect::to("/admin/users").into_response()
+        }
         Err(error) => logged_error_with_back(
             StatusCode::CONFLICT,
             "create subscription user",
@@ -2286,7 +2276,10 @@ async fn toggle_user_action(
     };
 
     match set_user_enabled(&state.pool, id, !user.enabled).await {
-        Ok(()) => Redirect::to("/admin/users").into_response(),
+        Ok(()) => {
+            queue_latest_reconcile(&state).await;
+            Redirect::to("/admin/users").into_response()
+        }
         Err(error) => logged_error_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
             "toggle user",
@@ -2400,7 +2393,10 @@ async fn delete_user_action(
     }
 
     match delete_user(&state.pool, id).await {
-        Ok(()) => Redirect::to("/admin/users").into_response(),
+        Ok(()) => {
+            queue_latest_reconcile(&state).await;
+            Redirect::to("/admin/users").into_response()
+        }
         Err(error) => logged_error_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
             "delete user",
@@ -2793,23 +2789,40 @@ fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Re
 async fn load_secret_values_map(
     pool: &SqlitePool,
     profiles: &[ProtocolProfile],
+    registry: &ProtocolRegistry,
 ) -> anyhow::Result<HashMap<String, String>> {
     let mut secrets = HashMap::new();
 
-    for secret_name in profiles
-        .iter()
-        .flat_map(ProtocolProfile::required_secret_names)
-    {
-        if secrets.contains_key(secret_name) {
-            continue;
-        }
-
-        if let Some(secret) = get_secret(pool, secret_name).await? {
-            secrets.insert(secret_name.to_string(), secret.value);
+    for profile in profiles {
+        let adapter = registry
+            .get(&profile.protocol_id)
+            .ok_or_else(|| anyhow::anyhow!("protocol adapter is unavailable"))?;
+        for reference in adapter.client_secret_references(&profile.config)? {
+            if secrets.contains_key(reference.as_str()) {
+                continue;
+            }
+            if let Some(secret) = get_secret(pool, reference.as_str()).await? {
+                secrets.insert(reference.as_str().to_string(), secret.value);
+            }
         }
     }
 
     Ok(secrets)
+}
+
+async fn queue_latest_reconcile(state: &AppState) {
+    let result = async {
+        let status = get_reconcile_state(&state.pool).await?;
+        let generation = u64::try_from(status.desired_generation)
+            .map_err(|_| anyhow::anyhow!("invalid desired generation"))?;
+        reconcile_request::publish(generation)
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::error!(
+            "desired state is pending but the root reconcile request could not be queued: {error}"
+        );
+    }
 }
 
 const fn is_owner_admin(auth: &AuthenticatedAdmin) -> bool {

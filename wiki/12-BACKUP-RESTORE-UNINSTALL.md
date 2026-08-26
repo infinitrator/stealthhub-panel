@@ -17,6 +17,7 @@ module manifests, systemd units и DNS/certificate state.
 | База панели | `/var/lib/infiproxy/infiproxy.sqlite` | Администраторы, session records, пользователи, subscription tokens, UUID, профили, routes, settings, secret values. |
 | База Headscale | `/var/lib/headscale/db.sqlite` | Узлы, users, routes, pre-auth state и координационные данные. |
 | Panel env | `/etc/infiproxy/infiproxy.env` | Bind, DB URL, cookie flags и logging. |
+| Private server secrets | `/etc/infiproxy/secrets.d` | Private keys/passwords, недоступные web-процессу. |
 | Proxy configs | `/etc/infiproxy-cores` | Server inbounds, credentials, TLS paths и MTProto env/upstream files. |
 | Headscale config | `/etc/headscale` | Public URL, prefixes, MagicDNS, ACL path и keys. |
 | Module registry | `/etc/infiproxy-modules.d` | Какие модули зарегистрированы и как обновляются. |
@@ -65,6 +66,7 @@ config.json.infiproxy-bak-<unix_timestamp>
 | Файл | Данные |
 |---|---|
 | `infiproxy` | Предыдущий `/usr/local/bin/infiproxy`, если существовал. |
+| `control-binaries/` | Panel, manifest, Headscale и reconcile helpers либо маркеры их отсутствия. |
 | `infiproxy.sqlite` | Online-consistent SQLite `.backup` базы панели. |
 | `system-configs.tar.gz` | Panel env, proxy configs, Headscale config, updater config, active/available manifests, Nginx sites. |
 | `metadata.env` | UTC creation time, previous Git commit и факт существования БД. |
@@ -83,7 +85,8 @@ Default retention — 30 дней через `INFIPROXY_BACKUP_RETENTION_DAYS`. 
 4. Восстановить SQLite с владельцем `infiproxy` и mode `0640`.
 5. Вернуть source checkout на предыдущий commit.
 6. Установить предыдущий binary.
-7. Повторно выполнить старый installer и запустить panel unit.
+7. Вернуть privileged helper binaries, включая reconciler.
+8. Повторно выполнить старый installer и запустить panel unit.
 
 Автоматический rollback является best effort. Строка `warning: automatic ...
 incomplete` требует ручного восстановления.
@@ -196,6 +199,9 @@ for path in \
   /etc/systemd/system/infiproxy-module-update.service \
   /etc/systemd/system/infiproxy-module-update.timer \
   /etc/systemd/system/infiproxy-module-update.path \
+  /etc/systemd/system/infiproxy-reconcile.service \
+  /etc/systemd/system/infiproxy-reconcile.timer \
+  /etc/systemd/system/infiproxy-reconcile.path \
   /etc/systemd/system/infiproxy-xray.service \
   /etc/systemd/system/infiproxy-sing-box.service \
   /etc/systemd/system/infiproxy-hysteria.service \

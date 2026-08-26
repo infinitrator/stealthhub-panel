@@ -3,12 +3,13 @@
 use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
-use stealthhub_core::models::ProtocolProfile;
+use stealthhub_core::{adapter::ProtocolRegistry, models::ProtocolProfile};
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
     secret_names: &[String],
     profiles: &[ProtocolProfile],
+    registry: &ProtocolRegistry,
 ) -> Response {
     Html(
         layout(
@@ -28,6 +29,9 @@ pub(crate) fn render(
                     h2 { "Create or rotate" }
                     div class="notice" {
                         "Saving an existing name rotates its value. Stored values are never returned to the browser after this request."
+                    }
+                    div class="notice" {
+                        "Server-only private material is rejected here. Manage those references through " code { "sudo infiproxy-manager" } "."
                     }
                     form method="post" action="/admin/secrets" class="form" autocomplete="off" {
                         (csrf_field(&auth.csrf_token))
@@ -57,7 +61,7 @@ pub(crate) fn render(
                                     @for name in secret_names {
                                         tr {
                                             td { code { (name) } }
-                                            td { (profile_usage(name, profiles)) }
+                                            td { (profile_usage(name, profiles, registry)) }
                                             td {
                                                 form method="post" action="/admin/secrets/delete" class="inline-form" {
                                                     (csrf_field(&auth.csrf_token))
@@ -80,10 +84,19 @@ pub(crate) fn render(
     .into_response()
 }
 
-fn profile_usage(name: &str, profiles: &[ProtocolProfile]) -> String {
+fn profile_usage(name: &str, profiles: &[ProtocolProfile], registry: &ProtocolRegistry) -> String {
     let names = profiles
         .iter()
-        .filter(|profile| profile.required_secret_names().contains(&name))
+        .filter(|profile| {
+            registry
+                .get(&profile.protocol_id)
+                .and_then(|adapter| adapter.secret_references(&profile.config).ok())
+                .is_some_and(|references| {
+                    references
+                        .iter()
+                        .any(|reference| reference.as_str() == name)
+                })
+        })
         .map(|profile| profile.name.as_str())
         .collect::<Vec<_>>();
     if names.is_empty() {

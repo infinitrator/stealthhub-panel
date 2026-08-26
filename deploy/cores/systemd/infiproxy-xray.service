@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=infiproxy
-Group=infiproxy
+User=infiproxy-runtime
+Group=infiproxy-runtime
 ExecStart=/opt/infiproxy/cores/xray/current/xray run -config /etc/infiproxy-cores/xray/config.json
 Restart=on-failure
 RestartSec=3

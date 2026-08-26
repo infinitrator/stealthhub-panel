@@ -4,8 +4,9 @@
 
 ## Перед настройкой
 
-Runtime module — исполняемый файл и systemd unit. Protocol profile — клиентская
-конфигурация. Между ними нет автоматического двустороннего binding.
+Runtime module — исполняемый файл и systemd unit. Protocol profile — desired
+client/server resource. Между ними нет двустороннего импорта ручных файлов, но
+поддержанный adapter однонаправленно и атомарно строит runtime config из SQLite.
 
 Для каждого транспорта заполните таблицу соответствия:
 
@@ -28,21 +29,18 @@ sudo systemctl status <unit> --no-pager
 
 После установки:
 
-1. сохраните backup starter config;
-2. сгенерируйте credentials локальным binary/openssl;
-3. заполните server config;
-4. проверьте синтаксис без restart, если core умеет;
+1. сохраните backup существующего config при миграции;
+2. создайте client secrets в web и private server secrets в root-TUI;
+3. настройте и включите protocol profile;
+4. дождитесь совпадения desired/applied generation;
 5. откройте firewall port;
-6. `enable --now` unit;
-7. прочитайте journal;
-8. проверьте socket;
-9. настройте client profile и secret values;
-10. проведите end-to-end test.
+6. прочитайте reconcile/runtime journals;
+7. проверьте socket и внешний handshake;
+8. проведите end-to-end test подписки.
 
 ```bash
-sudo cp -a /etc/infiproxy-cores/<core>/config.* \
-  /etc/infiproxy-cores/<core>/config.pre-change
-sudo systemctl enable --now infiproxy-<core>.service
+sudo systemctl start infiproxy-reconcile.service
+sudo journalctl -u infiproxy-reconcile.service -n 100 --no-pager
 sudo journalctl -u infiproxy-<core>.service -n 100 --no-pager
 sudo ss -lntup
 ```

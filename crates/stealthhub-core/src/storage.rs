@@ -11,13 +11,14 @@ use sqlx::{
     sqlite::{
         SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
     },
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
 };
-use std::{str::FromStr, time::Duration as StdDuration};
+use std::{fmt, str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
 use crate::{
-    models::{PanelSettings, ProtocolConfig, ProtocolProfile, ProxyKind, ProxyRole},
+    desired::DesiredState,
+    models::{PanelSettings, ProtocolProfile, ProxyRole},
     rules::{
         default_routing_rule_set, default_routing_rule_sets, is_valid_routing_target,
         validate_classical_rule_payload, RoutingRuleSet,
@@ -26,7 +27,7 @@ use crate::{
 
 pub type DbPool = SqlitePool;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct UserRecord {
     pub id: i64,
     pub username: String,
@@ -40,6 +41,24 @@ pub struct UserRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl fmt::Debug for UserRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserRecord")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("uuid", &"[REDACTED]")
+            .field("subscription_token", &"[REDACTED]")
+            .field("enabled", &self.enabled)
+            .field("traffic_limit_bytes", &self.traffic_limit_bytes)
+            .field("traffic_used_bytes", &self.traffic_used_bytes)
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NewUser {
     pub username: String,
@@ -47,7 +66,7 @@ pub struct NewUser {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdminRecord {
     pub id: i64,
     pub username: String,
@@ -56,7 +75,20 @@ pub struct AdminRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for AdminRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminRecord")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AdminSessionRecord {
     pub id: i64,
     pub admin_id: i64,
@@ -66,6 +98,20 @@ pub struct AdminSessionRecord {
     pub last_seen_at: DateTime<Utc>,
 }
 
+impl fmt::Debug for AdminSessionRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AdminSessionRecord")
+            .field("id", &self.id)
+            .field("admin_id", &self.admin_id)
+            .field("token_hash", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .field("created_at", &self.created_at)
+            .field("last_seen_at", &self.last_seen_at)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SettingRecord {
     pub key: String,
@@ -73,7 +119,33 @@ pub struct SettingRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Sanitized desired/applied controller status exposed to the panel.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReconcileStateRecord {
+    pub desired_generation: i64,
+    pub applied_generation: i64,
+    pub status: String,
+    pub last_operation_id: Option<String>,
+    pub last_error: Option<String>,
+    pub affected_resources_json: String,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Sanitized result copied from the root-owned transaction journal.
+pub struct ReconcileResultUpdate<'a> {
+    pub desired_generation: u64,
+    pub applied_generation: u64,
+    pub status: &'a str,
+    pub operation_id: &'a str,
+    pub affected_resources: &'a [String],
+    pub error: Option<&'a str>,
+    pub started_at: Option<&'a str>,
+    pub completed_at: Option<&'a str>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretRecord {
     pub name: String,
     pub value: String,
@@ -81,7 +153,19 @@ pub struct SecretRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl fmt::Debug for SecretRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SecretRecord")
+            .field("name", &self.name)
+            .field("value", &"[REDACTED]")
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtocolProfileRecord {
     pub id: i64,
     pub name: String,
@@ -91,6 +175,9 @@ pub struct ProtocolProfileRecord {
     pub server: String,
     pub port: i64,
     pub config_json: String,
+    pub schema_version: i64,
+    pub preferred_core_id: Option<String>,
+    pub managed_resource_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -98,12 +185,15 @@ pub struct ProtocolProfileRecord {
 #[derive(Debug, Clone)]
 pub struct NewProtocolProfile {
     pub name: String,
-    pub kind: ProxyKind,
+    pub protocol_id: String,
+    pub schema_version: u32,
     pub role: ProxyRole,
     pub enabled: bool,
     pub server: String,
     pub port: u16,
-    pub config: ProtocolConfig,
+    pub preferred_core_id: Option<String>,
+    pub managed_resource_id: Option<String>,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -112,7 +202,9 @@ pub struct UpdateProtocolProfile {
     pub enabled: bool,
     pub server: String,
     pub port: u16,
-    pub config: ProtocolConfig,
+    pub preferred_core_id: Option<String>,
+    pub managed_resource_id: Option<String>,
+    pub config: serde_json::Value,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +267,22 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for SettingRecord {
     }
 }
 
+impl<'r> sqlx::FromRow<'r, SqliteRow> for ReconcileStateRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            desired_generation: row.try_get("desired_generation")?,
+            applied_generation: row.try_get("applied_generation")?,
+            status: row.try_get("status")?,
+            last_operation_id: row.try_get("last_operation_id")?,
+            last_error: row.try_get("last_error")?,
+            affected_resources_json: row.try_get("affected_resources_json")?,
+            started_at: row.try_get("started_at")?,
+            completed_at: row.try_get("completed_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
 impl<'r> sqlx::FromRow<'r, SqliteRow> for SecretRecord {
     fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
         Ok(Self {
@@ -197,6 +305,9 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ProtocolProfileRecord {
             server: row.try_get("server")?,
             port: row.try_get("port")?,
             config_json: row.try_get("config_json")?,
+            schema_version: row.try_get("schema_version")?,
+            preferred_core_id: row.try_get("preferred_core_id")?,
+            managed_resource_id: row.try_get("managed_resource_id")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
@@ -245,6 +356,35 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         );
         ",
     )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r"
+        CREATE TABLE IF NOT EXISTS reconcile_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            desired_generation INTEGER NOT NULL DEFAULT 0 CHECK(desired_generation >= 0),
+            applied_generation INTEGER NOT NULL DEFAULT 0 CHECK(applied_generation >= 0),
+            status TEXT NOT NULL DEFAULT 'applied',
+            last_operation_id TEXT NULL,
+            last_error TEXT NULL,
+            affected_resources_json TEXT NOT NULL DEFAULT '[]',
+            started_at TEXT NULL,
+            completed_at TEXT NULL,
+            updated_at TEXT NOT NULL
+        );
+        ",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        r"
+        INSERT INTO reconcile_state (singleton, updated_at)
+        VALUES (1, ?)
+        ON CONFLICT(singleton) DO NOTHING
+        ",
+    )
+    .bind(Utc::now())
     .execute(pool)
     .await?;
 
@@ -350,6 +490,9 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
             server TEXT NOT NULL,
             port INTEGER NOT NULL CHECK(port > 0 AND port <= 65535),
             config_json TEXT NOT NULL,
+            schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version > 0),
+            preferred_core_id TEXT NULL,
+            managed_resource_id TEXT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -357,6 +500,8 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    ensure_protocol_profile_columns(pool).await?;
 
     sqlx::query(
         r"
@@ -376,6 +521,111 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    Ok(())
+}
+
+async fn bump_desired_generation(transaction: &mut Transaction<'_, Sqlite>) -> Result<u64> {
+    let operation_id = Uuid::new_v4().to_string();
+    let now = Utc::now();
+    sqlx::query(
+        r"
+        UPDATE reconcile_state
+        SET desired_generation = desired_generation + 1,
+            status = 'pending',
+            last_operation_id = ?,
+            last_error = NULL,
+            affected_resources_json = '[]',
+            started_at = NULL,
+            completed_at = NULL,
+            updated_at = ?
+        WHERE singleton = 1
+        ",
+    )
+    .bind(operation_id)
+    .bind(now)
+    .execute(&mut **transaction)
+    .await?;
+    let (generation,): (i64,) =
+        sqlx::query_as("SELECT desired_generation FROM reconcile_state WHERE singleton = 1")
+            .fetch_one(&mut **transaction)
+            .await?;
+    u64::try_from(generation).map_err(|_| anyhow::anyhow!("invalid desired generation"))
+}
+
+/// Returns the sanitized controller state used by UI and root worker.
+pub async fn get_reconcile_state(pool: &SqlitePool) -> Result<ReconcileStateRecord> {
+    Ok(sqlx::query_as::<_, ReconcileStateRecord>(
+        r"
+        SELECT desired_generation, applied_generation, status, last_operation_id,
+               last_error, affected_resources_json, started_at, completed_at, updated_at
+        FROM reconcile_state
+        WHERE singleton = 1
+        ",
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Persists a sanitized privileged-worker result without generated configs.
+pub async fn mark_reconcile_result(
+    pool: &SqlitePool,
+    update: ReconcileResultUpdate<'_>,
+) -> Result<()> {
+    let desired_generation = i64::try_from(update.desired_generation)?;
+    let applied_generation = i64::try_from(update.applied_generation)?;
+    let resources = serde_json::to_string(update.affected_resources)?;
+    let safe_error = update
+        .error
+        .map(|value| value.chars().take(512).collect::<String>());
+    sqlx::query(
+        r"
+        UPDATE reconcile_state
+        SET applied_generation = ?, status = ?, last_operation_id = ?,
+            last_error = ?, affected_resources_json = ?, started_at = ?,
+            completed_at = ?, updated_at = ?
+        WHERE singleton = 1 AND desired_generation = ?
+        ",
+    )
+    .bind(applied_generation)
+    .bind(update.status)
+    .bind(update.operation_id)
+    .bind(safe_error)
+    .bind(resources)
+    .bind(update.started_at)
+    .bind(update.completed_at)
+    .bind(Utc::now())
+    .bind(desired_generation)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn ensure_protocol_profile_columns(pool: &SqlitePool) -> Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(protocol_profiles)")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for (name, statement) in [
+        (
+            "schema_version",
+            "ALTER TABLE protocol_profiles ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version > 0)",
+        ),
+        (
+            "preferred_core_id",
+            "ALTER TABLE protocol_profiles ADD COLUMN preferred_core_id TEXT NULL",
+        ),
+        (
+            "managed_resource_id",
+            "ALTER TABLE protocol_profiles ADD COLUMN managed_resource_id TEXT NULL",
+        ),
+    ] {
+        if !columns.contains(name) {
+            sqlx::query(statement).execute(pool).await?;
+        }
+    }
     Ok(())
 }
 
@@ -424,91 +674,8 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
-    let defaults = vec![
-        NewProtocolProfile {
-            name: "VLESS-XHTTP-SAFE".to_string(),
-            kind: ProxyKind::VlessRealityXhttp,
-            role: ProxyRole::AutoSafe,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 8443,
-            config: ProtocolConfig::VlessRealityXhttp {
-                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                server_name: "www.microsoft.com".to_string(),
-                path: "/api/v1".to_string(),
-                public_key_secret: "xray.reality.public_key".to_string(),
-                short_id_secret: "xray.reality.short_id".to_string(),
-            },
-        },
-        NewProtocolProfile {
-            name: "VLESS-REALITY-TCP-FALLBACK".to_string(),
-            kind: ProxyKind::VlessRealityTcp,
-            role: ProxyRole::Compatibility,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 7443,
-            config: ProtocolConfig::VlessRealityTcp {
-                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                server_name: "www.microsoft.com".to_string(),
-                public_key_secret: "xray.reality.public_key".to_string(),
-                short_id_secret: "xray.reality.short_id".to_string(),
-            },
-        },
-        NewProtocolProfile {
-            name: "SS2022-SHADOWTLS-FALLBACK".to_string(),
-            kind: ProxyKind::Shadowsocks2022ShadowTls,
-            role: ProxyRole::Compatibility,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 9443,
-            config: ProtocolConfig::Shadowsocks2022ShadowTls {
-                server_name: "www.apple.com".to_string(),
-                password_secret: "shadowsocks.2022.password".to_string(),
-                shadow_tls_password_secret: "shadowtls.password".to_string(),
-            },
-        },
-        NewProtocolProfile {
-            name: "ANYTLS-EXPERIMENTAL".to_string(),
-            kind: ProxyKind::AnyTls,
-            role: ProxyRole::Compatibility,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 10443,
-            config: ProtocolConfig::AnyTls {
-                password_secret: "anytls.password".to_string(),
-                sni: "www.apple.com".to_string(),
-            },
-        },
-        NewProtocolProfile {
-            name: "HYSTERIA2-SPEED".to_string(),
-            kind: ProxyKind::Hysteria2,
-            role: ProxyRole::Speed,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 443,
-            config: ProtocolConfig::Hysteria2 {
-                password_secret: "hysteria2.password".to_string(),
-                sni: "www.bing.com".to_string(),
-                obfs_password_secret: Some("hysteria2.obfs_password".to_string()),
-            },
-        },
-        NewProtocolProfile {
-            name: "TUIC-SPEED".to_string(),
-            kind: ProxyKind::Tuic,
-            role: ProxyRole::Speed,
-            enabled: false,
-            server: "node.infiproxy.local".to_string(),
-            port: 11443,
-            config: ProtocolConfig::Tuic {
-                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                password_secret: "tuic.password".to_string(),
-                sni: "www.github.com".to_string(),
-            },
-        },
-    ];
-
-    for profile in defaults {
-        ensure_protocol_profile(pool, &profile).await?;
+    for profile in crate::adapters::default_profiles() {
+        ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
     }
 
     Ok(())
@@ -516,31 +683,51 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
 
 async fn ensure_protocol_profile(pool: &SqlitePool, input: &NewProtocolProfile) -> Result<()> {
     let now = Utc::now();
-    let kind = storage_string(&input.kind)?;
     let role = storage_string(&input.role)?;
     let config_json = serde_json::to_string(&input.config)?;
 
     sqlx::query(
         r"
         INSERT INTO protocol_profiles (
-            name, kind, role, enabled, server, port, config_json, created_at, updated_at
+            name, kind, role, enabled, server, port, config_json, schema_version,
+            preferred_core_id, managed_resource_id, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO NOTHING
         ",
     )
     .bind(input.name.trim())
-    .bind(kind)
+    .bind(input.protocol_id.trim())
     .bind(role)
     .bind(input.enabled)
     .bind(input.server.trim())
     .bind(i64::from(input.port))
     .bind(config_json)
+    .bind(i64::from(input.schema_version))
+    .bind(input.preferred_core_id.as_deref())
+    .bind(input.managed_resource_id.as_deref())
     .bind(now)
     .bind(now)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+impl From<ProtocolProfile> for NewProtocolProfile {
+    fn from(profile: ProtocolProfile) -> Self {
+        Self {
+            name: profile.name,
+            protocol_id: profile.protocol_id,
+            schema_version: profile.schema_version,
+            role: profile.role,
+            enabled: profile.enabled,
+            server: profile.server,
+            port: profile.port,
+            preferred_core_id: profile.preferred_core_id,
+            managed_resource_id: profile.managed_resource_id,
+            config: profile.config,
+        }
+    }
 }
 
 pub async fn admin_count(pool: &SqlitePool) -> Result<i64> {
@@ -854,6 +1041,74 @@ pub async fn upsert_settings(pool: &SqlitePool, values: &[(String, String)]) -> 
     Ok(())
 }
 
+/// Atomically writes runtime-affecting settings and advances desired state.
+pub async fn upsert_desired_settings(
+    pool: &SqlitePool,
+    values: &[(String, String)],
+) -> Result<u64> {
+    let now = Utc::now();
+    let mut transaction = pool.begin().await?;
+    for (key, value) in values {
+        sqlx::query(
+            r"
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            ",
+        )
+        .bind(key.trim())
+        .bind(value)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let generation = bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
+    Ok(generation)
+}
+
+/// Atomically writes settings and advances desired state only when one of the
+/// selected runtime keys actually changes.
+pub async fn upsert_settings_with_runtime_keys(
+    pool: &SqlitePool,
+    values: &[(String, String)],
+    runtime_keys: &[&str],
+) -> Result<Option<u64>> {
+    let now = Utc::now();
+    let mut transaction = pool.begin().await?;
+    let mut runtime_changed = false;
+    for (key, value) in values {
+        if runtime_keys.contains(&key.as_str()) {
+            let previous =
+                sqlx::query_as::<_, (String,)>("SELECT value FROM settings WHERE key = ?")
+                    .bind(key.trim())
+                    .fetch_optional(&mut *transaction)
+                    .await?
+                    .map(|(value,)| value);
+            runtime_changed |= previous.as_deref() != Some(value.as_str());
+        }
+        sqlx::query(
+            r"
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            ",
+        )
+        .bind(key.trim())
+        .bind(value)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    let generation = if runtime_changed {
+        Some(bump_desired_generation(&mut transaction).await?)
+    } else {
+        None
+    };
+    transaction.commit().await?;
+    Ok(generation)
+}
+
 async fn upsert_setting_if_missing(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     let now = Utc::now();
 
@@ -904,6 +1159,7 @@ pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingRecord>> {
 
 pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result<()> {
     let now = Utc::now();
+    let mut transaction = pool.begin().await?;
 
     sqlx::query(
         r"
@@ -918,9 +1174,10 @@ pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result
     .bind(value)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
-
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -954,14 +1211,17 @@ pub async fn list_secret_names(pool: &SqlitePool) -> Result<Vec<String>> {
 }
 
 pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<()> {
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM secret_values WHERE name = ?")
         .bind(name.trim())
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
 
     if result.rows_affected() == 0 {
         bail!("secret not found");
     }
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -970,10 +1230,10 @@ pub async fn create_protocol_profile(
     input: NewProtocolProfile,
 ) -> Result<ProtocolProfileRecord> {
     let now = Utc::now();
-    let kind = storage_string(&input.kind)?;
     let role = storage_string(&input.role)?;
     let config_json = serde_json::to_string(&input.config)?;
 
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
         INSERT INTO protocol_profiles (
@@ -984,23 +1244,31 @@ pub async fn create_protocol_profile(
             server,
             port,
             config_json,
+            schema_version,
+            preferred_core_id,
+            managed_resource_id,
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ",
     )
     .bind(input.name.trim())
-    .bind(kind)
+    .bind(input.protocol_id.trim())
     .bind(role)
     .bind(input.enabled)
     .bind(input.server.trim())
     .bind(i64::from(input.port))
     .bind(config_json)
+    .bind(i64::from(input.schema_version))
+    .bind(input.preferred_core_id.as_deref())
+    .bind(input.managed_resource_id.as_deref())
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
 
     get_protocol_profile_by_name(pool, &input.name)
         .await?
@@ -1022,6 +1290,9 @@ pub async fn get_protocol_profile_by_name(
             server,
             port,
             config_json,
+            schema_version,
+            preferred_core_id,
+            managed_resource_id,
             created_at,
             updated_at
         FROM protocol_profiles
@@ -1047,6 +1318,9 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
             server,
             port,
             config_json,
+            schema_version,
+            preferred_core_id,
+            managed_resource_id,
             created_at,
             updated_at
         FROM protocol_profiles
@@ -1060,20 +1334,84 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
 }
 
 pub fn decode_protocol_profile(record: ProtocolProfileRecord) -> Result<ProtocolProfile> {
-    let kind: ProxyKind = serde_json::from_value(serde_json::Value::String(record.kind))?;
     let role: ProxyRole = serde_json::from_value(serde_json::Value::String(record.role))?;
-    let config: ProtocolConfig = serde_json::from_str(&record.config_json)?;
+    let config: serde_json::Value = serde_json::from_str(&record.config_json)?;
     let port = u16::try_from(record.port).map_err(|_| anyhow::anyhow!("invalid protocol port"))?;
+    let schema_version = u32::try_from(record.schema_version)
+        .map_err(|_| anyhow::anyhow!("invalid protocol schema version"))?;
 
     Ok(ProtocolProfile {
         name: record.name,
-        kind,
+        protocol_id: record.kind,
+        schema_version,
         role,
         server: record.server,
         port,
         enabled: record.enabled,
+        preferred_core_id: record.preferred_core_id,
+        managed_resource_id: record.managed_resource_id,
         config,
     })
+}
+
+/// Idempotently upgrades known adapter payloads while preserving unknown rows.
+pub async fn migrate_protocol_adapter_configs(
+    pool: &SqlitePool,
+    registry: &crate::adapter::ProtocolRegistry,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    let records = sqlx::query_as::<_, ProtocolProfileRecord>(
+        r"
+        SELECT id, name, kind, role, enabled, server, port, config_json,
+               schema_version, preferred_core_id, managed_resource_id,
+               created_at, updated_at
+        FROM protocol_profiles
+        ORDER BY id ASC
+        ",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    for record in records {
+        let Some(adapter) = registry.get(&record.kind) else {
+            continue;
+        };
+        let config = serde_json::from_str(&record.config_json)?;
+        let from_version = u32::try_from(record.schema_version)
+            .map_err(|_| anyhow::anyhow!("invalid adapter schema version"))?;
+        let (schema_version, migrated) = adapter.migrate_config(from_version, config)?;
+        let migrated_json = serde_json::to_string(&migrated)?;
+        let preferred_core_id = record.preferred_core_id.clone().or_else(|| {
+            crate::adapters::legacy_runtime_preference(&record.kind).map(str::to_string)
+        });
+        let managed_resource_id = record
+            .managed_resource_id
+            .clone()
+            .or_else(|| Some(format!("legacy-profile-{}", record.id)));
+        if schema_version != from_version
+            || migrated_json != record.config_json
+            || preferred_core_id != record.preferred_core_id
+            || managed_resource_id != record.managed_resource_id
+        {
+            sqlx::query(
+                r"
+                UPDATE protocol_profiles
+                SET schema_version = ?, config_json = ?, preferred_core_id = ?,
+                    managed_resource_id = ?, updated_at = ?
+                WHERE id = ?
+                ",
+            )
+            .bind(i64::from(schema_version))
+            .bind(migrated_json)
+            .bind(preferred_core_id)
+            .bind(managed_resource_id)
+            .bind(Utc::now())
+            .bind(record.id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 pub async fn list_protocol_profiles_decoded(pool: &SqlitePool) -> Result<Vec<ProtocolProfile>> {
@@ -1082,6 +1420,59 @@ pub async fn list_protocol_profiles_decoded(pool: &SqlitePool) -> Result<Vec<Pro
         .into_iter()
         .map(decode_protocol_profile)
         .collect()
+}
+
+/// Loads one coherent desired-state snapshot for the privileged worker.
+pub async fn load_desired_state(pool: &SqlitePool) -> Result<DesiredState> {
+    let mut transaction = pool.begin().await?;
+    let (generation,): (i64,) =
+        sqlx::query_as("SELECT desired_generation FROM reconcile_state WHERE singleton = 1")
+            .fetch_one(&mut *transaction)
+            .await?;
+    let records = sqlx::query_as::<_, ProtocolProfileRecord>(
+        r"
+        SELECT id, name, kind, role, enabled, server, port, config_json,
+               schema_version, preferred_core_id, managed_resource_id,
+               created_at, updated_at
+        FROM protocol_profiles
+        ORDER BY role ASC, name ASC
+        ",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let now = Utc::now();
+    let users = sqlx::query_as::<_, UserRecord>(
+        r"
+        SELECT id, username, uuid, subscription_token, enabled, traffic_limit_bytes,
+               traffic_used_bytes, expires_at, created_at, updated_at
+        FROM users
+        WHERE enabled = 1
+          AND (expires_at IS NULL OR expires_at > ?)
+          AND (traffic_limit_bytes IS NULL OR traffic_used_bytes < traffic_limit_bytes)
+        ORDER BY id ASC
+        ",
+    )
+    .bind(now)
+    .fetch_all(&mut *transaction)
+    .await?;
+    let settings =
+        sqlx::query_as::<_, (String, String)>("SELECT key, value FROM settings ORDER BY key ASC")
+            .fetch_all(&mut *transaction)
+            .await?
+            .into_iter()
+            .collect();
+    transaction.commit().await?;
+    Ok(DesiredState {
+        generation: u64::try_from(generation)
+            .map_err(|_| anyhow::anyhow!("invalid desired generation"))?,
+        profiles: records
+            .into_iter()
+            .map(decode_protocol_profile)
+            .collect::<Result<Vec<_>>>()?,
+        users: users.into_iter().map(Into::into).collect(),
+        settings,
+        infrastructure: Vec::new(),
+    })
 }
 
 pub async fn update_protocol_profile(
@@ -1094,10 +1485,12 @@ pub async fn update_protocol_profile(
     let now = Utc::now();
     let config_json = serde_json::to_string(&input.config)?;
 
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
         UPDATE protocol_profiles
-        SET enabled = ?, server = ?, port = ?, config_json = ?, updated_at = ?
+        SET enabled = ?, server = ?, port = ?, config_json = ?, preferred_core_id = ?,
+            managed_resource_id = ?, updated_at = ?
         WHERE name = ?
         ",
     )
@@ -1105,10 +1498,14 @@ pub async fn update_protocol_profile(
     .bind(input.server.trim())
     .bind(i64::from(input.port))
     .bind(config_json)
+    .bind(input.preferred_core_id.as_deref())
+    .bind(input.managed_resource_id.as_deref())
     .bind(now)
     .bind(existing.name.as_str())
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
 
     get_protocol_profile_by_name(pool, &existing.name)
         .await?
@@ -1217,6 +1614,7 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
     let uuid = Uuid::new_v4().to_string();
     let subscription_token = Uuid::new_v4().simple().to_string();
 
+    let mut transaction = pool.begin().await?;
     sqlx::query(
         r"
         INSERT INTO users (
@@ -1240,8 +1638,10 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
     .bind(input.expires_at)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
 
     get_user_by_token(pool, &subscription_token).await
 }
@@ -1321,6 +1721,7 @@ pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
 
 pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Result<()> {
     let now = Utc::now();
+    let mut transaction = pool.begin().await?;
 
     let result = sqlx::query(
         r"
@@ -1332,13 +1733,14 @@ pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Resu
     .bind(enabled)
     .bind(now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
-
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1367,6 +1769,7 @@ pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result
 }
 
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r"
         DELETE FROM users
@@ -1374,13 +1777,14 @@ pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
         ",
     )
     .bind(id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
-
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1585,6 +1989,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn only_runtime_setting_changes_advance_desired_generation() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let runtime_keys = ["subscription_domain", "node_domain"];
+
+        let generation = upsert_settings_with_runtime_keys(
+            &pool,
+            &[("panel_name".to_string(), "Operations".to_string())],
+            &runtime_keys,
+        )
+        .await?;
+        assert_eq!(generation, None);
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 0);
+
+        let generation = upsert_settings_with_runtime_keys(
+            &pool,
+            &[(
+                "subscription_domain".to_string(),
+                "sub.example.test".to_string(),
+            )],
+            &runtime_keys,
+        )
+        .await?;
+        assert_eq!(generation, Some(1));
+
+        let generation = upsert_settings_with_runtime_keys(
+            &pool,
+            &[(
+                "subscription_domain".to_string(),
+                "sub.example.test".to_string(),
+            )],
+            &runtime_keys,
+        )
+        .await?;
+        assert_eq!(generation, None);
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 1);
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_database_records_are_redacted_in_debug_output() {
+        let now = Utc::now();
+        let secret = SecretRecord {
+            name: "runtime.secret".to_string(),
+            value: "plaintext-canary".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let user = UserRecord {
+            id: 1,
+            username: "operator".to_string(),
+            uuid: "uuid-canary".to_string(),
+            subscription_token: "subscription-canary".to_string(),
+            enabled: true,
+            traffic_limit_bytes: None,
+            traffic_used_bytes: 0,
+            expires_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let subscription_user = crate::models::SubscriptionUser {
+            username: "operator".to_string(),
+            uuid: "subscription-uuid-canary".to_string(),
+            subscription_token: "subscription-model-canary".to_string(),
+        };
+        let debug = format!("{secret:?} {user:?} {subscription_user:?}");
+        assert!(!debug.contains("plaintext-canary"));
+        assert!(!debug.contains("uuid-canary"));
+        assert!(!debug.contains("subscription-canary"));
+        assert!(!debug.contains("subscription-uuid-canary"));
+        assert!(!debug.contains("subscription-model-canary"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
     async fn protocol_profiles_store_structured_config() -> Result<()> {
         let (pool, path) = test_pool().await?;
 
@@ -1592,18 +2072,20 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
-                kind: ProxyKind::VlessRealityXhttp,
+                protocol_id: "vless-reality-xhttp".to_string(),
+                schema_version: 1,
                 role: ProxyRole::AutoSafe,
                 enabled: true,
                 server: "iberia.example.test".to_string(),
                 port: 8443,
-                config: ProtocolConfig::VlessRealityXhttp {
-                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                    server_name: "www.microsoft.com".to_string(),
-                    path: "/api/v1".to_string(),
-                    public_key_secret: "xray.reality.public_key".to_string(),
-                    short_id_secret: "xray.reality.short_id".to_string(),
-                },
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({
+                    "server_name": "www.microsoft.com",
+                    "path": "/api/v1",
+                    "public_key_secret": "xray.reality.public_key",
+                    "short_id_secret": "xray.reality.short_id"
+                }),
             },
         )
         .await?;
@@ -1612,17 +2094,8 @@ mod tests {
         assert_eq!(profile.role, "auto-safe");
         assert_eq!(profile.port, 8443);
 
-        let config: ProtocolConfig = serde_json::from_str(&profile.config_json)?;
-        assert_eq!(
-            config,
-            ProtocolConfig::VlessRealityXhttp {
-                uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                server_name: "www.microsoft.com".to_string(),
-                path: "/api/v1".to_string(),
-                public_key_secret: "xray.reality.public_key".to_string(),
-                short_id_secret: "xray.reality.short_id".to_string(),
-            }
-        );
+        let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
+        assert_eq!(config["path"], "/api/v1");
 
         let profiles = list_protocol_profiles(&pool).await?;
         assert_eq!(profiles.len(), 1);
@@ -1640,18 +2113,15 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
-                kind: ProxyKind::VlessRealityXhttp,
+                protocol_id: "vless-reality-xhttp".to_string(),
+                schema_version: 1,
                 role: ProxyRole::AutoSafe,
                 enabled: true,
                 server: "old.example.test".to_string(),
                 port: 8443,
-                config: ProtocolConfig::VlessRealityXhttp {
-                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                    server_name: "www.microsoft.com".to_string(),
-                    path: "/api/v1".to_string(),
-                    public_key_secret: "xray.reality.public_key".to_string(),
-                    short_id_secret: "xray.reality.short_id".to_string(),
-                },
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({"server_name":"www.microsoft.com","path":"/api/v1","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id"}),
             },
         )
         .await?;
@@ -1663,13 +2133,9 @@ mod tests {
                 enabled: false,
                 server: "new.example.test".to_string(),
                 port: 9443,
-                config: ProtocolConfig::VlessRealityXhttp {
-                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                    server_name: "www.apple.com".to_string(),
-                    path: "/edge".to_string(),
-                    public_key_secret: "xray.reality.public_key".to_string(),
-                    short_id_secret: "xray.reality.short_id".to_string(),
-                },
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({"server_name":"www.apple.com","path":"/edge","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id"}),
             },
         )
         .await?;
@@ -1694,7 +2160,7 @@ mod tests {
         assert_eq!(profiles.len(), 6);
         assert!(profiles
             .iter()
-            .any(|profile| profile.kind == ProxyKind::VlessRealityTcp));
+            .any(|profile| profile.protocol_id == "vless-reality-tcp"));
 
         update_protocol_profile(
             &pool,
@@ -1703,13 +2169,9 @@ mod tests {
                 enabled: true,
                 server: "custom.example.test".to_string(),
                 port: 9443,
-                config: ProtocolConfig::VlessRealityXhttp {
-                    uuid_source: crate::models::UserUuidSource::SubscriptionUser,
-                    server_name: "www.apple.com".to_string(),
-                    path: "/custom".to_string(),
-                    public_key_secret: "xray.reality.public_key".to_string(),
-                    short_id_secret: "xray.reality.short_id".to_string(),
-                },
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({"server_name":"www.apple.com","path":"/custom","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id"}),
             },
         )
         .await?;
@@ -1724,6 +2186,86 @@ mod tests {
         assert!(customized.enabled);
         assert_eq!(customized.server, "custom.example.test");
         assert_eq!(customized.port, 9443);
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adapter_migration_is_idempotent_and_preserves_profiles_and_unknown_data() -> Result<()>
+    {
+        let (pool, path) = test_pool().await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        let original = list_protocol_profiles(&pool).await?;
+        assert_eq!(original.len(), 6);
+        let mut expected_enabled = std::collections::BTreeMap::new();
+
+        for (index, record) in original.iter().enumerate() {
+            expected_enabled.insert(record.id, index % 2 == 0);
+            let mut config: serde_json::Value = serde_json::from_str(&record.config_json)?;
+            config["future_option"] = serde_json::json!({"preserve": index});
+            if let Some(object) = config.as_object_mut() {
+                object.remove("private_key_secret");
+            }
+            sqlx::query(
+                r"
+                UPDATE protocol_profiles
+                SET enabled = ?, config_json = ?, preferred_core_id = NULL,
+                    managed_resource_id = NULL
+                WHERE id = ?
+                ",
+            )
+            .bind(index % 2 == 0)
+            .bind(serde_json::to_string(&config)?)
+            .bind(record.id)
+            .execute(&pool)
+            .await?;
+        }
+        create_protocol_profile(
+            &pool,
+            NewProtocolProfile {
+                name: "EXTERNAL-PRESERVED".to_string(),
+                protocol_id: "external-future-adapter".to_string(),
+                schema_version: 7,
+                role: ProxyRole::Manual,
+                enabled: false,
+                server: "future.example.test".to_string(),
+                port: 18443,
+                preferred_core_id: Some("external-future-core".to_string()),
+                managed_resource_id: Some("external-future-resource".to_string()),
+                config: serde_json::json!({
+                    "opaque": [1, 2, 3],
+                    "secret_ref": "future.secret.reference"
+                }),
+            },
+        )
+        .await?;
+
+        let registry = crate::adapters::protocol_registry()?;
+        migrate_protocol_adapter_configs(&pool, &registry).await?;
+        let first = list_protocol_profiles(&pool).await?;
+        migrate_protocol_adapter_configs(&pool, &registry).await?;
+        let second = list_protocol_profiles(&pool).await?;
+
+        assert_eq!(first.len(), 7);
+        assert_eq!(first, second);
+        for record in first
+            .iter()
+            .filter(|record| record.kind != "external-future-adapter")
+        {
+            assert_eq!(Some(&record.enabled), expected_enabled.get(&record.id));
+            let config: serde_json::Value = serde_json::from_str(&record.config_json)?;
+            assert!(config["future_option"]["preserve"].is_number());
+            assert!(record.managed_resource_id.is_some());
+        }
+        let external = first
+            .iter()
+            .find(|record| record.kind == "external-future-adapter")
+            .expect("unknown adapter row must survive migration");
+        assert!(!external.enabled);
+        assert_eq!(external.schema_version, 7);
+        assert_eq!(external.role, "manual");
+        assert!(external.config_json.contains("future.secret.reference"));
 
         close_and_remove(pool, &path).await;
         Ok(())

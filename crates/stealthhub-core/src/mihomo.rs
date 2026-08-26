@@ -4,44 +4,44 @@
 //! profiles, secrets and routing rule sets into client-importable Mihomo config.
 //! Inputs are explicit so generation can be tested without a database.
 
-use anyhow::{bail, Result};
+use std::collections::{BTreeMap, HashMap};
+
+use anyhow::{bail, Context, Result};
 use serde_json::json;
 
-use crate::models::{
-    PanelSettings, ProtocolConfig, ProtocolProfile, ProxyRole, SubscriptionUser, UserUuidSource,
+use crate::{
+    adapter::{ClientRenderContext, MapSecretResolver, ProtocolRegistry},
+    models::{PanelSettings, ProtocolProfile, ProxyRole, SubscriptionUser},
+    rules::RoutingRuleSet,
 };
-use crate::rules::RoutingRuleSet;
 
-fn secret_value<'a>(
-    secrets: &'a std::collections::HashMap<String, String>,
-    secret_name: &'a str,
-) -> Result<&'a str> {
-    let value = secrets
-        .get(secret_name)
-        .map(String::as_str)
-        .ok_or_else(|| anyhow::anyhow!("required secret is missing: {secret_name}"))?
-        .trim();
-    if value.is_empty() || value == secret_name || value.starts_with("REPLACE_WITH_") {
-        bail!("required secret is not configured: {secret_name}");
-    }
-    Ok(value)
-}
-
-fn user_uuid<'a>(user: &'a SubscriptionUser, uuid_source: &UserUuidSource) -> Result<&'a str> {
-    match uuid_source {
-        UserUuidSource::SubscriptionUser => Ok(user.uuid.as_str()),
-        UserUuidSource::StaticSecret => {
-            bail!("static UUID profiles are unsupported without an explicit secret reference")
-        }
-    }
-}
-
+/// Generates a Mihomo document with the trusted built-in adapter registry.
 pub fn generate_mihomo_yaml(
     settings: &PanelSettings,
     user: &SubscriptionUser,
     profiles: &[ProtocolProfile],
-    secrets: &std::collections::HashMap<String, String>,
+    secrets: &HashMap<String, String>,
     routing_rule_sets: &[RoutingRuleSet],
+) -> Result<String> {
+    let registry = crate::adapters::protocol_registry()?;
+    generate_mihomo_yaml_with_registry(
+        settings,
+        user,
+        profiles,
+        secrets,
+        routing_rule_sets,
+        &registry,
+    )
+}
+
+/// Generates a Mihomo document without branching on concrete protocol IDs.
+pub fn generate_mihomo_yaml_with_registry(
+    settings: &PanelSettings,
+    user: &SubscriptionUser,
+    profiles: &[ProtocolProfile],
+    secrets: &HashMap<String, String>,
+    routing_rule_sets: &[RoutingRuleSet],
+    registry: &ProtocolRegistry,
 ) -> Result<String> {
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
     if enabled_profiles.is_empty() {
@@ -51,130 +51,22 @@ pub fn generate_mihomo_yaml(
         bail!("subscription token is empty");
     }
 
-    let proxies: Vec<_> = enabled_profiles
+    let secret_values = secrets
         .iter()
-        .map(|profile| -> Result<_> {
-            let proxy = match &profile.config {
-                ProtocolConfig::VlessRealityXhttp {
-                    uuid_source,
-                    server_name,
-                    path,
-                    public_key_secret,
-                    short_id_secret,
-                } => json!({
-                    "name": profile.name,
-                    "type": "vless",
-                    "server": profile.server,
-                    "port": profile.port,
-                    "udp": true,
-                    "uuid": user_uuid(user, uuid_source)?,
-                    "encryption": "",
-                    "tls": true,
-                    "servername": server_name,
-                    "client-fingerprint": "chrome",
-                    "reality-opts": {
-                        "public-key": secret_value(secrets, public_key_secret)?,
-                        "short-id": secret_value(secrets, short_id_secret)?
-                    },
-                    "network": "xhttp",
-                    "xhttp-opts": {
-                        "path": path,
-                        "host": server_name
-                    }
-                }),
-                ProtocolConfig::VlessRealityTcp {
-                    uuid_source,
-                    server_name,
-                    public_key_secret,
-                    short_id_secret,
-                } => json!({
-                    "name": profile.name,
-                    "type": "vless",
-                    "server": profile.server,
-                    "port": profile.port,
-                    "udp": true,
-                    "uuid": user_uuid(user, uuid_source)?,
-                    "encryption": "",
-                    "tls": true,
-                    "servername": server_name,
-                    "client-fingerprint": "chrome",
-                    "reality-opts": {
-                        "public-key": secret_value(secrets, public_key_secret)?,
-                        "short-id": secret_value(secrets, short_id_secret)?
-                    }
-                }),
-                ProtocolConfig::Shadowsocks2022ShadowTls {
-                    server_name,
-                    password_secret,
-                    shadow_tls_password_secret,
-                } => json!({
-                    "name": profile.name,
-                    "type": "ss",
-                    "server": profile.server,
-                    "port": profile.port,
-                    "cipher": "2022-blake3-aes-256-gcm",
-                    "password": secret_value(secrets, password_secret)?,
-                    "udp": true,
-                    "plugin": "shadow-tls",
-                    "client-fingerprint": "chrome",
-                    "plugin-opts": {
-                        "host": server_name,
-                        "password": secret_value(secrets, shadow_tls_password_secret)?,
-                        "version": 3
-                    }
-                }),
-                ProtocolConfig::Hysteria2 {
-                    password_secret,
-                    sni,
-                    obfs_password_secret,
-                } => {
-                    let mut proxy = json!({
-                        "name": profile.name,
-                        "type": "hysteria2",
-                        "server": profile.server,
-                        "port": profile.port,
-                        "password": secret_value(secrets, password_secret)?,
-                        "sni": sni,
-                        "alpn": ["h3"]
-                    });
-
-                    if let Some(obfs_secret) = obfs_password_secret {
-                        proxy["obfs"] = json!("salamander");
-                        proxy["obfs-password"] = json!(secret_value(secrets, obfs_secret)?);
-                    }
-
-                    proxy
-                }
-                ProtocolConfig::AnyTls {
-                    password_secret,
-                    sni,
-                } => json!({
-                    "name": profile.name,
-                    "type": "anytls",
-                    "server": profile.server,
-                    "port": profile.port,
-                    "password": secret_value(secrets, password_secret)?,
-                    "client-fingerprint": "chrome",
-                    "udp": true,
-                    "sni": sni
-                }),
-                ProtocolConfig::Tuic {
-                    uuid_source,
-                    password_secret,
-                    sni,
-                } => json!({
-                    "name": profile.name,
-                    "type": "tuic",
-                    "server": profile.server,
-                    "port": profile.port,
-                    "uuid": user_uuid(user, uuid_source)?,
-                    "password": secret_value(secrets, password_secret)?,
-                    "udp": true,
-                    "sni": sni,
-                    "alpn": ["h3"]
-                }),
-            };
-            Ok(proxy)
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let resolver = MapSecretResolver::new(&secret_values);
+    let proxies = enabled_profiles
+        .iter()
+        .map(|profile| {
+            let adapter = registry.get(&profile.protocol_id).with_context(|| {
+                format!("protocol adapter `{}` is unavailable", profile.protocol_id)
+            })?;
+            adapter.render_client(&ClientRenderContext {
+                profile,
+                user,
+                secrets: &resolver,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -331,7 +223,66 @@ fn routing_rules(rule_sets: &[RoutingRuleSet]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{models::ProxyKind, rules::default_routing_rule_sets};
+    use crate::adapter::{
+        ClientRenderContext, ConfigField, ProtocolAdapter, ProtocolAdapterManifest, SecretRef,
+        ServerFragment, ServerRenderContext, ADAPTER_API_VERSION,
+    };
+    use crate::rules::default_routing_rule_sets;
+    use std::{collections::BTreeSet, sync::Arc};
+
+    struct ExternalProtocol {
+        manifest: ProtocolAdapterManifest,
+    }
+
+    impl ProtocolAdapter for ExternalProtocol {
+        fn manifest(&self) -> &ProtocolAdapterManifest {
+            &self.manifest
+        }
+
+        fn fields(&self) -> &[ConfigField] {
+            &[]
+        }
+
+        fn validate_config(&self, schema_version: u32, config: &serde_json::Value) -> Result<()> {
+            if schema_version != 1 || !config.is_object() {
+                bail!("invalid external adapter config");
+            }
+            Ok(())
+        }
+
+        fn migrate_config(
+            &self,
+            _from_version: u32,
+            config: serde_json::Value,
+        ) -> Result<(u32, serde_json::Value)> {
+            Ok((1, config))
+        }
+
+        fn client_secret_references(&self, _config: &serde_json::Value) -> Result<Vec<SecretRef>> {
+            Ok(Vec::new())
+        }
+
+        fn server_secret_references(&self, _config: &serde_json::Value) -> Result<Vec<SecretRef>> {
+            Ok(Vec::new())
+        }
+
+        fn render_client(&self, context: &ClientRenderContext<'_>) -> Result<serde_json::Value> {
+            Ok(json!({
+                "name": context.profile.name,
+                "type": "external-test",
+                "server": context.profile.server,
+                "port": context.profile.port,
+            }))
+        }
+
+        fn render_server(&self, context: &ServerRenderContext<'_>) -> Result<ServerFragment> {
+            Ok(ServerFragment {
+                profile_id: context.profile.name.clone(),
+                capability: "external-capability".to_string(),
+                payload: json!({}),
+            })
+        }
+    }
 
     fn fixture_settings() -> PanelSettings {
         PanelSettings {
@@ -352,18 +303,21 @@ mod tests {
     fn fixture_profile() -> ProtocolProfile {
         ProtocolProfile {
             name: "VLESS-XHTTP-SAFE".to_string(),
-            kind: ProxyKind::VlessRealityXhttp,
+            protocol_id: "vless-reality-xhttp".to_string(),
+            schema_version: 1,
             role: ProxyRole::AutoSafe,
             server: "node.example.test".to_string(),
             port: 8443,
             enabled: true,
-            config: ProtocolConfig::VlessRealityXhttp {
-                uuid_source: UserUuidSource::SubscriptionUser,
-                server_name: "www.microsoft.com".to_string(),
-                path: "/api/v1".to_string(),
-                public_key_secret: "xray.reality.public_key".to_string(),
-                short_id_secret: "xray.reality.short_id".to_string(),
-            },
+            preferred_core_id: None,
+            managed_resource_id: None,
+            config: json!({
+                "server_name": "www.microsoft.com",
+                "path": "/api/v1",
+                "public_key_secret": "xray.reality.public_key",
+                "short_id_secret": "xray.reality.short_id",
+                "private_key_secret": "xray.reality.private_key"
+            }),
         }
     }
 
@@ -413,7 +367,7 @@ mod tests {
             &default_routing_rule_sets(),
         )
         .unwrap_err();
-        assert!(error.to_string().contains("required secret is missing"));
+        assert!(error.to_string().contains("unresolved"));
 
         let error = generate_mihomo_yaml(
             &settings,
@@ -441,5 +395,46 @@ mod tests {
         let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &[]).unwrap();
         assert!(!yaml.contains("RULE-SET,"));
         assert!(!yaml.contains("/rules/"));
+    }
+
+    #[test]
+    fn externally_added_protocol_renders_without_generic_assembler_changes() {
+        let mut registry = ProtocolRegistry::default();
+        registry
+            .register(Arc::new(ExternalProtocol {
+                manifest: ProtocolAdapterManifest {
+                    api_version: ADAPTER_API_VERSION,
+                    id: "external-test".to_string(),
+                    display_name: "External test".to_string(),
+                    schema_version: 1,
+                    required_core_capabilities: BTreeSet::from(["external-capability".to_string()]),
+                    user_participates: true,
+                },
+            }))
+            .unwrap();
+        let profile = ProtocolProfile {
+            name: "EXTERNAL".to_string(),
+            protocol_id: "external-test".to_string(),
+            schema_version: 1,
+            role: ProxyRole::Manual,
+            server: "node.example.test".to_string(),
+            port: 443,
+            enabled: true,
+            preferred_core_id: None,
+            managed_resource_id: Some("external-resource".to_string()),
+            config: json!({}),
+        };
+
+        let yaml = generate_mihomo_yaml_with_registry(
+            &fixture_settings(),
+            &fixture_user(),
+            &[profile],
+            &HashMap::new(),
+            &[],
+            &registry,
+        )
+        .unwrap();
+        assert!(yaml.contains("external-test"));
+        assert!(yaml.contains("EXTERNAL"));
     }
 }

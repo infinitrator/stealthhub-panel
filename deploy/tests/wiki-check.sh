@@ -26,6 +26,7 @@ required_pages=(
   wiki/13-SECURITY-OPERATIONS.md
   wiki/14-TROUBLESHOOTING-AND-REFERENCE.md
   wiki/15-RELEASE-0.1-BETA.md
+  wiki/16-ADAPTERS-AND-RECONCILIATION.md
 )
 
 for page in "${required_pages[@]}"; do

@@ -3,8 +3,9 @@
 use crate::{admin_bar, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
+use stealthhub_core::storage::ReconcileStateRecord;
 
-pub(crate) fn render(auth: &AuthenticatedAdmin) -> Response {
+pub(crate) fn render(auth: &AuthenticatedAdmin, reconcile: &ReconcileStateRecord) -> Response {
     Html(
             layout(
                 "Dashboard",
@@ -14,21 +15,25 @@ pub(crate) fn render(auth: &AuthenticatedAdmin) -> Response {
 
                     div class="status-strip" {
                         div class="metric" {
-                            span { "Admin" }
-                            strong { "protected" }
+                            span { "Desired generation" }
+                            strong { (reconcile.desired_generation) }
                         }
                         div class="metric" {
-                            span { "Storage" }
-                            strong { "SQLite" }
+                            span { "Applied generation" }
+                            strong { (reconcile.applied_generation) }
                         }
                         div class="metric" {
-                            span { "Client" }
-                            strong { "Mihomo YAML" }
+                            span { "Reconciliation" }
+                            strong { (&reconcile.status) }
                         }
                         div class="metric" {
-                            span { "Mode" }
-                            strong { "single-node" }
+                            span { "Operation" }
+                            strong { (reconcile.last_operation_id.as_deref().unwrap_or("none")) }
                         }
+                    }
+
+                    @if let Some(error) = &reconcile.last_error {
+                        div class="notice warning" { strong { "Last operation: " } (error) }
                     }
 
                     div class="grid" {

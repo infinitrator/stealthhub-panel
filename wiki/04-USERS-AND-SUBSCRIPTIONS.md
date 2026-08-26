@@ -18,9 +18,9 @@ User — запись, определяющая доступ к общей ге�
 | `traffic_used_bytes` | Сохраненный счетчик. |
 | `expires_at` | Опциональный UTC timestamp окончания. |
 
-User Infiproxy не создает автоматически соответствующего user во всех Xray,
-sing-box, Hysteria и TUIC server configs. Серверная аутентификация должна быть
-согласована отдельно.
+Для adapters с индивидуальной identity (сейчас VLESS и TUIC) user входит в
+generated server authorization и меняется атомарно вместе с runtime. Протоколы
+с общим password не получают отдельную server identity на каждого user.
 
 ## Создание
 
@@ -113,9 +113,11 @@ server access log может содержать token. Не демонстрир
 - account page показывает block reason;
 - import/download недоступен;
 - уже загруженная конфигурация на клиенте не стирается;
-- уже известные runtime credentials не отзываются автоматически.
+- participating adapters удаляют user из нового runtime candidate; shared
+  protocol password остается действительным для ранее скачанного клиента.
 
-Для полноценного revoke нужно также удалить/заменить credential в server core.
+Для shared-password протокола полноценный revoke требует rotation общего
+secret, что затронет всех использующих его клиентов.
 
 ### Enable
 
@@ -140,7 +142,8 @@ server credentials.
 ### Delete
 
 Удаляет SQLite user и token после confirmation. Действие необратимо через GUI.
-Оно не редактирует core configs и не выключает существующий runtime credential.
+Оно создает desired generation; participating adapters удаляют identity только
+после успешного `Applied`. Shared password отдельно не вращается.
 
 ## Публичная account page
 

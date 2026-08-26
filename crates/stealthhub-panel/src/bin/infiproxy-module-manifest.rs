@@ -248,9 +248,12 @@ fn select_release_metadata(pattern: &str, release: &Release) -> anyhow::Result<R
     }
     let version = release
         .tag_name
-        .strip_prefix("app/v")
-        .or_else(|| release.tag_name.strip_prefix("tuic-server-"))
-        .or_else(|| release.tag_name.strip_prefix('v'))
+        .char_indices()
+        .find_map(|(index, character)| {
+            character
+                .is_ascii_digit()
+                .then_some(&release.tag_name[index..])
+        })
         .unwrap_or(&release.tag_name);
     let expected = pattern
         .replace("{version}", version)

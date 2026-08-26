@@ -278,7 +278,7 @@ async fn refresh_with_client(
     let installed = Path::new(&spec.binary_path).is_file();
     let update_available = installed
         && installed_version != "unknown"
-        && normalize_version(&installed_version) != normalize_version(&latest_version);
+        && versions_differ(&spec.upstream, &installed_version, &latest_version);
     let auto_update = load_auto_update(pool, &spec.id).await?;
     let status = ModuleStatus {
         spec,
@@ -309,7 +309,7 @@ async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleS
     let update_available = installed
         && latest_version != "unknown"
         && installed_version != "unknown"
-        && normalize_version(&installed_version) != normalize_version(&latest_version);
+        && versions_differ(&spec.upstream, &installed_version, &latest_version);
     let persisted_status = setting_or_default(
         pool,
         &spec.id,
@@ -494,11 +494,17 @@ fn setting_key(module_id: &str, suffix: &str) -> String {
     format!("module_{module_id}_{suffix}")
 }
 
-fn normalize_version(value: &str) -> &str {
+fn versions_differ(upstream: &UpstreamKind, installed: &str, latest: &str) -> bool {
+    match upstream {
+        UpstreamKind::Release => release_version(installed) != release_version(latest),
+        UpstreamKind::Commit { .. } => installed != latest,
+    }
+}
+
+fn release_version(value: &str) -> &str {
     value
-        .strip_prefix("app/v")
-        .or_else(|| value.strip_prefix("tuic-server-"))
-        .or_else(|| value.strip_prefix('v'))
+        .char_indices()
+        .find_map(|(index, character)| character.is_ascii_digit().then_some(&value[index..]))
         .unwrap_or(value)
 }
 
@@ -531,9 +537,9 @@ mod tests {
 
     #[test]
     fn version_normalization_handles_upstream_prefixes() {
-        assert_eq!(normalize_version("v1.2.3"), "1.2.3");
-        assert_eq!(normalize_version("app/v2.10.0"), "2.10.0");
-        assert_eq!(normalize_version("tuic-server-1.0.0"), "1.0.0");
+        assert_eq!(release_version("v1.2.3"), "1.2.3");
+        assert_eq!(release_version("release/v2.10.0"), "2.10.0");
+        assert_eq!(release_version("server-release-1.0.0"), "1.0.0");
     }
 
     #[test]

@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=infiproxy
-Group=infiproxy
+User=infiproxy-runtime
+Group=infiproxy-runtime
 EnvironmentFile=/etc/infiproxy-cores/mtproto/mtproto.env
 WorkingDirectory=/etc/infiproxy-cores/mtproto
 ExecStart=/opt/infiproxy/cores/mtproto/current/mtproto-proxy -p $MTPROTO_STATS_PORT -H $MTPROTO_PORT -S $MTPROTO_SECRET --aes-pwd $MTPROTO_AES_PWD $MTPROTO_PROXY_CONFIG -M $MTPROTO_WORKERS

@@ -8,9 +8,10 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 > [!IMPORTANT]
 > Infiproxy является панелью управления и генератором клиентских подписок.
 > Она не передает пользовательский трафик сама. Xray, sing-box, Hysteria,
-> TUIC, Telegram MTProxy и Headscale работают отдельными процессами. Поля во
-> вкладке **Protocols** описывают клиентские объекты Mihomo и не переписывают
-> автоматически серверные inbound-конфиги этих процессов.
+> TUIC, Telegram MTProxy и Headscale работают отдельными процессами. Для
+> поддержанных protocol/core adapters вкладка **Protocols** формирует desired
+> state, а отдельный root reconciler атомарно применяет server config только
+> после validation, health/listener checks и с rollback.
 
 ## Как читать wiki
 
@@ -32,6 +33,7 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 14. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE).
 15. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
 16. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
+17. [Адаптеры и атомарное применение](16-ADAPTERS-AND-RECONCILIATION).
 
 ## Уровни готовности операций
 
@@ -53,23 +55,26 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - создание первого владельца и администраторских сессий;
 - пользователи, сроки действия и Mihomo subscription URL;
 - клиентские Mihomo-профили и встроенные rule-provider;
+- desired/applied generations и атомарная синхронизация поддержанных runtime;
 - динамический каталог runtime-модулей;
 - проверяемые обновления бинарников с атомарным переключением версии;
 - обновление самой панели с pre-update backup и rollback;
 - Cloudflare DNS-01, Let's Encrypt и Nginx через root-TUI;
 - установка и базовая настройка Telegram MTProxy и Headscale;
 - owner-only хранилище client-side secret values без обратного показа значений;
+- root-only хранилище private server secrets через SSH-TUI;
 - allowlist-редактор конфигов, health/readiness и локальная IP-диагностика;
 - смена пароля администратора с отзывом всех существующих сессий.
 
-## Что не следует считать автоматизированным
+## Границы автоматизации
 
-- серверные inbound-конфиги Xray и sing-box устанавливаются как безопасные
-  пустые заготовки; их необходимо заполнить;
-- starter-конфиги Hysteria и TUIC содержат placeholder-секреты/пустых
-  пользователей и требуют финальной настройки;
-- вкладка **Protocols** не синхронизирует UUID, пароли, REALITY-ключи и порты с
-  серверными конфигами;
+- только зарегистрированные protocol/core adapter combinations участвуют в
+  server reconciliation; внешний module manifest сам по себе не добавляет
+  renderer в панель;
+- private server keys не принимаются из браузера и создаются/вращаются через
+  **Privileged runtime secrets** в root-TUI;
+- изменение считается рабочим только при совпадении desired/applied generation
+  и статусе `Applied`;
 - счетчик `traffic_used_bytes` хранится и проверяется, но встроенного сборщика
   статистики с proxy-ядер в этой ревизии нет;
 - вкладка **System** показывает состояние и точные root-команды, но не управляет

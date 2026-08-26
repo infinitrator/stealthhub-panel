@@ -29,6 +29,8 @@ LOCK_FILE="${INFIPROXY_MODULE_UPDATE_LOCK_FILE:-/run/lock/infiproxy-module-updat
 GITHUB_API="https://api.github.com/repos"
 APP_USER="${INFIPROXY_USER:-infiproxy}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
+RUNTIME_GROUP="${INFIPROXY_RUNTIME_GROUP:-infiproxy-runtime}"
+RECONCILE_APPLIED_FILE="${INFIPROXY_RECONCILE_APPLIED_FILE:-${ROOT_STATE_DIR}/reconcile/applied.json}"
 LAST_MODULE_BACKUP=""
 
 log() {
@@ -664,7 +666,7 @@ register_requested() {
       install -o root -g root -m 0644 "$source" "$target"
       rm -f "${DISABLED_DIR}/${id}" "${request}.failed"
       load_module "$id" || die "installed manifest could not be reloaded: ${id}"
-      install -d -o root -g "$APP_GROUP" -m 0770 "$(dirname "$M_CONFIG")"
+      install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$(dirname "$M_CONFIG")"
       if (update_module "$id"); then
         rm -f "$request"
       else
@@ -696,6 +698,14 @@ remove_requested() {
     fi
     id="$(basename "$request" .remove)"
     if load_module "$id"; then
+      if [[ -f "$RECONCILE_APPLIED_FILE" && ! -L "$RECONCILE_APPLIED_FILE" ]] \
+          && grep -Eq '"active_core_ids"[[:space:]]*:[[:space:]]*\[[^]]*"'"$id"'"' \
+              "$RECONCILE_APPLIED_FILE"; then
+        mv -f "$request" "${request}.failed"
+        log "removal blocked for active desired-state adapter ${id}"
+        failed=1
+        continue
+      fi
       if [[ ! -e "${AVAILABLE_DIR}/${id}.module" ]]; then
         install -o root -g root -m 0644 "$(manifest_file "$id")" "${AVAILABLE_DIR}/${id}.module"
       fi

@@ -8,10 +8,7 @@
 use super::*;
 use crate::{
     health, ip, modules,
-    ops::{
-        format_duration, percent, trim_command_output, CONFIG_FILES, IP_REPUTATION_SOURCES,
-        SYSTEM_TARGETS,
-    },
+    ops::{format_duration, percent, trim_command_output, IP_REPUTATION_SOURCES},
 };
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
@@ -203,19 +200,39 @@ fn protocol_servers_are_host_only_and_accept_bare_ipv6() {
 #[test]
 fn protocol_secret_references_and_paths_fail_closed() {
     assert_eq!(
-        required_secret_reference("xray.reality.public_key", "secret").unwrap(),
+        SecretRef::parse("xray.reality.public_key")
+            .unwrap()
+            .as_str(),
         "xray.reality.public_key"
     );
-    assert!(required_secret_reference("../secret", "secret").is_err());
-    assert_eq!(required_http_path("/api/v1").unwrap(), "/api/v1");
-    assert!(required_http_path("api/v1").is_err());
-    assert!(required_http_path("/api path").is_err());
+    assert!(SecretRef::parse("../secret").is_err());
     assert_eq!(
-        required_tls_name("WWW.Example.COM.", "TLS SNI").unwrap(),
+        normalize_profile_server("WWW.Example.COM.").unwrap(),
         "www.example.com"
     );
-    assert!(required_tls_name("example.com:443", "TLS SNI").is_err());
-    assert!(required_tls_name("example com", "TLS SNI").is_err());
+    assert!(normalize_profile_server("example.com:443").is_err());
+    assert!(normalize_profile_server("example com").is_err());
+}
+
+#[test]
+fn server_only_secret_references_cannot_enter_web_storage() {
+    let registry = stealthhub_core::adapters::protocol_registry().unwrap();
+    let profiles = stealthhub_core::adapters::default_profiles();
+    assert!(is_server_only_secret_reference(
+        "xray.reality.private_key",
+        &profiles,
+        &registry
+    ));
+    assert!(!is_server_only_secret_reference(
+        "xray.reality.public_key",
+        &profiles,
+        &registry
+    ));
+    assert!(!is_server_only_secret_reference(
+        "hysteria.password",
+        &profiles,
+        &registry
+    ));
 }
 
 #[test]
@@ -303,10 +320,10 @@ fn uninstall_plans_are_preview_runbooks() {
     assert!(factory.title.contains("Factory"));
     let full_commands = full.commands.join("\n");
     let factory_commands = factory.commands.join("\n");
-    assert!(full_commands.contains("infiproxy-mtproto.service"));
-    assert!(factory_commands.contains("infiproxy-mtproto.service"));
-    assert!(full_commands.contains("headscale.service"));
-    assert!(factory_commands.contains("headscale.service"));
+    assert!(full_commands.contains("infiproxy-module-manifest read"));
+    assert!(factory_commands.contains("infiproxy-module-manifest read"));
+    assert!(full_commands.contains("infiproxy-reconcile"));
+    assert!(factory_commands.contains("infiproxy-reconcile"));
     assert!(factory_commands.contains("infiproxy-manager"));
     assert!(uninstall_plan("unknown").is_none());
 }
@@ -356,11 +373,9 @@ fn mtproto_runtime_is_wired_into_panel_contracts() {
         .iter()
         .any(|module| module.service == "infiproxy-mtproto.service"
             && module.binary_path.ends_with("/mtproto-proxy")));
-    assert!(SYSTEM_TARGETS
+    assert!(config_files()
         .iter()
-        .any(|target| target.units == ["infiproxy-mtproto.service"].as_slice()));
-    assert!(CONFIG_FILES.iter().any(|spec| spec.slug == "mtproto-core"
-        && spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env"));
+        .any(|spec| { spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env" && !spec.editable }));
 }
 
 #[test]
@@ -371,16 +386,9 @@ fn headscale_module_is_wired_into_panel_contracts() {
         .any(|module| module.id == "headscale"
             && module.service == "headscale.service"
             && module.binary_path.ends_with("/headscale")));
-    assert!(SYSTEM_TARGETS
+    assert!(config_files()
         .iter()
-        .any(|target| target.units == ["headscale.service"].as_slice()));
-    assert!(CONFIG_FILES
-        .iter()
-        .any(|spec| spec.slug == "headscale-config" && spec.path == "/etc/headscale/config.yaml"));
-    assert!(CONFIG_FILES
-        .iter()
-        .any(|spec| spec.slug == "headscale-nginx"
-            && spec.path == "/etc/nginx/sites-available/infiproxy-headscale.conf"));
+        .any(|spec| { spec.path == "/etc/headscale/config.yaml" && !spec.editable }));
 }
 
 #[test]

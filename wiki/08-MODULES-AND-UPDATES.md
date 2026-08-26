@@ -60,15 +60,16 @@ Parser:
 - требует root ownership и отсутствие group/world write для installed registry;
 - для generic import ограничивает runtime собственным tree/unit/config.
 
-## Web checker и root updater
+## Web metadata и root updater
 
 Это разные компоненты:
 
-### Web checker
+### Web metadata reader
 
-- стартует примерно через 35 секунд после панели;
-- каждые 2 часа опрашивает GitHub API;
-- сохраняет latest/check state в SQLite;
+- периодически и при открытии страницы перечитывает sanitized state;
+- для module metadata может выполнять bounded GitHub API check;
+- для обновления самой панели GitHub не вызывает;
+- сохраняет безопасные latest/check fields в SQLite;
 - зеркалирует безопасные state fields в `/var/lib/infiproxy/modules/<id>.env`;
 - никогда не скачивает и не запускает binary.
 
@@ -272,10 +273,11 @@ decision root-оператора.
 
 ### Detection
 
-- web checker стартует примерно через 20 секунд;
-- каждые 2 часа сравнивает current SHA и GitHub ref;
+- root timer каждые 15 минут fetch-ит pinned Git ref;
 - repo/ref читаются из root-owned `/etc/infiproxy-update.conf`;
-- state записывается в SQLite и `panel-update-state.env`.
+- applied SHA берется из root-written `panel-last-applied.sha`;
+- root пишет bounded `panel-update-status.env`, а web только зеркалирует его в
+  SQLite и публикует policy в `panel-update-state.env`.
 
 ### Schedule
 
@@ -287,16 +289,14 @@ maintenance time.
 
 Web owner button и TUI создают request file. Наличие request bypass-ит schedule.
 
-> [!CAUTION]
-> TUI **Update panel now** позволяет подтвердить запуск даже когда check пишет
-> `status current`. Request bypass-ит normal due check, поэтому возможна лишняя
-> повторная сборка/установка. Если current, отвечайте No.
+Если current и latest совпадают, request удаляется до backup/build, поэтому
+повторная сборка не выполняется.
 
 ### Pre-update backup
 
 Root updater до checkout создает:
 
-- копии panel binary и обоих privileged Rust helpers;
+- копии panel binary и всех privileged Rust helpers, включая reconciler;
 - SQLite `.backup`;
 - tar panel/core/Headscale configs;
 - manifests/catalog;

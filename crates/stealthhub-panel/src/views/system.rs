@@ -183,10 +183,10 @@ pub(crate) fn render(
                                         td { code { "systemctl reload ssh.service" } }
                                     }
                                     tr {
-                                        td { "Proxy cores" }
-                                        td { code { "/etc/infiproxy-cores/{xray,sing-box,hysteria,tuic}" } }
-                                        td { code { "<core> check / --version" } }
-                                        td { code { "systemctl restart infiproxy-<core>.service" } }
+                                        td { "Runtime modules" }
+                                        td { code { "/etc/infiproxy-modules.d/*.module" } }
+                                        td { code { "adapter-owned validation" } }
+                                        td { code { "root reconciler" } }
                                     }
                                 }
                             }

@@ -18,6 +18,7 @@
 |---|---|---|
 | Веб-панель | `infiproxy` | Пользователи, профили, маршруты, очередь модулей, просмотр состояния, allowlist-конфиги. |
 | Panel updater | `root` | Получение исходников, сборка, backup, установка бинарника и rollback. |
+| Desired-state reconciler | `root` | Candidate validation, snapshot, runtime apply, health/listener checks и rollback. |
 | Module updater | `root` | Загрузка, проверка и атомарное переключение runtime-модулей. |
 | SSH-TUI | `root` | Установка, HTTPS, systemd, модули, Headscale, MTProto и удаление. |
 | Proxy-runtime | Обычно `infiproxy` | Передача proxy-трафика по своему серверному конфигу. |
@@ -245,7 +246,7 @@ Headscale нужен отдельный DNS-only hostname: обычный Cloudf
 
 | Пункт | Поведение |
 |---|---|
-| **Check GitHub now** | Сравнивает локальный `git rev-parse HEAD` с `git ls-remote REPO REF`. Ничего не устанавливает. |
+| **Check GitHub now** | Запускает единый root updater с `--check`; он обновляет sanitized status mirror и ничего не устанавливает. |
 | **Update panel now** | Показывает сравнение, просит подтверждение, создает request-файл и запускает root updater. |
 | **Show updater log** | Показывает последние 120 строк updater log. |
 | **Restart timer and path watcher** | Перечитывает systemd и включает timer/path units. |
@@ -254,7 +255,15 @@ Headscale нужен отдельный DNS-only hostname: обычный Cloudf
 backup/build/install. Полная модель обновления описана в
 [разделе 8](08-MODULES-AND-UPDATES#обновление-панели).
 
-### 4.8. Panel environment
+### 4.8. Privileged runtime secrets
+
+Этот owner/root-only пункт перечисляет только имена файлов в
+`/etc/infiproxy/secrets.d`; значения не печатаются. **Create or rotate**
+принимает hidden input, создает root-owned mode `0600` файл атомарно и запускает
+reconciler. **Delete** требует точного имени и также запускает reconcile.
+Используйте его для private server keys, которые web-процесс не должен читать.
+
+### 4.9. Panel environment
 
 Открывает `/etc/infiproxy/infiproxy.env` в `$EDITOR`, `nano` или `vi`. Перед
 открытием TUI нормализует каталог и права, а после выхода немедленно рестартует
@@ -266,7 +275,7 @@ backup/build/install. Полная модель обновления описа�
 
 Поля перечислены в [разделе 11](11-CONFIGURATION#3-окружение-панели).
 
-### 4.9. Guided deployment
+### 4.10. Guided deployment
 
 Единый цикл предлагает в безопасном порядке:
 
@@ -288,7 +297,7 @@ backup/build/install. Полная модель обновления описа�
 sudo infiproxy-manager --guided
 ```
 
-### 4.10. Advanced tools
+### 4.11. Advanced tools
 
 | Пункт | Назначение |
 |---|---|
@@ -315,7 +324,7 @@ service. Сначала обновите module `mtproto`, затем повто
 Все пункты этого подменю разобраны в
 [разделе 9](09-HEADSCALE#headscale-в-ssh-tui).
 
-### 4.11. Danger zone
+### 4.12. Danger zone
 
 | Пункт | Требуемое подтверждение |
 |---|---|
