@@ -2,9 +2,12 @@
 
 use crate::{
     admin_bar,
-    ops::{HostSnapshot, ServiceState, SYSTEM_TARGETS},
+    ops::{HostSnapshot, ServiceState, CONTROL_PLANE_TARGETS},
     ui::layout,
-    views::components::{meter_bar, service_state_badge},
+    views::components::{
+        adapter_inventory_table, meter_bar, resource_inventory_table, runtime_inventory_table,
+        service_state_badge,
+    },
     DEPLOYMENT_MODE,
 };
 use axum::{
@@ -12,6 +15,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use maud::{html, Markup};
+use stealthhub_core::inventory::{adapter_kind, AdapterInventory};
 
 pub(crate) struct Component {
     pub(crate) name: &'static str,
@@ -26,6 +30,7 @@ pub(crate) struct Report<'a> {
     pub(crate) components: &'a [Component],
     pub(crate) host: &'a HostSnapshot,
     pub(crate) service_states: &'a [ServiceState],
+    pub(crate) inventory: &'a AdapterInventory,
     pub(crate) uptime: String,
 }
 
@@ -75,12 +80,12 @@ pub(crate) fn render(auth: &crate::AuthenticatedAdmin, report: Report<'_>) -> Re
                         }
                     }
                     section {
-                        h2 { "Service sensors" }
+                        h2 { "Control plane" }
                         div class="table-wrap" {
                             table {
                                 thead { tr { th { "Target" } th { "State" } th { "Config" } } }
                                 tbody {
-                                    @for (target, state) in SYSTEM_TARGETS.iter().zip(report.service_states) {
+                                    @for (target, state) in CONTROL_PLANE_TARGETS.iter().zip(report.service_states) {
                                         tr {
                                             td { strong { (target.name) } }
                                             td { (service_state_badge(state)) }
@@ -90,6 +95,24 @@ pub(crate) fn render(auth: &crate::AuthenticatedAdmin, report: Report<'_>) -> Re
                                 }
                             }
                         }
+                    }
+                    section {
+                        h2 { "Protocol adapters" }
+                        (adapter_inventory_table(report.inventory, Some(adapter_kind::PROTOCOL)))
+                    }
+                    section {
+                        h2 { "Core and runtime adapters" }
+                        (adapter_inventory_table(report.inventory, Some(adapter_kind::CORE)))
+                        (adapter_inventory_table(report.inventory, Some(adapter_kind::MODULE)))
+                    }
+                    section {
+                        h2 { "Active runtimes" }
+                        (runtime_inventory_table(report.inventory))
+                    }
+                    section {
+                        h2 { "Infrastructure resources" }
+                        (adapter_inventory_table(report.inventory, Some(adapter_kind::INFRASTRUCTURE)))
+                        (resource_inventory_table(report.inventory))
                     }
                     section {
                         h2 { "Probe contract" }

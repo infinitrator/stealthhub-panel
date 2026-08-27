@@ -8,6 +8,7 @@
 mod atomic_file;
 mod headscale;
 mod health;
+mod inventory;
 mod ip;
 mod modules;
 mod ops;
@@ -21,8 +22,8 @@ use crate::{
     health::{admin_health, health, readiness},
     ip::ip_check_page,
     ops::{
-        config_files, host_snapshot, read_config_spec, service_states_for_targets, uninstall_plan,
-        write_config_file,
+        config_files, control_plane_service_states, host_snapshot, read_config_spec,
+        uninstall_plan, write_config_file,
     },
     ui::{APP_NAME, PANEL_CSS},
 };
@@ -52,8 +53,8 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 use stealthhub_core::{
-    adapter::{ConfigFieldKind, ProtocolRegistry, SecretRef},
-    adapters::protocol_registry,
+    adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, SecretRef},
+    adapters::{core_registry, protocol_registry},
     mihomo::generate_mihomo_yaml_with_registry,
     models::{ProtocolProfile, SubscriptionUser},
     rules::{default_routing_rule_set, is_valid_routing_target, routing_rule_payload_yaml},
@@ -64,11 +65,12 @@ use stealthhub_core::{
         ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
         get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
         is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
-        load_panel_settings, load_routing_rule_sets, migrate_protocol_adapter_configs, open_pool,
-        reset_user_subscription_token, set_user_enabled, touch_admin_session,
-        update_admin_password_and_revoke_sessions, update_protocol_profile,
-        update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
-        AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
+        load_panel_settings, load_routing_rule_sets, migrate_available_adapter_states,
+        migrate_protocol_adapter_configs, open_pool, reset_user_subscription_token,
+        set_user_enabled, touch_admin_session, update_admin_password_and_revoke_sessions,
+        update_protocol_profile, update_routing_rule_set, upsert_secret, upsert_setting,
+        upsert_settings_with_runtime_keys, AdminRecord, NewUser, UpdateProtocolProfile,
+        UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -96,6 +98,7 @@ const PASSWORD_WORKER_LIMIT: usize = 2;
 pub(crate) struct AppState {
     pub(crate) pool: SqlitePool,
     pub(crate) protocol_registry: Arc<ProtocolRegistry>,
+    pub(crate) core_registry: Arc<CoreRegistry>,
     cookie_secure: bool,
     setup_token: Arc<str>,
     login_limiter: Arc<LoginRateLimiter>,
@@ -281,10 +284,12 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = open_pool(&db_url).await?;
     let protocol_registry = Arc::new(protocol_registry()?);
+    let core_registry = Arc::new(core_registry()?);
     init_db(&pool).await?;
     ensure_default_settings(&pool).await?;
     ensure_default_protocol_profiles(&pool).await?;
     migrate_protocol_adapter_configs(&pool, &protocol_registry).await?;
+    migrate_available_adapter_states(&pool, &protocol_registry, &core_registry).await?;
     ensure_default_routing_rule_sets(&pool).await?;
     delete_expired_admin_sessions(&pool).await?;
     let admin_total = admin_count(&pool).await?;
@@ -304,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         pool,
         protocol_registry,
+        core_registry,
         cookie_secure,
         setup_token: Arc::from(setup_token),
         login_limiter: Arc::new(LoginRateLimiter::default()),
@@ -840,7 +846,12 @@ async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> R
         Ok(value) => value,
         Err(error) => return internal_error("load reconciliation state", error),
     };
-    views::dashboard::render(&auth, &reconcile)
+    let inventory =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value,
+            Err(error) => return internal_error("load runtime inventory", error),
+        };
+    views::dashboard::render(&auth, &reconcile, &inventory.inventory)
 }
 
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1059,21 +1070,28 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Ok(value) => value,
         Err(response) => return response,
     };
-    let (statuses, available) = match modules::load_page(&state.pool).await {
-        Ok(value) => value,
-        Err(error) => {
-            return logged_error_with_back(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "load module state",
-                error,
-                "Module state unavailable",
-                "Module state could not be loaded. Review the server journal.",
-                "/admin",
-                "Back to Dashboard",
-            );
-        }
-    };
-    views::modules::render(&auth, &statuses, &available)
+    let page =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value,
+            Err(error) => {
+                return logged_error_with_back(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "load module state",
+                    error,
+                    "Module state unavailable",
+                    "Module state could not be loaded. Review the server journal.",
+                    "/admin",
+                    "Back to Dashboard",
+                );
+            }
+        };
+    views::modules::render(
+        &auth,
+        &page.inventory,
+        &page.module_statuses,
+        &page.available_modules,
+        &page.diagnostics,
+    )
 }
 
 async fn headscale_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1548,9 +1566,21 @@ async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Respo
         .await
         .is_ok();
     let host = host_snapshot().await;
-    let service_states = service_states_for_targets().await;
+    let service_states = control_plane_service_states().await;
+    let inventory =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value.inventory,
+            Err(error) => return internal_error("load system inventory", error),
+        };
 
-    views::system::render(&auth, db_ready, state.cookie_secure, &host, &service_states)
+    views::system::render(
+        &auth,
+        db_ready,
+        state.cookie_secure,
+        &host,
+        &service_states,
+        &inventory,
+    )
 }
 
 async fn configs_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1566,8 +1596,13 @@ async fn configs_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         .into_iter()
         .map(read_config_spec)
         .collect::<Vec<_>>();
+    let inventory =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value.inventory,
+            Err(error) => return internal_error("load config resource inventory", error),
+        };
 
-    views::configs::render_index(&auth, &snapshots)
+    views::configs::render_index(&auth, &snapshots, &inventory)
 }
 
 async fn config_save_action(
@@ -1831,6 +1866,11 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
             );
         }
     };
+    let inventory =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value.inventory,
+            Err(error) => return internal_error("load protocol inventory", error),
+        };
 
     views::protocols::render(
         &auth,
@@ -1838,6 +1878,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         &profiles,
         &secret_names,
         &state.protocol_registry,
+        &inventory,
     )
 }
 

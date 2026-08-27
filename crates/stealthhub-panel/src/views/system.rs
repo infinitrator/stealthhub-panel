@@ -2,13 +2,14 @@
 
 use crate::{
     admin_bar, csrf_field,
-    ops::{HostSnapshot, ServiceState, UninstallPlan, SYSTEM_TARGETS},
+    ops::{HostSnapshot, ServiceState, UninstallPlan, CONTROL_PLANE_TARGETS},
     ui::layout,
-    views::components::{meter_bar, service_state_badge},
+    views::components::{meter_bar, runtime_inventory_table, service_state_badge},
     AuthenticatedAdmin, DEPLOYMENT_MODE,
 };
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
+use stealthhub_core::inventory::AdapterInventory;
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
@@ -16,6 +17,7 @@ pub(crate) fn render(
     cookie_secure: bool,
     host: &HostSnapshot,
     service_states: &[ServiceState],
+    inventory: &AdapterInventory,
 ) -> Response {
     Html(
             layout(
@@ -130,7 +132,7 @@ pub(crate) fn render(
                                     }
                                 }
                                 tbody {
-                                    @for (target, state) in SYSTEM_TARGETS.iter().zip(service_states) {
+                                    @for (target, state) in CONTROL_PLANE_TARGETS.iter().zip(service_states) {
                                         tr {
                                             td { strong { (target.name) } }
                                             td { (service_state_badge(state)) }
@@ -146,6 +148,14 @@ pub(crate) fn render(
                                 }
                             }
                         }
+                    }
+
+                    section {
+                        h2 { "Discovered runtime services" }
+                        div class="notice" {
+                            "Rows are discovered from registered adapters and root-owned module manifests. HTTP access remains observational."
+                        }
+                        (runtime_inventory_table(inventory))
                     }
 
                     section {

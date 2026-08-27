@@ -1,10 +1,14 @@
 //! Protocols-page presentation and form components.
 
-use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
+use crate::{
+    admin_bar, csrf_field, ui::layout, views::components::adapter_inventory_table,
+    AuthenticatedAdmin,
+};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
 use stealthhub_core::{
     adapter::{ConfigField, ConfigFieldKind, ProtocolRegistry},
+    inventory::{adapter_kind, AdapterInventory},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
 };
 
@@ -14,6 +18,7 @@ pub(crate) fn render(
     profiles: &[ProtocolProfile],
     secret_names: &[String],
     registry: &ProtocolRegistry,
+    inventory: &AdapterInventory,
 ) -> Response {
     Html(
             layout(
@@ -52,22 +57,8 @@ pub(crate) fn render(
                     }
 
                     section {
-                        h2 { "Installed protocol adapters" }
-                        div class="table-wrap" {
-                            table {
-                                thead { tr { th { "Adapter" } th { "Schema" } th { "Runtime capabilities" } th { "Per-user auth" } } }
-                                tbody {
-                                    @for manifest in registry.manifests() {
-                                        tr {
-                                            td { strong { (&manifest.display_name) } br; code { (&manifest.id) } }
-                                            td { (manifest.schema_version) }
-                                            td { @for capability in &manifest.required_core_capabilities { code { (capability) } " " } }
-                                            td { @if manifest.user_participates { "yes" } @else { "shared credentials" } }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        h2 { "Protocol adapter inventory" }
+                        (adapter_inventory_table(inventory, Some(adapter_kind::PROTOCOL)))
                     }
 
                     section {

@@ -16,8 +16,8 @@ use stealthhub_core::{
     models::PanelSettings,
     reconcile::{FileReconcileStore, ReconcileStore, Reconciler},
     storage::{
-        delete_secret, get_secret, init_db, load_desired_state, mark_reconcile_result, open_pool,
-        ReconcileResultUpdate,
+        delete_secret, get_secret, init_db, load_desired_state, mark_reconcile_result,
+        migrate_available_adapter_states, open_pool, ReconcileResultUpdate,
     },
 };
 
@@ -162,6 +162,8 @@ async fn process(request_path: Option<&Path>) -> Result<()> {
     };
     desired.infrastructure.extend(desired_resources(&settings));
     let protocols = protocol_registry()?;
+    let cores = core_registry()?;
+    migrate_available_adapter_states(&pool, &protocols, &cores).await?;
     let secret_protocols = protocols.clone();
     let state_dir = env_path("INFIPROXY_RECONCILE_STATE_DIR", DEFAULT_STATE_DIR);
     let transaction_dir = env_path(
@@ -170,7 +172,7 @@ async fn process(request_path: Option<&Path>) -> Result<()> {
     );
     let store = std::sync::Arc::new(FileReconcileStore::new(&state_dir));
     store.publish_desired_generation(desired.generation)?;
-    let reconciler = Reconciler::new(protocols, core_registry()?, store.clone(), transaction_dir);
+    let reconciler = Reconciler::new(protocols, cores, store.clone(), transaction_dir);
 
     if let Some(recovery) = reconciler.recover()? {
         persist_status(

@@ -4,11 +4,11 @@
 //! explicit user maintenance without starting the web control plane.
 
 use clap::{Parser, Subcommand};
-use stealthhub_core::adapters::protocol_registry;
+use stealthhub_core::adapters::{core_registry, protocol_registry};
 use stealthhub_core::storage::{
     create_user, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
-    ensure_default_settings, init_db, list_users, migrate_protocol_adapter_configs, open_pool,
-    DbPool, NewUser,
+    ensure_default_settings, init_db, list_users, migrate_available_adapter_states,
+    migrate_protocol_adapter_configs, open_pool, DbPool, NewUser,
 };
 
 #[derive(Parser)]
@@ -97,7 +97,10 @@ async fn open_initialized_pool(database_url: &str) -> anyhow::Result<DbPool> {
     init_db(&pool).await?;
     ensure_default_settings(&pool).await?;
     ensure_default_protocol_profiles(&pool).await?;
-    migrate_protocol_adapter_configs(&pool, &protocol_registry()?).await?;
+    let protocols = protocol_registry()?;
+    let cores = core_registry()?;
+    migrate_protocol_adapter_configs(&pool, &protocols).await?;
+    migrate_available_adapter_states(&pool, &protocols, &cores).await?;
     ensure_default_routing_rule_sets(&pool).await?;
     Ok(pool)
 }

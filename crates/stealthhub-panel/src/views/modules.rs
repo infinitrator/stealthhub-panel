@@ -4,15 +4,19 @@ use crate::{
     admin_bar, csrf_field, is_owner_admin,
     modules::{self, ModuleSpec, ModuleStatus},
     ui::layout,
+    views::components::runtime_inventory_table,
     AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
+use stealthhub_core::inventory::AdapterInventory;
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
+    inventory: &AdapterInventory,
     statuses: &[ModuleStatus],
     available: &[ModuleSpec],
+    diagnostics: &[String],
 ) -> Response {
     let installed_count = statuses.iter().filter(|status| status.installed).count();
     let updates_count = statuses
@@ -27,6 +31,10 @@ pub(crate) fn render(
                 html! {
                     (admin_bar(auth))
                     h1 { "Modules" }
+
+                    @for diagnostic in diagnostics {
+                        div class="notice warning" { (diagnostic) }
+                    }
 
                     div class="status-strip" {
                         div class="metric" {
@@ -45,6 +53,11 @@ pub(crate) fn render(
                             span { "Upstream check" }
                             strong { "every 2 hours" }
                         }
+                    }
+
+                    section {
+                        h2 { "Runtime inventory" }
+                        (runtime_inventory_table(inventory))
                     }
 
                     section {

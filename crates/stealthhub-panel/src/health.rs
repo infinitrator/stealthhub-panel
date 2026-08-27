@@ -63,7 +63,22 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
     };
 
     let host = host_snapshot().await;
-    let service_states = crate::ops::service_states_for_targets().await;
+    let service_states = crate::ops::control_plane_service_states().await;
+    let inventory =
+        match crate::inventory::load(&state.pool, &state.protocol_registry, &state.core_registry)
+            .await
+        {
+            Ok(value) => value.inventory,
+            Err(error) => {
+                tracing::warn!("health inventory unavailable: {error}");
+                Default::default()
+            }
+        };
+    let context = DashboardContext {
+        host: &host,
+        service_states: &service_states,
+        inventory: &inventory,
+    };
     match readiness {
         Ok(()) => render_dashboard(
             &auth,
@@ -92,8 +107,7 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
                     detail: "Authenticated control plane is available.",
                 },
             ],
-            &host,
-            &service_states,
+            context,
         ),
         Err((status, message)) => render_dashboard(
             &auth,
@@ -123,10 +137,16 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
                         "Login may work, but state-changing operations require database access.",
                 },
             ],
-            &host,
-            &service_states,
+            context,
         ),
     }
+}
+
+#[derive(Clone, Copy)]
+struct DashboardContext<'a> {
+    host: &'a crate::ops::HostSnapshot,
+    service_states: &'a [crate::ops::ServiceState],
+    inventory: &'a stealthhub_core::inventory::AdapterInventory,
 }
 
 fn render_dashboard(
@@ -135,8 +155,7 @@ fn render_dashboard(
     state_label: &'static str,
     summary: &'static str,
     components: &[Component],
-    host: &crate::ops::HostSnapshot,
-    service_states: &[crate::ops::ServiceState],
+    context: DashboardContext<'_>,
 ) -> Response {
     crate::views::health::render(
         auth,
@@ -145,8 +164,9 @@ fn render_dashboard(
             state_label,
             summary,
             components,
-            host,
-            service_states,
+            host: context.host,
+            service_states: context.service_states,
+            inventory: context.inventory,
             uptime: app_uptime_label(),
         },
     )

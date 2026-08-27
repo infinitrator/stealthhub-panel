@@ -4,6 +4,7 @@ use crate::{
     admin_bar, csrf_field,
     ops::{ConfigFileSnapshot, ConfigWriteReport},
     ui::layout,
+    views::components::resource_inventory_table,
     AuthenticatedAdmin,
 };
 use axum::{
@@ -11,10 +12,12 @@ use axum::{
     response::{Html, IntoResponse, Response},
 };
 use maud::{html, Markup};
+use stealthhub_core::inventory::AdapterInventory;
 
 pub(crate) fn render_index(
     auth: &AuthenticatedAdmin,
     snapshots: &[ConfigFileSnapshot],
+    inventory: &AdapterInventory,
 ) -> Response {
     Html(
             layout(
@@ -40,6 +43,11 @@ pub(crate) fn render_index(
                             span { "Shell access" }
                             strong { "none" }
                         }
+                    }
+
+                    section {
+                        h2 { "Desired resource overview" }
+                        (resource_inventory_table(inventory))
                     }
 
                     section {

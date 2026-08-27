@@ -3,9 +3,13 @@
 use crate::{admin_bar, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
-use stealthhub_core::storage::ReconcileStateRecord;
+use stealthhub_core::{inventory::AdapterInventory, storage::ReconcileStateRecord};
 
-pub(crate) fn render(auth: &AuthenticatedAdmin, reconcile: &ReconcileStateRecord) -> Response {
+pub(crate) fn render(
+    auth: &AuthenticatedAdmin,
+    reconcile: &ReconcileStateRecord,
+    inventory: &AdapterInventory,
+) -> Response {
     Html(
             layout(
                 "Dashboard",
@@ -27,8 +31,16 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, reconcile: &ReconcileStateRecord
                             strong { (&reconcile.status) }
                         }
                         div class="metric" {
-                            span { "Operation" }
-                            strong { (reconcile.last_operation_id.as_deref().unwrap_or("none")) }
+                            span { "Adapters" }
+                            strong { (inventory.adapters.len()) }
+                        }
+                        div class="metric" {
+                            span { "Runtimes" }
+                            strong { (inventory.runtimes.len()) }
+                        }
+                        div class="metric" {
+                            span { "Resources" }
+                            strong { (inventory.resources.len()) }
                         }
                     }
 

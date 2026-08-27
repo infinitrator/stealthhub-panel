@@ -14,7 +14,7 @@ use std::{
 
 const CONFIG_BACKUP_RETENTION_COUNT: usize = 20;
 
-pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
+pub(crate) const CONTROL_PLANE_TARGETS: &[SystemTarget] = &[
     SystemTarget {
         name: "Panel service",
         kind: "systemd",
@@ -25,31 +25,25 @@ pub(crate) const SYSTEM_TARGETS: &[SystemTarget] = &[
         reload: "systemctl restart infiproxy.service",
     },
     SystemTarget {
-        name: "SSH daemon",
-        kind: "host",
-        unit: "ssh.service / sshd.service",
-        units: &["ssh.service", "sshd.service"],
-        config: "/etc/ssh/sshd_config",
-        check: "sshd -t && systemctl status ssh || systemctl status sshd",
-        reload: "sshd -t && systemctl reload ssh || systemctl reload sshd",
+        name: "Reconciler",
+        kind: "control-plane",
+        unit: "infiproxy-reconcile.timer",
+        units: &["infiproxy-reconcile.timer", "infiproxy-reconcile.path"],
+        config: "/etc/systemd/system/infiproxy-reconcile.service",
+        check: "systemctl status infiproxy-reconcile.timer",
+        reload: "systemctl restart infiproxy-reconcile.timer infiproxy-reconcile.path",
     },
     SystemTarget {
-        name: "Nginx reverse proxy",
-        kind: "host",
-        unit: "nginx.service",
-        units: &["nginx.service"],
-        config: "/etc/nginx/sites-available/infiproxy.conf",
-        check: "nginx -t && systemctl status nginx.service",
-        reload: "nginx -t && systemctl reload nginx.service",
-    },
-    SystemTarget {
-        name: "Firewall",
-        kind: "host",
-        unit: "ufw / nftables",
-        units: &["ufw.service", "nftables.service"],
-        config: "/etc/ufw / /etc/nftables.conf",
-        check: "ufw status verbose || nft list ruleset",
-        reload: "ufw reload || systemctl reload nftables.service",
+        name: "Panel updater",
+        kind: "control-plane",
+        unit: "infiproxy-panel-update.timer",
+        units: &[
+            "infiproxy-panel-update.timer",
+            "infiproxy-panel-update.path",
+        ],
+        config: "/etc/infiproxy-update.conf",
+        check: "systemctl status infiproxy-panel-update.timer",
+        reload: "systemctl restart infiproxy-panel-update.timer infiproxy-panel-update.path",
     },
 ];
 #[derive(Debug, Clone, Copy)]
@@ -820,9 +814,9 @@ pub(crate) fn format_kibibytes(value: u64) -> String {
     }
 }
 
-pub(crate) async fn service_states_for_targets() -> Vec<ServiceState> {
+pub(crate) async fn control_plane_service_states() -> Vec<ServiceState> {
     let mut units = Vec::new();
-    for target in SYSTEM_TARGETS {
+    for target in CONTROL_PLANE_TARGETS {
         for unit in target.units {
             if !units.contains(unit) {
                 units.push(*unit);
@@ -830,18 +824,9 @@ pub(crate) async fn service_states_for_targets() -> Vec<ServiceState> {
         }
     }
 
-    let mut command = tokio::process::Command::new("systemctl");
-    command
-        .arg("show")
-        .args(["--no-pager", "--property=Id,LoadState,ActiveState"])
-        .args(&units)
-        .kill_on_drop(true);
-    let observed = match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
-        Ok(Ok(output)) => parse_systemctl_show(&String::from_utf8_lossy(&output.stdout)),
-        _ => HashMap::new(),
-    };
+    let observed = service_statuses_for_units(&units).await;
 
-    SYSTEM_TARGETS
+    CONTROL_PLANE_TARGETS
         .iter()
         .map(|target| {
             target
@@ -866,6 +851,23 @@ pub(crate) async fn service_states_for_targets() -> Vec<ServiceState> {
                 })
         })
         .collect()
+}
+
+/// Observes arbitrary validated systemd unit names in one bounded subprocess.
+pub(crate) async fn service_statuses_for_units(units: &[&str]) -> HashMap<String, ServiceStatus> {
+    if units.is_empty() {
+        return HashMap::new();
+    }
+    let mut command = tokio::process::Command::new("systemctl");
+    command
+        .arg("show")
+        .args(["--no-pager", "--property=Id,LoadState,ActiveState"])
+        .args(units)
+        .kill_on_drop(true);
+    match tokio::time::timeout(Duration::from_secs(3), command.output()).await {
+        Ok(Ok(output)) => parse_systemctl_show(&String::from_utf8_lossy(&output.stdout)),
+        _ => HashMap::new(),
+    }
 }
 
 fn parse_systemctl_show(output: &str) -> HashMap<String, ServiceStatus> {
