@@ -75,6 +75,68 @@ pub struct ClientPolicy {
     pub rules: Vec<RoutingPolicyRule>,
 }
 
+/// DNS behavior kept independent from transport selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsPolicy {
+    pub enabled: bool,
+    pub ipv6: bool,
+    pub enhanced_mode: String,
+    pub respect_rules: bool,
+    pub bootstrap_resolvers: Vec<String>,
+    pub remote_resolvers: Vec<String>,
+    pub direct_resolvers: Vec<String>,
+}
+
+impl DnsPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if !matches!(self.enhanced_mode.as_str(), "redir-host" | "fake-ip") {
+            bail!("unsupported DNS enhanced mode");
+        }
+        for resolver in self
+            .bootstrap_resolvers
+            .iter()
+            .chain(&self.remote_resolvers)
+            .chain(&self.direct_resolvers)
+        {
+            if resolver.is_empty()
+                || resolver.len() > 256
+                || resolver.chars().any(char::is_control)
+                || !(resolver == "system"
+                    || resolver.parse::<std::net::IpAddr>().is_ok()
+                    || ["https://", "tls://", "quic://", "udp://", "tcp://"]
+                        .iter()
+                        .any(|prefix| resolver.starts_with(prefix)))
+            {
+                bail!("invalid DNS resolver");
+            }
+        }
+        if self.enabled
+            && (self.bootstrap_resolvers.is_empty()
+                || self.remote_resolvers.is_empty()
+                || self.direct_resolvers.is_empty())
+        {
+            bail!("enabled DNS policy requires bootstrap, remote, and direct resolvers");
+        }
+        Ok(())
+    }
+}
+
+#[must_use]
+pub fn default_dns_policy() -> DnsPolicy {
+    DnsPolicy {
+        enabled: true,
+        ipv6: false,
+        enhanced_mode: "redir-host".to_string(),
+        respect_rules: true,
+        bootstrap_resolvers: vec!["1.1.1.1".to_string(), "9.9.9.9".to_string()],
+        remote_resolvers: vec![
+            "https://cloudflare-dns.com/dns-query".to_string(),
+            "https://dns.quad9.net/dns-query".to_string(),
+        ],
+        direct_resolvers: vec!["system".to_string()],
+    }
+}
+
 impl ClientPolicy {
     /// Validates references and rejects pool cycles before subscription output.
     pub fn validate(&self, profiles: &[ProtocolProfile]) -> Result<()> {

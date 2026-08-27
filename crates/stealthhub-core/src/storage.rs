@@ -22,8 +22,8 @@ use crate::{
     inventory::{adapter_kind, PersistedAdapterState},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
     policy::{
-        default_client_policy, parse_role, role_name, ClientPolicy, PoolKind, PoolMember,
-        RoutingPolicyRule, TransportPool,
+        default_client_policy, default_dns_policy, parse_role, role_name, ClientPolicy, DnsPolicy,
+        PoolKind, PoolMember, RoutingPolicyRule, TransportPool,
     },
     rules::{
         default_routing_rule_sets, is_valid_routing_target, validate_classical_rule_payload,
@@ -566,6 +566,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
 const ADAPTER_STATE_MIGRATION: i64 = 1;
 const ACTIVE_RUNTIME_IDS_MIGRATION: i64 = 2;
 const CLIENT_POLICY_MIGRATION: i64 = 3;
+const DNS_POLICY_MIGRATION: i64 = 4;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -606,6 +607,34 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(ADAPTER_STATE_MIGRATION)
             .bind("add opaque durable adapter state")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(DNS_POLICY_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        sqlx::query(
+            r"CREATE TABLE client_dns_policy (
+                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                enabled INTEGER NOT NULL,
+                ipv6 INTEGER NOT NULL,
+                enhanced_mode TEXT NOT NULL,
+                respect_rules INTEGER NOT NULL,
+                bootstrap_resolvers_json TEXT NOT NULL,
+                remote_resolvers_json TEXT NOT NULL,
+                direct_resolvers_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(DNS_POLICY_MIGRATION)
+            .bind("add independent client DNS policy")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -835,6 +864,7 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
         .await?;
     }
     ensure_default_client_policy(pool).await?;
+    ensure_default_dns_policy(pool).await?;
     Ok(())
 }
 
@@ -1932,6 +1962,58 @@ pub async fn load_client_policy(pool: &SqlitePool) -> Result<ClientPolicy> {
     Ok(ClientPolicy { pools, rules })
 }
 
+async fn ensure_default_dns_policy(pool: &SqlitePool) -> Result<()> {
+    let policy = default_dns_policy();
+    sqlx::query("INSERT INTO client_dns_policy (singleton,enabled,ipv6,enhanced_mode,respect_rules,bootstrap_resolvers_json,remote_resolvers_json,direct_resolvers_json,updated_at) VALUES (1,?,?,?,?,?,?,?,?) ON CONFLICT(singleton) DO NOTHING")
+        .bind(policy.enabled).bind(policy.ipv6).bind(policy.enhanced_mode).bind(policy.respect_rules)
+        .bind(serde_json::to_string(&policy.bootstrap_resolvers)?)
+        .bind(serde_json::to_string(&policy.remote_resolvers)?)
+        .bind(serde_json::to_string(&policy.direct_resolvers)?)
+        .bind(Utc::now()).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn load_dns_policy(pool: &SqlitePool) -> Result<DnsPolicy> {
+    let row = sqlx::query("SELECT enabled,ipv6,enhanced_mode,respect_rules,bootstrap_resolvers_json,remote_resolvers_json,direct_resolvers_json FROM client_dns_policy WHERE singleton=1")
+        .fetch_one(pool).await?;
+    let policy = DnsPolicy {
+        enabled: row.try_get("enabled")?,
+        ipv6: row.try_get("ipv6")?,
+        enhanced_mode: row.try_get("enhanced_mode")?,
+        respect_rules: row.try_get("respect_rules")?,
+        bootstrap_resolvers: serde_json::from_str(
+            &row.try_get::<String, _>("bootstrap_resolvers_json")?,
+        )?,
+        remote_resolvers: serde_json::from_str(
+            &row.try_get::<String, _>("remote_resolvers_json")?,
+        )?,
+        direct_resolvers: serde_json::from_str(
+            &row.try_get::<String, _>("direct_resolvers_json")?,
+        )?,
+    };
+    policy.validate()?;
+    Ok(policy)
+}
+
+pub async fn update_dns_policy(pool: &SqlitePool, policy: &DnsPolicy) -> Result<()> {
+    policy.validate()?;
+    let result = sqlx::query("UPDATE client_dns_policy SET enabled=?,ipv6=?,enhanced_mode=?,respect_rules=?,bootstrap_resolvers_json=?,remote_resolvers_json=?,direct_resolvers_json=?,updated_at=? WHERE singleton=1")
+        .bind(policy.enabled)
+        .bind(policy.ipv6)
+        .bind(&policy.enhanced_mode)
+        .bind(policy.respect_rules)
+        .bind(serde_json::to_string(&policy.bootstrap_resolvers)?)
+        .bind(serde_json::to_string(&policy.remote_resolvers)?)
+        .bind(serde_json::to_string(&policy.direct_resolvers)?)
+        .bind(Utc::now())
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("DNS policy is not initialized");
+    }
+    Ok(())
+}
+
 const fn pool_kind_name(kind: PoolKind) -> &'static str {
     match kind {
         PoolKind::Select => "select",
@@ -2325,7 +2407,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 3);
+        assert_eq!(migrations, 4);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -2916,6 +2998,13 @@ mod tests {
         assert_eq!(policy.pools.len(), 6);
         assert_eq!(policy.rules.len(), 5);
         policy.validate(&crate::adapters::default_profiles())?;
+        let mut dns = load_dns_policy(&pool).await?;
+        assert_eq!(dns.enhanced_mode, "redir-host");
+        dns.ipv6 = true;
+        update_dns_policy(&pool, &dns).await?;
+        assert!(load_dns_policy(&pool).await?.ipv6);
+        dns.remote_resolvers = vec!["file:///etc/passwd".to_string()];
+        assert!(update_dns_policy(&pool, &dns).await.is_err());
 
         sqlx::query("UPDATE client_transport_pools SET interval_seconds=777 WHERE id='AUTO-SAFE'")
             .execute(&pool)

@@ -32,6 +32,7 @@ const DURABLE_TABLES: &[&str] = &[
     "client_transport_pool_members",
     "client_routing_rules",
     "routing_rule_sets",
+    "client_dns_policy",
 ];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -105,6 +106,7 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
         "client_transport_pool_members",
         "client_routing_rules",
         "routing_rule_sets",
+        "client_dns_policy",
     ]
     .iter()
     .all(|table| after_second_migration.tables.contains_key(*table));

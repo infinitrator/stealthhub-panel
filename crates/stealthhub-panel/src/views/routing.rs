@@ -3,12 +3,16 @@
 use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
-use stealthhub_core::{policy::ClientPolicy, rules::RoutingRuleSet};
+use stealthhub_core::{
+    policy::{ClientPolicy, DnsPolicy},
+    rules::RoutingRuleSet,
+};
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
     rule_sets: &[RoutingRuleSet],
     policy: &ClientPolicy,
+    dns: &DnsPolicy,
 ) -> Response {
     let targets = ["DIRECT".to_string(), "REJECT".to_string()]
         .into_iter()
@@ -47,6 +51,36 @@ pub(crate) fn render(
                         div class="metric" {
                             span { "Transport pools" }
                             strong { (policy.pools.iter().filter(|pool| pool.enabled).count()) }
+                        }
+                    }
+
+                    section {
+                        h2 { "DNS policy" }
+                        form method="post" action="/admin/routing/dns" class="config-form wide" {
+                            (csrf_field(&auth.csrf_token))
+                            label class="switch-field" {
+                                input type="checkbox" name="enabled" checked[dns.enabled];
+                                span class="switch-ui" {}
+                                span { strong { "Enabled" } small { "Generate a managed Mihomo DNS block." } }
+                            }
+                            label class="switch-field" {
+                                input type="checkbox" name="respect_rules" checked[dns.respect_rules];
+                                span class="switch-ui" {}
+                                span { strong { "Respect routing rules" } small { "Route DNS connections according to policy; bootstrap resolvers prevent node-resolution loops." } }
+                            }
+                            label class="switch-field" {
+                                input type="checkbox" name="ipv6" checked[dns.ipv6];
+                                span class="switch-ui" {}
+                                span { strong { "IPv6 answers" } small { "Return AAAA responses when the client network supports IPv6." } }
+                            }
+                            label { span { "Enhanced mode" } select name="enhanced_mode" {
+                                option value="redir-host" selected[dns.enhanced_mode == "redir-host"] { "redir-host" }
+                                option value="fake-ip" selected[dns.enhanced_mode == "fake-ip"] { "fake-ip" }
+                            } }
+                            label { span { "Bootstrap / node resolvers" } textarea name="bootstrap_resolvers" rows="4" { (dns.bootstrap_resolvers.join("\n")) } small { "One IP or supported resolver URL per line." } }
+                            label { span { "Secure remote resolvers" } textarea name="remote_resolvers" rows="4" { (dns.remote_resolvers.join("\n")) } small { "Used by default and for proxied rule sets." } }
+                            label { span { "Direct resolvers" } textarea name="direct_resolvers" rows="4" { (dns.direct_resolvers.join("\n")) } small { "Used for rule sets targeting DIRECT." } }
+                            button type="submit" { "Save DNS policy" }
                         }
                     }
 

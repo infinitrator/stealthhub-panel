@@ -54,7 +54,7 @@ use std::{
 use stealthhub_core::{
     adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, SecretRef},
     adapters::{core_registry, protocol_registry},
-    mihomo::generate_mihomo_yaml_with_registry,
+    mihomo::{generate_mihomo_yaml_with_registry, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
     rules::routing_rule_payload_yaml,
     storage::{
@@ -64,10 +64,10 @@ use stealthhub_core::{
         ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
         get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
         is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
-        load_client_policy, load_panel_settings, load_routing_rule_sets,
+        load_client_policy, load_dns_policy, load_panel_settings, load_routing_rule_sets,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
         reset_user_subscription_token, set_user_enabled, touch_admin_session,
-        update_admin_password_and_revoke_sessions, update_protocol_profile,
+        update_admin_password_and_revoke_sessions, update_dns_policy, update_protocol_profile,
         update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
         AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
     },
@@ -156,6 +156,22 @@ struct RoutingRuleSetForm {
     enabled: String,
     target: String,
     payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DnsPolicyForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    enabled: String,
+    #[serde(default)]
+    ipv6: String,
+    #[serde(default)]
+    respect_rules: String,
+    enhanced_mode: String,
+    bootstrap_resolvers: String,
+    remote_resolvers: String,
+    direct_resolvers: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -341,6 +357,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/routing",
             get(routing_page).post(update_routing_rule_action),
         )
+        .route("/admin/routing/dns", post(update_dns_policy_action))
         .route("/admin/system", get(system_page))
         .route(
             "/admin/configs",
@@ -436,14 +453,21 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         Ok(value) => value,
         Err(error) => return subscription_internal_error("load client policy", error),
     };
+    let dns_policy = match load_dns_policy(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return subscription_internal_error("load DNS policy", error),
+    };
 
     let yaml = match generate_mihomo_yaml_with_registry(
-        &settings,
-        &subscription_user,
-        &profiles,
-        &secrets,
-        &routing_rule_sets,
-        &client_policy,
+        MihomoGenerationInput {
+            settings: &settings,
+            user: &subscription_user,
+            profiles: &profiles,
+            secrets: &secrets,
+            routing_rule_sets: &routing_rule_sets,
+            policy: &client_policy,
+            dns_policy: &dns_policy,
+        },
         &state.protocol_registry,
     ) {
         Ok(value) => value,
@@ -1310,8 +1334,22 @@ async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
             );
         }
     };
+    let dns_policy = match load_dns_policy(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            return logged_error_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "load DNS policy",
+                error,
+                "Routing unavailable",
+                "DNS policy could not be loaded. Review the server journal.",
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
 
-    views::routing::render(&auth, &rule_sets, &policy)
+    views::routing::render(&auth, &rule_sets, &policy, &dns_policy)
 }
 
 async fn update_routing_rule_action(
@@ -1352,6 +1390,50 @@ async fn update_routing_rule_action(
         Err(error) => html_error_response_with_back(
             StatusCode::BAD_REQUEST,
             "Routing update failed",
+            error.to_string(),
+            "/admin/routing",
+            "Back to Routing",
+        ),
+    }
+}
+
+async fn update_dns_policy_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DnsPolicyForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let resolvers = |value: &str| {
+        value
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    let policy = stealthhub_core::policy::DnsPolicy {
+        enabled: checkbox_enabled(&form.enabled),
+        ipv6: checkbox_enabled(&form.ipv6),
+        enhanced_mode: form.enhanced_mode,
+        respect_rules: checkbox_enabled(&form.respect_rules),
+        bootstrap_resolvers: resolvers(&form.bootstrap_resolvers),
+        remote_resolvers: resolvers(&form.remote_resolvers),
+        direct_resolvers: resolvers(&form.direct_resolvers),
+    };
+    match update_dns_policy(&state.pool, &policy).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
+            "DNS policy update failed",
             error.to_string(),
             "/admin/routing",
             "Back to Routing",

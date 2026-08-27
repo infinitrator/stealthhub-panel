@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::{
     adapter::{ClientRenderContext, MapSecretResolver, ProtocolRegistry},
     models::{PanelSettings, ProtocolProfile, SubscriptionUser},
-    policy::{default_client_policy, ClientPolicy},
+    policy::{default_client_policy, default_dns_policy, ClientPolicy, DnsPolicy},
     rules::RoutingRuleSet,
 };
 
@@ -26,26 +26,44 @@ pub fn generate_mihomo_yaml(
 ) -> Result<String> {
     let registry = crate::adapters::protocol_registry()?;
     generate_mihomo_yaml_with_registry(
+        MihomoGenerationInput {
+            settings,
+            user,
+            profiles,
+            secrets,
+            routing_rule_sets,
+            policy: &default_client_policy(),
+            dns_policy: &default_dns_policy(),
+        },
+        &registry,
+    )
+}
+
+/// Complete typed input for one client subscription document.
+pub struct MihomoGenerationInput<'a> {
+    pub settings: &'a PanelSettings,
+    pub user: &'a SubscriptionUser,
+    pub profiles: &'a [ProtocolProfile],
+    pub secrets: &'a HashMap<String, String>,
+    pub routing_rule_sets: &'a [RoutingRuleSet],
+    pub policy: &'a ClientPolicy,
+    pub dns_policy: &'a DnsPolicy,
+}
+
+/// Generates a Mihomo document without branching on concrete protocol IDs.
+pub fn generate_mihomo_yaml_with_registry(
+    input: MihomoGenerationInput<'_>,
+    registry: &ProtocolRegistry,
+) -> Result<String> {
+    let MihomoGenerationInput {
         settings,
         user,
         profiles,
         secrets,
         routing_rule_sets,
-        &default_client_policy(),
-        &registry,
-    )
-}
-
-/// Generates a Mihomo document without branching on concrete protocol IDs.
-pub fn generate_mihomo_yaml_with_registry(
-    settings: &PanelSettings,
-    user: &SubscriptionUser,
-    profiles: &[ProtocolProfile],
-    secrets: &HashMap<String, String>,
-    routing_rule_sets: &[RoutingRuleSet],
-    policy: &ClientPolicy,
-    registry: &ProtocolRegistry,
-) -> Result<String> {
+        policy,
+        dns_policy,
+    } = input;
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
     if enabled_profiles.is_empty() {
         bail!("no protocol profiles are enabled");
@@ -74,6 +92,7 @@ pub fn generate_mihomo_yaml_with_registry(
         .collect::<Result<Vec<_>>>()?;
 
     let resolved_pools = policy.resolved_pools(profiles)?;
+    dns_policy.validate()?;
     let active_rule_sets = active_routing_rule_sets(routing_rule_sets);
 
     let doc = json!({
@@ -84,6 +103,7 @@ pub fn generate_mihomo_yaml_with_registry(
         "ipv6": false,
         "external-controller": "127.0.0.1:9090",
         "secret": user.subscription_token,
+        "dns": dns_config(dns_policy, &active_rule_sets),
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
         "proxy-groups": proxy_groups(&resolved_pools),
@@ -91,6 +111,32 @@ pub fn generate_mihomo_yaml_with_registry(
     });
 
     Ok(serde_norway::to_string(&doc)?)
+}
+
+fn dns_config(policy: &DnsPolicy, rule_sets: &[RoutingRuleSet]) -> serde_json::Value {
+    let nameserver_policy = rule_sets
+        .iter()
+        .map(|rule_set| {
+            let resolvers = if rule_set.target == "DIRECT" {
+                &policy.direct_resolvers
+            } else {
+                &policy.remote_resolvers
+            };
+            (format!("rule-set:{}", rule_set.slug), json!(resolvers))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "enable": policy.enabled,
+        "ipv6": policy.ipv6,
+        "enhanced-mode": policy.enhanced_mode,
+        "respect-rules": policy.respect_rules,
+        "default-nameserver": policy.bootstrap_resolvers,
+        "proxy-server-nameserver": policy.bootstrap_resolvers,
+        "nameserver": policy.remote_resolvers,
+        "direct-nameserver": policy.direct_resolvers,
+        "direct-nameserver-follow-policy": true,
+        "nameserver-policy": nameserver_policy,
+    })
 }
 
 fn proxy_groups(pools: &[(crate::policy::TransportPool, Vec<String>)]) -> Vec<serde_json::Value> {
@@ -303,6 +349,16 @@ mod tests {
             parsed["proxies"][0]["xhttp-opts"]["host"],
             "www.microsoft.com"
         );
+        assert_eq!(parsed["dns"]["enhanced-mode"], "redir-host");
+        assert_eq!(parsed["dns"]["respect-rules"], true);
+        assert!(parsed["dns"]["proxy-server-nameserver"].is_sequence());
+        assert_eq!(
+            parsed["dns"]["nameserver-policy"]["rule-set:banking-direct"][0],
+            "system"
+        );
+        assert!(parsed["dns"]["nameserver-policy"]["rule-set:proxy-ai"][0]
+            .as_str()
+            .is_some_and(|resolver| resolver.starts_with("https://")));
     }
 
     #[test]
@@ -378,12 +434,15 @@ mod tests {
         };
 
         let yaml = generate_mihomo_yaml_with_registry(
-            &fixture_settings(),
-            &fixture_user(),
-            &[profile],
-            &HashMap::new(),
-            &[],
-            &default_client_policy(),
+            MihomoGenerationInput {
+                settings: &fixture_settings(),
+                user: &fixture_user(),
+                profiles: &[profile],
+                secrets: &HashMap::new(),
+                routing_rule_sets: &[],
+                policy: &default_client_policy(),
+                dns_policy: &default_dns_policy(),
+            },
             &registry,
         )
         .unwrap();
