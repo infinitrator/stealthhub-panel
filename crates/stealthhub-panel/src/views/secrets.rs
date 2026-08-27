@@ -37,7 +37,7 @@ pub(crate) fn render(
                         (csrf_field(&auth.csrf_token))
                         label {
                             span { "Secret name" }
-                            input type="text" name="name" minlength="1" maxlength="128" placeholder="xray.reality.public_key" required;
+                            input type="text" name="name" minlength="1" maxlength="128" placeholder="adapter.secret.reference" required;
                             small { "Letters, digits, dot, underscore and dash only." }
                         }
                         label class="full-span" {

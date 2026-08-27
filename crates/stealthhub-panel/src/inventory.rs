@@ -142,13 +142,12 @@ pub(crate) async fn load(
         .map(|observation| observation.manifest.clone())
         .collect::<Vec<_>>();
     let runtime_facts = runtime_facts.into_values().collect::<Vec<_>>();
-    let applied_runtime_ids = applied_runtime_ids(
-        protocols,
-        cores,
-        &desired.profiles,
-        &desired.infrastructure,
-        reconcile.desired_generation == reconcile.applied_generation,
-    );
+    let applied_runtime_ids = if reconcile.desired_generation == reconcile.applied_generation {
+        serde_json::from_str::<BTreeSet<String>>(&reconcile.active_runtime_ids_json)
+            .unwrap_or_default()
+    } else {
+        BTreeSet::new()
+    };
     let inventory = build_inventory(InventoryFacts {
         protocol_manifests: &protocol_manifests,
         core_manifests: &core_manifests,
@@ -185,33 +184,4 @@ async fn load_persisted_state_lossy(pool: &SqlitePool) -> Result<Vec<PersistedAd
             })
         })
         .collect())
-}
-
-fn applied_runtime_ids(
-    protocols: &ProtocolRegistry,
-    cores: &CoreRegistry,
-    profiles: &[stealthhub_core::models::ProtocolProfile],
-    infrastructure: &[stealthhub_core::desired::InfrastructureResource],
-    generations_match: bool,
-) -> BTreeSet<String> {
-    if !generations_match {
-        return BTreeSet::new();
-    }
-    let mut ids = infrastructure
-        .iter()
-        .filter(|resource| resource.enabled)
-        .map(|resource| resource.adapter_id.clone())
-        .collect::<BTreeSet<_>>();
-    for profile in profiles.iter().filter(|profile| profile.enabled) {
-        let Some(adapter) = protocols.get(&profile.protocol_id) else {
-            continue;
-        };
-        if let Ok(Some(core)) = cores.select(
-            &adapter.manifest().required_core_capabilities,
-            profile.preferred_core_id.as_deref(),
-        ) {
-            ids.insert(core.manifest().id.clone());
-        }
-    }
-    ids
 }

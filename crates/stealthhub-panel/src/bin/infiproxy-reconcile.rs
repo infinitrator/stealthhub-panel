@@ -226,6 +226,7 @@ async fn persist_status(
             status: status_name(status),
             operation_id: &journal.operation_id,
             affected_resources: &journal.core_ids,
+            active_runtime_ids: &applied.active_core_ids,
             error,
             started_at: Some(&journal.started_at),
             completed_at: journal.completed_at.as_deref(),

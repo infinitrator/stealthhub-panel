@@ -132,9 +132,6 @@ pub(crate) fn render(
                                                         (csrf_field(&auth.csrf_token))
                                                         button class="compact secondary" type="submit" { "Check" }
                                                     }
-                                                    @if status.spec.id == "headscale" && status.installed {
-                                                        a class="button compact secondary" href="/admin/headscale" { "Manage" }
-                                                    }
                                                     @if status.latest_version != "unknown" && (!status.installed || status.update_available) {
                                                         form method="post" action=(format!("/admin/modules/{}/update", status.spec.id)) class="inline-form" {
                                                             (csrf_field(&auth.csrf_token))
@@ -189,12 +186,10 @@ pub(crate) fn render(
                         dl class="details" {
                             dt { "Proxy runtimes" }
                             dd { code { "/opt/infiproxy/cores/{core}/{version}" } }
-                            dt { "Headscale runtime" }
-                            dd { code { "/opt/infiproxy/modules/headscale/{version}" } }
                             dt { "Active version" }
                             dd { code { "/opt/infiproxy/cores/{core}/current" } }
                             dt { "Configs" }
-                            dd { code { "/etc/infiproxy-cores/{core} and /etc/headscale" } }
+                            dd { code { "/etc/infiproxy-cores/{module}" } " or the manifest-declared path" }
                             dt { "Verification" }
                             dd { "GitHub release digest or official checksum sidecar, followed by a binary smoke test." }
                             dt { "Activation" }

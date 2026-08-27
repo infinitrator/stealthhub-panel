@@ -130,6 +130,7 @@ pub struct ReconcileStateRecord {
     pub last_operation_id: Option<String>,
     pub last_error: Option<String>,
     pub affected_resources_json: String,
+    pub active_runtime_ids_json: String,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
@@ -155,6 +156,7 @@ pub struct ReconcileResultUpdate<'a> {
     pub status: &'a str,
     pub operation_id: &'a str,
     pub affected_resources: &'a [String],
+    pub active_runtime_ids: &'a [String],
     pub error: Option<&'a str>,
     pub started_at: Option<&'a str>,
     pub completed_at: Option<&'a str>,
@@ -291,6 +293,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ReconcileStateRecord {
             last_operation_id: row.try_get("last_operation_id")?,
             last_error: row.try_get("last_error")?,
             affected_resources_json: row.try_get("affected_resources_json")?,
+            active_runtime_ids_json: row.try_get("active_runtime_ids_json")?,
             started_at: row.try_get("started_at")?,
             completed_at: row.try_get("completed_at")?,
             updated_at: row.try_get("updated_at")?,
@@ -557,6 +560,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
 }
 
 const ADAPTER_STATE_MIGRATION: i64 = 1;
+const ACTIVE_RUNTIME_IDS_MIGRATION: i64 = 2;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -601,6 +605,24 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(ACTIVE_RUNTIME_IDS_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        sqlx::query(
+            "ALTER TABLE reconcile_state ADD COLUMN active_runtime_ids_json TEXT NOT NULL DEFAULT '[]'",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(ACTIVE_RUNTIME_IDS_MIGRATION)
+            .bind("persist exact applied runtime identities")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -638,7 +660,8 @@ pub async fn get_reconcile_state(pool: &SqlitePool) -> Result<ReconcileStateReco
     Ok(sqlx::query_as::<_, ReconcileStateRecord>(
         r"
         SELECT desired_generation, applied_generation, status, last_operation_id,
-               last_error, affected_resources_json, started_at, completed_at, updated_at
+               last_error, affected_resources_json, active_runtime_ids_json,
+               started_at, completed_at, updated_at
         FROM reconcile_state
         WHERE singleton = 1
         ",
@@ -655,6 +678,7 @@ pub async fn mark_reconcile_result(
     let desired_generation = i64::try_from(update.desired_generation)?;
     let applied_generation = i64::try_from(update.applied_generation)?;
     let resources = serde_json::to_string(update.affected_resources)?;
+    let active_runtime_ids = serde_json::to_string(update.active_runtime_ids)?;
     let safe_error = update
         .error
         .map(|value| value.chars().take(512).collect::<String>());
@@ -662,7 +686,7 @@ pub async fn mark_reconcile_result(
         r"
         UPDATE reconcile_state
         SET applied_generation = ?, status = ?, last_operation_id = ?,
-            last_error = ?, affected_resources_json = ?, started_at = ?,
+            last_error = ?, affected_resources_json = ?, active_runtime_ids_json = ?, started_at = ?,
             completed_at = ?, updated_at = ?
         WHERE singleton = 1 AND desired_generation = ?
         ",
@@ -672,6 +696,7 @@ pub async fn mark_reconcile_result(
     .bind(update.operation_id)
     .bind(safe_error)
     .bind(resources)
+    .bind(active_runtime_ids)
     .bind(update.started_at)
     .bind(update.completed_at)
     .bind(Utc::now())
@@ -2131,12 +2156,50 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 1);
+        assert_eq!(migrations, 2);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
             .await?;
         assert_eq!(integrity, "ok");
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_result_persists_exact_active_runtime_ids() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let affected = vec!["changed-runtime".to_string()];
+        let active = vec![
+            "active-runtime-a".to_string(),
+            "active-runtime-b".to_string(),
+        ];
+
+        mark_reconcile_result(
+            &pool,
+            ReconcileResultUpdate {
+                desired_generation: 0,
+                applied_generation: 0,
+                status: "applied",
+                operation_id: "operation-id",
+                affected_resources: &affected,
+                active_runtime_ids: &active,
+                error: None,
+                started_at: None,
+                completed_at: None,
+            },
+        )
+        .await?;
+        let state = get_reconcile_state(&pool).await?;
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&state.active_runtime_ids_json)?,
+            active
+        );
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&state.affected_resources_json)?,
+            affected
+        );
 
         close_and_remove(pool, &path).await;
         Ok(())
