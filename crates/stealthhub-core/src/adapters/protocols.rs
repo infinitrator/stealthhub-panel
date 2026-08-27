@@ -7,9 +7,9 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     adapter::{
-        ClientRenderContext, ConfigField, ConfigFieldKind, ProtocolAdapter,
-        ProtocolAdapterManifest, ProtocolRegistry, SecretRef, ServerFragment, ServerRenderContext,
-        UserParticipation, ADAPTER_API_VERSION,
+        ClientRenderContext, ConfigField, ConfigFieldKind, ListenerClaim, ListenerNetwork,
+        ProtocolAdapter, ProtocolAdapterManifest, ProtocolRegistry, SecretRef, ServerFragment,
+        ServerRenderContext, UserParticipation, ADAPTER_API_VERSION,
     },
     models::{ProtocolProfile, ProxyRole},
 };
@@ -37,6 +37,7 @@ impl JsonProtocolAdapter {
         implementation: Implementation,
         fields: Vec<ConfigField>,
         user_participation: UserParticipation,
+        listener_network: ListenerNetwork,
     ) -> Self {
         Self {
             manifest: ProtocolAdapterManifest {
@@ -46,6 +47,7 @@ impl JsonProtocolAdapter {
                 schema_version: 1,
                 required_core_capabilities: BTreeSet::from([id.to_string()]),
                 user_participation,
+                listener_network,
             },
             fields,
             implementation,
@@ -336,13 +338,17 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 .requires_individual_users()
                 .then(|| context.users.iter().map(|user| user.uuid.clone()).collect()),
             payload: json!({
-                "server": context.profile.server,
-                "port": context.profile.port,
-                "config": context.profile.config,
-                "users": users,
-                "resolved_secrets": secrets,
-                "managed_resource_id": context.profile.managed_resource_id,
+            "server": context.profile.server,
+            "port": context.profile.port,
+            "config": context.profile.config,
+            "users": users,
+            "resolved_secrets": secrets,
+            "managed_resource_id": context.profile.managed_resource_id,
             }),
+            listeners: vec![ListenerClaim {
+                network: self.manifest.listener_network,
+                port: context.profile.port,
+            }],
         })
     }
 }
@@ -397,6 +403,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
             ],
             UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
             "vless-reality-tcp",
@@ -424,6 +431,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
             ],
             UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
             "shadowsocks2022-shadow-tls",
@@ -449,6 +457,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
             ],
             UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
             "hysteria2",
@@ -470,6 +479,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
             ],
             UserParticipation::SharedCredential,
+            ListenerNetwork::Udp,
         ),
         JsonProtocolAdapter::new(
             "any-tls",
@@ -485,6 +495,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 text("sni", "SNI", "TLS certificate hostname."),
             ],
             UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
             "tuic",
@@ -500,6 +511,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 text("sni", "SNI", "TLS certificate hostname."),
             ],
             UserParticipation::PerUserUuid,
+            ListenerNetwork::Udp,
         ),
     ];
     for adapter in adapters {

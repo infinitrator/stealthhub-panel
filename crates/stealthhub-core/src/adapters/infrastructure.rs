@@ -643,6 +643,7 @@ mod tests {
                 capability: SUBSCRIPTION_ADAPTER_ID.to_string(),
                 payload: json!({"subscription_domain": domain}),
                 expected_user_ids: None,
+                listeners: Vec::new(),
             }],
         }
     }

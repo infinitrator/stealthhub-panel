@@ -205,6 +205,9 @@ impl Reconciler {
             Ok(plans) => plans,
             Err(_) => return self.fail_without_mutation(journal, "desired state rendering failed"),
         };
+        if validate_listener_plan(&plans).is_err() {
+            return self.fail_without_mutation(journal, "desired listener plan conflicts");
+        }
 
         journal.core_ids = plans.keys().cloned().collect();
         journal.status = ReconcileStatus::Applying;
@@ -625,6 +628,7 @@ impl Reconciler {
                     capability: resource.adapter_id.clone(),
                     payload: resource.config.clone(),
                     expected_user_ids: None,
+                    listeners: Vec::new(),
                 });
         }
 
@@ -744,6 +748,23 @@ impl Reconciler {
             let _ = fs::remove_dir_all(path);
         }
     }
+}
+
+fn validate_listener_plan(plans: &CorePlans) -> Result<()> {
+    let mut owners = BTreeMap::new();
+    for (_, plan) in plans.values() {
+        for fragment in &plan.fragments {
+            for listener in &fragment.listeners {
+                if owners
+                    .insert(*listener, fragment.profile_id.as_str())
+                    .is_some()
+                {
+                    bail!("multiple resources claim the same listener");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_json_or_default<T>(path: &Path) -> Result<T>
@@ -1038,6 +1059,7 @@ mod tests {
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
                     user_participation: crate::adapter::UserParticipation::PerUserUuid,
+                    listener_network: crate::adapter::ListenerNetwork::Tcp,
                 },
                 fields: Vec::new(),
                 secret: None,
@@ -1053,6 +1075,7 @@ mod tests {
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
                     user_participation: crate::adapter::UserParticipation::PerUserUuid,
+                    listener_network: crate::adapter::ListenerNetwork::Tcp,
                 },
                 fields: Vec::new(),
                 secret: Some(SecretRef::parse(reference).unwrap()),
@@ -1115,6 +1138,10 @@ mod tests {
                 expected_user_ids: Some(
                     context.users.iter().map(|user| user.uuid.clone()).collect(),
                 ),
+                listeners: vec![crate::adapter::ListenerClaim {
+                    network: self.manifest.listener_network,
+                    port: context.profile.port,
+                }],
             })
         }
     }
@@ -1184,18 +1211,50 @@ mod tests {
         preferred_core_id: Option<&str>,
         enabled: bool,
     ) -> ProtocolProfile {
+        let port = 10_000
+            + protocol_id
+                .bytes()
+                .map(u16::from)
+                .fold(0_u16, u16::wrapping_add)
+                % 50_000;
         ProtocolProfile {
             name: format!("profile-{protocol_id}"),
             protocol_id: protocol_id.to_string(),
             schema_version: 1,
             role: ProxyRole::AutoSafe,
             server: "node.example.test".to_string(),
-            port: 443,
+            port,
             enabled,
             preferred_core_id: preferred_core_id.map(str::to_string),
             managed_resource_id: Some(format!("resource-{protocol_id}")),
             config: json!({}),
         }
+    }
+
+    #[test]
+    fn duplicate_listener_claims_fail_before_runtime_mutation() {
+        let core = FakeCore::new("core-a", &["capability-a", "capability-b"]);
+        let (protocols, cores) = registries(
+            vec![
+                FakeProtocol::new("protocol-a", "capability-a"),
+                FakeProtocol::new("protocol-b", "capability-b"),
+            ],
+            vec![core.clone()],
+        );
+        let store = FakeStore::new(1);
+        let reconciler = Reconciler::new(protocols, cores, store, temp_dir());
+        let mut first = profile("protocol-a", None, true);
+        let mut second = profile("protocol-b", None, true);
+        first.port = 443;
+        second.port = 443;
+
+        let outcome = reconciler
+            .reconcile(&desired(1, vec![first, second], &["alice"]), &resolver(&[]))
+            .unwrap();
+
+        assert_eq!(outcome.status, ReconcileStatus::Failed);
+        assert_eq!(core.state.lock().unwrap().installs, 0);
+        assert_eq!(core.state.lock().unwrap().current, "known-good");
     }
 
     fn desired(generation: u64, profiles: Vec<ProtocolProfile>, users: &[&str]) -> DesiredState {

@@ -278,6 +278,7 @@ mod tests {
                 capability: "external-capability".to_string(),
                 payload: json!({}),
                 expected_user_ids: None,
+                listeners: Vec::new(),
             })
         }
     }
@@ -417,6 +418,7 @@ mod tests {
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from(["external-capability".to_string()]),
                     user_participation: crate::adapter::UserParticipation::None,
+                    listener_network: crate::adapter::ListenerNetwork::Tcp,
                 },
             }))
             .unwrap();

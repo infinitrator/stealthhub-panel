@@ -136,6 +136,22 @@ pub struct ProtocolAdapterManifest {
     pub schema_version: u32,
     pub required_core_capabilities: BTreeSet<String>,
     pub user_participation: UserParticipation,
+    pub listener_network: ListenerNetwork,
+}
+
+/// Socket protocol claimed by a rendered server listener.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerNetwork {
+    Tcp,
+    Udp,
+}
+
+/// Non-secret listener ownership used for global pre-mutation validation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ListenerClaim {
+    pub network: ListenerNetwork,
+    pub port: u16,
 }
 
 /// How subscription users participate in one protocol runtime.
@@ -195,6 +211,7 @@ pub struct ServerFragment {
     pub payload: Value,
     /// Expected non-secret runtime identities, or `None` for shared/no auth.
     pub expected_user_ids: Option<BTreeSet<String>>,
+    pub listeners: Vec<ListenerClaim>,
 }
 
 impl fmt::Debug for ServerFragment {
@@ -582,6 +599,7 @@ mod tests {
             capability: "fake".to_string(),
             payload: serde_json::json!({"password": "canary-secret-value"}),
             expected_user_ids: None,
+            listeners: Vec::new(),
         };
         let rendered = format!("{fragment:?}");
         assert!(!rendered.contains("canary"));

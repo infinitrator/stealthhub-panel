@@ -272,16 +272,14 @@ impl CoreAdapter for ManagedCoreAdapter {
         let desired = plan
             .fragments
             .iter()
-            .map(|fragment| {
-                let port = fragment
-                    .payload
-                    .get("port")
-                    .and_then(Value::as_u64)
-                    .and_then(|port| u16::try_from(port).ok())
-                    .context("adapter fragment has invalid port")?;
-                Ok((port, capability_uses_udp(&fragment.capability)))
+            .flat_map(|fragment| &fragment.listeners)
+            .map(|listener| {
+                (
+                    listener.port,
+                    listener.network == crate::adapter::ListenerNetwork::Udp,
+                )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
         *self
             .listeners
             .lock()
@@ -612,10 +610,6 @@ fn compose_tuic(plan: &CorePlan) -> Result<Value> {
     Ok(
         json!({"server":format!("[::]:{}",port(payload)?),"users":user_map,"certificate":CERTIFICATE_PATH,"private_key":PRIVATE_KEY_PATH,"congestion_control":"bbr","alpn":["h3"],"zero_rtt_handshake":false}),
     )
-}
-
-fn capability_uses_udp(capability: &str) -> bool {
-    matches!(capability, "hysteria2" | "tuic")
 }
 
 fn listener_line_has_port(line: &str, port: u16) -> bool {
