@@ -12,8 +12,14 @@ use crate::{
 };
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
-use std::collections::HashSet;
-use stealthhub_core::storage::{AdminRecord, UserRecord};
+use std::collections::{BTreeSet, HashSet};
+use stealthhub_core::{
+    inventory::{
+        AdapterInventory, AdapterInventoryEntry, AdapterInventoryState, RuntimeInventoryEntry,
+        RuntimeInventoryState,
+    },
+    storage::{AdminRecord, UserRecord},
+};
 
 fn fixture_user() -> UserRecord {
     let now = Utc::now();
@@ -405,4 +411,57 @@ fn config_editor_rejects_root_only_targets() {
 
     assert!(!report.success);
     assert!(report.message.contains("read-only"));
+}
+
+#[test]
+fn shared_inventory_components_render_dynamic_and_historical_entries() {
+    let inventory = AdapterInventory {
+        adapters: vec![AdapterInventoryEntry {
+            id: "detached-adapter".to_string(),
+            kind: "protocol".to_string(),
+            display_name: "Detached adapter".to_string(),
+            state: AdapterInventoryState::Historical,
+            present: false,
+            configured: true,
+            schema_version: Some(7),
+            capabilities: BTreeSet::new(),
+            detail: "Configuration preserved; adapter currently unavailable".to_string(),
+        }],
+        runtimes: vec![RuntimeInventoryEntry {
+            id: "runtime-from-manifest".to_string(),
+            display_name: "Manifest runtime".to_string(),
+            state: RuntimeInventoryState::InstalledInactive,
+            adapter_present: true,
+            installed: Some(true),
+            desired: false,
+            applied: false,
+            active: Some(false),
+            healthy: None,
+            listeners_healthy: None,
+            service: Some("manifest-runtime.service".to_string()),
+            version: Some("1.2.3".to_string()),
+            capabilities: BTreeSet::new(),
+            detail: "Core installed but unused".to_string(),
+        }],
+        ..AdapterInventory::default()
+    };
+
+    let adapters = views::components::adapter_inventory_table(&inventory, None).into_string();
+    let runtimes = views::components::runtime_inventory_table(&inventory).into_string();
+    assert!(adapters.contains("detached-adapter"));
+    assert!(adapters.contains("historical"));
+    assert!(runtimes.contains("runtime-from-manifest"));
+    assert!(runtimes.contains("installed inactive"));
+}
+
+#[test]
+fn runtime_views_do_not_restore_the_legacy_static_target_array() {
+    let sources = [
+        include_str!("ops.rs"),
+        include_str!("views/health.rs"),
+        include_str!("views/system.rs"),
+    ];
+    assert!(sources
+        .iter()
+        .all(|source| !source.contains("SYSTEM_TARGETS")));
 }

@@ -1973,6 +1973,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "toml",

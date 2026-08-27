@@ -37,7 +37,35 @@ Web-процесс работает как `infiproxy`. Он транзакци�
 Если числа различаются, сохранение принято панелью, но сервер еще не подтвердил
 его. Не выдавайте новый профиль клиенту как рабочий, пока статус не `Applied`.
 
-## 3. Статусы
+## 3. Динамический inventory и статусы
+
+Dashboard, Health, System, Modules, Protocols и обзор Configs используют один
+application-level inventory. Он собирается из зарегистрированных protocol/core/
+infrastructure adapters, root-owned module manifests, installed binaries,
+systemd units, desired/applied generations и сохраненного adapter state. View не
+ищут runtime самостоятельно и не содержат списков имен ядер или протоколов.
+
+Состояния adapter:
+
+| Состояние | Значение |
+|---|---|
+| `Available` | Adapter зарегистрирован, его runtime доступен. |
+| `AdapterOnly` | Контракт adapter есть, но совместимый runtime не установлен. |
+| `Historical` | Adapter отсутствует, но его opaque configuration сохранена. |
+| `UnsupportedSchema` | Adapter найден, но сохраненная schema новее понятной ему версии. |
+
+Состояния runtime: `AvailableNotInstalled`, `InstalledInactive`,
+`ActiveHealthy`, `ActiveDegraded`, `Failed`, `MissingAdapter`. Состояния
+resource: `AdapterOnly`, `ConfiguredPending`, `AppliedHealthy`,
+`AppliedDegraded`, `Unsupported`, `CoreUnavailable`, `Disabled`. Ошибка одного
+systemd/binary/manifest probe становится `unknown` или degraded detail и не
+роняет весь Health dashboard.
+
+Ни наличие бинарника, ни `active` unit сами по себе не означают `Applied`.
+Подтвержденное состояние требует совпадающих generation и успешной runtime
+проверки.
+
+## 4. Reconcile-статусы
 
 | Статус | Значение | Действие оператора |
 |---|---|---|
@@ -61,7 +89,7 @@ sudo systemctl start infiproxy-reconcile.service
 `/var/lib/infiproxy-maintenance/reconcile`. Не редактируйте generation, journal
 или snapshot вручную во время активной операции.
 
-## 4. Контракт protocol adapter
+## 5. Контракт protocol adapter
 
 Protocol adapter владеет стабильным ID, версией JSON schema, GUI-полями,
 проверкой config, ссылками на client/server secrets, участием пользователей,
@@ -73,7 +101,7 @@ Mihomo client object и server fragment. Generic subscription assembler знае
 ветвится по имени протокола. Preferred core является политикой выбора, а не
 жесткой связью: без preference выбирается установленный совместимый adapter.
 
-## 5. Контракт core adapter
+## 6. Контракт core adapter
 
 Core adapter владеет сборкой полного server config, native validation,
 snapshot/rollback, atomic install, systemd lifecycle, health и listener checks.
@@ -84,7 +112,7 @@ snapshot/rollback, atomic install, systemd lifecycle, health и listener checks.
 него enabled-профиль потеряет последнюю совместимую capability. Сначала
 установите замену, переключите preference, дождитесь `Applied`, затем удаляйте.
 
-## 6. Server secrets
+## 7. Server secrets
 
 Ссылки на secrets хранятся в profile JSON, но root-only значения должны
 находиться отдельными regular files:
@@ -121,7 +149,7 @@ Helper сначала сверяет adapter-классификацию, зат�
 root-копия уже существует, повторный запуск безопасен; несовпадающие копии
 останавливают migration без вывода plaintext.
 
-## 7. Infrastructure ownership
+## 8. Infrastructure ownership
 
 Admin frontend остается installer/TUI-owned в
 `/etc/nginx/sites-available/infiproxy.conf`. Reconciler не изменяет его.
@@ -139,7 +167,76 @@ syntax. **Certificate issuance не реализован этим adapter**: с�
 certificate через HTTPS/Cloudflare TUI. `node_domain` является отдельным
 DNS-readiness ресурсом и не создает cover-vhost.
 
-## 8. Миграция существующего сервера
+## 9. Durable adapter state
+
+SQLite является независимым durable data layer, а не cache реализации. Данные
+разделены концептуально на users/subscriptions, panel/routing settings, desired
+profiles/resources, applied generation/operation metadata и generic
+`adapter_state`.
+
+`adapter_state` использует стабильные строковые `adapter_kind`, `adapter_id` и
+`resource_id`, положительную adapter-owned `schema_version`, `enabled` и opaque
+`config_json`. В durable identity не записываются Rust type names или enum
+discriminants. Если package отсутствует, JSON не десериализуется в его Rust-тип,
+не заменяется defaults и не удаляется.
+
+**Removing an adapter does not delete its persisted configuration.**
+
+После удаления UI показывает historical/missing запись, а reconciler не
+выполняет runtime mutation для неизвестного adapter. Возврат package с тем же
+stable ID запускает `migrate_state` этого adapter. Успешная миграция
+транзакционно повышает schema и снова присоединяет конфигурацию; несовместимая
+будущая schema остается нетронутой.
+
+**Reinstalling an adapter with the same stable adapter ID reconnects preserved
+configuration after adapter-owned schema migration.**
+
+## 10. Политика миграций SQLite
+
+Legacy baseline создается идемпотентным additive DDL. Все новые изменения после
+baseline имеют монотонный integer ID в `schema_migrations` и выполняются в
+транзакции. Версия durable schema не связана с `CARGO_PKG_VERSION`.
+
+Обязательная политика:
+
+1. Не удалять неизвестные profile, setting, adapter ID или JSON fields.
+2. Не подменять непонятное значение default-настройкой.
+3. Предпочитать новые таблицы/колонки и обратимо заполняемые значения.
+4. Destructive transformation допустима только с явным backup и доказуемым преобразованием.
+5. Повторный startup обязан быть idempotent.
+6. Неуспешная adapter-owned migration оставляет исходную строку без изменений.
+7. Старые данные должны оставаться читаемыми или хотя бы непрозрачно сохраненными.
+8. Каждая release migration проверяется на offline-копии старой схемы.
+
+## 11. Offline database compatibility harness
+
+Harness никогда не ищет production DB самостоятельно и отказывается принимать
+`/var/lib/infiproxy/infiproxy.sqlite`. Сначала создайте согласованную offline
+копию штатным SQLite backup-механизмом, затем перенесите ее в checkout, например
+в `target/compat/production-copy.sqlite`. Не передавайте простой copy файла с
+непустым `-wal`: harness остановится и попросит сделать корректный backup.
+
+```bash
+mkdir -p target/compat
+# Поместите сюда уже созданную offline SQLite backup-копию.
+cargo run --locked --release -p stealthhub-panel \
+  --bin infiproxy-db-compat -- \
+  target/compat/production-copy.sqlite
+```
+
+Команда создает рядом отдельный файл
+`*.compat-working-<uuid>.sqlite`, запускает текущий `init_db` дважды и печатает
+machine-readable JSON. Она сравнивает count и SHA-256 всех существовавших
+столбцов durable-таблиц, включая unknown JSON, users/subscription records,
+flags, limits, expiration, addresses, ports, routing/settings, desired/applied
+metadata и historical adapter state. Также проверяются `integrity_check`,
+`foreign_key_check` и отношение `0 <= applied_generation <= desired_generation`.
+
+Значения, username, UUID, token, secret, address и JSON в отчет не выводятся.
+При failure working copy сохраняется для ручного анализа. Исходная offline copy
+не мигрируется.
+
+## 12. Миграция существующего сервера
 
 Перед обновлением остановите auto-update и сделайте backup по
 [разделу 12](12-BACKUP-RESTORE-UNINSTALL). Миграция schema идемпотентна,
@@ -161,7 +258,7 @@ profiles. До него обязательно:
 
 Adoption сам удаляет legacy SQLite value только после проверки root-копии.
 
-## 9. Crash recovery
+## 13. Crash recovery
 
 Перед live mutation worker сохраняет snapshots и durable journal. Если процесс
 прерван до mutation, операция становится `Failed`. После mutation worker
@@ -182,7 +279,7 @@ sudo ss -lntup
 SQLite и units из одного согласованного backup, проверьте native configtest,
 затем включите worker снова.
 
-## 9. Добавление нового адаптера
+## 14. Добавление нового адаптера
 
 Для нового protocol adapter нужны manifest, schema migration, field metadata,
 client/server secret references, client renderer, server fragment и тесты
