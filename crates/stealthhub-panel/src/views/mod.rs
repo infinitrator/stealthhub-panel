@@ -5,7 +5,6 @@ pub(crate) mod components;
 pub(crate) mod configs;
 pub(crate) mod credits;
 pub(crate) mod dashboard;
-pub(crate) mod headscale;
 pub(crate) mod health;
 pub(crate) mod ip;
 pub(crate) mod modules;

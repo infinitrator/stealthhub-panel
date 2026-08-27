@@ -6,7 +6,6 @@
 //! on request/response flow.
 
 mod atomic_file;
-mod headscale;
 mod health;
 mod inventory;
 mod ip;
@@ -146,32 +145,6 @@ struct ModuleRemovalForm {
     #[serde(default)]
     csrf_token: String,
     confirm: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HeadscaleUserForm {
-    #[serde(default)]
-    csrf_token: String,
-    username: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HeadscaleKeyForm {
-    #[serde(default)]
-    csrf_token: String,
-    user_id: u64,
-    expiration: String,
-    #[serde(default)]
-    reusable: String,
-    #[serde(default)]
-    ephemeral: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HeadscaleNodeForm {
-    #[serde(default)]
-    csrf_token: String,
-    node_id: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -380,24 +353,6 @@ async fn main() -> anyhow::Result<()> {
             post(uninstall_preview_action),
         )
         .route("/admin/cores", get(cores_page))
-        .route("/admin/headscale", get(headscale_page))
-        .route("/admin/headscale/refresh", post(headscale_refresh_action))
-        .route(
-            "/admin/headscale/clear-result",
-            post(headscale_clear_result_action),
-        )
-        .route(
-            "/admin/headscale/users/create",
-            post(headscale_create_user_action),
-        )
-        .route(
-            "/admin/headscale/keys/create",
-            post(headscale_create_key_action),
-        )
-        .route(
-            "/admin/headscale/nodes/expire",
-            post(headscale_expire_node_action),
-        )
         .route("/admin/ip", get(ip_check_page))
         .route("/admin/credits", get(credits_page))
         .route("/admin/health", get(admin_health))
@@ -1091,164 +1046,6 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         &page.module_statuses,
         &page.available_modules,
         &page.diagnostics,
-    )
-}
-
-async fn headscale_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let auth = match require_admin(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if !is_owner_admin(&auth) {
-        return owner_only_response();
-    }
-    let snapshot = match headscale::snapshot() {
-        Ok(value) => value,
-        Err(error) => {
-            return logged_error_with_back(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "load Headscale state",
-                error,
-                "Headscale state unavailable",
-                "Headscale state could not be loaded. Review the server journal.",
-                "/admin",
-                "Back to Dashboard",
-            );
-        }
-    };
-    let installed = modules::find("headscale")
-        .ok()
-        .flatten()
-        .is_some_and(|spec| std::path::Path::new(&spec.binary_path).is_file());
-    views::headscale::render(&auth, &snapshot, installed)
-}
-
-async fn headscale_refresh_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
-) -> Response {
-    queue_headscale_request(
-        &state,
-        &headers,
-        &form.csrf_token,
-        headscale::HeadscaleRequest::Refresh,
-    )
-    .await
-}
-
-async fn headscale_clear_result_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<CsrfForm>,
-) -> Response {
-    queue_headscale_request(
-        &state,
-        &headers,
-        &form.csrf_token,
-        headscale::HeadscaleRequest::ClearResult,
-    )
-    .await
-}
-
-async fn headscale_create_user_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<HeadscaleUserForm>,
-) -> Response {
-    if !stealthhub_core::headscale_control::valid_username(form.username.trim()) {
-        return headscale_input_error("Invalid Headscale username");
-    }
-    queue_headscale_request(
-        &state,
-        &headers,
-        &form.csrf_token,
-        headscale::HeadscaleRequest::CreateUser {
-            username: form.username.trim().to_string(),
-        },
-    )
-    .await
-}
-
-async fn headscale_create_key_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<HeadscaleKeyForm>,
-) -> Response {
-    let expiration = form.expiration.trim();
-    if form.user_id == 0 || !stealthhub_core::headscale_control::valid_expiration(expiration) {
-        return headscale_input_error("Invalid Headscale user or key lifetime");
-    }
-    queue_headscale_request(
-        &state,
-        &headers,
-        &form.csrf_token,
-        headscale::HeadscaleRequest::CreatePreAuthKey {
-            user_id: form.user_id,
-            expiration: expiration.to_string(),
-            reusable: checkbox_enabled(&form.reusable),
-            ephemeral: checkbox_enabled(&form.ephemeral),
-        },
-    )
-    .await
-}
-
-async fn headscale_expire_node_action(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<HeadscaleNodeForm>,
-) -> Response {
-    if form.node_id == 0 {
-        return headscale_input_error("Invalid Headscale node ID");
-    }
-    queue_headscale_request(
-        &state,
-        &headers,
-        &form.csrf_token,
-        headscale::HeadscaleRequest::ExpireNode {
-            node_id: form.node_id,
-        },
-    )
-    .await
-}
-
-async fn queue_headscale_request(
-    state: &AppState,
-    headers: &HeaderMap,
-    csrf_token: &str,
-    request: headscale::HeadscaleRequest,
-) -> Response {
-    let auth = match require_admin(state, headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    if let Some(response) = csrf_error_response(&auth, csrf_token) {
-        return response;
-    }
-    if !is_owner_admin(&auth) {
-        return owner_only_response();
-    }
-    match headscale::request(&request) {
-        Ok(()) => Redirect::to("/admin/headscale").into_response(),
-        Err(error) => logged_error_with_back(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "queue Headscale operation",
-            error,
-            "Headscale operation not queued",
-            "The privileged request could not be queued. Review the server journal.",
-            "/admin/headscale",
-            "Back to Headscale",
-        ),
-    }
-}
-
-fn headscale_input_error(message: &'static str) -> Response {
-    html_error_response_with_back(
-        StatusCode::BAD_REQUEST,
-        "Headscale request rejected",
-        message,
-        "/admin/headscale",
-        "Back to Headscale",
     )
 }
 

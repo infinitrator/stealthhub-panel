@@ -33,7 +33,6 @@ jobs:
           mkdir -p dist/infiproxy-linux-x86_64
           cp target/release/stealthhub-panel dist/infiproxy-linux-x86_64/infiproxy
           cp target/release/infiproxy-module-manifest dist/infiproxy-linux-x86_64/
-          cp target/release/infiproxy-headscale-control dist/infiproxy-linux-x86_64/
           cp -R deploy wiki README.md LICENSE LICENSE.ru.md dist/infiproxy-linux-x86_64/
           tar -C dist -czf infiproxy-linux-x86_64.tar.gz infiproxy-linux-x86_64
           sha256sum infiproxy-linux-x86_64.tar.gz > infiproxy-linux-x86_64.tar.gz.sha256

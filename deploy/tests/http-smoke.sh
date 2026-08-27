@@ -100,8 +100,6 @@ INFIPROXY_MODULE_AVAILABLE_DIR="${ROOT_DIR}/deploy/modules.d" \
 INFIPROXY_MODULE_STATE_DIR="${TMP_DIR}/module-state" \
 INFIPROXY_MODULE_REQUEST_DIR="${TMP_DIR}/module-requests" \
 INFIPROXY_MODULE_VERSION_DIR="${TMP_DIR}/module-versions" \
-INFIPROXY_HEADSCALE_STATE_FILE="${TMP_DIR}/headscale-state.json" \
-INFIPROXY_HEADSCALE_REQUEST_DIR="${TMP_DIR}/headscale-requests" \
 RUST_LOG=warn \
 "$PANEL_BIN" >"$LOG_FILE" 2>&1 &
 PANEL_PID="$!"
@@ -158,7 +156,6 @@ for path in \
     /admin/secrets \
     /admin/routing \
     /admin/cores \
-    /admin/headscale \
     /admin/ip \
     /admin/system \
     /admin/configs \
@@ -269,11 +266,6 @@ request 303 /admin/panel-update-now --request POST \
     || fail "panel update request symlink was not replaced"
 grep -Fq 'panel-victim-preserved' "${TMP_DIR}/panel-request-victim" \
     || fail "panel update request followed an attacker-controlled symlink"
-request 303 /admin/headscale/refresh --request POST \
-    --data-urlencode csrf_token="$CSRF_TOKEN"
-grep -Fq '"action":"refresh"' "${TMP_DIR}"/headscale-requests/*.request \
-    || fail "typed Headscale request was not queued"
-
 request 303 "/admin/users/1/toggle" --request POST \
     --data-urlencode csrf_token="$CSRF_TOKEN"
 request 403 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"

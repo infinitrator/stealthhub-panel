@@ -263,32 +263,6 @@ EOF
 )
 
 (
-    export INFIPROXY_HEADSCALE_CONFIG="${TMP_DIR}/generated-headscale/config.yaml"
-    export INFIPROXY_HEADSCALE_STATE_DIR="${TMP_DIR}/generated-headscale/state"
-    INFIPROXY_GROUP="$(id -gn)"
-    export INFIPROXY_GROUP
-    # shellcheck source=deploy/infiproxy-manager.sh
-    source "${ROOT_DIR}/deploy/infiproxy-manager.sh"
-    require_cmd() { :; }
-    secure_headscale_paths() {
-        mkdir -p "$(dirname "$HEADSCALE_CONFIG")" "$HEADSCALE_STATE_DIR"
-    }
-    headscale_configtest() { [[ -f "${1:-}" ]]; }
-    publish_staged_file() {
-        chmod "$5" "$1"
-        mv -f -- "$1" "$2"
-    }
-
-    write_headscale_config \
-        "https://hs.example.test" "tailnet.example.test" >/dev/null
-    assert_file_contains "$HEADSCALE_CONFIG" "prefixes:"
-    assert_file_contains "$HEADSCALE_CONFIG" "  allocation: sequential"
-    if grep -Fqx 'allocation: sequential' "$HEADSCALE_CONFIG"; then
-        fail "Headscale allocation escaped the prefixes mapping"
-    fi
-)
-
-(
     export INFIPROXY_MODULE_REQUEST_DIR="${TMP_DIR}/manager-module-requests"
     INFIPROXY_USER="$(id -un)"
     INFIPROXY_GROUP="$(id -gn)"
@@ -325,7 +299,6 @@ EOF
     export INFIPROXY_SRC_DIR="${TMP_DIR}/panel-source"
     export INFIPROXY_PANEL_BINARY="${TMP_DIR}/installed/infiproxy"
     export INFIPROXY_MANIFEST_HELPER_BINARY="${TMP_DIR}/installed/infiproxy-module-manifest"
-    export INFIPROXY_HEADSCALE_HELPER_BINARY="${TMP_DIR}/installed/infiproxy-headscale-control"
     export INFIPROXY_RECONCILE_HELPER_BINARY="${TMP_DIR}/installed/infiproxy-reconcile"
     # shellcheck source=deploy/panel-update.sh
     source "${ROOT_DIR}/deploy/panel-update.sh"
@@ -364,21 +337,17 @@ EOF
     mkdir -p "$(dirname "$PANEL_BINARY")"
     printf 'old panel\n' >"$PANEL_BINARY"
     printf 'old manifest helper\n' >"$MANIFEST_HELPER_BINARY"
-    printf 'old Headscale helper\n' >"$HEADSCALE_HELPER_BINARY"
     printf 'old reconcile helper\n' >"$RECONCILE_HELPER_BINARY"
-    chmod 0755 "$PANEL_BINARY" "$MANIFEST_HELPER_BINARY" "$HEADSCALE_HELPER_BINARY" \
-        "$RECONCILE_HELPER_BINARY"
+    chmod 0755 "$PANEL_BINARY" "$MANIFEST_HELPER_BINARY" "$RECONCILE_HELPER_BINARY"
     PANEL_BACKUP="${TMP_DIR}/panel-backup"
     mkdir -p "$PANEL_BACKUP"
     backup_control_binaries "$PANEL_BACKUP"
     printf 'new panel\n' >"$PANEL_BINARY"
     printf 'new manifest helper\n' >"$MANIFEST_HELPER_BINARY"
-    printf 'new Headscale helper\n' >"$HEADSCALE_HELPER_BINARY"
     printf 'new reconcile helper\n' >"$RECONCILE_HELPER_BINARY"
     restore_control_binaries "$PANEL_BACKUP"
     assert_file_contains "$PANEL_BINARY" "old panel"
     assert_file_contains "$MANIFEST_HELPER_BINARY" "old manifest helper"
-    assert_file_contains "$HEADSCALE_HELPER_BINARY" "old Headscale helper"
     assert_file_contains "$RECONCILE_HELPER_BINARY" "old reconcile helper"
     backup_database "$PANEL_BACKUP"
     backup_system_configs "$PANEL_BACKUP"

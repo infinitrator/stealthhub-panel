@@ -30,7 +30,6 @@ NGINX_SUBSCRIPTION_AVAILABLE="${INFIPROXY_NGINX_SUBSCRIPTION_AVAILABLE:-/etc/ngi
 NGINX_HEADSCALE_AVAILABLE="${INFIPROXY_NGINX_HEADSCALE_AVAILABLE:-/etc/nginx/sites-available/infiproxy-headscale.conf}"
 PANEL_BINARY="${INFIPROXY_PANEL_BINARY:-/usr/local/bin/infiproxy}"
 MANIFEST_HELPER_BINARY="${INFIPROXY_MANIFEST_HELPER_BINARY:-/usr/local/libexec/infiproxy-module-manifest}"
-HEADSCALE_HELPER_BINARY="${INFIPROXY_HEADSCALE_HELPER_BINARY:-/usr/local/libexec/infiproxy-headscale-control}"
 RECONCILE_HELPER_BINARY="${INFIPROXY_RECONCILE_HELPER_BINARY:-/usr/local/libexec/infiproxy-reconcile}"
 INSTALL_STATE_LIB="${INFIPROXY_INSTALL_STATE_LIB:-/usr/local/libexec/infiproxy-install-state}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
@@ -168,7 +167,6 @@ backup_control_binaries() {
     local -a binaries=(
         "infiproxy:${PANEL_BINARY}"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}"
-        "infiproxy-headscale-control:${HEADSCALE_HELPER_BINARY}"
         "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}"
     )
     install -d -o root -g root -m 0700 "${backup_dir}/control-binaries"
@@ -194,7 +192,6 @@ restore_control_binaries() {
     local -a binaries=(
         "infiproxy:${PANEL_BINARY}:stealthhub-panel"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}:infiproxy-module-manifest"
-        "infiproxy-headscale-control:${HEADSCALE_HELPER_BINARY}:infiproxy-headscale-control"
         "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}:infiproxy-reconcile"
     )
     install -d -m 0755 "${SOURCE_DIR}/target/release"

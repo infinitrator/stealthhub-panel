@@ -385,16 +385,14 @@ fn mtproto_runtime_is_wired_into_panel_contracts() {
 }
 
 #[test]
-fn headscale_module_is_wired_into_panel_contracts() {
-    assert!(modules::registry()
+fn retired_headscale_surface_is_absent_from_normal_ui_and_routes() {
+    let shell = ui::layout("test", maud::html! { p { "content" } }).into_string();
+    assert!(!shell.to_ascii_lowercase().contains("headscale"));
+    assert!(!include_str!("main.rs").contains("/admin/headscale"));
+    assert!(!modules::registry()
         .unwrap()
         .iter()
-        .any(|module| module.id == "headscale"
-            && module.service == "headscale.service"
-            && module.binary_path.ends_with("/headscale")));
-    assert!(config_files()
-        .iter()
-        .any(|spec| { spec.path == "/etc/headscale/config.yaml" && !spec.editable }));
+        .any(|module| module.id == "headscale"));
 }
 
 #[test]

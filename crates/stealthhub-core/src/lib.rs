@@ -8,7 +8,6 @@ pub mod adapter;
 pub mod adapters;
 pub mod compatibility;
 pub mod desired;
-pub mod headscale_control;
 pub mod inventory;
 pub mod mihomo;
 pub mod models;

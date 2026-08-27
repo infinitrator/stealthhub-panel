@@ -31,15 +31,6 @@ MTPROTO_ENV="${INFIPROXY_MTPROTO_ENV:-${MTPROTO_DIR}/mtproto.env}"
 MTPROTO_BINARY="${INFIPROXY_MTPROTO_BINARY:-/opt/infiproxy/cores/mtproto/current/mtproto-proxy}"
 MTPROTO_SECRET_URL="https://core.telegram.org/getProxySecret"
 MTPROTO_CONFIG_URL="https://core.telegram.org/getProxyConfig"
-HEADSCALE_SERVICE="headscale.service"
-HEADSCALE_CONFIG="${INFIPROXY_HEADSCALE_CONFIG:-/etc/headscale/config.yaml}"
-HEADSCALE_STATE_DIR="${INFIPROXY_HEADSCALE_STATE_DIR:-/var/lib/headscale}"
-HEADSCALE_NGINX_SITE="${INFIPROXY_HEADSCALE_NGINX_SITE:-/etc/nginx/sites-available/infiproxy-headscale.conf}"
-HEADSCALE_NGINX_ENABLED="${INFIPROXY_HEADSCALE_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy-headscale.conf}"
-HEADSCALE_LISTEN_ADDR="${INFIPROXY_HEADSCALE_LISTEN_ADDR:-127.0.0.1:8088}"
-HEADSCALE_METRICS_ADDR="${INFIPROXY_HEADSCALE_METRICS_ADDR:-127.0.0.1:9098}"
-HEADSCALE_GRPC_ADDR="${INFIPROXY_HEADSCALE_GRPC_ADDR:-127.0.0.1:50443}"
-HEADSCALE_LATEST_API="https://api.github.com/repos/juanfont/headscale/releases/latest"
 MAX_MTPROTO_CONFIG_BYTES=8388608
 
 green=$'\033[38;5;71m'
@@ -365,10 +356,6 @@ valid_cloudflare_token() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{20,200}$ ]]
 }
 
-valid_headscale_user() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]{1,63}$ ]] && [[ "$1" != *@* ]]
-}
-
 public_ip() {
   https_curl --max-time 10 https://api.ipify.org
 }
@@ -387,33 +374,8 @@ env_value() {
   awk -F= -v key="$key" '$1 == key { value=$0; sub("^[^=]*=", "", value); print value }' "$file" 2>/dev/null | tail -1
 }
 
-headscale_arch() {
-  case "$(uname -m)" in
-    x86_64|amd64) echo "amd64" ;;
-    aarch64|arm64) echo "arm64" ;;
-    *)
-      echo "${danger}Unsupported Headscale architecture: $(uname -m)${reset}" >&2
-      return 1
-      ;;
-  esac
-}
-
-headscale_latest_version() {
-  https_curl --max-time 20 "$HEADSCALE_LATEST_API" \
-    | "$MODULE_MANIFEST_HELPER" release-tag \
-    | sed 's/^v//'
-}
-
 cloudflare_token_from_file() {
   awk -F= '/dns_cloudflare_api_token/ { value=$2; sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value }' "$CLOUDFLARE_CREDENTIALS" 2>/dev/null | tail -1
-}
-
-headscale_cmd() {
-  headscale -c "$HEADSCALE_CONFIG" "$@"
-}
-
-headscale_configtest() {
-  headscale -c "$1" configtest
 }
 
 publish_staged_file() {
@@ -545,8 +507,7 @@ restart_menu() {
     2 "Validate and reload nginx" \
     3 "Validate and reload SSH" \
     4 "Restart all enabled modules" \
-    5 "Validate and restart Headscale" \
-    6 "Reboot server" \
+    5 "Reboot server" \
     0 "Back")" || return
   case "$choice" in
     1) need_root; run_cmd systemctl restart "$PANEL_SERVICE" || true ;;
@@ -579,16 +540,6 @@ restart_menu() {
       done < <(registered_services)
       ;;
     5)
-      need_root
-      if ! have_cmd headscale; then
-        echo "${danger}headscale is not installed.${reset}" >&2
-      elif headscale_cmd configtest; then
-        run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
-      else
-        echo "${danger}Headscale config validation failed; service was not restarted.${reset}" >&2
-      fi
-      ;;
-    6)
       need_root
       read -r -p "Type REBOOT to reboot this server: " confirm
       if [[ "$confirm" == "REBOOT" ]]; then
@@ -878,369 +829,6 @@ mtproto_setup_menu() {
   pause
 }
 
-# Install Headscale through the same versioned module pipeline used by every
-# other runtime. Its configuration and service state survive the binary switch.
-install_headscale_release() {
-  need_root
-  run_cmd "$MODULE_UPDATE_BIN" --update headscale
-  usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
-}
-
-secure_headscale_paths() {
-  install -d -m 0770 -o root -g "$APP_GROUP" "$(dirname "$HEADSCALE_CONFIG")"
-  install -d -m 0750 -o headscale -g headscale "$HEADSCALE_STATE_DIR" 2>/dev/null \
-    || install -d -m 0750 "$HEADSCALE_STATE_DIR"
-  if id -u headscale >/dev/null 2>&1; then
-    usermod -aG "$APP_GROUP" headscale 2>/dev/null || true
-  fi
-}
-
-# Headscale upstream examples default to 127.0.0.1:8080, which collides with the
-# panel. Infiproxy pins Headscale to 127.0.0.1:8088 and exposes it through a
-# dedicated HTTPS virtual host.
-write_headscale_config() {
-  local server_url="$1"
-  local base_domain="$2"
-  local backup="" temp="" restore_temp="" authority host port="" was_active=0
-
-  require_cmd headscale || return 1
-  [[ "$server_url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?$ ]] || {
-    echo "${danger}Headscale server URL must look like https://hs.example.com${reset}" >&2
-    return 1
-  }
-  authority="${server_url#https://}"
-  host="${authority%%:*}"
-  [[ "$authority" == "$host" ]] || port="${authority##*:}"
-  valid_domain "$host" || {
-    echo "${danger}Headscale server URL contains an invalid domain.${reset}" >&2
-    return 1
-  }
-  [[ -z "$port" ]] || valid_port "$port" || {
-    echo "${danger}Headscale server URL contains an invalid port.${reset}" >&2
-    return 1
-  }
-  valid_domain "$base_domain" || { echo "${danger}Invalid MagicDNS base domain: $base_domain${reset}" >&2; return 1; }
-
-  secure_headscale_paths
-  temp="$(mktemp "${HEADSCALE_CONFIG}.tmp.XXXXXX")"
-  cat >"$temp" <<EOF
-server_url: ${server_url}
-listen_addr: ${HEADSCALE_LISTEN_ADDR}
-metrics_listen_addr: ${HEADSCALE_METRICS_ADDR}
-grpc_listen_addr: ${HEADSCALE_GRPC_ADDR}
-grpc_allow_insecure: false
-trusted_proxies:
-  - 127.0.0.1/32
-  - ::1/128
-
-noise:
-  private_key_path: ${HEADSCALE_STATE_DIR}/noise_private.key
-
-prefixes:
-  v4: 100.64.0.0/10
-  v6: fd7a:115c:a1e0::/48
-  allocation: sequential
-
-derp:
-  server:
-    enabled: false
-    region_id: 999
-    region_code: "infiproxy"
-    region_name: "Infiproxy Headscale"
-    verify_clients: true
-    stun_listen_addr: "0.0.0.0:3478"
-    private_key_path: ${HEADSCALE_STATE_DIR}/derp_server_private.key
-    automatically_add_embedded_derp_region: true
-  urls:
-    - https://controlplane.tailscale.com/derpmap/default
-  paths: []
-  auto_update_enabled: true
-  update_frequency: 3h
-
-disable_check_updates: false
-node:
-  expiry: 0
-  ephemeral:
-    inactivity_timeout: 30m
-  routes:
-    ha:
-      probe_interval: 10s
-      probe_timeout: 5s
-
-database:
-  type: sqlite
-  sqlite:
-    path: ${HEADSCALE_STATE_DIR}/db.sqlite
-    write_ahead_log: true
-
-tls_cert_path: ""
-tls_key_path: ""
-
-log:
-  level: info
-  format: text
-
-policy:
-  mode: file
-  path: ""
-
-dns:
-  magic_dns: true
-  base_domain: ${base_domain}
-  override_local_dns: true
-  nameservers:
-    global:
-      - 1.1.1.1
-      - 1.0.0.1
-
-unix_socket: /var/run/headscale/headscale.sock
-unix_socket_permission: "0770"
-
-logtail:
-  enabled: false
-taildrop:
-  enabled: true
-auto_update:
-  enabled: false
-EOF
-
-  if [[ -f "$HEADSCALE_CONFIG" && ! -L "$HEADSCALE_CONFIG" ]]; then
-    backup="${HEADSCALE_CONFIG}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$HEADSCALE_CONFIG" "$backup"
-  elif [[ -e "$HEADSCALE_CONFIG" || -L "$HEADSCALE_CONFIG" ]]; then
-    rm -f -- "$temp"
-    echo "${danger}Refusing to replace a non-regular Headscale config.${reset}" >&2
-    return 1
-  fi
-
-  if systemctl is-active --quiet "$HEADSCALE_SERVICE" 2>/dev/null; then
-    was_active=1
-    if ! systemctl stop "$HEADSCALE_SERVICE"; then
-      rm -f -- "$temp"
-      echo "${danger}Could not stop Headscale for a safe config test.${reset}" >&2
-      return 1
-    fi
-  fi
-
-  if ! headscale_configtest "$temp"; then
-    rm -f -- "$temp"
-    [[ "$was_active" -eq 0 ]] || systemctl start "$HEADSCALE_SERVICE" || true
-    echo "${danger}Headscale rejected the generated config; the active file was not changed.${reset}" >&2
-    return 1
-  fi
-
-  if ! publish_staged_file "$temp" "$HEADSCALE_CONFIG" root "$APP_GROUP" 0660; then
-    rm -f -- "$temp"
-    [[ "$was_active" -eq 0 ]] || systemctl start "$HEADSCALE_SERVICE" || true
-    echo "${danger}Could not atomically publish the Headscale config.${reset}" >&2
-    return 1
-  fi
-
-  if [[ "$was_active" -eq 1 ]] && ! systemctl start "$HEADSCALE_SERVICE"; then
-    if [[ -n "$backup" ]]; then
-      restore_temp="$(mktemp "${HEADSCALE_CONFIG}.restore.XXXXXX")"
-      cp -a "$backup" "$restore_temp"
-      publish_staged_file "$restore_temp" "$HEADSCALE_CONFIG" root "$APP_GROUP" 0660
-    else
-      rm -f -- "$HEADSCALE_CONFIG"
-    fi
-    systemctl start "$HEADSCALE_SERVICE" || true
-    echo "${danger}Headscale failed with the new config; the previous file was restored.${reset}" >&2
-    return 1
-  fi
-  echo "${green}Headscale config written: ${HEADSCALE_CONFIG}${reset}"
-}
-
-# Serve Headscale through Nginx with WebSocket upgrade forwarding. Tailscale
-# clients use a custom POST-based upgrade, so this site intentionally keeps the
-# proxy rules explicit instead of sharing the simpler panel reverse proxy block.
-write_headscale_nginx_config() {
-  local domain="$1"
-  local backup="" link_created=0
-
-  need_root
-  valid_domain "$domain" || { echo "${danger}Invalid Headscale domain: $domain${reset}" >&2; return 1; }
-  install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_SITE")"
-  if [[ -f "$HEADSCALE_NGINX_SITE" ]]; then
-    backup="${HEADSCALE_NGINX_SITE}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$HEADSCALE_NGINX_SITE" "$backup"
-  fi
-  cat >"$HEADSCALE_NGINX_SITE" <<EOF
-map \$http_upgrade \$headscale_connection_upgrade {
-    default keep-alive;
-    '' close;
-}
-
-upstream infiproxy_headscale {
-    server ${HEADSCALE_LISTEN_ADDR} max_fails=1 fail_timeout=5s;
-    keepalive 2;
-}
-
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${domain};
-
-    location = /generate_204 {
-        return 204;
-    }
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${domain};
-
-    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_session_tickets off;
-    server_tokens off;
-
-    add_header X-Frame-Options DENY always;
-    add_header X-Content-Type-Options nosniff always;
-    add_header Referrer-Policy no-referrer always;
-    add_header Strict-Transport-Security "max-age=31536000" always;
-
-    location / {
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection \$headscale_connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header True-Client-IP \$remote_addr;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_buffering off;
-        proxy_pass http://infiproxy_headscale;
-    }
-}
-EOF
-  install -d -m 0755 "$(dirname "$HEADSCALE_NGINX_ENABLED")"
-  if [[ ! -e "$HEADSCALE_NGINX_ENABLED" ]]; then
-    ln -s "$HEADSCALE_NGINX_SITE" "$HEADSCALE_NGINX_ENABLED"
-    link_created=1
-  fi
-  if ! run_cmd nginx -t; then
-    if [[ -n "$backup" ]]; then
-      cp -a "$backup" "$HEADSCALE_NGINX_SITE"
-    else
-      rm -f "$HEADSCALE_NGINX_SITE"
-    fi
-    [[ "$link_created" -eq 0 ]] || rm -f "$HEADSCALE_NGINX_ENABLED"
-    echo "${danger}Nginx rejected the Headscale site; the previous file was restored.${reset}" >&2
-    return 1
-  fi
-  run_cmd systemctl reload nginx.service || return 1
-}
-
-# Full Headscale hub flow: DNS-only Cloudflare record, DNS-01 certificate,
-# reverse proxy, verified binary install, config write and service start.
-guided_headscale_setup() {
-  local zone domain magic_domain email ip token stored_token install_answer proxied=false
-
-  prompt_value domain "Headscale setup" "Public Headscale hostname (hs.example.com)" || return
-  prompt_value magic_domain "Headscale setup" "MagicDNS base domain" "tailnet.${domain}" || return
-  prompt_value zone "Headscale setup" "Cloudflare zone (example.com)" || return
-  prompt_value email "Headscale setup" "Let's Encrypt email" || return
-  prompt_value ip "Headscale setup" "Public IPv4 (blank: detect automatically)" || return
-  if [[ -z "$ip" ]]; then
-    ip="$(public_ip || true)"
-  fi
-  stored_token="$(cloudflare_token_from_file)"
-  prompt_value token "Headscale setup" "Cloudflare API token (blank: use stored token)" "" 1 || return
-  token="${token:-$stored_token}"
-
-  echo "${muted}Headscale must not be proxied through Cloudflare; DNS-only A record will be used.${reset}"
-  install_https_deps || return
-  cloudflare_write_a_record "$token" "$zone" "$domain" "$ip" "$proxied" || return
-  save_cloudflare_credentials "$token" || return
-  issue_cloudflare_certificate "$domain" "$email" || return
-  write_headscale_nginx_config "$domain" || return
-
-  if have_cmd headscale; then
-    if confirm_yes "Headscale binary already exists. Reinstall/update from verified release?" "N"; then
-      install_answer=1
-    else
-      install_answer=0
-    fi
-  else
-    install_answer=1
-  fi
-  if [[ "$install_answer" -eq 1 ]]; then
-    install_headscale_release || return
-  fi
-
-  write_headscale_config "https://${domain}" "$magic_domain" || return
-  run_cmd systemctl enable --now "$HEADSCALE_SERVICE" || true
-  run_cmd systemctl --no-pager --full status "$HEADSCALE_SERVICE" || true
-  echo "${green}${bold}Headscale URL: https://${domain}${reset}"
-  echo "Client command:"
-  echo "  tailscale up --login-server https://${domain} --authkey <key>"
-}
-
-headscale_create_preauth_key() {
-  local user user_id expiration key created
-
-  require_cmd headscale || return 1
-  prompt_value user "Headscale enrollment" "Headscale user ID or login" "admin" || return
-  valid_headscale_user "$user" || { echo "${danger}Invalid Headscale user: $user${reset}" >&2; return 1; }
-  prompt_value expiration "Headscale enrollment" "Key expiration" "24h" || return
-  if created="$(headscale_cmd users create "$user" --output json 2>/dev/null)"; then
-    user_id="$("$MODULE_MANIFEST_HELPER" headscale-user-id <<<"$created")" || return 1
-  else
-    headscale_cmd users list || true
-    prompt_value user_id "Headscale enrollment" "Existing numeric user ID" || return
-  fi
-  [[ "$user_id" =~ ^[1-9][0-9]*$ ]] || { echo "${danger}Invalid Headscale user ID.${reset}" >&2; return 1; }
-  key="$(headscale_cmd preauthkeys create --user "$user_id" --expiration "$expiration")"
-  echo
-  echo "${green}${bold}Pre-auth key:${reset}"
-  echo "$key"
-  echo
-  echo "Client command:"
-  echo "tailscale up --login-server <HEADSCALE_URL> --authkey ${key}"
-}
-
-headscale_menu() {
-  need_root
-  choice="$(tui_menu "Headscale mesh hub" "Coordination server configuration" \
-    1 "Guided Headscale hub setup" \
-    2 "Install/update verified release" \
-    3 "Write Headscale config" \
-    4 "Create user and pre-auth key" \
-    5 "List Headscale users" \
-    6 "Validate and restart Headscale" \
-    7 "Headscale logs" \
-    0 "Back")" || return
-  case "$choice" in
-    1) guided_headscale_setup || true ;;
-    2) install_headscale_release || true ;;
-    3)
-      read -r -p "Headscale URL (https://hs.example.com): " url
-      read -r -p "MagicDNS base domain (tailnet.example.com): " base_domain
-      write_headscale_config "$url" "$base_domain" || true
-      ;;
-    4) headscale_create_preauth_key || true ;;
-    5) run_cmd headscale -c "$HEADSCALE_CONFIG" users list || true ;;
-    6)
-      if headscale_cmd configtest; then
-        run_cmd systemctl restart "$HEADSCALE_SERVICE" || true
-      else
-        echo "${danger}Headscale config validation failed; service was not restarted.${reset}" >&2
-      fi
-      ;;
-    7) run_cmd journalctl -u "$HEADSCALE_SERVICE" -n 120 --no-pager || true ;;
-    0) return ;;
-    *) invalid_choice; return ;;
-  esac
-  pause
-}
-
 install_https_deps() {
   need_root
   header
@@ -1450,12 +1038,12 @@ guided_deployment() {
   need_root
   if tui_available; then
     whiptail --title "Infiproxy guided deployment" --msgbox \
-      "One installation cycle will:\n\n1. Install or repair the panel\n2. Configure optional HTTPS\n3. Install verified runtime modules\n4. Configure optional MTProto\n5. Configure optional Headscale\n6. Verify final service state" \
+      "One installation cycle will:\n\n1. Install or repair the panel\n2. Configure optional HTTPS\n3. Install verified runtime modules\n4. Configure optional MTProto\n5. Verify final service state" \
       18 72
   else
     header
     echo "${bold}Guided deployment cycle${reset}"
-    echo "Panel, HTTPS, verified modules, MTProto, Headscale and final checks."
+    echo "Panel, HTTPS, verified modules, MTProto and final checks."
     echo
   fi
 
@@ -1504,13 +1092,6 @@ guided_deployment() {
     fi
     guided_mtproto_setup || {
       echo "${danger}MTProto setup did not complete. You can rerun Telegram MTProto setup later.${reset}" >&2
-    }
-  fi
-
-  echo
-  if confirm_yes "Configure Headscale mesh hub now?" "N"; then
-    guided_headscale_setup || {
-      echo "${danger}Headscale setup did not complete. You can rerun Headscale hub setup later.${reset}" >&2
     }
   fi
 
@@ -1763,14 +1344,12 @@ advanced_menu() {
     choice="$(tui_menu "Advanced tools" "Installation and specialized modules" \
       1 "Install or repair panel" \
       2 "Telegram MTProto configuration" \
-      3 "Headscale hub configuration" \
-      4 "Manual verified archive import" \
+      3 "Manual verified archive import" \
       0 "Back")" || return
     case "$choice" in
       1) install_or_repair ;;
       2) mtproto_setup_menu ;;
-      3) headscale_menu ;;
-      4) core_helper ;;
+      3) core_helper ;;
       0) return ;;
       *) invalid_choice ;;
     esac

@@ -22,7 +22,6 @@ CORE_ROOT="${INFIPROXY_CORE_ROOT:-/opt/infiproxy/cores}"
 MODULE_ROOT="${INFIPROXY_MODULE_ROOT:-/opt/infiproxy/modules}"
 CORE_INSTALLER="${INFIPROXY_CORE_INSTALLER:-/usr/local/sbin/infiproxy-core-install}"
 MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
-HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
 PANEL_STATE="${STATE_DIR}/panel-update-state.env"
 RUN_LOG="${ROOT_STATE_DIR}/module-update.log"
 LOCK_FILE="${INFIPROXY_MODULE_UPDATE_LOCK_FILE:-/run/lock/infiproxy-module-update.lock}"
@@ -784,9 +783,6 @@ run_automatic() {
 
 run_due() {
   local failed=0
-  if [[ -x "$HEADSCALE_CONTROL_HELPER" ]]; then
-    "$HEADSCALE_CONTROL_HELPER" --process || failed=1
-  fi
   register_requested || failed=1
   remove_requested || failed=1
   run_requested || failed=1

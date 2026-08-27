@@ -530,9 +530,9 @@ mod tests {
     #[test]
     fn bundled_registry_is_dynamic_and_valid() {
         let specs = registry().expect("bundled manifests load");
-        assert!(specs.len() >= 6);
+        assert!(specs.len() >= 5);
         assert!(specs.iter().any(|spec| spec.id == "xray"));
-        assert!(specs.iter().any(|spec| spec.id == "headscale"));
+        assert!(!specs.iter().any(|spec| spec.id == "headscale"));
     }
 
     #[test]
