@@ -17,7 +17,9 @@ use std::{fmt, str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
 use crate::{
+    adapter::{valid_adapter_id, CoreRegistry, ProtocolRegistry},
     desired::DesiredState,
+    inventory::{adapter_kind, PersistedAdapterState},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
     rules::{
         default_routing_rule_set, default_routing_rule_sets, is_valid_routing_target,
@@ -130,6 +132,19 @@ pub struct ReconcileStateRecord {
     pub affected_resources_json: String,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Opaque durable state retained even while its adapter package is absent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdapterStateRecord {
+    pub adapter_id: String,
+    pub adapter_kind: String,
+    pub resource_id: String,
+    pub schema_version: i64,
+    pub config_json: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -278,6 +293,21 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ReconcileStateRecord {
             affected_resources_json: row.try_get("affected_resources_json")?,
             started_at: row.try_get("started_at")?,
             completed_at: row.try_get("completed_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for AdapterStateRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            adapter_id: row.try_get("adapter_id")?,
+            adapter_kind: row.try_get("adapter_kind")?,
+            resource_id: row.try_get("resource_id")?,
+            schema_version: row.try_get("schema_version")?,
+            config_json: row.try_get("config_json")?,
+            enabled: row.try_get("enabled")?,
+            created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
     }
@@ -521,6 +551,57 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    run_versioned_migrations(pool).await?;
+
+    Ok(())
+}
+
+const ADAPTER_STATE_MIGRATION: i64 = 1;
+
+async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query(
+        r"
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY CHECK(version > 0),
+            name TEXT NOT NULL UNIQUE,
+            applied_at TEXT NOT NULL
+        )
+        ",
+    )
+    .execute(&mut *transaction)
+    .await?;
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(ADAPTER_STATE_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        sqlx::query(
+            r"
+            CREATE TABLE adapter_state (
+                adapter_id TEXT NOT NULL,
+                adapter_kind TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                schema_version INTEGER NOT NULL CHECK(schema_version > 0),
+                config_json TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(adapter_kind, adapter_id, resource_id)
+            )
+            ",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(ADAPTER_STATE_MIGRATION)
+            .bind("add opaque durable adapter state")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -1157,6 +1238,149 @@ pub async fn list_settings(pool: &SqlitePool) -> Result<Vec<SettingRecord>> {
     Ok(settings)
 }
 
+fn valid_adapter_namespace(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn valid_adapter_resource_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Inserts or updates opaque adapter-owned state without interpreting payload fields.
+pub async fn upsert_adapter_state(pool: &SqlitePool, state: &PersistedAdapterState) -> Result<()> {
+    if !valid_adapter_id(&state.adapter_id)
+        || !valid_adapter_namespace(&state.adapter_kind)
+        || !valid_adapter_resource_id(&state.resource_id)
+        || state.schema_version == 0
+    {
+        bail!("invalid durable adapter state identity");
+    }
+    let config_json = serde_json::to_string(&state.config)?;
+    let now = Utc::now();
+    sqlx::query(
+        r"
+        INSERT INTO adapter_state (
+            adapter_id, adapter_kind, resource_id, schema_version, config_json,
+            enabled, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(adapter_kind, adapter_id, resource_id) DO UPDATE SET
+            schema_version = excluded.schema_version,
+            config_json = excluded.config_json,
+            enabled = excluded.enabled,
+            updated_at = excluded.updated_at
+        ",
+    )
+    .bind(&state.adapter_id)
+    .bind(&state.adapter_kind)
+    .bind(&state.resource_id)
+    .bind(i64::from(state.schema_version))
+    .bind(config_json)
+    .bind(state.enabled)
+    .bind(now)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Returns every adapter row, including unavailable and unknown adapter kinds.
+pub async fn list_adapter_state_records(pool: &SqlitePool) -> Result<Vec<AdapterStateRecord>> {
+    Ok(sqlx::query_as::<_, AdapterStateRecord>(
+        r"
+        SELECT adapter_id, adapter_kind, resource_id, schema_version,
+               config_json, enabled, created_at, updated_at
+        FROM adapter_state
+        ORDER BY adapter_kind, adapter_id, resource_id
+        ",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Decodes only the generic envelope; adapter configuration remains opaque JSON.
+pub fn decode_adapter_state(record: &AdapterStateRecord) -> Result<PersistedAdapterState> {
+    Ok(PersistedAdapterState {
+        adapter_id: record.adapter_id.clone(),
+        adapter_kind: record.adapter_kind.clone(),
+        resource_id: record.resource_id.clone(),
+        schema_version: u32::try_from(record.schema_version)
+            .map_err(|_| anyhow::anyhow!("invalid adapter state schema version"))?,
+        config: serde_json::from_str(&record.config_json)?,
+        enabled: record.enabled,
+    })
+}
+
+pub async fn list_adapter_states(pool: &SqlitePool) -> Result<Vec<PersistedAdapterState>> {
+    list_adapter_state_records(pool)
+        .await?
+        .iter()
+        .map(decode_adapter_state)
+        .collect()
+}
+
+/// Reattaches state for adapters currently present. Unknown/future rows remain untouched.
+pub async fn migrate_available_adapter_states(
+    pool: &SqlitePool,
+    protocols: &ProtocolRegistry,
+    cores: &CoreRegistry,
+) -> Result<Vec<String>> {
+    let records = list_adapter_state_records(pool).await?;
+    let mut migrated = Vec::new();
+    let mut transaction = pool.begin().await?;
+    for record in records {
+        let Ok(from_version) = u32::try_from(record.schema_version) else {
+            continue;
+        };
+        let Ok(config) = serde_json::from_str::<serde_json::Value>(&record.config_json) else {
+            continue;
+        };
+        let migration = match record.adapter_kind.as_str() {
+            adapter_kind::PROTOCOL => protocols
+                .get(&record.adapter_id)
+                .and_then(|adapter| adapter.migrate_state(from_version, config).ok()),
+            adapter_kind::CORE | adapter_kind::INFRASTRUCTURE => cores
+                .get(&record.adapter_id)
+                .and_then(|adapter| adapter.migrate_state(from_version, config).ok()),
+            _ => None,
+        };
+        let Some((schema_version, config)) = migration else {
+            continue;
+        };
+        let config_json = serde_json::to_string(&config)?;
+        if schema_version != from_version || config_json != record.config_json {
+            sqlx::query(
+                r"
+                UPDATE adapter_state
+                SET schema_version = ?, config_json = ?, updated_at = ?
+                WHERE adapter_kind = ? AND adapter_id = ? AND resource_id = ?
+                ",
+            )
+            .bind(i64::from(schema_version))
+            .bind(config_json)
+            .bind(Utc::now())
+            .bind(&record.adapter_kind)
+            .bind(&record.adapter_id)
+            .bind(&record.resource_id)
+            .execute(&mut *transaction)
+            .await?;
+            migrated.push(format!(
+                "{}:{}:{}",
+                record.adapter_kind, record.adapter_id, record.resource_id
+            ));
+        }
+    }
+    transaction.commit().await?;
+    Ok(migrated)
+}
+
 pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result<()> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
@@ -1791,7 +2015,94 @@ pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
+    use crate::adapter::{
+        ClientRenderContext, ConfigField, ProtocolAdapter, ProtocolAdapterManifest, ServerFragment,
+        ServerRenderContext, ADAPTER_API_VERSION,
+    };
+    use std::{
+        collections::BTreeSet,
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    struct StateMigrationAdapter {
+        manifest: ProtocolAdapterManifest,
+    }
+
+    impl StateMigrationAdapter {
+        fn new() -> Self {
+            Self {
+                manifest: ProtocolAdapterManifest {
+                    api_version: ADAPTER_API_VERSION,
+                    id: "returning-adapter".to_string(),
+                    display_name: "Returning adapter".to_string(),
+                    schema_version: 1,
+                    required_core_capabilities: BTreeSet::from(["test-capability".to_string()]),
+                    user_participates: false,
+                },
+            }
+        }
+    }
+
+    impl ProtocolAdapter for StateMigrationAdapter {
+        fn manifest(&self) -> &ProtocolAdapterManifest {
+            &self.manifest
+        }
+
+        fn fields(&self) -> &[ConfigField] {
+            &[]
+        }
+
+        fn validate_config(&self, _schema_version: u32, _config: &serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn migrate_config(
+            &self,
+            from_version: u32,
+            config: serde_json::Value,
+        ) -> Result<(u32, serde_json::Value)> {
+            Ok((from_version, config))
+        }
+
+        fn state_schema_version(&self) -> u32 {
+            2
+        }
+
+        fn migrate_state(
+            &self,
+            from_version: u32,
+            mut config: serde_json::Value,
+        ) -> Result<(u32, serde_json::Value)> {
+            if from_version > self.state_schema_version() {
+                bail!("adapter state schema is newer than this adapter");
+            }
+            config["migrated"] = serde_json::json!(true);
+            Ok((self.state_schema_version(), config))
+        }
+
+        fn client_secret_references(
+            &self,
+            _config: &serde_json::Value,
+        ) -> Result<Vec<crate::adapter::SecretRef>> {
+            Ok(Vec::new())
+        }
+
+        fn server_secret_references(
+            &self,
+            _config: &serde_json::Value,
+        ) -> Result<Vec<crate::adapter::SecretRef>> {
+            Ok(Vec::new())
+        }
+
+        fn render_client(&self, _context: &ClientRenderContext<'_>) -> Result<serde_json::Value> {
+            bail!("not used by storage migration tests")
+        }
+
+        fn render_server(&self, _context: &ServerRenderContext<'_>) -> Result<ServerFragment> {
+            bail!("not used by storage migration tests")
+        }
+    }
 
     async fn test_pool() -> Result<(SqlitePool, PathBuf)> {
         let path =
@@ -1810,6 +2121,99 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+    }
+
+    #[tokio::test]
+    async fn adapter_state_migration_is_idempotent() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+
+        init_db(&pool).await?;
+        let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(migrations, 1);
+
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(integrity, "ok");
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unavailable_adapter_state_survives_restart_unchanged() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let state = PersistedAdapterState {
+            adapter_id: "detached-adapter".to_string(),
+            adapter_kind: adapter_kind::PROTOCOL.to_string(),
+            resource_id: "primary".to_string(),
+            schema_version: 7,
+            config: serde_json::json!({
+                "opaque": {"future": [1, 2, 3]},
+                "unknown_secret_reference": "preserve-only"
+            }),
+            enabled: false,
+        };
+        upsert_adapter_state(&pool, &state).await?;
+        let before = list_adapter_state_records(&pool).await?;
+
+        init_db(&pool).await?;
+        let empty_protocols = ProtocolRegistry::default();
+        let empty_cores = CoreRegistry::default();
+        assert!(
+            migrate_available_adapter_states(&pool, &empty_protocols, &empty_cores)
+                .await?
+                .is_empty()
+        );
+        let after = list_adapter_state_records(&pool).await?;
+
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].adapter_id, after[0].adapter_id);
+        assert_eq!(before[0].schema_version, after[0].schema_version);
+        assert_eq!(before[0].config_json, after[0].config_json);
+        assert_eq!(before[0].enabled, after[0].enabled);
+        assert_eq!(before[0].updated_at, after[0].updated_at);
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn returning_adapter_migrates_preserved_state_without_losing_unknown_fields() -> Result<()>
+    {
+        let (pool, path) = test_pool().await?;
+        upsert_adapter_state(
+            &pool,
+            &PersistedAdapterState {
+                adapter_id: "returning-adapter".to_string(),
+                adapter_kind: adapter_kind::PROTOCOL.to_string(),
+                resource_id: "primary".to_string(),
+                schema_version: 1,
+                config: serde_json::json!({"known": true, "future": {"keep": 42}}),
+                enabled: true,
+            },
+        )
+        .await?;
+        let mut protocols = ProtocolRegistry::default();
+        protocols.register(Arc::new(StateMigrationAdapter::new()))?;
+
+        let migrated =
+            migrate_available_adapter_states(&pool, &protocols, &CoreRegistry::default()).await?;
+        assert_eq!(migrated, vec!["protocol:returning-adapter:primary"]);
+        let state = list_adapter_states(&pool).await?.remove(0);
+        assert_eq!(state.schema_version, 2);
+        assert_eq!(state.config["migrated"], true);
+        assert_eq!(state.config["future"]["keep"], 42);
+        assert!(
+            migrate_available_adapter_states(&pool, &protocols, &CoreRegistry::default(),)
+                .await?
+                .is_empty()
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
     }
 
     #[tokio::test]

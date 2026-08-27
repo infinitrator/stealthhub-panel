@@ -125,10 +125,12 @@ pub struct PersistedAdapterState {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeInventoryFact {
     pub id: String,
+    pub adapter_kind: String,
     pub display_name: String,
     pub service: Option<String>,
     pub capabilities: BTreeSet<String>,
     pub adapter_present: bool,
+    pub state_schema_version: u32,
     pub probe: CoreRuntimeProbe,
 }
 
@@ -260,31 +262,52 @@ fn build_protocol_adapters(
 }
 
 fn build_non_protocol_adapters(facts: &InventoryFacts<'_>) -> Vec<AdapterInventoryEntry> {
-    let core = facts
-        .core_manifests
-        .iter()
-        .map(|manifest| AdapterInventoryEntry {
-            id: manifest.id.clone(),
-            kind: adapter_kind::CORE.to_string(),
-            display_name: manifest.display_name.clone(),
-            state: AdapterInventoryState::Available,
-            present: true,
-            configured: facts
+    let available = facts.runtime_facts.iter().map(|runtime| {
+        let persisted = facts.persisted_adapter_state.iter().filter(|state| {
+            state.adapter_kind == runtime.adapter_kind && state.adapter_id == runtime.id
+        });
+        let configured = persisted.clone().next().is_some()
+            || facts
                 .profiles
                 .iter()
-                .any(|profile| profile.preferred_core_id.as_deref() == Some(&manifest.id))
-                || facts
-                    .infrastructure
-                    .iter()
-                    .any(|resource| resource.adapter_id == manifest.id),
-            schema_version: Some(1),
-            capabilities: manifest.capabilities.clone(),
-            detail: "Runtime adapter available".to_string(),
-        });
+                .any(|profile| profile.preferred_core_id.as_deref() == Some(&runtime.id))
+            || facts
+                .infrastructure
+                .iter()
+                .any(|resource| resource.adapter_id == runtime.id);
+        let future_schema = persisted
+            .clone()
+            .any(|state| state.schema_version > runtime.state_schema_version);
+        let state = if future_schema {
+            AdapterInventoryState::UnsupportedSchema
+        } else if runtime.probe.installed == Some(true) {
+            AdapterInventoryState::Available
+        } else {
+            AdapterInventoryState::AdapterOnly
+        };
+        AdapterInventoryEntry {
+            id: runtime.id.clone(),
+            kind: runtime.adapter_kind.clone(),
+            display_name: runtime.display_name.clone(),
+            state,
+            present: runtime.adapter_present,
+            configured,
+            schema_version: Some(runtime.state_schema_version),
+            capabilities: runtime.capabilities.clone(),
+            detail: match state {
+                AdapterInventoryState::UnsupportedSchema => {
+                    "Persisted schema is newer than this adapter"
+                }
+                AdapterInventoryState::AdapterOnly => "Adapter available; runtime is not installed",
+                _ => "Runtime adapter available",
+            }
+            .to_string(),
+        }
+    });
     let known = facts
-        .core_manifests
+        .runtime_facts
         .iter()
-        .map(|manifest| (adapter_kind::CORE, manifest.id.as_str()))
+        .map(|runtime| (runtime.adapter_kind.as_str(), runtime.id.as_str()))
         .chain(
             facts
                 .protocol_manifests
@@ -307,7 +330,7 @@ fn build_non_protocol_adapters(facts: &InventoryFacts<'_>) -> Vec<AdapterInvento
             capabilities: BTreeSet::new(),
             detail: "Configuration preserved; adapter currently unavailable".to_string(),
         });
-    core.chain(historical).collect()
+    available.chain(historical).collect()
 }
 
 fn build_runtimes(
@@ -566,10 +589,12 @@ mod tests {
     fn runtime(installed: bool, active: bool, healthy: bool) -> RuntimeInventoryFact {
         RuntimeInventoryFact {
             id: "core-a".to_string(),
+            adapter_kind: adapter_kind::CORE.to_string(),
             display_name: "Core A".to_string(),
             service: Some("core-a.service".to_string()),
             capabilities: BTreeSet::from(["capability-a".to_string()]),
             adapter_present: true,
+            state_schema_version: 1,
             probe: CoreRuntimeProbe {
                 installed: Some(installed),
                 active: Some(active),

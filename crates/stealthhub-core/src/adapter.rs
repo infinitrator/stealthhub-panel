@@ -206,6 +206,17 @@ pub trait ProtocolAdapter: Send + Sync {
     fn fields(&self) -> &[ConfigField];
     fn validate_config(&self, schema_version: u32, config: &Value) -> Result<()>;
     fn migrate_config(&self, from_version: u32, config: Value) -> Result<(u32, Value)>;
+    /// Current schema for optional adapter-package state outside profile rows.
+    fn state_schema_version(&self) -> u32 {
+        1
+    }
+    /// Migrates opaque package state after a previously absent adapter returns.
+    fn migrate_state(&self, from_version: u32, config: Value) -> Result<(u32, Value)> {
+        if from_version > self.state_schema_version() {
+            bail!("adapter state schema is newer than this adapter");
+        }
+        Ok((self.state_schema_version(), config))
+    }
     fn client_secret_references(&self, config: &Value) -> Result<Vec<SecretRef>>;
     fn server_secret_references(&self, config: &Value) -> Result<Vec<SecretRef>>;
     /// Returns the subset of server references that must only be resolved by
@@ -251,10 +262,29 @@ pub struct CoreRuntimeProbe {
     pub detail: Option<String>,
 }
 
+/// Read-only registry observation safe to pass into inventory construction.
+#[derive(Debug, Clone)]
+pub struct CoreAdapterObservation {
+    pub manifest: CoreAdapterManifest,
+    pub state_schema_version: u32,
+    pub probe: CoreRuntimeProbe,
+}
+
 /// Privileged runtime behavior used by the generic transaction engine.
 pub trait CoreAdapter: Send + Sync {
     fn manifest(&self) -> &CoreAdapterManifest;
     fn installed(&self) -> Result<bool>;
+    /// Current schema for optional adapter-owned durable settings.
+    fn state_schema_version(&self) -> u32 {
+        1
+    }
+    /// Migrates opaque settings when this stable adapter ID becomes available.
+    fn migrate_state(&self, from_version: u32, config: Value) -> Result<(u32, Value)> {
+        if from_version > self.state_schema_version() {
+            bail!("adapter state schema is newer than this adapter");
+        }
+        Ok((self.state_schema_version(), config))
+    }
     /// Observes runtime state without changing files, services, or desired state.
     fn probe(&self) -> CoreRuntimeProbe {
         match self.installed() {
@@ -397,6 +427,19 @@ impl CoreRegistry {
         self.adapters
             .values()
             .map(|adapter| adapter.manifest().clone())
+            .collect()
+    }
+
+    /// Probes every registered runtime independently in stable ID order.
+    #[must_use]
+    pub fn observations(&self) -> Vec<CoreAdapterObservation> {
+        self.adapters
+            .values()
+            .map(|adapter| CoreAdapterObservation {
+                manifest: adapter.manifest().clone(),
+                state_schema_version: adapter.state_schema_version(),
+                probe: adapter.probe(),
+            })
             .collect()
     }
 }
