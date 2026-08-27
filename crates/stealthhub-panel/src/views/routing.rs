@@ -3,9 +3,23 @@
 use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
-use stealthhub_core::rules::{RoutingRuleSet, ROUTING_TARGETS};
+use stealthhub_core::{policy::ClientPolicy, rules::RoutingRuleSet};
 
-pub(crate) fn render(auth: &AuthenticatedAdmin, rule_sets: &[RoutingRuleSet]) -> Response {
+pub(crate) fn render(
+    auth: &AuthenticatedAdmin,
+    rule_sets: &[RoutingRuleSet],
+    policy: &ClientPolicy,
+) -> Response {
+    let targets = ["DIRECT".to_string(), "REJECT".to_string()]
+        .into_iter()
+        .chain(
+            policy
+                .pools
+                .iter()
+                .filter(|pool| pool.enabled)
+                .map(|pool| pool.id.clone()),
+        )
+        .collect::<Vec<_>>();
     Html(
             layout(
                 "Routing",
@@ -29,6 +43,56 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, rule_sets: &[RoutingRuleSet]) ->
                         div class="metric" {
                             span { "Import" }
                             strong { "RULE-SET" }
+                        }
+                        div class="metric" {
+                            span { "Transport pools" }
+                            strong { (policy.pools.iter().filter(|pool| pool.enabled).count()) }
+                        }
+                    }
+
+                    section {
+                        h2 { "Transport pools" }
+                        div class="table-wrap" {
+                            table {
+                                thead { tr { th { "Pool" } th { "Behavior" } th { "Members" } th { "Probe" } th { "State" } } }
+                                tbody {
+                                    @for pool in &policy.pools {
+                                        tr {
+                                            td { strong { (&pool.id) } }
+                                            td { code { (pool.kind.mihomo_name()) } }
+                                            td { (pool.members.len()) " selectors" }
+                                            td {
+                                                @if let Some(url) = &pool.test_url { code { (url) } }
+                                                @if let Some(interval) = pool.interval_seconds { br; (interval) " s" }
+                                            }
+                                            td {
+                                                span class=(format!("badge {}", if pool.enabled { "ok" } else { "off" })) {
+                                                    @if pool.enabled { "enabled" } @else { "disabled" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    section {
+                        h2 { "Inline policy" }
+                        div class="table-wrap" {
+                            table {
+                                thead { tr { th { "Priority" } th { "Rule" } th { "Target" } th { "State" } } }
+                                tbody {
+                                    @for rule in &policy.rules {
+                                        tr {
+                                            td { (rule.priority) }
+                                            td { code { (&rule.condition) } }
+                                            td { code { (&rule.target) } }
+                                            td { @if rule.enabled { span class="badge ok" { "enabled" } } @else { span class="badge off" { "disabled" } } }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -70,7 +134,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, rule_sets: &[RoutingRuleSet]) ->
                         h2 { "Rule parameters" }
                         div class="config-list" {
                             @for rule_set in rule_sets {
-                                (routing_rule_editor(rule_set, auth))
+                                (routing_rule_editor(rule_set, auth, &targets))
                             }
                         }
                     }
@@ -84,6 +148,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, rule_sets: &[RoutingRuleSet]) ->
 fn routing_rule_editor(
     rule_set: &stealthhub_core::rules::RoutingRuleSet,
     auth: &AuthenticatedAdmin,
+    targets: &[String],
 ) -> Markup {
     html! {
         section class="config-row" {
@@ -111,7 +176,7 @@ fn routing_rule_editor(
                 label {
                     span { "Target group" }
                     select name="target" {
-                        @for target in ROUTING_TARGETS {
+                        @for target in targets {
                             option value=(target) selected[*target == rule_set.target] { (target) }
                         }
                     }

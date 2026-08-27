@@ -11,7 +11,8 @@ use serde_json::json;
 
 use crate::{
     adapter::{ClientRenderContext, MapSecretResolver, ProtocolRegistry},
-    models::{PanelSettings, ProtocolProfile, ProxyRole, SubscriptionUser},
+    models::{PanelSettings, ProtocolProfile, SubscriptionUser},
+    policy::{default_client_policy, ClientPolicy},
     rules::RoutingRuleSet,
 };
 
@@ -30,6 +31,7 @@ pub fn generate_mihomo_yaml(
         profiles,
         secrets,
         routing_rule_sets,
+        &default_client_policy(),
         &registry,
     )
 }
@@ -41,6 +43,7 @@ pub fn generate_mihomo_yaml_with_registry(
     profiles: &[ProtocolProfile],
     secrets: &HashMap<String, String>,
     routing_rule_sets: &[RoutingRuleSet],
+    policy: &ClientPolicy,
     registry: &ProtocolRegistry,
 ) -> Result<String> {
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
@@ -70,17 +73,7 @@ pub fn generate_mihomo_yaml_with_registry(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let proxy_names: Vec<_> = enabled_profiles
-        .iter()
-        .map(|profile| profile.name.as_str())
-        .collect();
-    let auto_safe_names = names_for_roles(
-        &enabled_profiles,
-        &[ProxyRole::AutoSafe, ProxyRole::Compatibility],
-        &proxy_names,
-    );
-    let speed_names = names_for_roles(&enabled_profiles, &[ProxyRole::Speed], &proxy_names);
-    let ru_access_names = names_for_roles(&enabled_profiles, &[ProxyRole::RuAccess], &proxy_names);
+    let resolved_pools = policy.resolved_pools(profiles)?;
     let active_rule_sets = active_routing_rule_sets(routing_rule_sets);
 
     let doc = json!({
@@ -93,86 +86,37 @@ pub fn generate_mihomo_yaml_with_registry(
         "secret": user.subscription_token,
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
-        "proxy-groups": [
-            {
-                "name": "MANUAL",
-                "type": "select",
-                "proxies": manual_group(&proxy_names)
-            },
-            {
-                "name": "AUTO-SAFE",
-                "type": "url-test",
-                "proxies": auto_safe_names,
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 300,
-                "tolerance": 50
-            },
-            {
-                "name": "FAILOVER",
-                "type": "fallback",
-                "proxies": auto_safe_names,
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 120
-            },
-            {
-                "name": "BALANCE",
-                "type": "load-balance",
-                "strategy": "round-robin",
-                "proxies": auto_safe_names,
-                "url": "https://www.gstatic.com/generate_204",
-                "interval": 180
-            },
-            {
-                "name": "SPEED",
-                "type": "select",
-                "proxies": select_group(&speed_names, &auto_safe_names)
-            },
-            {
-                "name": "RU-ACCESS",
-                "type": "select",
-                "proxies": select_group(&ru_access_names, &auto_safe_names)
-            }
-        ],
-        "rules": routing_rules(&active_rule_sets)
+        "proxy-groups": proxy_groups(&resolved_pools),
+        "rules": routing_rules(&active_rule_sets, policy)
     });
 
     Ok(serde_norway::to_string(&doc)?)
 }
 
-fn names_for_roles<'a>(
-    profiles: &[&'a ProtocolProfile],
-    roles: &[ProxyRole],
-    fallback: &[&'a str],
-) -> Vec<&'a str> {
-    let mut names: Vec<_> = profiles
+fn proxy_groups(pools: &[(crate::policy::TransportPool, Vec<String>)]) -> Vec<serde_json::Value> {
+    pools
         .iter()
-        .filter(|profile| roles.contains(&profile.role))
-        .map(|profile| profile.name.as_str())
-        .collect();
-
-    if names.is_empty() {
-        names.extend_from_slice(fallback);
-    }
-
-    names
-}
-
-fn select_group<'a>(preferred: &[&'a str], fallback: &[&'a str]) -> Vec<&'a str> {
-    let mut names = preferred.to_vec();
-    if names.is_empty() {
-        names.extend_from_slice(fallback);
-    }
-    if !names.contains(&"DIRECT") {
-        names.push("DIRECT");
-    }
-    names
-}
-
-fn manual_group<'a>(proxy_names: &'a [&'a str]) -> Vec<&'a str> {
-    let mut names = vec!["AUTO-SAFE", "FAILOVER", "BALANCE", "SPEED", "RU-ACCESS"];
-    names.extend_from_slice(proxy_names);
-    names.push("DIRECT");
-    names
+        .map(|(pool, members)| {
+            let mut group = serde_json::Map::from_iter([
+                ("name".to_string(), json!(pool.id)),
+                ("type".to_string(), json!(pool.kind.mihomo_name())),
+                ("proxies".to_string(), json!(members)),
+            ]);
+            if let Some(url) = &pool.test_url {
+                group.insert("url".to_string(), json!(url));
+            }
+            if let Some(interval) = pool.interval_seconds {
+                group.insert("interval".to_string(), json!(interval));
+            }
+            if let Some(tolerance) = pool.tolerance_ms {
+                group.insert("tolerance".to_string(), json!(tolerance));
+            }
+            if let Some(strategy) = &pool.strategy {
+                group.insert("strategy".to_string(), json!(strategy));
+            }
+            serde_json::Value::Object(group)
+        })
+        .collect()
 }
 
 fn active_routing_rule_sets(rule_sets: &[RoutingRuleSet]) -> Vec<RoutingRuleSet> {
@@ -206,17 +150,23 @@ fn rule_provider_map(
     providers
 }
 
-fn routing_rules(rule_sets: &[RoutingRuleSet]) -> Vec<String> {
+fn routing_rules(rule_sets: &[RoutingRuleSet], policy: &ClientPolicy) -> Vec<String> {
     let mut rules: Vec<_> = rule_sets
         .iter()
         .map(|rule_set| format!("RULE-SET,{},{}", rule_set.slug, rule_set.target))
         .collect();
 
-    rules.push("GEOIP,RU,DIRECT".to_string());
-    rules.push("IP-CIDR,10.0.0.0/8,DIRECT,no-resolve".to_string());
-    rules.push("IP-CIDR,172.16.0.0/12,DIRECT,no-resolve".to_string());
-    rules.push("IP-CIDR,192.168.0.0/16,DIRECT,no-resolve".to_string());
-    rules.push("MATCH,MANUAL".to_string());
+    let mut inline = policy
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .collect::<Vec<_>>();
+    inline.sort_by_key(|rule| rule.priority);
+    rules.extend(
+        inline
+            .into_iter()
+            .map(|rule| format!("{},{}", rule.condition, rule.target)),
+    );
     rules
 }
 
@@ -227,6 +177,7 @@ mod tests {
         ClientRenderContext, ConfigField, ProtocolAdapter, ProtocolAdapterManifest, SecretRef,
         ServerFragment, ServerRenderContext, ADAPTER_API_VERSION,
     };
+    use crate::models::ProxyRole;
     use crate::rules::default_routing_rule_sets;
     use std::{collections::BTreeSet, sync::Arc};
 
@@ -432,6 +383,7 @@ mod tests {
             &[profile],
             &HashMap::new(),
             &[],
+            &default_client_policy(),
             &registry,
         )
         .unwrap();

@@ -56,7 +56,7 @@ use stealthhub_core::{
     adapters::{core_registry, protocol_registry},
     mihomo::generate_mihomo_yaml_with_registry,
     models::{ProtocolProfile, SubscriptionUser},
-    rules::{default_routing_rule_set, is_valid_routing_target, routing_rule_payload_yaml},
+    rules::routing_rule_payload_yaml,
     storage::{
         admin_count, create_admin_session, create_first_admin, create_user, delete_admin_session,
         delete_expired_admin_sessions, delete_secret, delete_user,
@@ -64,12 +64,12 @@ use stealthhub_core::{
         ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
         get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
         is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
-        load_panel_settings, load_routing_rule_sets, migrate_available_adapter_states,
-        migrate_protocol_adapter_configs, open_pool, reset_user_subscription_token,
-        set_user_enabled, touch_admin_session, update_admin_password_and_revoke_sessions,
-        update_protocol_profile, update_routing_rule_set, upsert_secret, upsert_setting,
-        upsert_settings_with_runtime_keys, AdminRecord, NewUser, UpdateProtocolProfile,
-        UpdateRoutingRuleSet, UserRecord,
+        load_client_policy, load_panel_settings, load_routing_rule_sets,
+        migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
+        reset_user_subscription_token, set_user_enabled, touch_admin_session,
+        update_admin_password_and_revoke_sessions, update_protocol_profile,
+        update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
+        AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -432,6 +432,10 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         Ok(value) => value,
         Err(error) => return subscription_internal_error("load routing", error),
     };
+    let client_policy = match load_client_policy(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return subscription_internal_error("load client policy", error),
+    };
 
     let yaml = match generate_mihomo_yaml_with_registry(
         &settings,
@@ -439,6 +443,7 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         &profiles,
         &secrets,
         &routing_rule_sets,
+        &client_policy,
         &state.protocol_registry,
     ) {
         Ok(value) => value,
@@ -1291,8 +1296,22 @@ async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
             );
         }
     };
+    let policy = match load_client_policy(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            return logged_error_with_back(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "load client policy",
+                error,
+                "Routing unavailable",
+                "Client transport policy could not be loaded. Review the server journal.",
+                "/admin",
+                "Back to Dashboard",
+            );
+        }
+    };
 
-    views::routing::render(&auth, &rule_sets)
+    views::routing::render(&auth, &rule_sets, &policy)
 }
 
 async fn update_routing_rule_action(
@@ -1310,17 +1329,6 @@ async fn update_routing_rule_action(
     }
     if !is_owner_admin(&auth) {
         return owner_only_response();
-    }
-    if default_routing_rule_set(form.slug.trim()).is_none()
-        || !is_valid_routing_target(form.target.trim())
-    {
-        return html_error_response_with_back(
-            StatusCode::BAD_REQUEST,
-            "Routing update failed",
-            "The rule-set identifier or routing target is invalid.",
-            "/admin/routing",
-            "Back to Routing",
-        );
     }
     if let Err(error) = routing_rule_payload_yaml(&form.payload) {
         return html_error_response_with_back(
@@ -1341,12 +1349,10 @@ async fn update_routing_rule_action(
 
     match update_routing_rule_set(&state.pool, input).await {
         Ok(()) => Redirect::to("/admin/routing").into_response(),
-        Err(error) => logged_error_with_back(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "update routing rule set",
-            error,
+        Err(error) => html_error_response_with_back(
+            StatusCode::BAD_REQUEST,
             "Routing update failed",
-            "The routing rule set could not be saved. Review the server journal.",
+            error.to_string(),
             "/admin/routing",
             "Back to Routing",
         ),

@@ -28,6 +28,10 @@ const DURABLE_TABLES: &[&str] = &[
     "reconcile_state",
     "adapter_state",
     "schema_migrations",
+    "client_transport_pools",
+    "client_transport_pool_members",
+    "client_routing_rules",
+    "routing_rule_sets",
 ];
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -53,6 +57,7 @@ pub struct CompatibilityReport {
     pub migration_idempotent: bool,
     pub integrity_ok: bool,
     pub foreign_key_violations: u64,
+    pub routing_schema_present: bool,
     pub before: DatabaseSnapshot,
     pub after_first_migration: DatabaseSnapshot,
     pub after_second_migration: DatabaseSnapshot,
@@ -65,6 +70,7 @@ impl CompatibilityReport {
             && self.migration_idempotent
             && self.integrity_ok
             && self.foreign_key_violations == 0
+            && self.routing_schema_present
             && self.after_second_migration.generation_relationship_valid
     }
 }
@@ -94,6 +100,14 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
     let migration_idempotent = after_first_migration == after_second_migration;
     let integrity_ok = after_second_migration.integrity_ok;
     let foreign_key_violations = after_second_migration.foreign_key_violations;
+    let routing_schema_present = [
+        "client_transport_pools",
+        "client_transport_pool_members",
+        "client_routing_rules",
+        "routing_rule_sets",
+    ]
+    .iter()
+    .all(|table| after_second_migration.tables.contains_key(*table));
     Ok(CompatibilityReport {
         source,
         working_copy,
@@ -101,6 +115,7 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
         migration_idempotent,
         integrity_ok,
         foreign_key_violations,
+        routing_schema_present,
         before,
         after_first_migration,
         after_second_migration,

@@ -12,6 +12,7 @@ pub mod inventory;
 pub mod mihomo;
 pub mod models;
 pub mod module_manifest;
+pub mod policy;
 pub mod reconcile;
 pub mod rules;
 pub mod storage;
