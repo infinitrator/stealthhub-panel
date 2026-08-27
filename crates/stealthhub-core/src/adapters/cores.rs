@@ -17,7 +17,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::adapter::{
-    CoreAdapter, CoreAdapterManifest, CorePlan, CoreRegistry, CoreSnapshot, ADAPTER_API_VERSION,
+    CoreAdapter, CoreAdapterManifest, CorePlan, CoreRegistry, CoreSnapshot, UserSyncObservation,
+    ADAPTER_API_VERSION,
 };
 
 const CERTIFICATE_PATH: &str = "/etc/infiproxy-cores/tls/fullchain.pem";
@@ -347,6 +348,28 @@ impl CoreAdapter for ManagedCoreAdapter {
         }
     }
 
+    fn observe_users(&self, plan: &CorePlan) -> Result<UserSyncObservation> {
+        let expected = plan
+            .fragments
+            .iter()
+            .filter_map(|fragment| fragment.expected_user_ids.as_ref())
+            .flatten()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if !plan
+            .fragments
+            .iter()
+            .any(|fragment| fragment.expected_user_ids.is_some())
+        {
+            return Ok(UserSyncObservation::InSync { user_count: 0 });
+        }
+        let config = self
+            .read_current_config()?
+            .context("runtime user observation requires a live config")?;
+        let observed = discover_config_users(self.flavor, &config)?;
+        Ok(UserSyncObservation::compare(&expected, &observed))
+    }
+
     fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()> {
         let config = snapshot.path.join("config");
         if config.is_file() {
@@ -672,6 +695,67 @@ fn discover_config_ports(flavor: Flavor, bytes: &[u8]) -> Result<Vec<(u16, bool)
     Ok(ports)
 }
 
+fn discover_config_users(
+    flavor: Flavor,
+    bytes: &[u8],
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut users = std::collections::BTreeSet::new();
+    match flavor {
+        Flavor::Xray => {
+            let value: Value = serde_json::from_slice(bytes)?;
+            for inbound in value
+                .get("inbounds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for user in inbound
+                    .pointer("/settings/clients")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = user.get("id").and_then(Value::as_str) {
+                        users.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        Flavor::SingBox => {
+            let value: Value = serde_json::from_slice(bytes)?;
+            for inbound in value
+                .get("inbounds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                for user in inbound
+                    .get("users")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(id) = user.get("uuid").and_then(Value::as_str) {
+                        users.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        Flavor::Tuic => {
+            let value: Value = serde_json::from_slice(bytes)?;
+            users.extend(
+                value
+                    .get("users")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|entries| entries.keys().cloned()),
+            );
+        }
+        Flavor::Hysteria => {}
+    }
+    Ok(users)
+}
+
 pub(super) fn registry() -> Result<CoreRegistry> {
     let all = [
         "vless-reality-tcp",
@@ -740,6 +824,27 @@ mod tests {
     fn listener_matching_does_not_confuse_port_suffixes() {
         assert!(listener_line_has_port("tcp LISTEN 0 128 [::]:7443", 7443));
         assert!(!listener_line_has_port("tcp LISTEN 0 128 [::]:17443", 7443));
+    }
+
+    #[test]
+    fn live_user_discovery_is_runtime_specific_and_ignores_shared_credentials() {
+        let xray = br#"{"inbounds":[{"settings":{"clients":[{"id":"user-a"},{"id":"user-b"}]}}]}"#;
+        assert_eq!(
+            discover_config_users(Flavor::Xray, xray).unwrap(),
+            BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
+        );
+
+        let sing_box = br#"{"inbounds":[{"users":[{"name":"shared","password":"secret"},{"name":"alice","uuid":"user-a"}]}]}"#;
+        assert_eq!(
+            discover_config_users(Flavor::SingBox, sing_box).unwrap(),
+            BTreeSet::from(["user-a".to_string()])
+        );
+
+        let tuic = br#"{"users":{"user-a":"secret","user-b":"secret"}}"#;
+        assert_eq!(
+            discover_config_users(Flavor::Tuic, tuic).unwrap(),
+            BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
+        );
     }
 
     #[test]

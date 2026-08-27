@@ -135,7 +135,27 @@ pub struct ProtocolAdapterManifest {
     pub display_name: String,
     pub schema_version: u32,
     pub required_core_capabilities: BTreeSet<String>,
-    pub user_participates: bool,
+    pub user_participation: UserParticipation,
+}
+
+/// How subscription users participate in one protocol runtime.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UserParticipation {
+    /// The protocol has no user authorization material.
+    None,
+    /// Every subscription user receives the same server-side credential.
+    SharedCredential,
+    /// Every enabled subscription user must exist in runtime state by UUID.
+    PerUserUuid,
+}
+
+impl UserParticipation {
+    /// Whether runtime state must contain one identity per enabled user.
+    #[must_use]
+    pub const fn requires_individual_users(self) -> bool {
+        matches!(self, Self::PerUserUuid)
+    }
 }
 
 /// Declarative runtime metadata used for capability selection.
@@ -173,6 +193,8 @@ pub struct ServerFragment {
     pub profile_id: String,
     pub capability: String,
     pub payload: Value,
+    /// Expected non-secret runtime identities, or `None` for shared/no auth.
+    pub expected_user_ids: Option<BTreeSet<String>>,
 }
 
 impl fmt::Debug for ServerFragment {
@@ -181,6 +203,10 @@ impl fmt::Debug for ServerFragment {
             .debug_struct("ServerFragment")
             .field("profile_id", &self.profile_id)
             .field("capability", &self.capability)
+            .field(
+                "expected_user_count",
+                &self.expected_user_ids.as_ref().map(BTreeSet::len),
+            )
             .field("payload", &"[REDACTED]")
             .finish()
     }
@@ -262,6 +288,43 @@ pub struct CoreRuntimeProbe {
     pub detail: Option<String>,
 }
 
+/// Result of comparing desired per-user identities with a live runtime config.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case", tag = "status")]
+pub enum UserSyncObservation {
+    Unsupported,
+    InSync {
+        user_count: usize,
+    },
+    Drift {
+        expected_count: usize,
+        observed_count: usize,
+        missing_count: usize,
+        unexpected_count: usize,
+    },
+}
+
+impl UserSyncObservation {
+    /// Builds a count-only observation without persisting user identifiers.
+    #[must_use]
+    pub fn compare(expected: &BTreeSet<String>, observed: &BTreeSet<String>) -> Self {
+        let missing_count = expected.difference(observed).count();
+        let unexpected_count = observed.difference(expected).count();
+        if missing_count == 0 && unexpected_count == 0 {
+            Self::InSync {
+                user_count: expected.len(),
+            }
+        } else {
+            Self::Drift {
+                expected_count: expected.len(),
+                observed_count: observed.len(),
+                missing_count,
+                unexpected_count,
+            }
+        }
+    }
+}
+
 /// Read-only registry observation safe to pass into inventory construction.
 #[derive(Debug, Clone)]
 pub struct CoreAdapterObservation {
@@ -305,6 +368,10 @@ pub trait CoreAdapter: Send + Sync {
     fn activate(&self, plan: &CorePlan) -> Result<()>;
     fn healthcheck(&self, plan: &CorePlan) -> Result<()>;
     fn verify_listeners(&self, plan: &CorePlan) -> Result<()>;
+    /// Verifies individual user authorization in the installed live config.
+    fn observe_users(&self, _plan: &CorePlan) -> Result<UserSyncObservation> {
+        Ok(UserSyncObservation::Unsupported)
+    }
     fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()>;
 }
 
@@ -514,6 +581,7 @@ mod tests {
             profile_id: "test".to_string(),
             capability: "fake".to_string(),
             payload: serde_json::json!({"password": "canary-secret-value"}),
+            expected_user_ids: None,
         };
         let rendered = format!("{fragment:?}");
         assert!(!rendered.contains("canary"));
@@ -527,5 +595,25 @@ mod tests {
         assert!(!valid_adapter_id("../fake"));
         assert!(SecretRef::parse("runtime.client-key_1").is_ok());
         assert!(SecretRef::parse("../../secret").is_err());
+    }
+
+    #[test]
+    fn user_sync_observation_reports_counts_without_identifiers() {
+        let observation = UserSyncObservation::compare(
+            &BTreeSet::from(["expected-user".to_string()]),
+            &BTreeSet::from(["unexpected-user".to_string()]),
+        );
+        assert_eq!(
+            observation,
+            UserSyncObservation::Drift {
+                expected_count: 1,
+                observed_count: 1,
+                missing_count: 1,
+                unexpected_count: 1,
+            }
+        );
+        let serialized = serde_json::to_string(&observation).unwrap();
+        assert!(!serialized.contains("expected-user"));
+        assert!(!serialized.contains("unexpected-user"));
     }
 }

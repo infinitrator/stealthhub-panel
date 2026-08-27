@@ -322,6 +322,40 @@ impl Reconciler {
                     "listener verification failed",
                 );
             }
+            let has_individual_users = prepared_core
+                .plan
+                .fragments
+                .iter()
+                .any(|fragment| fragment.expected_user_ids.is_some());
+            if has_individual_users {
+                match prepared_core.core.observe_users(&prepared_core.plan) {
+                    Ok(crate::adapter::UserSyncObservation::InSync { .. }) => {}
+                    Ok(crate::adapter::UserSyncObservation::Unsupported) => {
+                        return self.rollback(
+                            desired.generation,
+                            snapshotted,
+                            journal,
+                            "runtime does not support required user observation",
+                        );
+                    }
+                    Ok(crate::adapter::UserSyncObservation::Drift { .. }) => {
+                        return self.rollback(
+                            desired.generation,
+                            snapshotted,
+                            journal,
+                            "runtime user authorization drift detected",
+                        );
+                    }
+                    Err(_) => {
+                        return self.rollback(
+                            desired.generation,
+                            snapshotted,
+                            journal,
+                            "runtime user observation failed",
+                        );
+                    }
+                }
+            }
             if let Some(resource) = journal
                 .resources
                 .iter_mut()
@@ -590,6 +624,7 @@ impl Reconciler {
                     profile_id: resource.resource_id.clone(),
                     capability: resource.adapter_id.clone(),
                     payload: resource.config.clone(),
+                    expected_user_ids: None,
                 });
         }
 
@@ -789,7 +824,7 @@ mod tests {
         adapter::{
             ClientRenderContext, ConfigField, CoreAdapterManifest, MapSecretResolver,
             ProtocolAdapter, ProtocolAdapterManifest, SecretRef, ServerFragment,
-            ADAPTER_API_VERSION,
+            UserSyncObservation, ADAPTER_API_VERSION,
         },
         models::{ProtocolProfile, ProxyRole, SubscriptionUser},
     };
@@ -804,6 +839,7 @@ mod tests {
         Activate,
         Health,
         Listener,
+        UserDrift,
         Rollback,
     }
 
@@ -952,6 +988,27 @@ mod tests {
             Ok(())
         }
 
+        fn observe_users(&self, plan: &CorePlan) -> Result<UserSyncObservation> {
+            let expected_count = plan
+                .fragments
+                .iter()
+                .filter_map(|fragment| fragment.expected_user_ids.as_ref())
+                .flatten()
+                .collect::<BTreeSet<_>>()
+                .len();
+            if self.state.lock().unwrap().failure == Failure::UserDrift {
+                return Ok(UserSyncObservation::Drift {
+                    expected_count,
+                    observed_count: expected_count.saturating_sub(1),
+                    missing_count: usize::from(expected_count > 0),
+                    unexpected_count: 0,
+                });
+            }
+            Ok(UserSyncObservation::InSync {
+                user_count: expected_count,
+            })
+        }
+
         fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.rollbacks += 1;
@@ -980,7 +1037,7 @@ mod tests {
                     display_name: id.to_string(),
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
-                    user_participates: true,
+                    user_participation: crate::adapter::UserParticipation::PerUserUuid,
                 },
                 fields: Vec::new(),
                 secret: None,
@@ -995,7 +1052,7 @@ mod tests {
                     display_name: id.to_string(),
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
-                    user_participates: true,
+                    user_participation: crate::adapter::UserParticipation::PerUserUuid,
                 },
                 fields: Vec::new(),
                 secret: Some(SecretRef::parse(reference).unwrap()),
@@ -1055,6 +1112,9 @@ mod tests {
                     "users": context.users.iter().map(|user| &user.username).collect::<Vec<_>>(),
                     "secret": secret,
                 }),
+                expected_user_ids: Some(
+                    context.users.iter().map(|user| user.uuid.clone()).collect(),
+                ),
             })
         }
     }
@@ -1380,6 +1440,7 @@ mod tests {
             Failure::Activate,
             Failure::Health,
             Failure::Listener,
+            Failure::UserDrift,
         ] {
             let (outcome, core) = failure_outcome(failure);
             assert_eq!(outcome.status, ReconcileStatus::RolledBack);

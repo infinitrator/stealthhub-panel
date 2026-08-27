@@ -642,6 +642,7 @@ mod tests {
                 profile_id: SUBSCRIPTION_ADAPTER_ID.to_string(),
                 capability: SUBSCRIPTION_ADAPTER_ID.to_string(),
                 payload: json!({"subscription_domain": domain}),
+                expected_user_ids: None,
             }],
         }
     }

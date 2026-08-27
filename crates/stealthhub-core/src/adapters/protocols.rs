@@ -9,7 +9,7 @@ use crate::{
     adapter::{
         ClientRenderContext, ConfigField, ConfigFieldKind, ProtocolAdapter,
         ProtocolAdapterManifest, ProtocolRegistry, SecretRef, ServerFragment, ServerRenderContext,
-        ADAPTER_API_VERSION,
+        UserParticipation, ADAPTER_API_VERSION,
     },
     models::{ProtocolProfile, ProxyRole},
 };
@@ -36,7 +36,7 @@ impl JsonProtocolAdapter {
         display_name: &str,
         implementation: Implementation,
         fields: Vec<ConfigField>,
-        user_participates: bool,
+        user_participation: UserParticipation,
     ) -> Self {
         Self {
             manifest: ProtocolAdapterManifest {
@@ -45,7 +45,7 @@ impl JsonProtocolAdapter {
                 display_name: display_name.to_string(),
                 schema_version: 1,
                 required_core_capabilities: BTreeSet::from([id.to_string()]),
-                user_participates,
+                user_participation,
             },
             fields,
             implementation,
@@ -318,7 +318,7 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 Ok((reference.as_str().to_string(), json!(value.expose())))
             })
             .collect::<Result<Map<String, Value>>>()?;
-        let users = if self.manifest.user_participates {
+        let users = if self.manifest.user_participation.requires_individual_users() {
             context
                 .users
                 .iter()
@@ -330,6 +330,11 @@ impl ProtocolAdapter for JsonProtocolAdapter {
         Ok(ServerFragment {
             profile_id: context.profile.name.clone(),
             capability: self.manifest.id.clone(),
+            expected_user_ids: self
+                .manifest
+                .user_participation
+                .requires_individual_users()
+                .then(|| context.users.iter().map(|user| user.uuid.clone()).collect()),
             payload: json!({
                 "server": context.profile.server,
                 "port": context.profile.port,
@@ -391,7 +396,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                     true,
                 ),
             ],
-            true,
+            UserParticipation::PerUserUuid,
         ),
         JsonProtocolAdapter::new(
             "vless-reality-tcp",
@@ -418,7 +423,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                     true,
                 ),
             ],
-            true,
+            UserParticipation::PerUserUuid,
         ),
         JsonProtocolAdapter::new(
             "shadowsocks2022-shadow-tls",
@@ -443,7 +448,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                     true,
                 ),
             ],
-            false,
+            UserParticipation::SharedCredential,
         ),
         JsonProtocolAdapter::new(
             "hysteria2",
@@ -464,7 +469,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                     false,
                 ),
             ],
-            false,
+            UserParticipation::SharedCredential,
         ),
         JsonProtocolAdapter::new(
             "any-tls",
@@ -479,7 +484,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
                 text("sni", "SNI", "TLS certificate hostname."),
             ],
-            false,
+            UserParticipation::SharedCredential,
         ),
         JsonProtocolAdapter::new(
             "tuic",
@@ -494,7 +499,7 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
                 ),
                 text("sni", "SNI", "TLS certificate hostname."),
             ],
-            true,
+            UserParticipation::PerUserUuid,
         ),
     ];
     for adapter in adapters {

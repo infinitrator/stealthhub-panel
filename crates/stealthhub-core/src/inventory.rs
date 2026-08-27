@@ -569,7 +569,7 @@ mod tests {
             display_name: id.to_string(),
             schema_version,
             required_core_capabilities: BTreeSet::from(["capability-a".to_string()]),
-            user_participates: true,
+            user_participation: crate::adapter::UserParticipation::PerUserUuid,
         }
     }
     fn profile(adapter: &str, schema_version: u32, enabled: bool) -> ProtocolProfile {

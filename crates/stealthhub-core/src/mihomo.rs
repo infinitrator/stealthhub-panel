@@ -280,6 +280,7 @@ mod tests {
                 profile_id: context.profile.name.clone(),
                 capability: "external-capability".to_string(),
                 payload: json!({}),
+                expected_user_ids: None,
             })
         }
     }
@@ -408,7 +409,7 @@ mod tests {
                     display_name: "External test".to_string(),
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from(["external-capability".to_string()]),
-                    user_participates: true,
+                    user_participation: crate::adapter::UserParticipation::None,
                 },
             }))
             .unwrap();

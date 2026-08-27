@@ -2063,7 +2063,7 @@ mod tests {
                     display_name: "Returning adapter".to_string(),
                     schema_version: 1,
                     required_core_capabilities: BTreeSet::from(["test-capability".to_string()]),
-                    user_participates: false,
+                    user_participation: crate::adapter::UserParticipation::None,
                 },
             }
         }
