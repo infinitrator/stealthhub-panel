@@ -191,6 +191,7 @@ for path in \
   /etc/infiproxy-modules.available.d \
   /etc/infiproxy-update.conf \
   /etc/nginx/sites-available/infiproxy.conf \
+  /etc/nginx/sites-available/infiproxy-subscription.conf \
   /etc/nginx/sites-available/infiproxy-headscale.conf \
   /etc/systemd/system/infiproxy.service \
   /etc/systemd/system/infiproxy-panel-update.service \

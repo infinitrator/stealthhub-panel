@@ -108,7 +108,38 @@ TUI скрывает ввод, пишет через private temporary file, в�
 не является server-only. Значения, UUID и subscription token имеют redacted
 `Debug` и не входят в journal/error.
 
-## 7. Миграция существующего сервера
+Для legacy SQLite используйте **Adopt a legacy SQLite server-only reference**
+или точный эквивалент:
+
+```bash
+sudo /usr/local/libexec/infiproxy-reconcile \
+  --adopt-server-secret xray.reality.private_key
+```
+
+Helper сначала сверяет adapter-классификацию, затем атомарно создает и читает
+обратно root-only файл, и только после этого удаляет значение из SQLite. Если
+root-копия уже существует, повторный запуск безопасен; несовпадающие копии
+останавливают migration без вывода plaintext.
+
+## 7. Infrastructure ownership
+
+Admin frontend остается installer/TUI-owned в
+`/etc/nginx/sites-available/infiproxy.conf`. Reconciler не изменяет его.
+Subscription/rules adapter владеет только
+`/etc/nginx/sites-available/infiproxy-subscription.conf` и одноименным symlink:
+
+- `/sub/` передается панели без access log;
+- `/rules/` передается панели;
+- `/ready` используется для локально привязанной HTTPS-проверки;
+- любой другой root path получает `404`.
+
+До live mutation adapter проверяет отсутствие duplicate `server_name`, наличие
+и hostname/expiry существующего Let's Encrypt certificate и staged Nginx
+syntax. **Certificate issuance не реализован этим adapter**: сначала выпустите
+certificate через HTTPS/Cloudflare TUI. `node_domain` является отдельным
+DNS-readiness ресурсом и не создает cover-vhost.
+
+## 8. Миграция существующего сервера
 
 Перед обновлением остановите auto-update и сделайте backup по
 [разделу 12](12-BACKUP-RESTORE-UNINSTALL). Миграция schema идемпотентна,
@@ -121,17 +152,16 @@ profiles. До него обязательно:
 
 1. Сравнить существующие `/etc/infiproxy-cores` с ожидаемыми GUI-профилями.
 2. Убедиться, что каждый required runtime module установлен.
-3. Перенести private server credentials в `secrets.d` через root TUI.
+3. Перенести private server credentials через TUI adoption; не копировать их в
+   browser-managed Secrets.
 4. Проверить сертификат subscription hostname и публичное DNS-разрешение node
    hostname; значения `*.infiproxy.local` намеренно не управляют Nginx.
 5. Оставить вторую SSH-сессию и выполнить одно контролируемое изменение.
 6. Дождаться `Applied`, проверить listeners и подключение тестового клиента.
 
-После успешного переноса удалите legacy server-only value из browser-managed
-Secrets, чтобы private key не оставался в SQLite. Сначала убедитесь, что
-одноименный root-файл существует и имеет mode `0600`.
+Adoption сам удаляет legacy SQLite value только после проверки root-копии.
 
-## 8. Crash recovery
+## 9. Crash recovery
 
 Перед live mutation worker сохраняет snapshots и durable journal. Если процесс
 прерван до mutation, операция становится `Failed`. После mutation worker

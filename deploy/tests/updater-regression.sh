@@ -319,7 +319,9 @@ EOF
     export INFIPROXY_MODULE_MANIFEST_DIR="${TMP_DIR}/etc/modules.d"
     export INFIPROXY_MODULE_AVAILABLE_DIR="${TMP_DIR}/etc/modules.available.d"
     export INFIPROXY_NGINX_AVAILABLE="${TMP_DIR}/etc/nginx/infiproxy.conf"
+    export INFIPROXY_NGINX_SUBSCRIPTION_AVAILABLE="${TMP_DIR}/etc/nginx/subscription.conf"
     export INFIPROXY_NGINX_HEADSCALE_AVAILABLE="${TMP_DIR}/etc/nginx/headscale.conf"
+    export INFIPROXY_PANEL_APPLIED_SHA="${TMP_DIR}/panel-root-state/panel-last-applied.sha"
     export INFIPROXY_SRC_DIR="${TMP_DIR}/panel-source"
     export INFIPROXY_PANEL_BINARY="${TMP_DIR}/installed/infiproxy"
     export INFIPROXY_MANIFEST_HELPER_BINARY="${TMP_DIR}/installed/infiproxy-module-manifest"
@@ -346,6 +348,16 @@ EOF
     INFIPROXY_ALLOW_NON_FAST_FORWARD=true \
         is_safe_update_target "$SECOND_COMMIT" "$FIRST_COMMIT" \
         || fail "reviewed non-fast-forward recovery override was ignored"
+    mkdir -p "$(dirname "$APPLIED_SHA_FILE")"
+    printf '%s\n' "$FIRST_COMMIT" >"$APPLIED_SHA_FILE"
+    # Invoked indirectly by publish_verified_update_commit.
+    # shellcheck disable=SC2329
+    wait_panel_ready() { return 1; }
+    if publish_verified_update_commit "$SECOND_COMMIT"; then
+        fail "failed updater readiness unexpectedly published the target commit"
+    fi
+    [[ "$(cat "$APPLIED_SHA_FILE")" == "$FIRST_COMMIT" ]] \
+        || fail "failed updater rollback changed the applied commit marker"
     mkdir -p "$CONFIG_DIR" "$(dirname "$DATABASE_FILE")"
     printf 'settings\n' >"${CONFIG_DIR}/infiproxy.env"
     printf 'users and settings fixture\n' >"$DATABASE_FILE"

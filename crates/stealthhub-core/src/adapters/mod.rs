@@ -19,11 +19,14 @@ pub fn protocol_registry() -> Result<ProtocolRegistry> {
     protocols::registry()
 }
 
-/// Builds the four trusted runtime adapters shipped with this release.
+/// Builds the trusted runtime and infrastructure adapters shipped with this release.
 pub fn core_registry() -> Result<CoreRegistry> {
     let mut registry = cores::registry()?;
     registry.register(std::sync::Arc::new(
-        infrastructure::PublicFrontendAdapter::new(),
+        infrastructure::SubscriptionFrontendAdapter::new(),
+    ))?;
+    registry.register(std::sync::Arc::new(
+        infrastructure::NodeReadinessAdapter::new(),
     ))?;
     Ok(registry)
 }

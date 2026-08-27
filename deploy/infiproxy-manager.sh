@@ -12,6 +12,7 @@ SOURCE_DIR="${INFIPROXY_SRC_DIR:-/opt/infiproxy/source}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 APP_USER="${INFIPROXY_USER:-infiproxy}"
 PRIVILEGED_SECRET_DIR="${INFIPROXY_SECRET_DIR:-/etc/infiproxy/secrets.d}"
+RECONCILE_HELPER="${INFIPROXY_RECONCILE_HELPER:-/usr/local/libexec/infiproxy-reconcile}"
 PANEL_SERVICE="infiproxy.service"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
@@ -254,6 +255,26 @@ delete_privileged_secret() {
   pause
 }
 
+adopt_legacy_privileged_secret() {
+  local reference
+  prompt_value reference "Adopt legacy secret" \
+    "Server-only reference already used by an enabled profile" "" 0 || return
+  valid_secret_reference "$reference" || {
+    echo "${danger}Invalid reference. Use 1-128 letters, digits, dot, underscore or dash.${reset}" >&2
+    pause
+    return
+  }
+  [[ -x "$RECONCILE_HELPER" ]] || {
+    echo "${danger}Reconcile helper is not installed.${reset}" >&2
+    pause
+    return
+  }
+  echo "${muted}The value is copied to root-only storage, verified, then removed from SQLite.${reset}"
+  run_cmd "$RECONCILE_HELPER" --adopt-server-secret "$reference"
+  systemctl start infiproxy-reconcile.service || true
+  pause
+}
+
 privileged_secrets_menu() {
   local choice
   while true; do
@@ -262,6 +283,7 @@ privileged_secrets_menu() {
       1 "List configured reference names" \
       2 "Create or rotate a reference" \
       3 "Delete a reference" \
+      4 "Adopt a legacy SQLite server-only reference" \
       0 "Back")" || return
     case "$choice" in
       1)
@@ -273,6 +295,7 @@ privileged_secrets_menu() {
         ;;
       2) store_privileged_secret ;;
       3) delete_privileged_secret ;;
+      4) adopt_legacy_privileged_secret ;;
       0) return ;;
       *) invalid_choice ;;
     esac
@@ -1765,13 +1788,13 @@ rm -f /etc/systemd/system/infiproxy.service
 rm -f /etc/systemd/system/infiproxy-panel-update.service /etc/systemd/system/infiproxy-panel-update.timer /etc/systemd/system/infiproxy-panel-update.path
 rm -f /etc/systemd/system/infiproxy-reconcile.service /etc/systemd/system/infiproxy-reconcile.timer /etc/systemd/system/infiproxy-reconcile.path
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update /usr/local/libexec/infiproxy-reconcile /etc/infiproxy-update.conf
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-panel-update /usr/local/libexec/infiproxy-reconcile /usr/local/libexec/infiproxy-install-state /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /opt/infiproxy/source
 rm -f /var/lib/infiproxy/infiproxy.sqlite /var/lib/infiproxy/infiproxy.sqlite-wal /var/lib/infiproxy/infiproxy.sqlite-shm
 rm -f /var/lib/infiproxy/panel-update-state.env /var/lib/infiproxy/panel-update-now.request
 rm -rf /var/lib/infiproxy-maintenance/update-backups
 rm -f /var/lib/infiproxy-maintenance/panel-update-run.log /var/lib/infiproxy-maintenance/panel-last-applied.sha
-rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf /etc/nginx/sites-enabled/infiproxy-subscription.conf /etc/nginx/sites-available/infiproxy-subscription.conf
 if command -v nginx >/dev/null 2>&1 && nginx -t; then
   systemctl reload nginx.service || true
 fi
@@ -1794,14 +1817,14 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile
+rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile /usr/local/libexec/infiproxy-install-state
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
 rm -rf /etc/infiproxy-cores /opt/infiproxy/cores /opt/infiproxy/modules /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -rf /opt/infiproxy/source
-rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf /etc/nginx/sites-enabled/infiproxy-subscription.conf /etc/nginx/sites-available/infiproxy-subscription.conf
 rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
 if nginx -t; then
   systemctl reload nginx.service || true
@@ -1829,14 +1852,14 @@ rm -f /etc/systemd/system/headscale.service
 rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
-rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile
+rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile /usr/local/libexec/infiproxy-install-state
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
 rm -rf /etc/infiproxy-cores /opt/infiproxy /var/log/infiproxy-cores
 rm -rf /etc/headscale /var/lib/headscale
 rm -f /usr/local/bin/headscale
-rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf
+rm -f /etc/nginx/sites-enabled/infiproxy.conf /etc/nginx/sites-available/infiproxy.conf /etc/nginx/sites-enabled/infiproxy-subscription.conf /etc/nginx/sites-available/infiproxy-subscription.conf
 rm -f /etc/nginx/sites-enabled/infiproxy-headscale.conf /etc/nginx/sites-available/infiproxy-headscale.conf
 if nginx -t; then
   systemctl reload nginx.service || true

@@ -208,6 +208,11 @@ pub trait ProtocolAdapter: Send + Sync {
     fn migrate_config(&self, from_version: u32, config: Value) -> Result<(u32, Value)>;
     fn client_secret_references(&self, config: &Value) -> Result<Vec<SecretRef>>;
     fn server_secret_references(&self, config: &Value) -> Result<Vec<SecretRef>>;
+    /// Returns the subset of server references that must only be resolved by
+    /// the privileged worker and must never be stored in panel-readable state.
+    fn server_only_secret_references(&self, _config: &Value) -> Result<Vec<SecretRef>> {
+        Ok(Vec::new())
+    }
     fn secret_references(&self, config: &Value) -> Result<Vec<SecretRef>> {
         let mut references = self.client_secret_references(config)?;
         references.extend(self.server_secret_references(config)?);

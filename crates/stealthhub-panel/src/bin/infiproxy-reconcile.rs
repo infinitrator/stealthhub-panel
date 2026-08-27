@@ -2,7 +2,9 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 
@@ -14,7 +16,7 @@ use stealthhub_core::{
     models::PanelSettings,
     reconcile::{FileReconcileStore, ReconcileStore, Reconciler},
     storage::{
-        get_secret, init_db, load_desired_state, mark_reconcile_result, open_pool,
+        delete_secret, get_secret, init_db, load_desired_state, mark_reconcile_result, open_pool,
         ReconcileResultUpdate,
     },
 };
@@ -31,6 +33,69 @@ struct PrivilegedSecrets {
     values: BTreeMap<String, SecretValue>,
 }
 
+struct PrivilegedSecretStore {
+    directory: PathBuf,
+    required_uid: u32,
+}
+
+impl PrivilegedSecretStore {
+    fn root(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            required_uid: 0,
+        }
+    }
+
+    fn path(&self, reference: &SecretRef) -> PathBuf {
+        self.directory.join(reference.as_str())
+    }
+
+    fn read(&self, reference: &SecretRef) -> Result<SecretValue> {
+        let path = self.path(reference);
+        let metadata = fs::symlink_metadata(&path)
+            .context("required privileged secret reference is unresolved")?;
+        if !metadata.file_type().is_file() || metadata.len() > MAX_SECRET_BYTES {
+            bail!("privileged secret must be a bounded regular file");
+        }
+        if metadata.uid() != self.required_uid || metadata.permissions().mode() & 0o077 != 0 {
+            bail!("privileged secret has unsafe ownership or mode");
+        }
+        SecretValue::new(fs::read_to_string(path)?)
+    }
+
+    fn write(&self, reference: &SecretRef, value: &SecretValue) -> Result<()> {
+        let metadata = fs::symlink_metadata(&self.directory)?;
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != self.required_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            bail!("privileged secret directory has unsafe ownership or mode");
+        }
+        let path = self.path(reference);
+        let temporary = self
+            .directory
+            .join(format!(".adopt-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(value.expose().as_bytes())?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::hard_link(&temporary, &path)?;
+            fs::remove_file(&temporary)?;
+            fs::File::open(&self.directory)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(temporary);
+        }
+        result
+    }
+}
+
 impl SecretResolver for PrivilegedSecrets {
     fn resolve(&self, reference: &SecretRef) -> Result<SecretValue> {
         self.values
@@ -43,6 +108,19 @@ impl SecretResolver for PrivilegedSecrets {
 #[tokio::main]
 async fn main() -> Result<()> {
     require_root()?;
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_some_and(|value| value == "--adopt-server-secret")
+    {
+        if arguments.len() != 2 {
+            bail!("usage: infiproxy-reconcile --adopt-server-secret REFERENCE");
+        }
+        return adopt_legacy_server_secret(&arguments[1]).await;
+    }
+    if !arguments.is_empty() {
+        bail!("unsupported reconciler argument");
+    }
     let request_dir = env_path("INFIPROXY_RECONCILE_REQUEST_DIR", DEFAULT_REQUEST_DIR);
     validate_request_directory(&request_dir)?;
     let processing = claim_request(&request_dir)?;
@@ -160,42 +238,104 @@ async fn load_privileged_secrets(
     desired: &stealthhub_core::desired::DesiredState,
 ) -> Result<PrivilegedSecrets> {
     let secret_dir = env_path("INFIPROXY_SECRET_DIR", DEFAULT_SECRET_DIR);
+    let store = PrivilegedSecretStore::root(secret_dir);
     let mut values = BTreeMap::new();
     for profile in desired.profiles.iter().filter(|profile| profile.enabled) {
         let adapter = protocols
             .get(&profile.protocol_id)
             .context("desired protocol adapter is missing")?;
+        let server_only = adapter
+            .server_only_secret_references(&profile.config)?
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         for reference in adapter.server_secret_references(&profile.config)? {
             if values.contains_key(reference.as_str()) {
                 continue;
             }
-            let file = secret_dir.join(reference.as_str());
-            let value = if file.exists() {
-                read_root_secret(&file)?
-            } else if let Some(record) = get_secret(pool, reference.as_str()).await? {
-                SecretValue::new(record.value)?
-            } else {
-                bail!("required privileged secret reference is unresolved");
-            };
+            let value =
+                resolve_server_secret(pool, &store, &reference, server_only.contains(&reference))
+                    .await?;
             values.insert(reference.as_str().to_string(), value);
         }
     }
     Ok(PrivilegedSecrets { values })
 }
 
-fn read_root_secret(path: &Path) -> Result<SecretValue> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.len() > MAX_SECRET_BYTES {
-        bail!("privileged secret must be a bounded regular file");
+async fn resolve_server_secret(
+    pool: &sqlx::SqlitePool,
+    store: &PrivilegedSecretStore,
+    reference: &SecretRef,
+    server_only: bool,
+) -> Result<SecretValue> {
+    if server_only {
+        return store.read(reference);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.uid() != 0 || metadata.permissions().mode() & 0o077 != 0 {
-            bail!("privileged secret must be root-owned and mode 0600");
+    if store.path(reference).exists() {
+        return store.read(reference);
+    }
+    get_secret(pool, reference.as_str())
+        .await?
+        .map(|record| SecretValue::new(record.value))
+        .transpose()?
+        .context("required shared secret reference is unresolved")
+}
+
+async fn adopt_legacy_server_secret(reference: &str) -> Result<()> {
+    let reference = SecretRef::parse(reference)?;
+    let database_url = std::env::var("INFIPROXY_DB")
+        .or_else(|_| std::env::var("STEALTHHUB_DB"))
+        .unwrap_or_else(|_| "sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc".to_string());
+    let pool = open_pool(&database_url).await?;
+    init_db(&pool).await?;
+    let protocols = protocol_registry()?;
+    let store = PrivilegedSecretStore::root(env_path("INFIPROXY_SECRET_DIR", DEFAULT_SECRET_DIR));
+    adopt_server_only_secret(&pool, &protocols, &store, &reference).await?;
+    println!("Privileged secret reference was adopted successfully.");
+    Ok(())
+}
+
+async fn adopt_server_only_secret(
+    pool: &sqlx::SqlitePool,
+    protocols: &ProtocolRegistry,
+    store: &PrivilegedSecretStore,
+    reference: &SecretRef,
+) -> Result<()> {
+    let desired = load_desired_state(pool).await?;
+    let mut classified = false;
+    for profile in &desired.profiles {
+        let Some(adapter) = protocols.get(&profile.protocol_id) else {
+            continue;
+        };
+        classified |= adapter
+            .server_only_secret_references(&profile.config)?
+            .contains(reference);
+    }
+    if !classified {
+        bail!("reference is not classified as a server-only secret");
+    }
+
+    let legacy = get_secret(pool, reference.as_str()).await?;
+    if store.path(reference).exists() {
+        let privileged = store.read(reference)?;
+        if let Some(legacy) = &legacy {
+            if privileged != SecretValue::new(legacy.value.clone())? {
+                bail!("privileged and legacy secret values do not match");
+            }
         }
+    } else if let Some(legacy) = &legacy {
+        let value = SecretValue::new(legacy.value.clone())?;
+        store.write(reference, &value)?;
+        if store.read(reference)? != value {
+            bail!("privileged secret verification failed");
+        }
+    } else {
+        bail!("legacy server-only secret is unavailable");
     }
-    SecretValue::new(fs::read_to_string(path)?)
+
+    if legacy.is_some() {
+        delete_secret(pool, reference.as_str()).await?;
+    }
+    Ok(())
 }
 
 fn claim_request(directory: &Path) -> Result<Option<PathBuf>> {
@@ -283,5 +423,85 @@ const fn status_name(status: ReconcileStatus) -> &'static str {
         ReconcileStatus::RolledBack => "rolled-back",
         ReconcileStatus::Unsupported => "unsupported",
         ReconcileStatus::RecoveryRequired => "recovery-required",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stealthhub_core::storage::upsert_secret;
+
+    async fn test_context() -> Result<(sqlx::SqlitePool, PathBuf, PrivilegedSecretStore)> {
+        let root = std::env::temp_dir().join(format!(
+            "infiproxy-reconcile-secret-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let secret_dir = root.join("secrets");
+        fs::create_dir_all(&secret_dir)?;
+        fs::set_permissions(&secret_dir, fs::Permissions::from_mode(0o700))?;
+        let database = root.join("panel.sqlite");
+        let pool = open_pool(&format!("sqlite://{}?mode=rwc", database.display())).await?;
+        init_db(&pool).await?;
+        let required_uid = fs::metadata(&secret_dir)?.uid();
+        Ok((
+            pool,
+            root,
+            PrivilegedSecretStore {
+                directory: secret_dir,
+                required_uid,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn server_only_sqlite_fallback_is_rejected_but_shared_sqlite_still_works() -> Result<()> {
+        let (pool, root, store) = test_context().await?;
+        let private = SecretRef::parse("xray.reality.private_key")?;
+        let shared = SecretRef::parse("tuic.password")?;
+        upsert_secret(&pool, private.as_str(), "private-plaintext-canary").await?;
+        upsert_secret(&pool, shared.as_str(), "shared-secret").await?;
+
+        let error = resolve_server_secret(&pool, &store, &private, true)
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().contains("private-plaintext-canary"));
+        assert_eq!(
+            resolve_server_secret(&pool, &store, &shared, false)
+                .await?
+                .expose(),
+            "shared-secret"
+        );
+
+        let private_value = SecretValue::new("private-plaintext-canary")?;
+        store.write(&private, &private_value)?;
+        assert_eq!(
+            resolve_server_secret(&pool, &store, &private, true).await?,
+            private_value
+        );
+        assert!(!format!("{private_value:?}").contains("private-plaintext-canary"));
+
+        pool.close().await;
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_server_only_adoption_is_verified_and_idempotent() -> Result<()> {
+        let (pool, root, store) = test_context().await?;
+        let reference = SecretRef::parse("xray.reality.private_key")?;
+        stealthhub_core::storage::ensure_default_protocol_profiles(&pool).await?;
+        upsert_secret(&pool, reference.as_str(), "legacy-private-canary").await?;
+        let protocols = protocol_registry()?;
+
+        adopt_server_only_secret(&pool, &protocols, &store, &reference).await?;
+        assert!(get_secret(&pool, reference.as_str()).await?.is_none());
+        assert_eq!(store.read(&reference)?.expose(), "legacy-private-canary");
+
+        adopt_server_only_secret(&pool, &protocols, &store, &reference).await?;
+        assert!(get_secret(&pool, reference.as_str()).await?.is_none());
+
+        pool.close().await;
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

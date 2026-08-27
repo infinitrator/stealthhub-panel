@@ -26,13 +26,21 @@ HEADSCALE_CONFIG_DIR="${INFIPROXY_HEADSCALE_CONFIG_DIR:-/etc/headscale}"
 MODULE_MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
 MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
 NGINX_AVAILABLE="${INFIPROXY_NGINX_AVAILABLE:-/etc/nginx/sites-available/infiproxy.conf}"
+NGINX_SUBSCRIPTION_AVAILABLE="${INFIPROXY_NGINX_SUBSCRIPTION_AVAILABLE:-/etc/nginx/sites-available/infiproxy-subscription.conf}"
 NGINX_HEADSCALE_AVAILABLE="${INFIPROXY_NGINX_HEADSCALE_AVAILABLE:-/etc/nginx/sites-available/infiproxy-headscale.conf}"
 PANEL_BINARY="${INFIPROXY_PANEL_BINARY:-/usr/local/bin/infiproxy}"
 MANIFEST_HELPER_BINARY="${INFIPROXY_MANIFEST_HELPER_BINARY:-/usr/local/libexec/infiproxy-module-manifest}"
 HEADSCALE_HELPER_BINARY="${INFIPROXY_HEADSCALE_HELPER_BINARY:-/usr/local/libexec/infiproxy-headscale-control}"
 RECONCILE_HELPER_BINARY="${INFIPROXY_RECONCILE_HELPER_BINARY:-/usr/local/libexec/infiproxy-reconcile}"
+INSTALL_STATE_LIB="${INFIPROXY_INSTALL_STATE_LIB:-/usr/local/libexec/infiproxy-install-state}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
+
+if [[ ! -f "$INSTALL_STATE_LIB" ]]; then
+    INSTALL_STATE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/install-state.sh"
+fi
+# shellcheck disable=SC1090
+. "$INSTALL_STATE_LIB"
 
 log() {
     local line
@@ -123,7 +131,9 @@ backup_system_configs() {
         "$MODULE_MANIFEST_DIR" \
         "$MODULE_AVAILABLE_DIR" \
         "$NGINX_AVAILABLE" \
-        "$NGINX_HEADSCALE_AVAILABLE"
+        "$NGINX_SUBSCRIPTION_AVAILABLE" \
+        "$NGINX_HEADSCALE_AVAILABLE" \
+        "$INSTALL_STATE_LIB"
     do
         [[ "$path" == /* && "$path" != *$'\n'* ]] \
             || { log "unsafe backup path: $path"; return 1; }
@@ -258,6 +268,12 @@ wait_panel_ready() {
     return 1
 }
 
+publish_verified_update_commit() {
+    local commit="$1"
+    verify_and_publish_applied_sha \
+        "$APPLIED_SHA_FILE" "$commit" root "$APP_GROUP" wait_panel_ready
+}
+
 should_update_now() {
     local latest_sha="$1" applied_sha="$2"
     if [[ -f "$REQUEST_FILE" ]]; then
@@ -297,7 +313,7 @@ main() {
     fi
 
     local mode="${1:-}" repo ref repo_url previous_commit target_commit installed_commit applied_commit
-    local backup_dir applied_tmp
+    local backup_dir
     local database_was_present=0
     [[ -z "$mode" || "$mode" == "--check" ]] || {
         echo "Usage: infiproxy-panel-update [--check]" >&2
@@ -331,11 +347,11 @@ main() {
     fi
     installed_commit="$(awk -F= '$1 == "INFIPROXY_CURRENT_COMMIT" { sub("^[^=]*=", ""); print; exit }' \
         "${CONFIG_DIR}/infiproxy.env" 2>/dev/null || true)"
-    applied_commit="$(cat "$APPLIED_SHA_FILE" 2>/dev/null || true)"
-    if [[ ! "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+    applied_commit="$(read_applied_sha "$APPLIED_SHA_FILE" || true)"
+    if ! valid_commit_sha "$applied_commit"; then
         applied_commit="$installed_commit"
     fi
-    if [[ ! "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+    if ! valid_commit_sha "$applied_commit"; then
         applied_commit="$previous_commit"
     fi
     [[ "$applied_commit" =~ ^[A-Fa-f0-9]{40}$ ]] \
@@ -385,8 +401,9 @@ main() {
             --manifest-path "${SOURCE_DIR}/Cargo.toml" \
         || ! INFIPROXY_UPDATE_REPO="$repo" INFIPROXY_UPDATE_REF="$ref" \
             INFIPROXY_INSTALL_COMMIT="$target_commit" \
+            INFIPROXY_DEFER_APPLIED_SHA=true \
             bash "${SOURCE_DIR}/deploy/install.sh" --with-nginx \
-        || ! wait_panel_ready; then
+        || ! publish_verified_update_commit "$target_commit"; then
         log "panel update failed; restoring previous control plane and source revision"
         restore_update_backup "$backup_dir" "$database_was_present" \
             || log "warning: automatic data/config restore was incomplete"
@@ -395,6 +412,7 @@ main() {
         fi
         if restore_control_binaries "$backup_dir"; then
             INFIPROXY_UPDATE_REPO="$repo" INFIPROXY_UPDATE_REF="$ref" \
+                INFIPROXY_DEFER_APPLIED_SHA=true \
                 bash "${SOURCE_DIR}/deploy/install.sh" --with-nginx \
                 || log "warning: previous installer could not fully repair the control plane"
             systemctl restart infiproxy.service || true
@@ -405,11 +423,6 @@ main() {
         exit 1
     fi
     rm -f "$REQUEST_FILE"
-    applied_tmp="${APPLIED_SHA_FILE}.tmp.$$"
-    printf '%s\n' "$target_commit" >"$applied_tmp"
-    chmod 0640 "$applied_tmp"
-    chown root:"$APP_GROUP" "$applied_tmp"
-    mv -f "$applied_tmp" "$APPLIED_SHA_FILE"
     write_status "$repo" "$ref" "$target_commit" "$target_commit" current
     log "panel update completed at ${target_commit:0:12}"
 }

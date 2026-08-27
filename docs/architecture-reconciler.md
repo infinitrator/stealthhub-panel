@@ -98,10 +98,13 @@ successfully reconciled first.
 ## Infrastructure adapter contract
 
 Public subscription/node hostnames are infrastructure resources, not ordinary
-settings. Their adapter owns frontend configuration, certificate provisioning,
-validation, and health. The UI presents a changed hostname as `Pending` until
-the frontend and certificate are verified. Protocol adapters never contain
-Nginx or certificate logic.
+settings. The subscription adapter exclusively owns
+`infiproxy-subscription.conf`; it cannot overwrite the installer-owned admin
+vhost or unrelated sites. It validates already-provisioned TLS material,
+duplicate `server_name` declarations, Nginx syntax, HTTPS readiness and
+listeners before publishing `Applied`. It does not issue certificates. The
+independent node resource verifies DNS without claiming ownership of a cover
+vhost. Protocol adapters never contain Nginx or certificate logic.
 
 ## Desired and applied state
 
@@ -267,19 +270,19 @@ paths below only after CI is green for that exact commit.
    ```
 
 5. Before changing a user/profile/domain, provision every private server secret
-   with `sudo infiproxy-manager` -> **Privileged runtime secrets**. To migrate an
-   existing Xray REALITY key without printing it, first inspect the JSON schema,
-   then use the matching `jq` selector through a root-only pipe. For the common
-   Xray shape:
+   with `sudo infiproxy-manager` -> **Privileged runtime secrets**. If a migrated
+   profile still has a server-only value in legacy SQLite, choose **Adopt a
+   legacy SQLite server-only reference**, or run the equivalent root helper:
 
    ```bash
-   sudo bash -o pipefail -c 'umask 077; \
-     jq -er "[.inbounds[]?.streamSettings?.realitySettings?.privateKey // empty][0]" \
-       /etc/infiproxy-cores/xray/config.json | \
-     install -m 0600 -o root -g root /dev/stdin \
-       /etc/infiproxy/secrets.d/xray.reality.private_key'
+   sudo /usr/local/libexec/infiproxy-reconcile \
+     --adopt-server-secret xray.reality.private_key
    sudo test -s /etc/infiproxy/secrets.d/xray.reality.private_key
    ```
+
+   The helper accepts only a reference explicitly classified as server-only by
+   an installed protocol adapter, verifies the root copy, removes the SQLite
+   value, never prints plaintext, and is safe to run again.
 
 6. Confirm the subscription certificate covers `subscription_domain`, the
    `node_domain` resolves publicly, all selected module binaries exist, and the

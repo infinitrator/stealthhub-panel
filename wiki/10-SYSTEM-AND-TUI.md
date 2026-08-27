@@ -262,6 +262,9 @@ backup/build/install. Полная модель обновления описа�
 принимает hidden input, создает root-owned mode `0600` файл атомарно и запускает
 reconciler. **Delete** требует точного имени и также запускает reconcile.
 Используйте его для private server keys, которые web-процесс не должен читать.
+**Adopt a legacy SQLite server-only reference** переносит только явно
+классифицированное adapter-ом значение, проверяет root-копию и затем удаляет
+legacy SQLite row. Значение не отображается и не попадает в командную строку.
 
 ### 4.9. Panel environment
 

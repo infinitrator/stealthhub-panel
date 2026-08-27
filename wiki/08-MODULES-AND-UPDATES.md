@@ -300,7 +300,7 @@ Root updater до checkout создает:
 - SQLite `.backup`;
 - tar panel/core/Headscale configs;
 - manifests/catalog;
-- Nginx sites;
+- admin, subscription/rules и Headscale Nginx sites;
 - metadata с previous commit.
 
 Если DB/config backup failed, update не начинается.
@@ -313,7 +313,8 @@ Updater разрешает только fast-forward переход от уст�
 bootstrap/install и до 15 раз
 проверяет local `/ready` с интервалом 2 s. Он отказывается проверять non-local
 bind. При failure восстанавливает configs, DB, все control binaries и previous
-source revision.
+source revision. Failed target SHA не публикуется: root marker изменяется одной
+atomic replace только внутри successful readiness boundary.
 
 Лог:
 

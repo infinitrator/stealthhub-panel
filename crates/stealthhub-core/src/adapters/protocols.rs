@@ -157,6 +157,19 @@ impl ProtocolAdapter for JsonProtocolAdapter {
             .collect()
     }
 
+    fn server_only_secret_references(&self, config: &Value) -> Result<Vec<SecretRef>> {
+        self.validate_config(self.manifest.schema_version, config)?;
+        if matches!(
+            self.implementation,
+            Implementation::VlessXhttp | Implementation::VlessTcp
+        ) {
+            return Ok(vec![SecretRef::parse(
+                self.required_text(config, "private_key_secret")?,
+            )?]);
+        }
+        Ok(Vec::new())
+    }
+
     fn render_client(&self, context: &ClientRenderContext<'_>) -> Result<Value> {
         self.validate_config(context.profile.schema_version, &context.profile.config)?;
         let value = match self.implementation {

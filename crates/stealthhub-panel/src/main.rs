@@ -1763,30 +1763,22 @@ fn is_server_only_secret_reference(
     profiles: &[ProtocolProfile],
     registry: &ProtocolRegistry,
 ) -> bool {
-    let mut used_by_server = false;
-    let mut used_by_client = false;
     for profile in profiles {
         let Some(adapter) = registry.get(&profile.protocol_id) else {
             continue;
         };
-        used_by_server |=
-            adapter
-                .server_secret_references(&profile.config)
-                .is_ok_and(|references| {
-                    references
-                        .iter()
-                        .any(|reference| reference.as_str() == name)
-                });
-        used_by_client |=
-            adapter
-                .client_secret_references(&profile.config)
-                .is_ok_and(|references| {
-                    references
-                        .iter()
-                        .any(|reference| reference.as_str() == name)
-                });
+        if adapter
+            .server_only_secret_references(&profile.config)
+            .is_ok_and(|references| {
+                references
+                    .iter()
+                    .any(|reference| reference.as_str() == name)
+            })
+        {
+            return true;
+        }
     }
-    used_by_server && !used_by_client
+    false
 }
 
 async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Response {

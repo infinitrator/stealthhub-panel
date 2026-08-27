@@ -18,10 +18,12 @@ MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-modu
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
 HEADSCALE_CONTROL_HELPER="${INFIPROXY_HEADSCALE_CONTROL_HELPER:-/usr/local/libexec/infiproxy-headscale-control}"
 RECONCILE_HELPER="${INFIPROXY_RECONCILE_HELPER:-/usr/local/libexec/infiproxy-reconcile}"
+INSTALL_STATE_HELPER="${INFIPROXY_INSTALL_STATE_LIB:-/usr/local/libexec/infiproxy-install-state}"
 CORE_INSTALL_BIN="${INFIPROXY_CORE_INSTALL_BIN:-/usr/local/sbin/infiproxy-core-install}"
 CONFIG_DIR="${INFIPROXY_CONFIG_DIR:-${STEALTHHUB_CONFIG_DIR:-/etc/infiproxy}}"
 STATE_DIR="${INFIPROXY_STATE_DIR:-${STEALTHHUB_STATE_DIR:-/var/lib/infiproxy}}"
 ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
+APPLIED_SHA_FILE="${INFIPROXY_PANEL_APPLIED_SHA:-${ROOT_STATE_DIR}/panel-last-applied.sha}"
 MODULE_MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
 MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
@@ -44,6 +46,9 @@ NGINX_AVAILABLE="${INFIPROXY_NGINX_AVAILABLE:-/etc/nginx/sites-available/infipro
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_STATE_LIB="${ROOT_DIR}/deploy/lib/install-state.sh"
+# shellcheck disable=SC1090
+. "$INSTALL_STATE_LIB"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
 RELEASE_MANIFEST_HELPER="${ROOT_DIR}/target/release/infiproxy-module-manifest"
 RELEASE_HEADSCALE_HELPER="${ROOT_DIR}/target/release/infiproxy-headscale-control"
@@ -133,72 +138,46 @@ need_cmd() {
     fi
 }
 
-random_setup_token() {
-    if command -v openssl >/dev/null 2>&1; then
-        openssl rand -hex 32
-    else
-        od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
-    fi
-}
-
-ensure_setup_token() {
-    local current token temporary
-    current="$(awk -F= '$1 == "INFIPROXY_SETUP_TOKEN" { sub("^[^=]*=", ""); print; exit }' "$ENV_FILE")"
-    if [[ "${#current}" -ge 32 ]]; then
-        return
-    fi
-    token="$(random_setup_token)"
-    [[ "${#token}" -ge 32 ]] || {
-        echo "Failed to generate the initial setup token" >&2
-        exit 1
-    }
-    temporary="${ENV_FILE}.tmp.$$"
-    awk -v token="$token" '
-        BEGIN { found = 0 }
-        /^INFIPROXY_SETUP_TOKEN=/ {
-            print "INFIPROXY_SETUP_TOKEN=" token
-            found = 1
-            next
-        }
-        { print }
-        END {
-            if (!found) print "INFIPROXY_SETUP_TOKEN=" token
-        }
-    ' "$ENV_FILE" >"$temporary"
-    install -m 0660 -o root -g "$APP_GROUP" "$temporary" "$ENV_FILE"
-    rm -f "$temporary"
-    printf '%s\n' "$commit" \
-        | install -m 0640 -o root -g "$APP_GROUP" /dev/stdin \
-            "$ROOT_STATE_DIR/panel-last-applied.sha"
-}
-
 record_current_commit() {
-    local commit temporary
+    local commit
     commit="${INFIPROXY_INSTALL_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)}"
-    if [[ ! "$commit" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+    if ! valid_commit_sha "$commit"; then
         echo "Warning: current Git commit is unavailable; update status will show unknown." >&2
         return
     fi
-    temporary="${ENV_FILE}.tmp.$$"
-    awk -v commit="$commit" '
-        BEGIN { found = 0 }
-        /^INFIPROXY_CURRENT_COMMIT=/ {
-            print "INFIPROXY_CURRENT_COMMIT=" commit
-            found = 1
-            next
-        }
-        { print }
-        END {
-            if (!found) print "INFIPROXY_CURRENT_COMMIT=" commit
-        }
-    ' "$ENV_FILE" >"$temporary"
-    install -m 0660 -o root -g "$APP_GROUP" "$temporary" "$ENV_FILE"
-    rm -f "$temporary"
+    record_source_commit "$ENV_FILE" "$commit" root "$APP_GROUP"
+}
+
+wait_panel_ready() {
+    local bind host port attempts=15
+    bind="$(awk -F= '$1 == "INFIPROXY_BIND" { sub("^[^=]*=", ""); print; exit }' \
+        "$ENV_FILE" 2>/dev/null || true)"
+    bind="${bind:-127.0.0.1:8080}"
+    host="${bind%:*}"
+    port="${bind##*:}"
+    [[ "$port" =~ ^[0-9]{1,5}$ && "$port" -ge 1 && "$port" -le 65535 ]] || return 1
+    case "$host" in
+        127.0.0.1|localhost) ;;
+        0.0.0.0) host="127.0.0.1" ;;
+        "[::1]") ;;
+        "[::]") host="[::1]" ;;
+        *) return 1 ;;
+    esac
+    while [[ "$attempts" -gt 0 ]]; do
+        if systemctl is-active --quiet infiproxy.service \
+            && curl --fail --silent --show-error --max-time 3 \
+                "http://${host}:${port}/ready" >/dev/null; then
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 2
+    done
+    return 1
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
     echo "Preflight commands:"
-    for cmd in getent groupadd id install systemctl useradd; do
+    for cmd in curl getent groupadd id install systemctl useradd; do
         if command -v "$cmd" >/dev/null 2>&1; then
             echo "  $cmd: found"
         else
@@ -206,6 +185,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
         fi
     done
 else
+    need_cmd curl
     need_cmd getent
     need_cmd flock
     need_cmd groupadd
@@ -217,6 +197,7 @@ fi
 
 required_deploy_files=(
     deploy/infiproxy-manager.sh
+    deploy/lib/install-state.sh
     deploy/panel-update.sh
     deploy/module-update.sh
     deploy/cores/install-core.sh
@@ -296,6 +277,7 @@ Infiproxy install plan:
   module helper: $MODULE_MANIFEST_HELPER
   Headscale helper:$HEADSCALE_CONTROL_HELPER
   reconcile helper:$RECONCILE_HELPER
+  install-state helper:$INSTALL_STATE_HELPER
   core installer:$CORE_INSTALL_BIN
   release bin:   $RELEASE_BIN
   release helper:$RELEASE_MANIFEST_HELPER
@@ -357,6 +339,7 @@ install -d -o root -g root -m 0755 "$(dirname "$MODULE_UPDATE_BIN")"
 install -d -o root -g root -m 0755 "$(dirname "$MODULE_MANIFEST_HELPER")"
 install -d -o root -g root -m 0755 "$(dirname "$HEADSCALE_CONTROL_HELPER")"
 install -d -o root -g root -m 0755 "$(dirname "$RECONCILE_HELPER")"
+install -d -o root -g root -m 0755 "$(dirname "$INSTALL_STATE_HELPER")"
 install -d -o root -g root -m 0755 "$CORE_DIR"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR"
 install -d -o "$RUNTIME_USER" -g "$RUNTIME_GROUP" -m 0750 "$CORE_LOG_DIR"
@@ -380,6 +363,7 @@ install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
 install -m 0755 "$RELEASE_MANIFEST_HELPER" "$MODULE_MANIFEST_HELPER"
 install -m 0755 "$RELEASE_HEADSCALE_HELPER" "$HEADSCALE_CONTROL_HELPER"
 install -m 0755 "$RELEASE_RECONCILE_HELPER" "$RECONCILE_HELPER"
+install -m 0644 "${ROOT_DIR}/deploy/lib/install-state.sh" "$INSTALL_STATE_HELPER"
 install -m 0755 "${ROOT_DIR}/deploy/cores/install-core.sh" "$CORE_INSTALL_BIN"
 install -m 0644 "${ROOT_DIR}/deploy/infiproxy-profile.sh" "$PROFILE_FILE"
 HEADSCALE_STATE_FILE="$ROOT_STATE_DIR/headscale/state.json"
@@ -419,7 +403,7 @@ if [[ ! -f "$ENV_FILE" || "$FORCE_ENV" -eq 1 ]]; then
 else
     echo "Keeping existing env file: $ENV_FILE"
 fi
-ensure_setup_token
+ensure_setup_token "$ENV_FILE" root "$APP_GROUP"
 record_current_commit
 chown root:"$APP_GROUP" "$ENV_FILE"
 chmod 0660 "$ENV_FILE"
@@ -492,6 +476,11 @@ fi
 systemctl daemon-reload
 systemctl enable infiproxy.service
 systemctl restart infiproxy.service
+if [[ "${INFIPROXY_DEFER_APPLIED_SHA:-false}" != "true" ]]; then
+    install_commit="${INFIPROXY_INSTALL_COMMIT:-$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null || true)}"
+    verify_and_publish_applied_sha \
+        "$APPLIED_SHA_FILE" "$install_commit" root "$APP_GROUP" wait_panel_ready
+fi
 systemctl enable --now infiproxy-panel-update.timer
 systemctl enable --now infiproxy-panel-update.path
 systemctl enable --now infiproxy-module-update.timer
