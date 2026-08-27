@@ -240,10 +240,34 @@ pub struct CoreSnapshot {
     pub service_was_active: bool,
 }
 
+/// Best-effort, non-mutating runtime observation used by control-plane inventory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CoreRuntimeProbe {
+    pub installed: Option<bool>,
+    pub active: Option<bool>,
+    pub healthy: Option<bool>,
+    pub listeners_healthy: Option<bool>,
+    pub version: Option<String>,
+    pub detail: Option<String>,
+}
+
 /// Privileged runtime behavior used by the generic transaction engine.
 pub trait CoreAdapter: Send + Sync {
     fn manifest(&self) -> &CoreAdapterManifest;
     fn installed(&self) -> Result<bool>;
+    /// Observes runtime state without changing files, services, or desired state.
+    fn probe(&self) -> CoreRuntimeProbe {
+        match self.installed() {
+            Ok(installed) => CoreRuntimeProbe {
+                installed: Some(installed),
+                ..CoreRuntimeProbe::default()
+            },
+            Err(_) => CoreRuntimeProbe {
+                detail: Some("runtime installation probe failed".to_string()),
+                ..CoreRuntimeProbe::default()
+            },
+        }
+    }
     fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf>;
     fn validate(&self, candidate: &Path) -> Result<()>;
     fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot>;
