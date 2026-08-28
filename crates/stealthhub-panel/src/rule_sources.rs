@@ -10,7 +10,10 @@ use reqwest::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
-use std::{net::IpAddr, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 use stealthhub_core::{
     rules::{validate_classical_rule_payload, RuleSetSource, RuleSourceFormat},
     storage::{
@@ -92,15 +95,21 @@ pub(crate) async fn refresh(pool: &SqlitePool, id: &str) -> Result<RuleSetSource
 }
 
 async fn fetch(source: &RuleSetSource) -> Result<Option<RuleSetSource>> {
-    let client = Client::builder()
-        .redirect(Policy::none())
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(25))
-        .user_agent(concat!("Infiproxy/", env!("CARGO_PKG_VERSION")))
-        .build()?;
     let mut url = Url::parse(&source.url).context("invalid source URL")?;
     for redirect_count in 0..=MAX_REDIRECTS {
-        validate_remote_url(&url).await?;
+        let addresses = validate_remote_url(&url).await?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("remote rule source has no host"))?;
+        // Pin the connection to the addresses that passed the SSRF check. A
+        // second resolver lookup here would leave a DNS-rebinding race.
+        let client = Client::builder()
+            .redirect(Policy::none())
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(25))
+            .user_agent(concat!("Infiproxy/", env!("CARGO_PKG_VERSION")))
+            .resolve_to_addrs(host, &addresses)
+            .build()?;
         let mut request = client.get(url.clone());
         if let Some(etag) = source.etag.as_deref() {
             request = request.header(IF_NONE_MATCH, etag);
@@ -186,7 +195,7 @@ fn parse_source(format: RuleSourceFormat, text: &str) -> Result<Vec<String>> {
     validate_classical_rule_payload(&payload)
 }
 
-async fn validate_remote_url(url: &Url) -> Result<()> {
+async fn validate_remote_url(url: &Url) -> Result<Vec<SocketAddr>> {
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
         bail!("remote rule source must use HTTPS without URL credentials");
     }
@@ -199,12 +208,15 @@ async fn validate_remote_url(url: &Url) -> Result<()> {
     let addresses = tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443)))
         .await
         .context("resolve remote rule source")?
-        .map(|address| address.ip())
         .collect::<Vec<_>>();
-    if addresses.is_empty() || addresses.into_iter().any(forbidden_address) {
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| forbidden_address(address.ip()))
+    {
         bail!("remote rule source resolves to a forbidden address");
     }
-    Ok(())
+    Ok(addresses)
 }
 
 fn forbidden_address(address: IpAddr) -> bool {

@@ -105,9 +105,11 @@ enabled sources по расписанию и использует ETag/Last-Modi
 
 Fetcher ограничивает размер и redirects, запрещает credentials в URL, принимает
 только HTTPS и отклоняет loopback/private/link-local destination после DNS
-проверки. Native Mihomo `mrs` намеренно не генерируется: mixed classical rules
-не имеют одного корректного MRS behavior, поэтому endpoint возвращает явный
-`501 Unsupported` вместо файла с выдуманной семантикой.
+проверки. Соединение закрепляется за проверенными адресами отдельно на каждом
+redirect, чтобы повторное DNS-разрешение не создавало rebinding race. Native
+Mihomo `mrs` намеренно не генерируется: mixed classical rules не имеют одного
+корректного MRS behavior, поэтому endpoint возвращает явный `501 Unsupported`
+вместо файла с выдуманной семантикой.
 
 Допустимые строки payload:
 
