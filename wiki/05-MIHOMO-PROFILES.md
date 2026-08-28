@@ -67,10 +67,11 @@ Protocol profiles + secret_values + routing sets + subscription user UUID
 | `HYSTERIA2-SPEED` | Hysteria2 | SPEED | disabled | `node.infiproxy.local:443/udp` | `hysteria2.password`, optional `hysteria2.obfs_password` |
 | `TUIC-SPEED` | TUIC | SPEED | disabled | `node.infiproxy.local:11443/udp` | `tuic.password` |
 
-При первом запуске все шесть profiles выключены. Повторный запуск или обновление
-добавляет отсутствующие встроенные records через `ON CONFLICT DO NOTHING` и не
-перезаписывает уже измененные endpoint, параметры или switch. GUI редактирует
-встроенные records, но в beta не создает произвольные новые виды profile.
+При первом запуске все шесть profiles выключены. Schema v8 помечает bootstrap
+завершенным, поэтому повторный запуск или обновление не восстанавливает удаленные
+profiles и не перезаписывает endpoint, параметры или switch. GUI редактирует
+встроенные records; новые protocol kinds появляются только вместе с доверенным
+adapter package.
 
 ## Общие поля редактора
 
@@ -275,9 +276,12 @@ Generated object:
 - SNI и `alpn: [h3]`;
 - endpoint по UDP.
 
-Starter TUIC config содержит `"users": {}`. Для каждого Infiproxy user, которому
-выдается profile, server map должен содержать его UUID и password. Автоматической
-синхронизации нет.
+Для каждого enabled Infiproxy user server map должен содержать его UUID и
+password. Root reconciler строит runtime config из desired users, устанавливает
+его атомарно и после применения выполняет read-only observation. Панель хранит
+только desired/runtime counts и status (`synced`, `pending`, `drifted`,
+`runtime unavailable`, `unsupported observation` или `failed`), не дублируя
+UUID и credentials в таблице sync status.
 
 ## Roles и proxy groups
 

@@ -32,8 +32,8 @@ admin session и CSRF token.
 | Settings | `/admin/settings` | Глобальные hostnames и panel updater. |
 | Protocols | `/admin/protocols` | Клиентские proxy-объекты Mihomo. |
 | Secrets | `/admin/secrets` | Owner-only значения, подставляемые в клиентский YAML. |
-| Routing | `/admin/routing` | Встроенные rule-provider. |
-| Modules | `/admin/cores` | Динамический реестр runtime-модулей. |
+| Routing | `/admin/routing` | Pools, policies, rule sets, sources и DNS. |
+| Runtimes | `/admin/cores` | Динамический реестр runtime-модулей. |
 | IP Check | `/admin/ip` | Локальная диагностика и ссылки на reputation DB. |
 | System | `/admin/system` | Host sensors, services и uninstall preview. |
 | Configs | `/admin/configs` | Allowlist-редактор файлов. |
@@ -167,8 +167,9 @@ Status strip показывает число профилей, enabled, числ
 | Protocol-specific fields | SNI/path и **имена** записей в `secret_values`. |
 | **Save profile** | Обновляет существующую запись в SQLite; не валидирует/перезапускает серверный core. |
 
-Kind и role профиля в GUI read-only. Создания/удаления профилей через текущий
-веб-интерфейс нет. Подробно: [Профили Mihomo](05-MIHOMO-PROFILES).
+Kind и role встроенного профиля в GUI read-only. Создание новых protocol kinds
+выполняется установкой доверенного adapter package, а не свободным вводом имени
+в браузере. Подробно: [Профили Mihomo](05-MIHOMO-PROFILES).
 
 ## Secrets
 
@@ -188,19 +189,26 @@ subscription generation в fail-closed `503`, а не публикует имя/
 
 ## Routing
 
-На странице четыре фиксированных rule set. Для каждого:
+Страница управляет transport pools, inline policies, произвольными rule sets,
+нормализованными entries, remote sources и DNS policy.
 
 | Элемент | Что делает |
 |---|---|
-| **Enabled** switch | Публикует provider и включает `RULE-SET` в generated YAML. |
-| **Target group** | Выбирает `DIRECT`, `AUTO-SAFE`, `SPEED`, `RU-ACCESS`, `MANUAL`, `REJECT`. |
-| **Classical payload** | Редактирует одно правило Mihomo на строку. |
-| **Save rule set** | Валидирует payload и сохраняет этот set в SQLite. |
+| **Create/Save/Delete pool** | Управляет stable proxy groups и проверяет graph/references до commit. |
+| **Create/Save/Delete policy** | Управляет ordered inline conditions и target. |
+| **Create/Save/Clone/Delete rule set** | Управляет arbitrary provider sets. |
+| **Add/Edit/Delete normalized entry** | Меняет отдельное типизированное правило. |
+| **Import entries** | Выполняет bulk paste без raw YAML. |
+| **Deduplicate entries** | Удаляет дубликаты внутри set. |
+| **Export / preview YAML** | Открывает фактически скомпилированный provider. |
+| **Add/Save/Refresh/Delete source** | Управляет bounded HTTPS source и его cache. |
+| **Save DNS policy** | Сохраняет resolver policy для следующей subscription. |
 
-Нельзя создать произвольный slug или вложить `RULE-SET`/`SUB-RULE` внутрь
-payload. Подробно: [Маршрутизация](07-ROUTING).
+Нельзя вложить `RULE-SET`/`SUB-RULE` внутрь classical payload. Source format
+`mrs` не эмулируется для смешанных classical rules. Подробно:
+[Маршрутизация](07-ROUTING).
 
-## Modules
+## Runtimes
 
 Страница строится из root-owned manifests, поэтому список динамический.
 
@@ -212,11 +220,16 @@ payload. Подробно: [Маршрутизация](07-ROUTING).
 | Auto **On/Off** + **Save** | owner, сразу | Меняет policy автоматического обновления модуля. |
 | **Check** | owner, сразу для metadata | Проверяет upstream только выбранного модуля. |
 | **Install latest** | owner, в очередь | Request root-worker для неустановленного runtime. |
-| **Update latest** | owner, в очередь | Request root-worker для установленного runtime. |
-| **Remove** | owner, в очередь | Работает только если в поле набран точный module ID; config сохраняется. |
+| **Update** | owner, в очередь | Request root-worker для установленного runtime с доступной версией. |
+| **Start** | owner, в очередь | Запрашивает запуск manifest-declared systemd unit. |
+| **Stop** | owner, в очередь | Запрашивает остановку manifest-declared systemd unit. |
+| **Restart** | owner, в очередь | Запрашивает перезапуск manifest-declared systemd unit. |
+| **Remove** | owner, в очередь | Требует точный module ID; config сохраняется, а при enabled dependents кнопка блокируется. |
 
-Название update/install зависит от installed state. Request не гарантирует
-успех: результат проверяется по state/log/service.
+Название update/install зависит от installed state. Все lifecycle operations
+являются типизированными fixed-format requests: HTTP не принимает command, URL
+или unit name. Request не гарантирует успех: результат проверяется по
+state/log/service и user-sync badges.
 
 ### Available catalog
 

@@ -24,9 +24,9 @@ Infiproxy формирует клиентскую политику Mihomo. Ре�
 - inline rules со стабильным ID, priority, condition и target;
 - rule sets, опубликованные как удаленные providers.
 
-Миграция добавляет bootstrap policy только при отсутствии строк. Повторный запуск
-не перезаписывает операторские данные. Перед обновлением все эти таблицы входят
-в штатный SQLite backup.
+Schema v8 выполняет bootstrap policy ровно один раз. Обновление и повторный
+запуск не восстанавливают удаленные оператором profiles, pools, policies или
+rule sets. Перед обновлением все эти таблицы входят в штатный SQLite backup.
 
 ### Transport pools
 
@@ -38,10 +38,12 @@ Pool превращается в Mihomo `proxy-group`. Поддерживают�
 enabled profile/pool references, отсутствие циклов и непустой итоговый список.
 Невалидная policy останавливает выдачу ошибочного YAML вместо тихого fallback.
 
-Текущий экран показывает pools, kind, число selectors, probe URL, interval и
-enabled state. Изменение состава pools и inline rules через web UI в этой
-ревизии не реализовано; эти секции являются read-only представлением durable
-policy. Не редактируйте SQLite вручную.
+Экран позволяет создать, переименовать, включить, выключить и удалить pool,
+изменить strategy, priority, selectors, probe URL, interval, timeout, tolerance,
+max failures, lazy mode, minimum healthy count, fallback pool и load-balancing
+algorithm. Stable ID меняется как rename: все ссылки обновляются транзакционно.
+При удалении используйте replacement pool, если на объект ссылаются policies,
+rule sets или другие pools; без replacement такое удаление блокируется.
 
 ### Inline policy
 
@@ -51,19 +53,61 @@ Bootstrap policy содержит direct private networks, `GEOIP,RU` и фин�
 `MATCH,MANUAL`; это стартовые строки базы, а не protocol-specific branches в
 generator.
 
+В блоке **Inline routing policies** доступны create, edit, enable/disable,
+rename и delete. Числовой `priority` задает порядок без drag-and-drop. Condition
+содержит полное classical-условие без target, например
+`DOMAIN-SUFFIX,example.com`; target может быть `DIRECT`, `REJECT`, stable pool
+ID, точным profile name или `capability:<protocol-id>`. Dangling references и
+невалидные условия отклоняются до commit.
+
 ## 3. Rule sets
 
 Rule set хранит stable slug, название, описание эффекта, target, enabled flag и
-classical payload. В текущем UI можно:
+advanced classical payload. В текущем UI можно:
 
-- включить или выключить существующий set;
+- создать, изменить, клонировать и удалить произвольный set;
+- включить или выключить set;
 - выбрать `DIRECT`, `REJECT` или любой enabled transport pool;
-- заменить весь payload;
+- оставить raw classical layer, если нужен неподдержанный GUI-сценарий;
+- открыть скомпилированный YAML через **Export / preview YAML**;
 - сохранить изменение с CSRF и owner-проверкой.
 
-Создание, удаление и reorder самих sets через браузер пока не реализованы.
 Provider-level target применяется ко всем строкам одного set, поэтому правила с
 разными желаемыми targets следует хранить раздельно.
+
+### Нормализованные entries
+
+Основной режим не требует ручного YAML. Для каждой записи сохраняются stable ID,
+enabled state, kind, value, comment, source tag и числовой priority. Поддержаны
+`DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `IP-CIDR`, `IP-CIDR6`, `GEOIP`,
+`GEOSITE`, `ASN`, `PROCESS-NAME`, `DST-PORT`, `SRC-PORT`, `NETWORK` и
+`CLASSICAL`.
+
+| Элемент | Результат |
+|---|---|
+| **Add normalized entry** | Создает одну проверенную запись. |
+| **Edit / Save** | Меняет kind, value, comment, tag, priority и enabled state. |
+| **Delete** | Удаляет запись по stable ID. |
+| **Import entries** | Добавляет values построчно; в `CLASSICAL` принимает полные правила. |
+| **Deduplicate entries** | Удаляет повторения в пределах set, сохраняя первый приоритетный экземпляр. |
+| Filter / search | Фильтрует отображение по kind и тексту; для ограничения HTML выводятся первые 200 совпадений. |
+
+Компиляция объединяет enabled normalized entries, локальный advanced layer и
+последний успешный cache remote sources. Ошибка нового fetch не уничтожает
+проверенный cache.
+
+### Remote data sources
+
+Источник имеет stable ID, HTTPS URL, format, enabled state и refresh interval от
+300 до 604800 секунд. Поддержаны plain text, YAML payload и Mihomo classical
+provider. **Refresh** запускает немедленную загрузку; background checker обновляет
+enabled sources по расписанию и использует ETag/Last-Modified.
+
+Fetcher ограничивает размер и redirects, запрещает credentials в URL, принимает
+только HTTPS и отклоняет loopback/private/link-local destination после DNS
+проверки. Native Mihomo `mrs` намеренно не генерируется: mixed classical rules
+не имеют одного корректного MRS behavior, поэтому endpoint возвращает явный
+`501 Unsupported` вместо файла с выдуманной семантикой.
 
 Допустимые строки payload:
 
@@ -107,8 +151,8 @@ Subscription описывает provider как HTTP/classical/YAML, сохра�
 
 ## 5. Итоговый порядок правил
 
-Generator сначала добавляет enabled rule sets в их сохраненном порядке, затем
-enabled inline rules по priority:
+Generator сначала добавляет enabled rule sets в стабильном порядке, затем
+enabled inline policies по priority:
 
 ```text
 RULE-SET,<slug>,<target>

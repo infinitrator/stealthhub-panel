@@ -226,9 +226,12 @@ request 303 /admin/protocols/TUIC-SPEED/update --request POST \
     --data-urlencode port=11443 \
     --data-urlencode sni=www.github.com \
     --data-urlencode password_secret=tuic.password
-request 200 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
-body_contains 'type: tuic'
-body_contains 'smoke-tuic-password'
+# The smoke host has manifests but deliberately has no installed runtime binary.
+# Enabling a profile must therefore remain fail-closed instead of publishing an
+# unusable configuration or weakening the production runtime check for tests.
+request 503 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
+body_contains 'subscription is not configured'
+body_excludes 'smoke-tuic-password'
 body_excludes 'REPLACE_WITH_'
 body_excludes 'tuic.password'
 
@@ -286,7 +289,8 @@ request 200 /admin/users
 NEW_SUBSCRIPTION_TOKEN="$(subscription_token_from_body)"
 [[ "$NEW_SUBSCRIPTION_TOKEN" != "$SUBSCRIPTION_TOKEN" ]] \
     || fail "subscription token did not rotate"
-request 200 "/sub/${NEW_SUBSCRIPTION_TOKEN}/mihomo.yaml"
+request 503 "/sub/${NEW_SUBSCRIPTION_TOKEN}/mihomo.yaml"
+body_contains 'subscription is not configured'
 
 request 400 /admin/secrets/delete --request POST \
     --data-urlencode csrf_token="$CSRF_TOKEN" \
