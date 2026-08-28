@@ -107,7 +107,7 @@ pub fn generate_mihomo_yaml_with_registry(
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
         "proxy-groups": proxy_groups(&resolved_pools),
-        "rules": routing_rules(&active_rule_sets, policy)
+        "rules": routing_rules(&active_rule_sets, policy, profiles)?
     });
 
     Ok(serde_norway::to_string(&doc)?)
@@ -154,9 +154,16 @@ fn proxy_groups(pools: &[(crate::policy::TransportPool, Vec<String>)]) -> Vec<se
             if let Some(interval) = pool.interval_seconds {
                 group.insert("interval".to_string(), json!(interval));
             }
+            if let Some(timeout) = pool.timeout_ms {
+                group.insert("timeout".to_string(), json!(timeout));
+            }
             if let Some(tolerance) = pool.tolerance_ms {
                 group.insert("tolerance".to_string(), json!(tolerance));
             }
+            if let Some(max_failures) = pool.max_failures {
+                group.insert("max-failed-times".to_string(), json!(max_failures));
+            }
+            group.insert("lazy".to_string(), json!(pool.lazy));
             if let Some(strategy) = &pool.strategy {
                 group.insert("strategy".to_string(), json!(strategy));
             }
@@ -196,24 +203,23 @@ fn rule_provider_map(
     providers
 }
 
-fn routing_rules(rule_sets: &[RoutingRuleSet], policy: &ClientPolicy) -> Vec<String> {
+fn routing_rules(
+    rule_sets: &[RoutingRuleSet],
+    policy: &ClientPolicy,
+    profiles: &[ProtocolProfile],
+) -> Result<Vec<String>> {
     let mut rules: Vec<_> = rule_sets
         .iter()
         .map(|rule_set| format!("RULE-SET,{},{}", rule_set.slug, rule_set.target))
         .collect();
 
-    let mut inline = policy
-        .rules
-        .iter()
-        .filter(|rule| rule.enabled)
-        .collect::<Vec<_>>();
-    inline.sort_by_key(|rule| rule.priority);
     rules.extend(
-        inline
+        policy
+            .resolved_rules(profiles)?
             .into_iter()
-            .map(|rule| format!("{},{}", rule.condition, rule.target)),
+            .map(|(condition, target)| format!("{condition},{target}")),
     );
-    rules
+    Ok(rules)
 }
 
 #[cfg(test)]

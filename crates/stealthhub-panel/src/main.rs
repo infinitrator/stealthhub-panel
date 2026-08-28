@@ -56,11 +56,12 @@ use stealthhub_core::{
     adapters::{core_registry, protocol_registry},
     mihomo::{generate_mihomo_yaml_with_registry, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
+    policy::{parse_role, PoolKind, PoolMember, RoutingPolicyRule, TransportPool},
     rules::routing_rule_payload_yaml,
     storage::{
         admin_count, create_admin_session, create_first_admin, create_user, delete_admin_session,
-        delete_expired_admin_sessions, delete_secret, delete_user,
-        ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
+        delete_expired_admin_sessions, delete_routing_policy, delete_secret, delete_transport_pool,
+        delete_user, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
         ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
         get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
         is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
@@ -68,8 +69,9 @@ use stealthhub_core::{
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
         reset_user_subscription_token, set_user_enabled, touch_admin_session,
         update_admin_password_and_revoke_sessions, update_dns_policy, update_protocol_profile,
-        update_routing_rule_set, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
-        AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
+        update_routing_rule_set, upsert_routing_policy, upsert_secret, upsert_setting,
+        upsert_settings_with_runtime_keys, upsert_transport_pool, AdminRecord, NewUser,
+        UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -172,6 +174,70 @@ struct DnsPolicyForm {
     bootstrap_resolvers: String,
     remote_resolvers: String,
     direct_resolvers: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransportPoolForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    original_id: String,
+    id: String,
+    display_name: String,
+    kind: String,
+    #[serde(default)]
+    enabled: String,
+    members: String,
+    #[serde(default)]
+    test_url: String,
+    #[serde(default)]
+    interval_seconds: String,
+    #[serde(default)]
+    timeout_ms: String,
+    #[serde(default)]
+    tolerance_ms: String,
+    #[serde(default)]
+    max_failures: String,
+    #[serde(default)]
+    lazy: String,
+    #[serde(default)]
+    minimum_healthy_count: String,
+    #[serde(default)]
+    fallback_pool: String,
+    priority: i32,
+    #[serde(default)]
+    strategy: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteTransportPoolForm {
+    #[serde(default)]
+    csrf_token: String,
+    id: String,
+    #[serde(default)]
+    replacement: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RoutingPolicyForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    original_id: String,
+    id: String,
+    display_name: String,
+    #[serde(default)]
+    enabled: String,
+    priority: i32,
+    condition: String,
+    target: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteRoutingPolicyForm {
+    #[serde(default)]
+    csrf_token: String,
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -367,6 +433,22 @@ async fn main() -> anyhow::Result<()> {
             get(routing_page).post(update_routing_rule_action),
         )
         .route("/admin/routing/dns", post(update_dns_policy_action))
+        .route(
+            "/admin/routing/pools/save",
+            post(save_transport_pool_action),
+        )
+        .route(
+            "/admin/routing/pools/delete",
+            post(delete_transport_pool_action),
+        )
+        .route(
+            "/admin/routing/policies/save",
+            post(save_routing_policy_action),
+        )
+        .route(
+            "/admin/routing/policies/delete",
+            post(delete_routing_policy_action),
+        )
         .route("/admin/system", get(system_page))
         .route(
             "/admin/configs",
@@ -1497,8 +1579,12 @@ async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
             );
         }
     };
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load routing profiles", error),
+    };
 
-    views::routing::render(&auth, &rule_sets, &policy, &dns_policy)
+    views::routing::render(&auth, &rule_sets, &policy, &dns_policy, &profiles)
 }
 
 async fn update_routing_rule_action(
@@ -1588,6 +1674,197 @@ async fn update_dns_policy_action(
             "Back to Routing",
         ),
     }
+}
+
+async fn save_transport_pool_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TransportPoolForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let value = match transport_pool_from_form(&form) {
+        Ok(value) => value,
+        Err(error) => return routing_input_error("Transport pool rejected", error),
+    };
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profiles for transport pool", error),
+    };
+    let original_id = (!form.original_id.trim().is_empty()).then_some(form.original_id.trim());
+    match upsert_transport_pool(&state.pool, original_id, value, &profiles).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Transport pool rejected", error),
+    }
+}
+
+async fn delete_transport_pool_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteTransportPoolForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profiles for pool deletion", error),
+    };
+    let replacement = (!form.replacement.trim().is_empty()).then_some(form.replacement.trim());
+    match delete_transport_pool(&state.pool, form.id.trim(), replacement, &profiles).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Transport pool deletion rejected", error),
+    }
+}
+
+async fn save_routing_policy_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RoutingPolicyForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profiles for routing policy", error),
+    };
+    let value = RoutingPolicyRule {
+        id: form.id.trim().to_string(),
+        display_name: form.display_name.trim().to_string(),
+        enabled: checkbox_enabled(&form.enabled),
+        priority: form.priority,
+        condition: form.condition.trim().to_string(),
+        target: form.target.trim().to_string(),
+    };
+    let original_id = (!form.original_id.trim().is_empty()).then_some(form.original_id.trim());
+    match upsert_routing_policy(&state.pool, original_id, value, &profiles).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Routing policy rejected", error),
+    }
+}
+
+async fn delete_routing_policy_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<DeleteRoutingPolicyForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match delete_routing_policy(&state.pool, form.id.trim()).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Routing policy deletion rejected", error),
+    }
+}
+
+fn transport_pool_from_form(form: &TransportPoolForm) -> anyhow::Result<TransportPool> {
+    let optional_u32 = |label: &str, value: &str| -> anyhow::Result<Option<u32>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        value
+            .parse::<u32>()
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{label} must be an unsigned integer"))
+    };
+    let kind = match form.kind.as_str() {
+        "manual" | "select" => PoolKind::Select,
+        "url-test" => PoolKind::UrlTest,
+        "fallback" => PoolKind::Fallback,
+        "load-balance" => PoolKind::LoadBalance,
+        _ => anyhow::bail!("unknown transport pool strategy"),
+    };
+    let members = form
+        .members
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(parse_pool_member)
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(TransportPool {
+        id: form.id.trim().to_string(),
+        display_name: form.display_name.trim().to_string(),
+        kind,
+        enabled: checkbox_enabled(&form.enabled),
+        members,
+        test_url: (!form.test_url.trim().is_empty()).then(|| form.test_url.trim().to_string()),
+        interval_seconds: optional_u32("interval", &form.interval_seconds)?,
+        timeout_ms: optional_u32("timeout", &form.timeout_ms)?,
+        tolerance_ms: optional_u32("tolerance", &form.tolerance_ms)?,
+        max_failures: optional_u32("maximum failures", &form.max_failures)?,
+        lazy: checkbox_enabled(&form.lazy),
+        minimum_healthy_count: optional_u32("minimum healthy count", &form.minimum_healthy_count)?,
+        fallback_pool: (!form.fallback_pool.trim().is_empty())
+            .then(|| form.fallback_pool.trim().to_string()),
+        priority: form.priority,
+        strategy: (!form.strategy.trim().is_empty()).then(|| form.strategy.trim().to_string()),
+    })
+}
+
+fn parse_pool_member(value: &str) -> anyhow::Result<PoolMember> {
+    if value == "all-profiles" {
+        return Ok(PoolMember::AllProfiles);
+    }
+    if value == "DIRECT" {
+        return Ok(PoolMember::Direct);
+    }
+    if value == "REJECT" {
+        return Ok(PoolMember::Reject);
+    }
+    let (kind, value) = value
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("member must use kind:value syntax"))?;
+    if value.trim().is_empty() {
+        anyhow::bail!("transport pool member value is empty");
+    }
+    match kind {
+        "profile" => Ok(PoolMember::Profile(value.trim().to_string())),
+        "capability" => Ok(PoolMember::Capability(value.trim().to_string())),
+        "role" => Ok(PoolMember::Role(parse_role(value.trim())?)),
+        "pool" => Ok(PoolMember::Pool(value.trim().to_string())),
+        _ => anyhow::bail!("unknown transport pool member kind"),
+    }
+}
+
+fn routing_input_error(title: &'static str, error: anyhow::Error) -> Response {
+    html_error_response_with_back(
+        StatusCode::BAD_REQUEST,
+        title,
+        error.to_string(),
+        "/admin/routing",
+        "Back to Routing",
+    )
 }
 
 async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Response {

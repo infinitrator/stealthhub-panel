@@ -38,6 +38,7 @@ impl PoolKind {
 #[serde(rename_all = "kebab-case", tag = "kind", content = "value")]
 pub enum PoolMember {
     Profile(String),
+    Capability(String),
     Role(ProxyRole),
     Pool(String),
     AllProfiles,
@@ -49,12 +50,19 @@ pub enum PoolMember {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportPool {
     pub id: String,
+    pub display_name: String,
     pub kind: PoolKind,
     pub enabled: bool,
     pub members: Vec<PoolMember>,
     pub test_url: Option<String>,
     pub interval_seconds: Option<u32>,
+    pub timeout_ms: Option<u32>,
     pub tolerance_ms: Option<u32>,
+    pub max_failures: Option<u32>,
+    pub lazy: bool,
+    pub minimum_healthy_count: Option<u32>,
+    pub fallback_pool: Option<String>,
+    pub priority: i32,
     pub strategy: Option<String>,
 }
 
@@ -62,6 +70,7 @@ pub struct TransportPool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoutingPolicyRule {
     pub id: String,
+    pub display_name: String,
     pub enabled: bool,
     pub priority: i32,
     pub condition: String,
@@ -145,17 +154,27 @@ impl ClientPolicy {
             .filter(|profile| profile.enabled)
             .map(|profile| profile.name.as_str())
             .collect::<BTreeSet<_>>();
+        let all_pool_ids = self
+            .pools
+            .iter()
+            .map(|pool| pool.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if all_pool_ids.len() != self.pools.len() {
+            bail!("transport pool IDs must be unique");
+        }
+        for pool in &self.pools {
+            validate_policy_id(&pool.id)?;
+            if pool.display_name.trim().is_empty() || pool.display_name.len() > 80 {
+                bail!("transport pool display name is invalid");
+            }
+        }
         let pool_ids = self
             .pools
             .iter()
             .filter(|pool| pool.enabled)
             .map(|pool| pool.id.as_str())
             .collect::<BTreeSet<_>>();
-        if pool_ids.len() != self.pools.iter().filter(|pool| pool.enabled).count() {
-            bail!("transport pool IDs must be unique");
-        }
         for pool in self.pools.iter().filter(|pool| pool.enabled) {
-            validate_policy_id(&pool.id)?;
             if pool.members.is_empty() {
                 bail!("transport pool must contain at least one member");
             }
@@ -164,22 +183,80 @@ impl ClientPolicy {
                     PoolMember::Profile(id) if !profile_ids.contains(id.as_str()) => {
                         bail!("transport pool references an unavailable profile")
                     }
+                    PoolMember::Capability(id)
+                        if !profiles.iter().any(|profile| {
+                            profile.enabled && profile.protocol_id == id.as_str()
+                        }) =>
+                    {
+                        bail!("transport pool capability selector resolves to no profile")
+                    }
                     PoolMember::Pool(id) if !pool_ids.contains(id.as_str()) => {
                         bail!("transport pool references an unavailable pool")
                     }
                     _ => {}
                 }
             }
+            if let Some(fallback) = pool.fallback_pool.as_deref() {
+                if fallback == pool.id || !pool_ids.contains(fallback) {
+                    bail!("transport pool fallback reference is invalid");
+                }
+            }
+            if pool.timeout_ms == Some(0)
+                || pool.interval_seconds == Some(0)
+                || pool.max_failures == Some(0)
+                || pool.minimum_healthy_count == Some(0)
+            {
+                bail!("transport pool numeric limits must be positive");
+            }
+            if let Some(url) = pool.test_url.as_deref() {
+                if !url.starts_with("https://")
+                    || url.len() > 512
+                    || url.chars().any(char::is_control)
+                {
+                    bail!("transport pool health URL must be bounded HTTPS");
+                }
+            }
+            if let Some(strategy) = pool.strategy.as_deref() {
+                if !matches!(
+                    strategy,
+                    "round-robin" | "consistent-hashing" | "sticky-sessions"
+                ) {
+                    bail!("unsupported load-balance strategy");
+                }
+            }
             detect_cycle(&pool.id, &pool.id, &self.pools, &mut BTreeSet::new())?;
         }
-        for rule in self.rules.iter().filter(|rule| rule.enabled) {
+        let rule_ids = self
+            .rules
+            .iter()
+            .map(|rule| rule.id.as_str())
+            .collect::<BTreeSet<_>>();
+        if rule_ids.len() != self.rules.len() {
+            bail!("routing policy IDs must be unique");
+        }
+        for rule in &self.rules {
             validate_policy_id(&rule.id)?;
+            if rule.display_name.trim().is_empty() || rule.display_name.len() > 80 {
+                bail!("routing policy display name is invalid");
+            }
+            if !rule.enabled {
+                continue;
+            }
             if rule.condition.trim().is_empty() || rule.condition.contains('\n') {
                 bail!("routing policy condition is invalid");
             }
-            if !matches!(rule.target.as_str(), "DIRECT" | "REJECT")
-                && !pool_ids.contains(rule.target.as_str())
-            {
+            let target_valid = matches!(rule.target.as_str(), "DIRECT" | "REJECT")
+                || pool_ids.contains(rule.target.as_str())
+                || profile_ids.contains(rule.target.as_str())
+                || rule
+                    .target
+                    .strip_prefix("capability:")
+                    .is_some_and(|capability| {
+                        profiles
+                            .iter()
+                            .any(|profile| profile.enabled && profile.protocol_id == capability)
+                    });
+            if !target_valid {
                 bail!("routing policy references an unavailable target");
             }
         }
@@ -204,6 +281,12 @@ impl ClientPolicy {
                 for member in &pool.members {
                     match member {
                         PoolMember::Profile(id) | PoolMember::Pool(id) => members.push(id.clone()),
+                        PoolMember::Capability(capability) => members.extend(
+                            enabled
+                                .iter()
+                                .filter(|profile| profile.protocol_id == *capability)
+                                .map(|profile| profile.name.clone()),
+                        ),
                         PoolMember::Role(role) => members.extend(
                             enabled
                                 .iter()
@@ -223,6 +306,32 @@ impl ClientPolicy {
                     bail!("transport pool resolves to no members");
                 }
                 Ok((pool.clone(), members))
+            })
+            .collect()
+    }
+
+    /// Resolves routing selectors to concrete Mihomo targets.
+    pub fn resolved_rules(&self, profiles: &[ProtocolProfile]) -> Result<Vec<(String, String)>> {
+        self.validate(profiles)?;
+        let mut rules = self
+            .rules
+            .iter()
+            .filter(|rule| rule.enabled)
+            .collect::<Vec<_>>();
+        rules.sort_by_key(|rule| rule.priority);
+        rules
+            .into_iter()
+            .map(|rule| {
+                let target = if let Some(capability) = rule.target.strip_prefix("capability:") {
+                    profiles
+                        .iter()
+                        .find(|profile| profile.enabled && profile.protocol_id == capability)
+                        .map(|profile| profile.name.clone())
+                        .ok_or_else(|| anyhow::anyhow!("routing capability has no profile"))?
+                } else {
+                    rule.target.clone()
+                };
+                Ok((rule.condition.clone(), target))
             })
             .collect()
     }
@@ -252,10 +361,15 @@ fn detect_cycle<'a>(
     if !visiting.insert(pool.id.as_str()) {
         bail!("transport pool references contain a cycle");
     }
-    for child in pool.members.iter().filter_map(|member| match member {
-        PoolMember::Pool(id) => Some(id.as_str()),
-        _ => None,
-    }) {
+    let children = pool
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            PoolMember::Pool(id) => Some(id.as_str()),
+            _ => None,
+        })
+        .chain(pool.fallback_pool.as_deref());
+    for child in children {
         if child == root {
             bail!("transport pool references contain a cycle");
         }
@@ -276,12 +390,19 @@ pub fn default_client_policy() -> ClientPolicy {
                 tolerance: Option<u32>,
                 strategy: Option<&str>| TransportPool {
         id: id.to_string(),
+        display_name: id.to_string(),
         kind,
         enabled: true,
         members,
         test_url: interval.map(|_| "https://www.gstatic.com/generate_204".to_string()),
         interval_seconds: interval,
+        timeout_ms: interval.map(|_| 5_000),
         tolerance_ms: tolerance,
+        max_failures: interval.map(|_| 5),
+        lazy: true,
+        minimum_healthy_count: None,
+        fallback_pool: None,
+        priority: 100,
         strategy: strategy.map(str::to_string),
     };
     ClientPolicy {
@@ -358,6 +479,7 @@ pub fn default_client_policy() -> ClientPolicy {
         rules: vec![
             RoutingPolicyRule {
                 id: "geoip-ru".to_string(),
+                display_name: "Russian IP ranges".to_string(),
                 enabled: true,
                 priority: 100,
                 condition: "GEOIP,RU".to_string(),
@@ -365,6 +487,7 @@ pub fn default_client_policy() -> ClientPolicy {
             },
             RoutingPolicyRule {
                 id: "private-10".to_string(),
+                display_name: "Private 10/8".to_string(),
                 enabled: true,
                 priority: 110,
                 condition: "IP-CIDR,10.0.0.0/8,no-resolve".to_string(),
@@ -372,6 +495,7 @@ pub fn default_client_policy() -> ClientPolicy {
             },
             RoutingPolicyRule {
                 id: "private-172".to_string(),
+                display_name: "Private 172.16/12".to_string(),
                 enabled: true,
                 priority: 120,
                 condition: "IP-CIDR,172.16.0.0/12,no-resolve".to_string(),
@@ -379,6 +503,7 @@ pub fn default_client_policy() -> ClientPolicy {
             },
             RoutingPolicyRule {
                 id: "private-192".to_string(),
+                display_name: "Private 192.168/16".to_string(),
                 enabled: true,
                 priority: 130,
                 condition: "IP-CIDR,192.168.0.0/16,no-resolve".to_string(),
@@ -386,6 +511,7 @@ pub fn default_client_policy() -> ClientPolicy {
             },
             RoutingPolicyRule {
                 id: "catch-all".to_string(),
+                display_name: "Default route".to_string(),
                 enabled: true,
                 priority: 1000,
                 condition: "MATCH".to_string(),

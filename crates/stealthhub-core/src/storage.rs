@@ -567,6 +567,7 @@ const ADAPTER_STATE_MIGRATION: i64 = 1;
 const ACTIVE_RUNTIME_IDS_MIGRATION: i64 = 2;
 const CLIENT_POLICY_MIGRATION: i64 = 3;
 const DNS_POLICY_MIGRATION: i64 = 4;
+const EDITABLE_CLIENT_POLICY_MIGRATION: i64 = 5;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -686,6 +687,37 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(CLIENT_POLICY_MIGRATION)
             .bind("normalize client transport and routing policy")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(EDITABLE_CLIENT_POLICY_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            "ALTER TABLE client_transport_pools ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE client_transport_pools ADD COLUMN timeout_ms INTEGER NULL",
+            "ALTER TABLE client_transport_pools ADD COLUMN max_failures INTEGER NULL",
+            "ALTER TABLE client_transport_pools ADD COLUMN lazy INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE client_transport_pools ADD COLUMN minimum_healthy_count INTEGER NULL",
+            "ALTER TABLE client_transport_pools ADD COLUMN fallback_pool TEXT NULL",
+            "ALTER TABLE client_transport_pools ADD COLUMN priority INTEGER NOT NULL DEFAULT 100",
+            "ALTER TABLE client_routing_rules ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("UPDATE client_transport_pools SET display_name=id WHERE display_name='' ")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE client_routing_rules SET display_name=id WHERE display_name='' ")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(EDITABLE_CLIENT_POLICY_MIGRATION)
+            .bind("make transport pools and routing policies fully editable")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -1906,10 +1938,13 @@ async fn ensure_default_client_policy(pool: &SqlitePool) -> Result<()> {
     let policy = default_client_policy();
     let mut transaction = pool.begin().await?;
     for (position, pool) in policy.pools.iter().enumerate() {
-        sqlx::query("INSERT INTO client_transport_pools (id,kind,enabled,test_url,interval_seconds,tolerance_ms,strategy,position) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
-            .bind(&pool.id).bind(pool_kind_name(pool.kind)).bind(pool.enabled)
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,test_url,interval_seconds,timeout_ms,tolerance_ms,max_failures,lazy,minimum_healthy_count,fallback_pool,priority,strategy,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
+            .bind(&pool.id).bind(&pool.display_name).bind(pool_kind_name(pool.kind)).bind(pool.enabled)
             .bind(&pool.test_url).bind(pool.interval_seconds.map(i64::from))
-            .bind(pool.tolerance_ms.map(i64::from)).bind(&pool.strategy)
+            .bind(pool.timeout_ms.map(i64::from)).bind(pool.tolerance_ms.map(i64::from))
+            .bind(pool.max_failures.map(i64::from)).bind(pool.lazy)
+            .bind(pool.minimum_healthy_count.map(i64::from)).bind(&pool.fallback_pool)
+            .bind(pool.priority).bind(&pool.strategy)
             .bind(i64::try_from(position)?).execute(&mut *transaction).await?;
         for (member_position, member) in pool.members.iter().enumerate() {
             let (kind, value) = encode_pool_member(member);
@@ -1919,8 +1954,8 @@ async fn ensure_default_client_policy(pool: &SqlitePool) -> Result<()> {
         }
     }
     for rule in policy.rules {
-        sqlx::query("INSERT INTO client_routing_rules (id,enabled,priority,condition,target) VALUES (?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
-            .bind(rule.id).bind(rule.enabled).bind(rule.priority).bind(rule.condition).bind(rule.target)
+        sqlx::query("INSERT INTO client_routing_rules (id,display_name,enabled,priority,condition,target) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING")
+            .bind(rule.id).bind(rule.display_name).bind(rule.enabled).bind(rule.priority).bind(rule.condition).bind(rule.target)
             .execute(&mut *transaction).await?;
     }
     transaction.commit().await?;
@@ -1928,7 +1963,7 @@ async fn ensure_default_client_policy(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn load_client_policy(pool: &SqlitePool) -> Result<ClientPolicy> {
-    let pool_rows = sqlx::query("SELECT id,kind,enabled,test_url,interval_seconds,tolerance_ms,strategy FROM client_transport_pools ORDER BY position,id")
+    let pool_rows = sqlx::query("SELECT id,display_name,kind,enabled,test_url,interval_seconds,timeout_ms,tolerance_ms,max_failures,lazy,minimum_healthy_count,fallback_pool,priority,strategy FROM client_transport_pools ORDER BY priority,position,id")
         .fetch_all(pool).await?;
     let mut pools = Vec::new();
     for row in pool_rows {
@@ -1946,20 +1981,206 @@ pub async fn load_client_policy(pool: &SqlitePool) -> Result<ClientPolicy> {
             .collect::<Result<Vec<_>>>()?;
         pools.push(TransportPool {
             id,
+            display_name: row.try_get("display_name")?,
             kind: parse_pool_kind(row.try_get("kind")?)?,
             enabled: row.try_get("enabled")?,
             members,
             test_url: row.try_get("test_url")?,
             interval_seconds: optional_u32(row.try_get("interval_seconds")?)?,
+            timeout_ms: optional_u32(row.try_get("timeout_ms")?)?,
             tolerance_ms: optional_u32(row.try_get("tolerance_ms")?)?,
+            max_failures: optional_u32(row.try_get("max_failures")?)?,
+            lazy: row.try_get("lazy")?,
+            minimum_healthy_count: optional_u32(row.try_get("minimum_healthy_count")?)?,
+            fallback_pool: row.try_get("fallback_pool")?,
+            priority: row.try_get("priority")?,
             strategy: row.try_get("strategy")?,
         });
     }
-    let rules = sqlx::query("SELECT id,enabled,priority,condition,target FROM client_routing_rules ORDER BY priority,id")
+    let rules = sqlx::query("SELECT id,display_name,enabled,priority,condition,target FROM client_routing_rules ORDER BY priority,id")
         .fetch_all(pool).await?.into_iter().map(|row| Ok(RoutingPolicyRule {
-            id: row.try_get("id")?, enabled: row.try_get("enabled")?, priority: row.try_get("priority")?, condition: row.try_get("condition")?, target: row.try_get("target")?,
+            id: row.try_get("id")?, display_name: row.try_get("display_name")?, enabled: row.try_get("enabled")?, priority: row.try_get("priority")?, condition: row.try_get("condition")?, target: row.try_get("target")?,
         })).collect::<Result<Vec<_>>>()?;
     Ok(ClientPolicy { pools, rules })
+}
+
+/// Creates, updates, or renames one transport pool atomically.
+pub async fn upsert_transport_pool(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: TransportPool,
+    profiles: &[ProtocolProfile],
+) -> Result<()> {
+    let mut policy = load_client_policy(database).await?;
+    let mut renamed_pool = None;
+    if let Some(original_id) = original_id.filter(|id| !id.is_empty()) {
+        let index = policy
+            .pools
+            .iter()
+            .position(|pool| pool.id == original_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown transport pool"))?;
+        if original_id != value.id && policy.pools.iter().any(|pool| pool.id == value.id) {
+            bail!("transport pool ID already exists");
+        }
+        replace_pool_references(&mut policy, original_id, &value.id);
+        if original_id != value.id {
+            renamed_pool = Some((original_id.to_string(), value.id.clone()));
+        }
+        policy.pools[index] = value;
+    } else {
+        if policy.pools.iter().any(|pool| pool.id == value.id) {
+            bail!("transport pool ID already exists");
+        }
+        policy.pools.push(value);
+    }
+    policy.validate(profiles)?;
+    save_client_policy(database, &policy, renamed_pool.as_ref()).await
+}
+
+/// Deletes one transport pool, optionally migrating all references first.
+pub async fn delete_transport_pool(
+    database: &SqlitePool,
+    id: &str,
+    replacement: Option<&str>,
+    profiles: &[ProtocolProfile],
+) -> Result<()> {
+    let mut policy = load_client_policy(database).await?;
+    if !policy.pools.iter().any(|pool| pool.id == id) {
+        bail!("unknown transport pool");
+    }
+    let rule_set_references: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM routing_rule_sets WHERE target=?")
+            .bind(id)
+            .fetch_one(database)
+            .await?;
+    let referenced = policy.pools.iter().any(|pool| {
+        pool.fallback_pool.as_deref() == Some(id)
+            || pool
+                .members
+                .iter()
+                .any(|member| matches!(member, PoolMember::Pool(value) if value == id))
+    }) || policy.rules.iter().any(|rule| rule.target == id)
+        || rule_set_references > 0;
+    let mut renamed_pool = None;
+    if referenced {
+        let replacement = replacement
+            .filter(|value| !value.is_empty() && *value != id)
+            .ok_or_else(|| anyhow::anyhow!("transport pool is referenced; choose a replacement"))?;
+        if !policy.pools.iter().any(|pool| pool.id == replacement) {
+            bail!("replacement transport pool does not exist");
+        }
+        replace_pool_references(&mut policy, id, replacement);
+        renamed_pool = Some((id.to_string(), replacement.to_string()));
+    }
+    policy.pools.retain(|pool| pool.id != id);
+    policy.validate(profiles)?;
+    save_client_policy(database, &policy, renamed_pool.as_ref()).await
+}
+
+/// Creates or updates one ordered routing policy.
+pub async fn upsert_routing_policy(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: RoutingPolicyRule,
+    profiles: &[ProtocolProfile],
+) -> Result<()> {
+    let mut policy = load_client_policy(database).await?;
+    if let Some(original_id) = original_id.filter(|id| !id.is_empty()) {
+        let index = policy
+            .rules
+            .iter()
+            .position(|rule| rule.id == original_id)
+            .ok_or_else(|| anyhow::anyhow!("unknown routing policy"))?;
+        if original_id != value.id && policy.rules.iter().any(|rule| rule.id == value.id) {
+            bail!("routing policy ID already exists");
+        }
+        policy.rules[index] = value;
+    } else {
+        if policy.rules.iter().any(|rule| rule.id == value.id) {
+            bail!("routing policy ID already exists");
+        }
+        policy.rules.push(value);
+    }
+    policy.validate(profiles)?;
+    save_client_policy(database, &policy, None).await
+}
+
+/// Deletes one routing policy by stable ID.
+pub async fn delete_routing_policy(database: &SqlitePool, id: &str) -> Result<()> {
+    let mut policy = load_client_policy(database).await?;
+    let previous_len = policy.rules.len();
+    policy.rules.retain(|rule| rule.id != id);
+    if policy.rules.len() == previous_len {
+        bail!("unknown routing policy");
+    }
+    save_client_policy(database, &policy, None).await
+}
+
+fn replace_pool_references(policy: &mut ClientPolicy, old: &str, replacement: &str) {
+    for pool in &mut policy.pools {
+        for member in &mut pool.members {
+            if matches!(member, PoolMember::Pool(value) if value == old) {
+                *member = PoolMember::Pool(replacement.to_string());
+            }
+        }
+        if pool.fallback_pool.as_deref() == Some(old) {
+            pool.fallback_pool = Some(replacement.to_string());
+        }
+    }
+    for rule in &mut policy.rules {
+        if rule.target == old {
+            rule.target = replacement.to_string();
+        }
+    }
+}
+
+async fn save_client_policy(
+    database: &SqlitePool,
+    policy: &ClientPolicy,
+    renamed_pool: Option<&(String, String)>,
+) -> Result<()> {
+    let mut transaction = database.begin().await?;
+    sqlx::query("DELETE FROM client_transport_pool_members")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM client_routing_rules")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("DELETE FROM client_transport_pools")
+        .execute(&mut *transaction)
+        .await?;
+    for (position, pool) in policy.pools.iter().enumerate() {
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,test_url,interval_seconds,timeout_ms,tolerance_ms,max_failures,lazy,minimum_healthy_count,fallback_pool,priority,strategy,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&pool.id).bind(&pool.display_name).bind(pool_kind_name(pool.kind)).bind(pool.enabled)
+            .bind(&pool.test_url).bind(pool.interval_seconds.map(i64::from))
+            .bind(pool.timeout_ms.map(i64::from)).bind(pool.tolerance_ms.map(i64::from))
+            .bind(pool.max_failures.map(i64::from)).bind(pool.lazy)
+            .bind(pool.minimum_healthy_count.map(i64::from)).bind(&pool.fallback_pool)
+            .bind(pool.priority).bind(&pool.strategy).bind(i64::try_from(position)?)
+            .execute(&mut *transaction).await?;
+        for (member_position, member) in pool.members.iter().enumerate() {
+            let (kind, member_value) = encode_pool_member(member);
+            sqlx::query("INSERT INTO client_transport_pool_members (pool_id,position,member_kind,member_value) VALUES (?,?,?,?)")
+                .bind(&pool.id).bind(i64::try_from(member_position)?).bind(kind).bind(member_value)
+                .execute(&mut *transaction).await?;
+        }
+    }
+    for rule in &policy.rules {
+        sqlx::query("INSERT INTO client_routing_rules (id,display_name,enabled,priority,condition,target) VALUES (?,?,?,?,?,?)")
+            .bind(&rule.id).bind(&rule.display_name).bind(rule.enabled).bind(rule.priority)
+            .bind(&rule.condition).bind(&rule.target).execute(&mut *transaction).await?;
+    }
+    if let Some((old, replacement)) = renamed_pool {
+        sqlx::query("UPDATE routing_rule_sets SET target=?,updated_at=? WHERE target=?")
+            .bind(replacement)
+            .bind(Utc::now())
+            .bind(old)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    bump_desired_generation(&mut transaction).await?;
+    transaction.commit().await?;
+    Ok(())
 }
 
 async fn ensure_default_dns_policy(pool: &SqlitePool) -> Result<()> {
@@ -2036,6 +2257,7 @@ fn parse_pool_kind(value: String) -> Result<PoolKind> {
 fn encode_pool_member(member: &PoolMember) -> (&'static str, Option<String>) {
     match member {
         PoolMember::Profile(value) => ("profile", Some(value.clone())),
+        PoolMember::Capability(value) => ("capability", Some(value.clone())),
         PoolMember::Role(value) => ("role", Some(role_name(*value).to_string())),
         PoolMember::Pool(value) => ("pool", Some(value.clone())),
         PoolMember::AllProfiles => ("all-profiles", None),
@@ -2049,6 +2271,11 @@ fn decode_pool_member(kind: String, value: Option<String>) -> Result<PoolMember>
         "profile" => {
             Ok(PoolMember::Profile(value.ok_or_else(|| {
                 anyhow::anyhow!("profile member has no value")
+            })?))
+        }
+        "capability" => {
+            Ok(PoolMember::Capability(value.ok_or_else(|| {
+                anyhow::anyhow!("capability member has no value")
             })?))
         }
         "role" => {
@@ -2408,7 +2635,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 4);
+        assert_eq!(migrations, 5);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -3072,6 +3299,114 @@ mod tests {
 
         close_and_remove(pool, &path).await;
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_pool_and_routing_policy_crud_preserve_references() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_routing_rule_sets(&pool).await?;
+        let profiles = crate::adapters::default_profiles();
+        let custom = TransportPool {
+            id: "CUSTOM".to_string(),
+            display_name: "Custom transport".to_string(),
+            kind: PoolKind::Fallback,
+            enabled: true,
+            members: vec![PoolMember::Pool("AUTO-SAFE".to_string())],
+            test_url: Some("https://www.gstatic.com/generate_204".to_string()),
+            interval_seconds: Some(120),
+            timeout_ms: Some(3_000),
+            tolerance_ms: Some(50),
+            max_failures: Some(3),
+            lazy: true,
+            minimum_healthy_count: Some(1),
+            fallback_pool: None,
+            priority: 250,
+            strategy: None,
+        };
+        upsert_transport_pool(&pool, None, custom.clone(), &profiles).await?;
+        assert!(load_client_policy(&pool)
+            .await?
+            .pools
+            .iter()
+            .any(|entry| entry.id == "CUSTOM"));
+        update_routing_rule_set(
+            &pool,
+            UpdateRoutingRuleSet {
+                slug: "proxy-ai".to_string(),
+                enabled: true,
+                target: "CUSTOM".to_string(),
+                payload: "DOMAIN,example.test".to_string(),
+            },
+        )
+        .await?;
+        let mut cyclic = custom.clone();
+        cyclic.id = "CYCLE".to_string();
+        cyclic.members = vec![PoolMember::Pool("CYCLE".to_string())];
+        assert!(upsert_transport_pool(&pool, None, cyclic, &profiles)
+            .await
+            .is_err());
+
+        upsert_routing_policy(
+            &pool,
+            None,
+            RoutingPolicyRule {
+                id: "custom-domain".to_string(),
+                display_name: "Custom domain".to_string(),
+                enabled: true,
+                priority: 90,
+                condition: "DOMAIN,example.test".to_string(),
+                target: "CUSTOM".to_string(),
+            },
+            &profiles,
+        )
+        .await?;
+        let mut renamed = custom;
+        renamed.id = "CUSTOM-RENAMED".to_string();
+        upsert_transport_pool(&pool, Some("CUSTOM"), renamed, &profiles).await?;
+        let policy = load_client_policy(&pool).await?;
+        assert_eq!(
+            policy
+                .rules
+                .iter()
+                .find(|rule| rule.id == "custom-domain")
+                .map(|rule| rule.target.as_str()),
+            Some("CUSTOM-RENAMED")
+        );
+        assert_eq!(
+            load_routing_rule_sets(&pool)
+                .await?
+                .iter()
+                .find(|rule_set| rule_set.slug == "proxy-ai")
+                .map(|rule_set| rule_set.target.as_str()),
+            Some("CUSTOM-RENAMED")
+        );
+        assert!(
+            delete_transport_pool(&pool, "CUSTOM-RENAMED", None, &profiles)
+                .await
+                .is_err()
+        );
+        delete_transport_pool(&pool, "CUSTOM-RENAMED", Some("AUTO-SAFE"), &profiles).await?;
+        assert_eq!(
+            load_client_policy(&pool)
+                .await?
+                .rules
+                .iter()
+                .find(|rule| rule.id == "custom-domain")
+                .map(|rule| rule.target.as_str()),
+            Some("AUTO-SAFE")
+        );
+        assert_eq!(
+            load_routing_rule_sets(&pool)
+                .await?
+                .iter()
+                .find(|rule_set| rule_set.slug == "proxy-ai")
+                .map(|rule_set| rule_set.target.as_str()),
+            Some("AUTO-SAFE")
+        );
+        delete_routing_policy(&pool, "custom-domain").await?;
+
+        close_and_remove(pool, &path).await;
         Ok(())
     }
 }

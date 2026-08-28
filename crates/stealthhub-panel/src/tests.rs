@@ -404,6 +404,25 @@ fn content_etags_are_stable_and_change_with_the_payload() {
 }
 
 #[test]
+fn transport_pool_member_input_is_typed_and_rejects_ambiguous_values() {
+    assert_eq!(
+        parse_pool_member("profile:FAST").unwrap(),
+        PoolMember::Profile("FAST".to_string())
+    );
+    assert_eq!(
+        parse_pool_member("capability:hysteria2").unwrap(),
+        PoolMember::Capability("hysteria2".to_string())
+    );
+    assert_eq!(
+        parse_pool_member("pool:AUTO").unwrap(),
+        PoolMember::Pool("AUTO".to_string())
+    );
+    assert!(parse_pool_member("AUTO").is_err());
+    assert!(parse_pool_member("profile:").is_err());
+    assert!(parse_pool_member("shell:command").is_err());
+}
+
+#[test]
 fn argon2_upgrade_preserves_existing_phc_password_hashes() {
     const LEGACY_HASH: &str =
         "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
