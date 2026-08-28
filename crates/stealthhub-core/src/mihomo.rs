@@ -4,9 +4,9 @@
 //! profiles, secrets and routing rule sets into client-importable Mihomo config.
 //! Inputs are explicit so generation can be tested without a database.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::{
@@ -34,6 +34,7 @@ pub fn generate_mihomo_yaml(
             routing_rule_sets,
             policy: &default_client_policy(),
             dns_policy: &default_dns_policy(),
+            available_core_capabilities: None,
         },
         &registry,
     )
@@ -48,6 +49,14 @@ pub struct MihomoGenerationInput<'a> {
     pub routing_rule_sets: &'a [RoutingRuleSet],
     pub policy: &'a ClientPolicy,
     pub dns_policy: &'a DnsPolicy,
+    /// Installed runtime capabilities; `None` is reserved for offline tests/tools.
+    pub available_core_capabilities: Option<&'a BTreeSet<String>>,
+}
+
+/// Generated document plus non-fatal unavailable-profile diagnostics.
+pub struct MihomoGenerationOutput {
+    pub yaml: String,
+    pub warnings: Vec<String>,
 }
 
 /// Generates a Mihomo document without branching on concrete protocol IDs.
@@ -55,6 +64,14 @@ pub fn generate_mihomo_yaml_with_registry(
     input: MihomoGenerationInput<'_>,
     registry: &ProtocolRegistry,
 ) -> Result<String> {
+    Ok(generate_mihomo_yaml_detailed(input, registry)?.yaml)
+}
+
+/// Generates a subscription while explicitly reporting skipped historical profiles.
+pub fn generate_mihomo_yaml_detailed(
+    input: MihomoGenerationInput<'_>,
+    registry: &ProtocolRegistry,
+) -> Result<MihomoGenerationOutput> {
     let MihomoGenerationInput {
         settings,
         user,
@@ -63,6 +80,7 @@ pub fn generate_mihomo_yaml_with_registry(
         routing_rule_sets,
         policy,
         dns_policy,
+        available_core_capabilities,
     } = input;
     let enabled_profiles: Vec<_> = profiles.iter().filter(|profile| profile.enabled).collect();
     if enabled_profiles.is_empty() {
@@ -77,21 +95,41 @@ pub fn generate_mihomo_yaml_with_registry(
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect::<BTreeMap<_, _>>();
     let resolver = MapSecretResolver::new(&secret_values);
-    let proxies = enabled_profiles
-        .iter()
-        .map(|profile| {
-            let adapter = registry.get(&profile.protocol_id).with_context(|| {
-                format!("protocol adapter `{}` is unavailable", profile.protocol_id)
-            })?;
-            adapter.render_client(&ClientRenderContext {
-                profile,
-                user,
-                secrets: &resolver,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut proxies = Vec::new();
+    let mut available_profiles = Vec::new();
+    let mut warnings = Vec::new();
+    for profile in enabled_profiles {
+        let Some(adapter) = registry.get(&profile.protocol_id) else {
+            warnings.push(format!(
+                "profile `{}` skipped: protocol adapter is unavailable",
+                profile.name
+            ));
+            continue;
+        };
+        if available_core_capabilities.is_some_and(|capabilities| {
+            !adapter
+                .manifest()
+                .required_core_capabilities
+                .is_subset(capabilities)
+        }) {
+            warnings.push(format!(
+                "profile `{}` skipped: compatible runtime is unavailable",
+                profile.name
+            ));
+            continue;
+        }
+        proxies.push(adapter.render_client(&ClientRenderContext {
+            profile,
+            user,
+            secrets: &resolver,
+        })?);
+        available_profiles.push(profile.clone());
+    }
+    if proxies.is_empty() {
+        bail!("no enabled profile has an available protocol and runtime adapter");
+    }
 
-    let resolved_pools = policy.resolved_pools(profiles)?;
+    let resolved_pools = policy.resolved_pools(&available_profiles)?;
     dns_policy.validate()?;
     let active_rule_sets = active_routing_rule_sets(routing_rule_sets);
 
@@ -107,10 +145,13 @@ pub fn generate_mihomo_yaml_with_registry(
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
         "proxy-groups": proxy_groups(&resolved_pools),
-        "rules": routing_rules(&active_rule_sets, policy, profiles)?
+        "rules": routing_rules(&active_rule_sets, policy, &available_profiles)?
     });
 
-    Ok(serde_norway::to_string(&doc)?)
+    Ok(MihomoGenerationOutput {
+        yaml: serde_norway::to_string(&doc)?,
+        warnings,
+    })
 }
 
 fn dns_config(policy: &DnsPolicy, rule_sets: &[RoutingRuleSet]) -> serde_json::Value {
@@ -425,6 +466,7 @@ mod tests {
                     required_core_capabilities: BTreeSet::from(["external-capability".to_string()]),
                     user_participation: crate::adapter::UserParticipation::None,
                     listener_network: crate::adapter::ListenerNetwork::Tcp,
+                    composition: crate::adapter::ProtocolComposition::opaque("external-test"),
                 },
             }))
             .unwrap();
@@ -450,11 +492,57 @@ mod tests {
                 routing_rule_sets: &[],
                 policy: &default_client_policy(),
                 dns_policy: &default_dns_policy(),
+                available_core_capabilities: None,
             },
             &registry,
         )
         .unwrap();
         assert!(yaml.contains("external-test"));
         assert!(yaml.contains("EXTERNAL"));
+    }
+
+    #[test]
+    fn historical_profile_is_skipped_without_dangling_pool_members() {
+        let settings = fixture_settings();
+        let user = fixture_user();
+        let mut historical = fixture_profile();
+        historical.name = "HISTORICAL".to_string();
+        historical.protocol_id = "removed-adapter".to_string();
+        let profiles = vec![fixture_profile(), historical];
+        let secrets = HashMap::from([
+            (
+                "xray.reality.public_key".to_string(),
+                "public-key-value".to_string(),
+            ),
+            (
+                "xray.reality.short_id".to_string(),
+                "0123456789abcdef".to_string(),
+            ),
+        ]);
+        let registry = crate::adapters::protocol_registry().unwrap();
+        let generated = generate_mihomo_yaml_detailed(
+            MihomoGenerationInput {
+                settings: &settings,
+                user: &user,
+                profiles: &profiles,
+                secrets: &secrets,
+                routing_rule_sets: &[],
+                policy: &default_client_policy(),
+                dns_policy: &default_dns_policy(),
+                available_core_capabilities: None,
+            },
+            &registry,
+        )
+        .unwrap();
+        assert_eq!(generated.warnings.len(), 1);
+        assert!(!generated.yaml.contains("HISTORICAL"));
+        let parsed: serde_norway::Value = serde_norway::from_str(&generated.yaml).unwrap();
+        assert!(parsed["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .all(|group| group["proxies"]
+                .as_sequence()
+                .is_none_or(|members| members.iter().all(|member| member != "HISTORICAL"))));
     }
 }

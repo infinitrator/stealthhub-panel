@@ -9,7 +9,7 @@ use crate::{
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
 use stealthhub_core::{
-    adapter::{ConfigField, ConfigFieldKind, ProtocolRegistry},
+    adapter::{AdapterMaturity, ConfigField, ConfigFieldKind, ProtocolRegistry},
     inventory::{adapter_kind, AdapterInventory},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
     storage::UserSyncStatusRecord,
@@ -76,6 +76,7 @@ pub(crate) fn render(
                                         tr {
                                             th { "Name" }
                                             th { "Kind" }
+                                            th { "Composition" }
                                             th { "Role" }
                                             th { "Enabled" }
                                             th { "Endpoint" }
@@ -88,6 +89,7 @@ pub(crate) fn render(
                                             tr {
                                                 td { code { (&profile.name) } }
                                                 td { (protocol_label(profile, registry)) }
+                                                td { (protocol_composition(profile, registry)) }
                                                 td { (proxy_role_label(&profile.role)) }
                                                 td {
                                                     @if profile.enabled {
@@ -263,6 +265,26 @@ fn protocol_label(profile: &ProtocolProfile, registry: &ProtocolRegistry) -> Str
         .get(&profile.protocol_id)
         .map(|adapter| adapter.manifest().display_name.clone())
         .unwrap_or_else(|| format!("Unavailable: {}", profile.protocol_id))
+}
+
+fn protocol_composition(profile: &ProtocolProfile, registry: &ProtocolRegistry) -> Markup {
+    let Some(adapter) = registry.get(&profile.protocol_id) else {
+        return html! { span class="badge off" { "unavailable" } };
+    };
+    let composition = &adapter.manifest().composition;
+    let (class, maturity) = match composition.maturity {
+        AdapterMaturity::Stable => ("ok", "stable"),
+        AdapterMaturity::Experimental => ("neutral", "experimental"),
+        AdapterMaturity::Unsupported => ("off", "unsupported"),
+    };
+    html! {
+        code {
+            (&composition.protocol) " + " (&composition.transport) " + " (&composition.security)
+            @if let Some(flow) = &composition.flow { " + " (flow) }
+        }
+        br;
+        span class=(format!("badge {class}")) { (maturity) }
+    }
 }
 
 const fn proxy_role_label(role: &ProxyRole) -> &'static str {

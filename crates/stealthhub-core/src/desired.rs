@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
-use crate::models::{ProtocolProfile, SubscriptionUser};
+use crate::{
+    adapter::ListenerClaim,
+    models::{ProtocolProfile, SubscriptionUser},
+};
 
 /// Fixed-format unprivileged request consumed by the root worker.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,7 +47,27 @@ pub struct InfrastructureResource {
     pub adapter_id: String,
     pub schema_version: u32,
     pub enabled: bool,
+    #[serde(default)]
+    pub kind: InfrastructureResourceKind,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    #[serde(default)]
+    pub listeners: Vec<ListenerClaim>,
     pub config: serde_json::Value,
+}
+
+/// Stable shared-infrastructure role, independent of its concrete adapter.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum InfrastructureResourceKind {
+    Domain,
+    Certificate,
+    TlsFrontend,
+    DecoyTarget,
+    Listener,
+    PortAllocation,
+    #[default]
+    AdapterOwned,
 }
 
 /// Last generation proven healthy and atomically published.

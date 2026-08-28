@@ -571,6 +571,7 @@ mod tests {
             required_core_capabilities: BTreeSet::from(["capability-a".to_string()]),
             user_participation: crate::adapter::UserParticipation::PerUserUuid,
             listener_network: crate::adapter::ListenerNetwork::Tcp,
+            composition: crate::adapter::ProtocolComposition::opaque(id),
         }
     }
     fn profile(adapter: &str, schema_version: u32, enabled: bool) -> ProtocolProfile {

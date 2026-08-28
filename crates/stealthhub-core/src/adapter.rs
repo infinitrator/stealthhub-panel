@@ -137,6 +137,40 @@ pub struct ProtocolAdapterManifest {
     pub required_core_capabilities: BTreeSet<String>,
     pub user_participation: UserParticipation,
     pub listener_network: ListenerNetwork,
+    pub composition: ProtocolComposition,
+}
+
+/// Declarative layers of one tested client/server protocol combination.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProtocolComposition {
+    pub protocol: String,
+    pub transport: String,
+    pub security: String,
+    pub flow: Option<String>,
+    pub maturity: AdapterMaturity,
+}
+
+impl ProtocolComposition {
+    /// Creates metadata for adapters whose internal layers are not decomposed.
+    #[must_use]
+    pub fn opaque(protocol: impl Into<String>) -> Self {
+        Self {
+            protocol: protocol.into(),
+            transport: "adapter-defined".to_string(),
+            security: "adapter-defined".to_string(),
+            flow: None,
+            maturity: AdapterMaturity::Experimental,
+        }
+    }
+}
+
+/// Product confidence assigned only after client and server verification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterMaturity {
+    Stable,
+    Experimental,
+    Unsupported,
 }
 
 /// Socket protocol claimed by a rendered server listener.
@@ -695,10 +729,27 @@ fn validate_protocol_manifest(manifest: &ProtocolAdapterManifest) -> Result<()> 
         || manifest.display_name.trim().is_empty()
         || manifest.schema_version == 0
         || manifest.required_core_capabilities.is_empty()
+        || !valid_composition_value(&manifest.composition.protocol)
+        || !valid_composition_value(&manifest.composition.transport)
+        || !valid_composition_value(&manifest.composition.security)
+        || manifest
+            .composition
+            .flow
+            .as_deref()
+            .is_some_and(|value| !valid_composition_value(value))
+        || manifest.composition.maturity == AdapterMaturity::Unsupported
     {
         bail!("invalid protocol adapter manifest");
     }
     validate_capabilities(&manifest.required_core_capabilities)
+}
+
+fn valid_composition_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'.'))
 }
 
 fn validate_core_manifest(manifest: &CoreAdapterManifest) -> Result<()> {

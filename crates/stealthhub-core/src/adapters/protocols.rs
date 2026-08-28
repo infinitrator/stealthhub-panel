@@ -7,9 +7,10 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     adapter::{
-        ClientRenderContext, ConfigField, ConfigFieldKind, ListenerClaim, ListenerNetwork,
-        ProtocolAdapter, ProtocolAdapterManifest, ProtocolRegistry, SecretRef, ServerFragment,
-        ServerRenderContext, UserParticipation, ADAPTER_API_VERSION,
+        AdapterMaturity, ClientRenderContext, ConfigField, ConfigFieldKind, ListenerClaim,
+        ListenerNetwork, ProtocolAdapter, ProtocolAdapterManifest, ProtocolComposition,
+        ProtocolRegistry, SecretRef, ServerFragment, ServerRenderContext, UserParticipation,
+        ADAPTER_API_VERSION,
     },
     models::{ProtocolProfile, ProxyRole},
 };
@@ -48,6 +49,7 @@ impl JsonProtocolAdapter {
                 required_core_capabilities: BTreeSet::from([id.to_string()]),
                 user_participation,
                 listener_network,
+                composition: composition(implementation),
             },
             fields,
             implementation,
@@ -85,6 +87,36 @@ impl JsonProtocolAdapter {
             ("server".to_string(), json!(context.profile.server)),
             ("port".to_string(), json!(context.profile.port)),
         ])
+    }
+}
+
+fn composition(implementation: Implementation) -> ProtocolComposition {
+    let (protocol, transport, security, flow, maturity) = match implementation {
+        Implementation::VlessXhttp => ("vless", "xhttp", "reality", None, AdapterMaturity::Stable),
+        Implementation::VlessTcp => ("vless", "tcp", "reality", None, AdapterMaturity::Stable),
+        Implementation::ShadowsocksShadowTls => (
+            "shadowsocks-2022",
+            "tcp",
+            "shadow-tls-v3",
+            None,
+            AdapterMaturity::Stable,
+        ),
+        Implementation::Hysteria => (
+            "hysteria2",
+            "quic",
+            "tls+salamander",
+            None,
+            AdapterMaturity::Stable,
+        ),
+        Implementation::AnyTls => ("anytls", "tcp", "tls", None, AdapterMaturity::Experimental),
+        Implementation::Tuic => ("tuic-v5", "quic", "tls", None, AdapterMaturity::Stable),
+    };
+    ProtocolComposition {
+        protocol: protocol.to_string(),
+        transport: transport.to_string(),
+        security: security.to_string(),
+        flow: flow.map(str::to_string),
+        maturity,
     }
 }
 

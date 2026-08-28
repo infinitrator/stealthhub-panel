@@ -55,7 +55,7 @@ use std::{
 use stealthhub_core::{
     adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, RuntimeLifecycleAction, SecretRef},
     adapters::{core_registry, protocol_registry},
-    mihomo::{generate_mihomo_yaml_with_registry, MihomoGenerationInput},
+    mihomo::{generate_mihomo_yaml_detailed, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
     policy::{parse_role, PoolKind, PoolMember, RoutingPolicyRule, TransportPool},
     rules::{
@@ -675,7 +675,14 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         Err(error) => return subscription_internal_error("load DNS policy", error),
     };
 
-    let yaml = match generate_mihomo_yaml_with_registry(
+    let runtime_capabilities = state
+        .core_registry
+        .observations()
+        .into_iter()
+        .filter(|observation| observation.probe.installed == Some(true))
+        .flat_map(|observation| observation.manifest.capabilities)
+        .collect::<std::collections::BTreeSet<_>>();
+    let generated = match generate_mihomo_yaml_detailed(
         MihomoGenerationInput {
             settings: &settings,
             user: &subscription_user,
@@ -684,6 +691,7 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
             routing_rule_sets: &routing_rule_sets,
             policy: &client_policy,
             dns_policy: &dns_policy,
+            available_core_capabilities: Some(&runtime_capabilities),
         },
         &state.protocol_registry,
     ) {
@@ -697,6 +705,10 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
                 .into_response();
         }
     };
+    for warning in generated.warnings {
+        tracing::warn!("subscription generation warning: {warning}");
+    }
+    let yaml = generated.yaml;
 
     let mut headers = HeaderMap::new();
     headers.insert(

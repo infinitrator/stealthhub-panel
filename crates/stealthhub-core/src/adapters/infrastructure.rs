@@ -18,8 +18,11 @@ use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::{
-    adapter::{CoreAdapter, CoreAdapterManifest, CorePlan, CoreSnapshot, ADAPTER_API_VERSION},
-    desired::InfrastructureResource,
+    adapter::{
+        CoreAdapter, CoreAdapterManifest, CorePlan, CoreSnapshot, ListenerClaim, ListenerNetwork,
+        ADAPTER_API_VERSION,
+    },
+    desired::{InfrastructureResource, InfrastructureResourceKind},
     models::PanelSettings,
 };
 
@@ -72,14 +75,16 @@ impl SubscriptionFrontendAdapter {
         if plan.fragments.is_empty() {
             return Ok(None);
         }
-        if plan.fragments.len() != 1 {
-            bail!("subscription frontend supports one desired resource");
+        let mut domains = plan.fragments.iter().filter_map(|fragment| {
+            fragment
+                .payload
+                .get("subscription_domain")
+                .and_then(Value::as_str)
+        });
+        let domain = domains.next().context("subscription domain is missing")?;
+        if domains.next().is_some() {
+            bail!("subscription frontend has multiple domain owners");
         }
-        let domain = plan.fragments[0]
-            .payload
-            .get("subscription_domain")
-            .and_then(Value::as_str)
-            .context("subscription domain is missing")?;
         validate_domain(domain)?;
         Ok(Some(domain))
     }
@@ -597,13 +602,72 @@ fn validate_domain(value: &str) -> Result<()> {
 pub fn desired_resources(settings: &PanelSettings) -> Vec<InfrastructureResource> {
     let mut resources = Vec::new();
     if !settings.subscription_domain.ends_with(".local") {
-        resources.push(InfrastructureResource {
-            resource_id: "subscription-frontend".to_string(),
+        let resource = |resource_id: &str,
+                        kind: InfrastructureResourceKind,
+                        dependencies: &[&str],
+                        listeners: Vec<ListenerClaim>,
+                        config: Value| InfrastructureResource {
+            resource_id: resource_id.to_string(),
             adapter_id: SUBSCRIPTION_ADAPTER_ID.to_string(),
             schema_version: 1,
             enabled: true,
-            config: json!({"subscription_domain": settings.subscription_domain}),
-        });
+            kind,
+            dependencies: dependencies.iter().map(ToString::to_string).collect(),
+            listeners,
+            config,
+        };
+        resources.extend([
+            resource(
+                "subscription-domain",
+                InfrastructureResourceKind::Domain,
+                &[],
+                Vec::new(),
+                json!({"subscription_domain": settings.subscription_domain}),
+            ),
+            resource(
+                "subscription-certificate",
+                InfrastructureResourceKind::Certificate,
+                &["subscription-domain"],
+                Vec::new(),
+                json!({"issuer":"letsencrypt","domain_ref":"subscription-domain"}),
+            ),
+            resource(
+                "subscription-decoy",
+                InfrastructureResourceKind::DecoyTarget,
+                &[],
+                Vec::new(),
+                json!({"mode":"not-found"}),
+            ),
+            resource(
+                "subscription-port",
+                InfrastructureResourceKind::PortAllocation,
+                &[],
+                Vec::new(),
+                json!({"network":"tcp","port":443}),
+            ),
+            resource(
+                "subscription-listener",
+                InfrastructureResourceKind::Listener,
+                &["subscription-port"],
+                vec![ListenerClaim {
+                    network: ListenerNetwork::Tcp,
+                    port: 443,
+                }],
+                json!({"address":"0.0.0.0","network":"tcp","port":443}),
+            ),
+            resource(
+                "subscription-frontend",
+                InfrastructureResourceKind::TlsFrontend,
+                &[
+                    "subscription-domain",
+                    "subscription-certificate",
+                    "subscription-decoy",
+                    "subscription-listener",
+                ],
+                Vec::new(),
+                json!({"owner":"subscription-frontend"}),
+            ),
+        ]);
     }
     if !settings.node_domain.ends_with(".local") {
         resources.push(InfrastructureResource {
@@ -611,6 +675,9 @@ pub fn desired_resources(settings: &PanelSettings) -> Vec<InfrastructureResource
             adapter_id: NODE_ADAPTER_ID.to_string(),
             schema_version: 1,
             enabled: true,
+            kind: InfrastructureResourceKind::Domain,
+            dependencies: Vec::new(),
+            listeners: Vec::new(),
             config: json!({"node_domain": settings.node_domain}),
         });
     }
@@ -737,9 +804,11 @@ mod tests {
             ..PanelSettings::default()
         };
         let resources = desired_resources(&settings);
-        assert_eq!(resources.len(), 2);
-        assert_eq!(resources[0].adapter_id, SUBSCRIPTION_ADAPTER_ID);
-        assert_eq!(resources[1].adapter_id, NODE_ADAPTER_ID);
+        assert_eq!(resources.len(), 7);
+        assert!(resources[..6]
+            .iter()
+            .all(|resource| resource.adapter_id == SUBSCRIPTION_ADAPTER_ID));
+        assert_eq!(resources[6].adapter_id, NODE_ADAPTER_ID);
     }
 
     #[test]

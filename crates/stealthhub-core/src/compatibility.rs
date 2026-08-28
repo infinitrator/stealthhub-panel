@@ -35,6 +35,7 @@ const DURABLE_TABLES: &[&str] = &[
     "routing_rule_entries",
     "routing_rule_sources",
     "runtime_user_sync",
+    "bootstrap_state",
     "client_dns_policy",
 ];
 
@@ -112,6 +113,7 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
         "routing_rule_entries",
         "routing_rule_sources",
         "runtime_user_sync",
+        "bootstrap_state",
         "client_dns_policy",
     ]
     .iter()

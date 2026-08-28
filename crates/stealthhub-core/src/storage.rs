@@ -587,6 +587,7 @@ const DNS_POLICY_MIGRATION: i64 = 4;
 const EDITABLE_CLIENT_POLICY_MIGRATION: i64 = 5;
 const NORMALIZED_RULES_MIGRATION: i64 = 6;
 const USER_SYNC_STATUS_MIGRATION: i64 = 7;
+const ONE_TIME_BOOTSTRAP_MIGRATION: i64 = 8;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -841,6 +842,46 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(ONE_TIME_BOOTSTRAP_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        sqlx::query(
+            r"CREATE TABLE bootstrap_state (
+                key TEXT PRIMARY KEY,
+                completed_at TEXT NOT NULL
+            )",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        let existing_install: i64 = sqlx::query_scalar(
+            r"SELECT
+                (SELECT COUNT(*) FROM settings) +
+                (SELECT COUNT(*) FROM admins) +
+                (SELECT COUNT(*) FROM users) +
+                (SELECT COUNT(*) FROM protocol_profiles) +
+                (SELECT COUNT(*) FROM routing_rule_sets)",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if existing_install > 0 {
+            for key in ["protocol-profiles", "client-routing"] {
+                sqlx::query("INSERT INTO bootstrap_state (key,completed_at) VALUES (?,?)")
+                    .bind(key)
+                    .bind(Utc::now())
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(ONE_TIME_BOOTSTRAP_MIGRATION)
+            .bind("make editable defaults a one-time bootstrap")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -1045,6 +1086,9 @@ pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
+    if bootstrap_complete(pool, "client-routing").await? {
+        return Ok(());
+    }
     for rule_set in default_routing_rule_sets() {
         let enabled = get_setting(pool, &routing_setting_key(&rule_set.slug, "enabled"))
             .await?
@@ -1070,14 +1114,39 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
     }
     ensure_default_client_policy(pool).await?;
     ensure_default_dns_policy(pool).await?;
+    mark_bootstrap_complete(pool, "client-routing").await?;
     Ok(())
 }
 
 pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
+    if bootstrap_complete(pool, "protocol-profiles").await? {
+        return Ok(());
+    }
     for profile in crate::adapters::default_profiles() {
         ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
     }
+    mark_bootstrap_complete(pool, "protocol-profiles").await?;
+    Ok(())
+}
 
+async fn bootstrap_complete(pool: &SqlitePool, key: &str) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bootstrap_state WHERE key=?")
+            .bind(key)
+            .fetch_one(pool)
+            .await?
+            != 0,
+    )
+}
+
+async fn mark_bootstrap_complete(pool: &SqlitePool, key: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO bootstrap_state (key,completed_at) VALUES (?,?) ON CONFLICT DO NOTHING",
+    )
+    .bind(key)
+    .bind(Utc::now())
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -3135,6 +3204,7 @@ mod tests {
                     required_core_capabilities: BTreeSet::from(["test-capability".to_string()]),
                     user_participation: crate::adapter::UserParticipation::None,
                     listener_network: crate::adapter::ListenerNetwork::Tcp,
+                    composition: crate::adapter::ProtocolComposition::opaque("returning-adapter"),
                 },
             }
         }
@@ -3227,7 +3297,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 7);
+        assert_eq!(migrations, 8);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -3770,6 +3840,12 @@ mod tests {
         assert_eq!(customized.server, "custom.example.test");
         assert_eq!(customized.port, 9443);
 
+        sqlx::query("DELETE FROM protocol_profiles WHERE name='VLESS-REALITY-TCP-FALLBACK'")
+            .execute(&pool)
+            .await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        assert_eq!(list_protocol_profiles_decoded(&pool).await?.len(), 5);
+
         close_and_remove(pool, &path).await;
         Ok(())
     }
@@ -3887,6 +3963,26 @@ mod tests {
         let rule_sets = load_routing_rule_sets(&pool).await?;
         assert_eq!(rule_sets.len(), 4);
         assert!(rule_sets.iter().all(|rule_set| rule_set.enabled));
+
+        sqlx::query("DELETE FROM routing_rule_sets WHERE slug='streaming'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id='HTTPS-LIKE'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM client_transport_pools WHERE id='HTTPS-LIKE'")
+            .execute(&pool)
+            .await?;
+        ensure_default_routing_rule_sets(&pool).await?;
+        assert!(!load_routing_rule_sets(&pool)
+            .await?
+            .iter()
+            .any(|rule_set| rule_set.slug == "streaming"));
+        assert!(!load_client_policy(&pool)
+            .await?
+            .pools
+            .iter()
+            .any(|pool| pool.id == "HTTPS-LIKE"));
 
         update_routing_rule_set(
             &pool,

@@ -16,7 +16,8 @@ use crate::{
         ProtocolRegistry, SecretResolver, ServerRenderContext, UserSyncObservation, UserSyncStatus,
     },
     desired::{
-        AppliedState, DesiredState, JournalEntry, JournalPhase, JournalResource, ReconcileStatus,
+        AppliedState, DesiredState, InfrastructureResource, JournalEntry, JournalPhase,
+        JournalResource, ReconcileStatus,
     },
 };
 
@@ -699,7 +700,7 @@ impl Reconciler {
                     capability: resource.adapter_id.clone(),
                     payload: resource.config.clone(),
                     expected_user_ids: None,
-                    listeners: Vec::new(),
+                    listeners: resource.listeners.clone(),
                 });
         }
 
@@ -726,6 +727,7 @@ impl Reconciler {
     }
 
     fn validate_graph(&self, desired: &DesiredState, applied: &AppliedState) -> Result<()> {
+        validate_infrastructure_dependencies(&desired.infrastructure)?;
         for profile in desired.profiles.iter().filter(|profile| profile.enabled) {
             let protocol = self
                 .protocols
@@ -819,6 +821,51 @@ impl Reconciler {
             let _ = fs::remove_dir_all(path);
         }
     }
+}
+
+fn validate_infrastructure_dependencies(resources: &[InfrastructureResource]) -> Result<()> {
+    let enabled = resources
+        .iter()
+        .filter(|resource| resource.enabled)
+        .map(|resource| (resource.resource_id.as_str(), resource))
+        .collect::<BTreeMap<_, _>>();
+    if enabled.len() != resources.iter().filter(|resource| resource.enabled).count() {
+        bail!("duplicate infrastructure resource ID");
+    }
+    for resource in enabled.values() {
+        for dependency in &resource.dependencies {
+            if !enabled.contains_key(dependency.as_str()) {
+                bail!("infrastructure dependency is missing or disabled");
+            }
+        }
+    }
+
+    fn visit<'a>(
+        id: &'a str,
+        resources: &BTreeMap<&'a str, &'a InfrastructureResource>,
+        visiting: &mut std::collections::BTreeSet<&'a str>,
+        visited: &mut std::collections::BTreeSet<&'a str>,
+    ) -> Result<()> {
+        if visited.contains(id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            bail!("infrastructure dependency cycle");
+        }
+        for dependency in &resources[id].dependencies {
+            visit(dependency, resources, visiting, visited)?;
+        }
+        visiting.remove(id);
+        visited.insert(id);
+        Ok(())
+    }
+
+    let mut visiting = std::collections::BTreeSet::new();
+    let mut visited = std::collections::BTreeSet::new();
+    for id in enabled.keys().copied() {
+        visit(id, &enabled, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }
 
 fn validate_listener_plan(plans: &CorePlans) -> Result<()> {
@@ -1131,6 +1178,7 @@ mod tests {
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
                     user_participation: crate::adapter::UserParticipation::PerUserUuid,
                     listener_network: crate::adapter::ListenerNetwork::Tcp,
+                    composition: crate::adapter::ProtocolComposition::opaque(id),
                 },
                 fields: Vec::new(),
                 secret: None,
@@ -1147,6 +1195,7 @@ mod tests {
                     required_core_capabilities: BTreeSet::from([capability.to_string()]),
                     user_participation: crate::adapter::UserParticipation::PerUserUuid,
                     listener_network: crate::adapter::ListenerNetwork::Tcp,
+                    composition: crate::adapter::ProtocolComposition::opaque(id),
                 },
                 fields: Vec::new(),
                 secret: Some(SecretRef::parse(reference).unwrap()),
@@ -1373,6 +1422,33 @@ mod tests {
         assert!(validate_resource_id("profile_01").is_ok());
         assert!(validate_resource_id("../../etc").is_err());
         assert!(validate_resource_id("with/slash").is_err());
+    }
+
+    #[test]
+    fn infrastructure_dependencies_reject_dangling_references_and_cycles() {
+        let resource = |id: &str, dependencies: &[&str]| InfrastructureResource {
+            resource_id: id.to_string(),
+            adapter_id: "frontend-adapter".to_string(),
+            schema_version: 1,
+            enabled: true,
+            kind: crate::desired::InfrastructureResourceKind::TlsFrontend,
+            dependencies: dependencies.iter().map(ToString::to_string).collect(),
+            listeners: Vec::new(),
+            config: json!({}),
+        };
+        assert!(validate_infrastructure_dependencies(&[
+            resource("domain", &[]),
+            resource("frontend", &["domain"]),
+        ])
+        .is_ok());
+        assert!(
+            validate_infrastructure_dependencies(&[resource("frontend", &["missing"])]).is_err()
+        );
+        assert!(validate_infrastructure_dependencies(&[
+            resource("first", &["second"]),
+            resource("second", &["first"]),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1718,6 +1794,9 @@ mod tests {
                 adapter_id: "frontend-adapter".to_string(),
                 schema_version: 1,
                 enabled: true,
+                kind: crate::desired::InfrastructureResourceKind::Domain,
+                dependencies: Vec::new(),
+                listeners: Vec::new(),
                 config: json!({
                     "subscription_domain": "new.example.test",
                     "node_domain": "node.example.test"
