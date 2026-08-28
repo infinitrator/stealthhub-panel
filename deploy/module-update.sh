@@ -32,6 +32,15 @@ RUNTIME_GROUP="${INFIPROXY_RUNTIME_GROUP:-infiproxy-runtime}"
 RECONCILE_APPLIED_FILE="${INFIPROXY_RECONCILE_APPLIED_FILE:-${ROOT_STATE_DIR}/reconcile/applied.json}"
 LAST_MODULE_BACKUP=""
 
+module_is_retired() {
+  [[ "$1" == "headscale" ]]
+}
+
+require_active_product_module() {
+  module_is_retired "$1" && die "retired module supports removal only: $1"
+  valid_id "$1" || die "invalid module ID"
+}
+
 log() {
   local line
   line="$(date '+%Y-%m-%dT%H:%M:%S%z') $*"
@@ -659,7 +668,7 @@ register_requested() {
     id="$(basename "$request" .register)"
     source="${AVAILABLE_DIR}/${id}.module"
     target="$(manifest_file "$id")"
-    if valid_id "$id" \
+    if ! module_is_retired "$id" && valid_id "$id" \
       && [[ ! -e "$target" ]] \
       && "$MANIFEST_HELPER" validate "$source" --root-owned; then
       install -o root -g root -m 0644 "$source" "$target"
@@ -729,6 +738,12 @@ run_requested() {
   while IFS= read -r module; do
     request="${REQUEST_DIR}/${module}.request"
     [[ -f "$request" ]] || continue
+    if module_is_retired "$module"; then
+      mv -f "$request" "${request}.failed"
+      log "update rejected for retired module ${module}; remove it instead"
+      failed=1
+      continue
+    fi
     if ! safe_request_file "$request"; then
       discard_unsafe_request "$request"
       failed=1
@@ -756,6 +771,12 @@ lifecycle_requested() {
         continue
       fi
       id="$(basename "$request" ".${action}")"
+      if module_is_retired "$id"; then
+        mv -f "$request" "${request}.failed"
+        log "${action} rejected for retired module ${id}"
+        failed=1
+        continue
+      fi
       if ! load_module "$id" || [[ ! -x "$(module_binary)" ]]; then
         mv -f "$request" "${request}.failed"
         log "${action} rejected for unavailable runtime ${id}"
@@ -795,6 +816,7 @@ run_automatic() {
   [[ "$(cat "$marker" 2>/dev/null || true)" != "$today" ]] || return 0
 
   while IFS= read -r module; do
+    module_is_retired "$module" && continue
     state_file="${MODULE_STATE_DIR}/${module}.env"
     enabled="$(state_value "$state_file" AUTO_ENABLED || true)"
     installed="$(state_value "$state_file" INSTALLED || true)"
@@ -855,12 +877,20 @@ main() {
   "$MANIFEST_HELPER" list "$MANIFEST_DIR" --root-owned >/dev/null \
     || die "module registry validation failed"
   case "${1:-}" in
-    --check) check_module "${2:-}" ;;
+    --check)
+      require_active_product_module "${2:-}"
+      check_module "$2"
+      ;;
     --check-all)
       local module
-      while IFS= read -r module; do check_module "$module"; done < <(module_ids)
+      while IFS= read -r module; do
+        module_is_retired "$module" || check_module "$module"
+      done < <(module_ids)
       ;;
-    --update) with_lock update_module "${2:-}" ;;
+    --update)
+      require_active_product_module "${2:-}"
+      with_lock update_module "$2"
+      ;;
     --run-due) with_lock run_due ;;
     -h|--help) usage ;;
     *) usage >&2; exit 2 ;;
