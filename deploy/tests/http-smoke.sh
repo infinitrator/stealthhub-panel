@@ -46,6 +46,8 @@ request() {
     local actual
     shift 2
 
+    : >"$BODY_FILE"
+    : >"$HEADER_FILE"
     actual="$(curl --silent --show-error \
         --cookie "$COOKIE_JAR" --cookie-jar "$COOKIE_JAR" \
         --dump-header "$HEADER_FILE" --output "$BODY_FILE" \
@@ -244,6 +246,10 @@ request 303 /admin/routing --request POST \
     --data-urlencode payload=DOMAIN-SUFFIX,openai.com
 request 200 /rules/proxy-ai.yaml
 body_contains 'DOMAIN-SUFFIX,openai.com'
+RULE_ETAG="$(sed -nE 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*(.*)\r$/\1/p' "$HEADER_FILE")"
+[[ -n "$RULE_ETAG" ]] || fail "routing provider ETag is missing"
+request 304 /rules/proxy-ai.yaml --header "If-None-Match: ${RULE_ETAG}"
+[[ ! -s "$BODY_FILE" ]] || fail "304 routing provider response contains a body"
 
 mkdir -p "${TMP_DIR}/module-requests"
 printf 'module-victim-preserved\n' >"${TMP_DIR}/module-request-victim"

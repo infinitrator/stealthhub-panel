@@ -27,6 +27,7 @@ const DEFAULT_AVAILABLE_DIR: &str = "/etc/infiproxy-modules.available.d";
 const DEFAULT_STATE_DIR: &str = "/var/lib/infiproxy/modules";
 const DEFAULT_REQUEST_DIR: &str = "/var/lib/infiproxy/module-requests";
 const DEFAULT_VERSION_DIR: &str = "/var/lib/infiproxy-maintenance/module-versions";
+const RETIRED_PRODUCT_MODULE_IDS: &[&str] = &["headscale"];
 /// Persisted and locally observed module update state.
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleStatus {
@@ -66,7 +67,10 @@ pub(crate) fn spawn_checker(pool: SqlitePool) {
 /// Loads every valid manifest in deterministic ID order.
 pub(crate) fn registry() -> anyhow::Result<Vec<ModuleSpec>> {
     let directory = manifest_dir();
-    load_registry(&directory, registry_options(&directory))
+    Ok(load_registry(&directory, registry_options(&directory))?
+        .into_iter()
+        .filter(|spec| !is_retired_product_module(&spec.id))
+        .collect())
 }
 
 /// Loads catalog entries that are not currently active.
@@ -78,7 +82,7 @@ pub(crate) fn available() -> anyhow::Result<Vec<ModuleSpec>> {
     let directory = available_dir();
     Ok(load_registry(&directory, registry_options(&directory))?
         .into_iter()
-        .filter(|spec| !active.contains(&spec.id))
+        .filter(|spec| !active.contains(&spec.id) && !is_retired_product_module(&spec.id))
         .collect())
 }
 
@@ -121,7 +125,7 @@ pub(crate) async fn load_page(
     let directory = available_dir();
     let available = load_registry(&directory, registry_options(&directory))?
         .into_iter()
-        .filter(|spec| !active.contains(spec.id.as_str()))
+        .filter(|spec| !active.contains(spec.id.as_str()) && !is_retired_product_module(&spec.id))
         .collect();
     Ok((load_statuses(pool, specs).await?, available))
 }
@@ -216,6 +220,12 @@ pub(crate) fn short_version(value: &str) -> String {
     } else {
         value.chars().take(12).collect()
     }
+}
+
+// Retired product integrations may remain on upgraded hosts solely so the
+// privileged cleanup path can remove their historical footprint.
+fn is_retired_product_module(module_id: &str) -> bool {
+    RETIRED_PRODUCT_MODULE_IDS.contains(&module_id)
 }
 
 pub(crate) fn status_class(status: &ModuleStatus) -> &'static str {
@@ -533,6 +543,12 @@ mod tests {
         assert!(specs.len() >= 5);
         assert!(specs.iter().any(|spec| spec.id == "xray"));
         assert!(!specs.iter().any(|spec| spec.id == "headscale"));
+    }
+
+    #[test]
+    fn retired_product_modules_are_not_eligible_for_panel_inventory() {
+        assert!(is_retired_product_module("headscale"));
+        assert!(!is_retired_product_module("xray"));
     }
 
     #[test]

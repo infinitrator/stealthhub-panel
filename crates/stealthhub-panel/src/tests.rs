@@ -396,6 +396,28 @@ fn retired_headscale_surface_is_absent_from_normal_ui_and_routes() {
 }
 
 #[test]
+fn content_etags_are_stable_and_change_with_the_payload() {
+    let first = content_etag("payload:\n  - DOMAIN,example.com\n");
+    assert_eq!(first, content_etag("payload:\n  - DOMAIN,example.com\n"));
+    assert_ne!(first, content_etag("payload:\n  - DOMAIN,example.net\n"));
+    assert!(first.starts_with('"') && first.ends_with('"'));
+}
+
+#[test]
+fn argon2_upgrade_preserves_existing_phc_password_hashes() {
+    const LEGACY_HASH: &str =
+        "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
+
+    assert!(verify_password("password", LEGACY_HASH).expect("legacy hash is valid"));
+    assert!(!verify_password("incorrect", LEGACY_HASH).expect("legacy hash is valid"));
+
+    let first = hash_password("new-password").expect("password hashes");
+    let second = hash_password("new-password").expect("password hashes");
+    assert_ne!(first, second, "password salts must be unique");
+    assert!(verify_password("new-password", &first).expect("new hash verifies"));
+}
+
+#[test]
 fn config_editor_rejects_unknown_targets() {
     let report = write_config_file("../etc/passwd", "nope");
 

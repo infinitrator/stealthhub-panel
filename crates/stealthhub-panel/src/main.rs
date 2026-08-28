@@ -27,7 +27,7 @@ use crate::{
     ui::{APP_NAME, PANEL_CSS},
 };
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Argon2,
 };
 use axum::{
@@ -520,7 +520,11 @@ async fn subscription_page(State(state): State<AppState>, Path(token): Path<Stri
     )
 }
 
-async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+async fn rule_provider(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    request_headers: HeaderMap,
+) -> Response {
     let slug = name.trim_end_matches(".yaml");
     let rule_sets = match load_routing_rule_sets(&state.pool).await {
         Ok(value) => value,
@@ -539,17 +543,36 @@ async fn rule_provider(State(state): State<AppState>, Path(name): Path<String>) 
         Err(error) => return subscription_internal_error("render routing provider", error),
     };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
+    let etag = content_etag(&body);
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/yaml; charset=utf-8"),
     );
-    headers.insert(
+    response_headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=300"),
     );
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response_headers.insert(header::ETAG, value);
+    }
 
-    (headers, body).into_response()
+    if request_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == etag))
+    {
+        return (StatusCode::NOT_MODIFIED, response_headers).into_response();
+    }
+
+    (response_headers, body).into_response()
+}
+
+fn content_etag(content: &str) -> String {
+    format!(
+        "\"{}\"",
+        URL_SAFE_NO_PAD.encode(Sha256::digest(content.as_bytes()))
+    )
 }
 
 async fn index() -> impl IntoResponse {
@@ -2402,12 +2425,8 @@ async fn create_session_redirect(state: &AppState, admin_id: i64, location: &str
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {
-    let mut salt_bytes = [0_u8; 16];
-    getrandom::fill(&mut salt_bytes)?;
-    let salt = SaltString::encode_b64(&salt_bytes)
-        .map_err(|err| anyhow::anyhow!("argon2 salt encoding failed: {err}"))?;
     let password_hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|err| anyhow::anyhow!("argon2 password hash failed: {err}"))?;
 
     Ok(password_hash.to_string())
@@ -2419,7 +2438,7 @@ fn verify_password(password: &str, password_hash: &str) -> anyhow::Result<bool> 
 
     match Argon2::default().verify_password(password.as_bytes(), &parsed_hash) {
         Ok(()) => Ok(true),
-        Err(argon2::password_hash::Error::Password) => Ok(false),
+        Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
         Err(err) => Err(anyhow::anyhow!(
             "argon2 password verification failed: {err}"
         )),
