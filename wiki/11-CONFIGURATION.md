@@ -5,13 +5,13 @@ Infiproxy хранит состояние в трех разных местах,
 | Тип данных | Где хранится | Пример |
 |---|---|---|
 | Состояние control plane | SQLite панели | Администраторы, пользователи, Mihomo-профили, routing sets, настройки обновлений. |
-| Конфигурация процессов | Файлы ОС | `infiproxy.env`, Xray JSON, Headscale YAML, Nginx и SSH. |
+| Конфигурация процессов | Файлы ОС | `infiproxy.env`, runtime JSON/YAML, Nginx и SSH. |
 | Исполняемые версии | Versioned runtime directories | `/opt/infiproxy/cores/xray/<version>/xray` и symlink `current`. |
 
 Для поддержанных protocol/core adapters SQLite является desired state, а
 root-reconciler генерирует runtime config. Ручное изменение managed Xray,
 sing-box, Hysteria или TUIC config не обновляет SQLite и будет заменено следующим
-поколением. Nginx, SSH, Headscale и MTProto имеют отдельные контракты управления.
+поколением. Nginx, SSH и MTProto имеют отдельные контракты управления.
 
 ## 1. Вкладка Configs
 
@@ -84,13 +84,11 @@ config.json.infiproxy-bak-1786289123456
 | `hysteria-core` | `/etc/infiproxy-cores/hysteria/config.yaml` | 128 KiB | Да. |
 | `tuic-core` | `/etc/infiproxy-cores/tuic/config.json` | 128 KiB | Да. |
 | `mtproto-core` | `/etc/infiproxy-cores/mtproto/mtproto.env` | 16 KiB | Да. |
-| `headscale-config` | `/etc/headscale/config.yaml` | 128 KiB | Да. |
-| `headscale-nginx` | `/etc/nginx/sites-available/infiproxy-headscale.conf` | 64 KiB | Нет. |
 
 Для динамического модуля добавляется `module-<id>`, если его `config_path` еще
 не представлен фиксированным allowlist. Максимум динамического файла — 256 KiB;
 syntax определяется по расширению. Web write разрешается только под
-`/etc/infiproxy-cores/` и `/etc/headscale/`; остальные manifest paths read-only.
+`/etc/infiproxy-cores/`; остальные manifest paths read-only.
 
 ## 2. Универсальный безопасный цикл изменения
 
@@ -407,31 +405,7 @@ Template secret из нулей является placeholder. Не запуск�
 ним. Используйте TUI **Guided initial setup**, который делает backup старого env,
 скачивает оба upstream-файла и генерирует secret.
 
-## 11. Headscale YAML
-
-Файл: `/etc/headscale/config.yaml`.
-
-Он подробно разобран в [разделе 9](09-HEADSCALE). Критичные группы:
-
-| Группа | За что отвечает |
-|---|---|
-| `server_url` | Канонический HTTPS URL control server. |
-| `listen_addr` | Локальный HTTP listener; Infiproxy использует `127.0.0.1:8088`. |
-| `metrics_listen_addr` | Локальная метрика; `127.0.0.1:9098`. |
-| `grpc_listen_addr` | gRPC listener; `127.0.0.1:50443`. |
-| `prefixes` | Выделяемые mesh IPv4/IPv6 ranges. |
-| `database.sqlite.path` | Отдельная Headscale SQLite database. |
-| `dns` | MagicDNS и upstream resolvers. |
-| `policy.path` | ACL policy; пустое значение не равно продуманной least-privilege policy. |
-
-Проверка обязательна:
-
-```bash
-sudo headscale -c /etc/headscale/config.yaml configtest
-sudo systemctl restart headscale.service
-```
-
-## 12. TLS-материалы proxy-runtime
+## 11. TLS-материалы proxy-runtime
 
 Starter Hysteria и TUIC ожидают:
 
@@ -489,7 +463,6 @@ fail-closed с HTTP 503. Процедура внесения и сверки о�
 | `/opt/infiproxy/cores` | `root:root` | `0755` | Versioned binaries. |
 | `/etc/infiproxy-cores` | `root:infiproxy` | `0770` | Runtime configs. |
 | `/var/log/infiproxy-cores` | `infiproxy:infiproxy` | `0750` | Runtime logs, если unit их использует. |
-| `/etc/headscale` | `root:infiproxy` | `0770` | Headscale config readable/editable panel group. |
 
 Файлы runtime config обычно `root:infiproxy 0660`. Это позволяет веб-процессу
 редактировать allowlisted configs, но расширяет последствия компрометации admin
@@ -510,7 +483,7 @@ sudo chmod 0640 /var/lib/infiproxy/infiproxy.sqlite*
 ### Production-oriented
 
 1. Panel bind остается `127.0.0.1:8080`, cookie Secure включен.
-2. Panel, Headscale и proxy protocols получают отдельные hostnames/listeners.
+2. Panel и proxy protocols получают отдельные hostnames/listeners.
 3. Все placeholders заменены уникальными случайными credentials.
 4. Server config и Mihomo profile сверены по полям в таблице до выдачи подписки.
 5. Каждый config validation включен в change runbook.

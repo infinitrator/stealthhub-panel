@@ -19,7 +19,6 @@ required_pages=(
   wiki/06-PROXY-PROTOCOLS.md
   wiki/07-ROUTING.md
   wiki/08-MODULES-AND-UPDATES.md
-  wiki/09-HEADSCALE.md
   wiki/10-SYSTEM-AND-TUI.md
   wiki/11-CONFIGURATION.md
   wiki/12-BACKUP-RESTORE-UNINSTALL.md

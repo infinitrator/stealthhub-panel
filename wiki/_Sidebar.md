@@ -16,7 +16,6 @@
 - [Proxy-протоколы](06-PROXY-PROTOCOLS)
 - [Маршрутизация](07-ROUTING)
 - [Модули и обновления](08-MODULES-AND-UPDATES)
-- [Headscale](09-HEADSCALE)
 
 ## Эксплуатация
 

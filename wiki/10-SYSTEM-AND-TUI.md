@@ -20,9 +20,8 @@
 | Panel updater | `root` | Получение исходников, сборка, backup, установка бинарника и rollback. |
 | Desired-state reconciler | `root` | Candidate validation, snapshot, runtime apply, health/listener checks и rollback. |
 | Module updater | `root` | Загрузка, проверка и атомарное переключение runtime-модулей. |
-| SSH-TUI | `root` | Установка, HTTPS, systemd, модули, Headscale, MTProto и удаление. |
+| SSH-TUI | `root` | Установка, HTTPS, systemd, runtime-модули, MTProto и удаление. |
 | Proxy-runtime | Обычно `infiproxy` | Передача proxy-трафика по своему серверному конфигу. |
-| Headscale | `headscale` | Координация mesh-узлов и хранение собственного SQLite-состояния. |
 
 Веб-панель намеренно не содержит произвольного терминала. Все команды в ней
 сформированы кодом заранее; пользовательский ввод не подставляется в shell.
@@ -102,7 +101,7 @@ allowlist-редактор находится во вкладке **Configs** и
 | Кнопка | Что показывает |
 |---|---|
 | **Preview panel-only removal** | План удаления control plane с сохранением runtime-конфигов и стороннего ПО. |
-| **Preview full footprint removal** | План удаления панели, модулей, их конфигов, Headscale, Nginx-site и checkout. |
+| **Preview full footprint removal** | План удаления панели, модулей, их конфигов, Nginx-site, checkout и обнаруженных legacy-компонентов. |
 | **Preview factory footprint cleanup** | Более широкий план удаления каталога `/opt/infiproxy`; системные пакеты все равно не удаляются. |
 
 Исполнение доступно только в **Danger zone** TUI. Перед ним обязательны backup и
@@ -192,16 +191,7 @@ ssh -L 8080:127.0.0.1:8080 root@SERVER
 | **Validate and reload nginx** | Запускает `nginx -t`; reload выполняется только после успешной проверки. |
 | **Validate and reload SSH** | Запускает `sshd -t`; reload выполняется только после успешной проверки. |
 | **Restart all enabled modules** | Динамически перебирает manifest registry и рестартует только enabled units. |
-| **Validate and restart Headscale** | Вызывает `headscale configtest`, затем рестарт. В текущей реализации ошибка `configtest` не останавливает рестарт из-за `|| true`; перед критичным изменением проверяйте вручную. |
 | **Reboot server** | Выполняет `systemctl reboot` только после точного ввода `REBOOT`. |
-
-Безопасный ручной порядок для Headscale:
-
-```bash
-sudo headscale -c /etc/headscale/config.yaml configtest
-sudo systemctl restart headscale.service
-sudo systemctl --no-pager --full status headscale.service
-```
 
 ### 4.5. Logs and diagnostics
 
@@ -238,9 +228,9 @@ TUI намеренно не открывает бесконечный `journalct
 mode `0600`. Официальный порядок создания токена описан в
 [Cloudflare API Tokens](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/).
 
-Опция **Proxy through Cloudflare** относится только к hostname панели. Для
-Headscale нужен отдельный DNS-only hostname: обычный Cloudflare HTTP proxy может
-мешать протоколу координации и долгоживущим соединениям.
+Опция **Proxy through Cloudflare** относится только к hostname панели. Не
+направляйте через этот virtual host proxy-протоколы: он предназначен для HTTPS
+интерфейса и subscription/rules endpoints.
 
 ### 4.7. Panel updates
 
@@ -287,8 +277,7 @@ legacy SQLite row. Значение не отображается и не поп
 3. Настроить HTTPS через Cloudflare DNS-01.
 4. Установить выбранные release-модули с проверкой целостности.
 5. Собрать и настроить Telegram MTProxy.
-6. Установить и настроить Headscale.
-7. Показать URL и итоговое состояние units.
+6. Показать URL и итоговое состояние units.
 
 Отказ от необязательного шага не отменяет уже выполненные шаги. Мастер можно
 запускать повторно; конфиги в большинстве путей сохраняются или предварительно
@@ -306,7 +295,6 @@ sudo infiproxy-manager --guided
 |---|---|
 | **Install or repair panel** | Повторно запускает `deploy/install.sh --build`; можно добавить Nginx template либо принудительно заменить env с backup. |
 | **Telegram MTProto configuration** | Первичная настройка, обновление upstream-файлов, import link и управление unit. |
-| **Headscale hub configuration** | Установка release, конфиг, пользователи, pre-auth keys, проверка и logs. |
 | **Manual verified archive import** | Запрашивает module, version, URL и SHA-256 и передает их безопасному core installer. |
 
 #### Telegram MTProto configuration
@@ -321,11 +309,6 @@ sudo infiproxy-manager --guided
 
 Если MTProxy binary еще не установлен, мастер сохраняет конфиг, но не запускает
 service. Сначала обновите module `mtproto`, затем повторите запуск.
-
-#### Headscale hub configuration
-
-Все пункты этого подменю разобраны в
-[разделе 9](09-HEADSCALE#headscale-в-ssh-tui).
 
 ### 4.12. Danger zone
 
@@ -354,7 +337,7 @@ Hardening unit:
 - `ProtectHome=true` закрывает домашние каталоги;
 - `ProtectSystem=strict` делает систему read-only, кроме `ReadWritePaths`;
 - `MemoryDenyWriteExecute=true` затрудняет выполнение записываемой памяти;
-- записывать разрешено только в state/config-каталоги панели и Headscale.
+- записывать разрешено только в явно перечисленные state/config-каталоги панели.
 
 ### 5.2. Maintenance timers
 
@@ -366,7 +349,7 @@ Hardening unit:
 | `infiproxy-panel-update.timer` | Плановая проверка/установка панели. |
 | `infiproxy-panel-update.path` | Мгновенно реагирует на `panel-update-now.request`. |
 | `infiproxy-module-update.timer` | Плановые проверки runtime-модулей. |
-| `infiproxy-module-update.path` | Реагирует на `.request`, `.register`, `.remove` и Headscale requests. |
+| `infiproxy-module-update.path` | Реагирует на module `.request`, `.register` и `.remove` requests. |
 
 Проверка:
 
@@ -430,6 +413,5 @@ sudo infiproxy-manager --guided
 
 - [Конфигурационные файлы](11-CONFIGURATION)
 - [Модули и обновления](08-MODULES-AND-UPDATES)
-- [Headscale](09-HEADSCALE)
 - [Бэкапы и удаление](12-BACKUP-RESTORE-UNINSTALL)
 - [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE)

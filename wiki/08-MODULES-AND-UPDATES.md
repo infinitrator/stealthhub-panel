@@ -1,11 +1,11 @@
 # Модули и обновления
 
-[Назад: маршрутизация](07-ROUTING) | [К оглавлению](Home) | [Далее: Headscale](09-HEADSCALE)
+[Назад: маршрутизация](07-ROUTING) | [К оглавлению](Home) | [Далее: System и SSH-TUI](10-SYSTEM-AND-TUI)
 
 ## Зачем runtime-модули отделены от панели
 
-Панель, proxy cores и Headscale имеют разные upstream release cycles. Модульная
-модель позволяет обновить один binary без пересборки панели и без замены config.
+Панель и proxy runtimes имеют разные upstream release cycles. Модульная модель
+позволяет обновить один binary без пересборки панели и без замены config.
 
 ```text
 root-owned manifest
@@ -37,7 +37,6 @@ module updater -> version directory -> atomic current symlink -> service restore
 | `hysteria` | `apernet/hysteria` latest release | release | cores | `infiproxy-hysteria.service` |
 | `tuic` | `tuic-protocol/tuic` latest release | release | cores | `infiproxy-tuic.service` |
 | `mtproto` | `TelegramMessenger/MTProxy` `master` commit | source build | cores | `infiproxy-mtproto.service` |
-| `headscale` | `juanfont/headscale` latest release | dedicated | modules | `headscale.service` |
 
 MTProto version — commit SHA, потому что updater компилирует source. Остальные
 версии — GitHub release tags.
@@ -173,8 +172,6 @@ Runtime layouts:
 ```text
 /opt/infiproxy/cores/<id>/<version>/<binary>
 /opt/infiproxy/cores/<id>/current -> <version>
-/opt/infiproxy/modules/headscale/<version>/headscale
-/opt/infiproxy/modules/headscale/current -> <version>
 ```
 
 ## Service state и rollback
@@ -189,11 +186,9 @@ Runtime layouts:
   старый service restart-ится;
 - config не заменяется.
 
-Для обычных cores binary rollback не откатывает ручную config migration. Поэтому
+Binary rollback не откатывает ручную config migration. Поэтому
 не меняйте config под новую major version до успешного binary canary либо держите
-отдельный backup. Headscale обрабатывается строже: updater делает backup config и
-state/SQLite, останавливает active service перед потенциально мигрирующим
-`configtest` и при ошибке восстанавливает binary link, config, DB и service state.
+отдельный backup.
 
 ## Module config backup
 
@@ -298,9 +293,9 @@ Root updater до checkout создает:
 
 - копии panel binary и всех privileged Rust helpers, включая reconciler;
 - SQLite `.backup`;
-- tar panel/core/Headscale configs;
+- tar panel/core configs;
 - manifests/catalog;
-- admin, subscription/rules и Headscale Nginx sites;
+- admin и subscription/rules Nginx sites;
 - metadata с previous commit.
 
 Если DB/config backup failed, update не начинается.

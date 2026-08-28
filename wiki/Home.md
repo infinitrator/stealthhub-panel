@@ -1,14 +1,14 @@
 # Infiproxy Wiki
 
 Эта wiki описывает фактическое поведение Infiproxy: установку, веб-интерфейс,
-SSH-TUI, сетевую модель, Mihomo-подписки, внешние proxy-runtime, Headscale,
+SSH-TUI, сетевую модель, Mihomo-подписки, внешние proxy-runtime,
 обновления, резервные копии, безопасность и восстановление. Документация
 версионируется вместе с исходным кодом; точная ревизия доступна в истории Git.
 
 > [!IMPORTANT]
 > Infiproxy является панелью управления и генератором клиентских подписок.
 > Она не передает пользовательский трафик сама. Xray, sing-box, Hysteria,
-> TUIC, Telegram MTProxy и Headscale работают отдельными процессами. Для
+> TUIC и Telegram MTProxy работают отдельными процессами. Для
 > поддержанных protocol/core adapters вкладка **Protocols** формирует desired
 > state, а отдельный root reconciler атомарно применяет server config только
 > после validation, health/listener checks и с rollback.
@@ -25,15 +25,14 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 6. [Proxy-протоколы и серверные ядра](06-PROXY-PROTOCOLS).
 7. [Маршрутизация Mihomo](07-ROUTING).
 8. [Модули и обновления](08-MODULES-AND-UPDATES).
-9. [Headscale mesh hub](09-HEADSCALE).
-10. [Система и SSH-TUI](10-SYSTEM-AND-TUI).
-11. [Конфигурационные файлы](11-CONFIGURATION).
-12. [Бэкапы, восстановление и удаление](12-BACKUP-RESTORE-UNINSTALL).
-13. [Безопасная эксплуатация](13-SECURITY-OPERATIONS).
-14. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE).
-15. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
-16. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
-17. [Адаптеры и атомарное применение](16-ADAPTERS-AND-RECONCILIATION).
+9. [Система и SSH-TUI](10-SYSTEM-AND-TUI).
+10. [Конфигурационные файлы](11-CONFIGURATION).
+11. [Бэкапы, восстановление и удаление](12-BACKUP-RESTORE-UNINSTALL).
+12. [Безопасная эксплуатация](13-SECURITY-OPERATIONS).
+13. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE).
+14. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
+15. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
+16. [Адаптеры и атомарное применение](16-ADAPTERS-AND-RECONCILIATION).
 
 ## Уровни готовности операций
 
@@ -60,7 +59,7 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - проверяемые обновления бинарников с атомарным переключением версии;
 - обновление самой панели с pre-update backup и rollback;
 - Cloudflare DNS-01, Let's Encrypt и Nginx через root-TUI;
-- установка и базовая настройка Telegram MTProxy и Headscale;
+- установка и базовая настройка Telegram MTProxy;
 - owner-only хранилище client-side secret values без обратного показа значений;
 - root-only хранилище private server secrets через SSH-TUI;
 - allowlist-редактор конфигов, health/readiness и локальная IP-диагностика;
@@ -91,7 +90,6 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - панель слушает только `127.0.0.1:8080`;
 - отдельный HTTPS hostname панели за Nginx;
 - Cloudflare token ограничен одной зоной и минимальными DNS-правами;
-- Headscale использует отдельный DNS-only hostname;
 - включены только реально настроенные runtime-модули;
 - внешний зашифрованный backup вывозится с VPS;
 - обновления сначала проверяются на резервном узле или в maintenance window.
@@ -117,8 +115,6 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - [Hysteria 2 documentation](https://v2.hysteria.network/docs/)
 - [TUIC protocol repository](https://github.com/tuic-protocol/tuic)
 - [Telegram MTProxy repository](https://github.com/TelegramMessenger/MTProxy)
-- [Headscale documentation](https://headscale.net/stable/)
-- [Tailscale concepts](https://tailscale.com/docs/concepts/control-data-planes)
 - [Cloudflare API documentation](https://developers.cloudflare.com/fundamentals/api/)
 
 При расхождении wiki с установленной версией runtime приоритет имеют

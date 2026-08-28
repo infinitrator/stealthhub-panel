@@ -18,7 +18,7 @@ Nginx -> Infiproxy panel -> SQLite
                          root maintenance workers
                               |
                               v
-              Xray / sing-box / Hysteria / TUIC / MTProxy / Headscale
+              registered proxy runtimes / MTProxy
 ```
 
 - **Control plane**: панель, SQLite, TUI, manifests, updater и systemd. Он решает,
@@ -65,7 +65,7 @@ CIDR описывает сеть и длину префикса:
 
 - `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` — private IPv4;
 - `127.0.0.0/8` — loopback;
-- `100.64.0.0/10` — shared address space, используемый Headscale/Tailscale;
+- `100.64.0.0/10` — shared address space, не являющийся обычной private-сетью;
 - `::1/128` — IPv6 loopback;
 - `fd00::/8` — IPv6 unique local.
 
@@ -90,8 +90,8 @@ IP Check запускает `ip route get <IP>` и показывает имен
 ```
 
 `0.0.0.0`/`[::]` означает listener на внешних интерфейсах. `127.0.0.1`/`::1`
-доступен только на самом сервере. Поэтому panel и Headscale upstream безопасно
-держать на loopback, а публиковать через Nginx.
+доступен только на самом сервере. Поэтому backend панели безопасно держать на
+loopback, а публиковать через Nginx.
 
 Проверка:
 
@@ -149,10 +149,8 @@ DNS переводит hostname в IP и участвует в маршрути�
 - **PTR** связывает IP с reverse hostname и настраивается владельцем IP;
 - **TTL** определяет время кеширования записи;
 - **split DNS** может давать разные ответы внутри и снаружи сети;
-- **MagicDNS** Headscale раздает имена mesh-устройств клиентам.
-
-Subscription host должен резолвиться у клиента, node host — приводить к
-правильному proxy endpoint, Headscale host — быть DNS-only при Cloudflare.
+Subscription host должен резолвиться у клиента, а node host — приводить к
+правильному proxy endpoint.
 
 Проверка:
 
@@ -195,7 +193,6 @@ Nginx принимает публичный HTTPS, завершает TLS и п�
 
 ```text
 Internet -> 443/tcp Nginx -> 127.0.0.1:8080 Infiproxy
-Internet -> 443/tcp Nginx -> 127.0.0.1:8088 Headscale
 ```
 
 Плюсы:
@@ -204,10 +201,6 @@ Internet -> 443/tcp Nginx -> 127.0.0.1:8088 Headscale
 - один IP/443 обслуживает разные hostname;
 - origin listener не доступен извне;
 - конфиг можно проверить `nginx -t` перед reload.
-
-Headscale требует особого upgrade forwarding. Его hostname нельзя помещать за
-Cloudflare orange-cloud proxy: официальная документация Headscale предупреждает,
-что Cloudflare не поддерживает нужные POST WebSocket upgrades.
 
 ## Firewall и NAT
 
@@ -219,7 +212,7 @@ Firewall решает, какие входящие/исходящие packets р
 2. разрешить SSH с доверенных адресов, если возможно;
 3. разрешить `80/tcp`, `443/tcp` для Nginx;
 4. разрешить только порты включенных proxy-runtime;
-5. не публиковать `8080`, `8088`, `9098`, `50443`, MTProto stats;
+5. не публиковать `8080` и MTProto stats;
 6. запретить остальное входящее.
 
 Веб-страница только показывает команды проверки firewall. Reload и изменение
@@ -230,22 +223,6 @@ ruleset выполняются через root SSH-TUI или вручную п�
 NAT сопоставляет внутренние и внешние адреса/порты. Для VPS с прямым публичным
 IP обычно достаточно firewall. Для домашнего сервера нужен port forwarding, а
 CGNAT может исключить прямой входящий доступ.
-
-Headscale помогает peer discovery и NAT traversal mesh-клиентов, но сам
-coordination endpoint все равно должен быть доступен по HTTPS.
-
-## Control plane и data plane Headscale
-
-Headscale — self-hosted coordination server. Он хранит identities, публичные
-ключи, policy, DNS и маршруты. Зашифрованные пользовательские пакеты обычно идут
-между Tailscale-клиентами напрямую; при невозможности — через DERP relay.
-
-То есть Headscale не является классическим full-tunnel proxy автоматически.
-Full-tunnel появляется, когда конкретный mesh-node рекламируется и одобряется
-как exit node. Subnet router рекламирует только заданные сети.
-
-Официальное разделение control/data plane описано в
-[Tailscale documentation](https://tailscale.com/docs/concepts/control-data-planes).
 
 ## Подписка и rule-provider
 
@@ -280,7 +257,6 @@ Mihomo subscription. REALITY **public** key передается клиенту,
 | панель работает, subscription 404 | token/user state |
 | YAML скачан, profile не подключается | server config/secret/port/firewall |
 | TCP profile работает, Hysteria/TUIC нет | UDP/QUIC/firewall/ALPN |
-| Headscale UI виден, nodes не соединяются | DNS-only/TLS/upgrade/NAT/DERP |
 | update downloaded, service rolled back | new binary/config incompatibility |
 
 Именно поэтому проверка должна идти слой за слоем, а не одной кнопкой Health.

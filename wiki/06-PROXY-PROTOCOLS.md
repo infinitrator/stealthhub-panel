@@ -389,7 +389,7 @@ certificate mismatch или активный probe могут выдать се�
 - VLESS REALITY XHTTP/RAW как основной TCP transport;
 - Hysteria2 или TUIC как QUIC speed fallback, но не оба без необходимости;
 - MTProto только для Telegram;
-- отдельный Headscale hostname/mesh use case;
+- отдельные hostnames для административного HTTPS и proxy endpoints;
 - server credentials per user там, где runtime поддерживает;
 - inactive/unused units disabled и ports закрыты.
 

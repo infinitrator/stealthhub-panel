@@ -18,6 +18,23 @@ Web-процесс работает как `infiproxy`. Он транзакци�
 `infiproxy-reconcile.path` или safety timer и сам перечитывает целостное
 состояние из SQLite. Request не содержит конфиг, secret, команду или путь.
 
+Основной поток является однонаправленным по authority:
+
+```text
+DATABASE / DESIRED STATE
+          |
+          v
+PROTOCOL ADAPTERS -> CORE ADAPTERS -> RUNTIME
+```
+
+Обратный путь используется только для доказательства результата:
+
+```text
+RUNTIME -> CORE/PROTOCOL OBSERVATION -> DRIFT/HEALTH -> PANEL STATUS
+```
+
+Runtime config никогда не создает и не изменяет пользователей SQLite.
+
 ## 2. Desired generation и Applied generation
 
 Каждое изменение, влияющее на серверный runtime, увеличивает
@@ -101,6 +118,14 @@ Mihomo client object и server fragment. Generic subscription assembler знае
 ветвится по имени протокола. Preferred core является политикой выбора, а не
 жесткой связью: без preference выбирается установленный совместимый adapter.
 
+`UserParticipation` явно фиксирует, использует ли protocol отдельных
+пользователей. Для `PerUserUuid` adapter получает только enabled desired users и
+рендерит их в candidate. После активации core adapter повторно читает live config
+и сравнивает normalized identity set с ожидаемым. В статус/ошибку попадают только
+counts и тип drift, но не UUID или credential values. Если обязательное
+наблюдение не поддерживается, identities отличаются или runtime config не
+читается, операция откатывается и applied generation не продвигается.
+
 ## 6. Контракт core adapter
 
 Core adapter владеет сборкой полного server config, native validation,
@@ -111,6 +136,13 @@ snapshot/rollback, atomic install, systemd lifecycle, health и listener checks.
 Удаление runtime блокируется, если его ID присутствует в applied state или без
 него enabled-профиль потеряет последнюю совместимую capability. Сначала
 установите замену, переключите preference, дождитесь `Applied`, затем удаляйте.
+
+Каждый server fragment также объявляет `ListenerClaim`: network (`tcp`/`udp`) и
+порт. Reconciler собирает весь listener plan и отклоняет повторяющуюся пару
+`(network, port)` до stage, snapshot или live mutation. TCP и UDP на одном
+числовом порту считаются разными sockets. Явная модель shared frontend пока не
+реализована, поэтому совместное владение одним TCP listener нужно представлять
+одним infrastructure adapter, а не двумя claims.
 
 ## 7. Server secrets
 
@@ -208,7 +240,30 @@ baseline имеют монотонный integer ID в `schema_migrations` и в
 7. Старые данные должны оставаться читаемыми или хотя бы непрозрачно сохраненными.
 8. Каждая release migration проверяется на offline-копии старой схемы.
 
-## 11. Offline database compatibility harness
+Текущие additive migrations после adapter baseline включают:
+
+- v3: `client_transport_pools`, ordered members, `client_routing_rules` и
+  сохранение существующих `routing_rule_sets`;
+- v4: singleton `client_dns_policy`, независимый от transport policy.
+
+Bootstrap выполняется через `INSERT ... ON CONFLICT DO NOTHING`, поэтому
+повторная инициализация не возвращает операторские значения к defaults.
+
+## 11. Client routing pipeline
+
+```text
+DOMAIN/RULE -> RULE SET или INLINE RULE -> TRANSPORT POOL
+            -> ENABLED PROFILE -> PROTOCOL ADAPTER -> MIHOMO OBJECT
+```
+
+Pool и rule targets используют стабильные IDs. Mihomo generator не содержит
+фиксированный список proxy groups: он валидирует сохраненную policy, разрешает
+role/profile/pool selectors и строит groups динамически. Cyclic pool graph,
+missing enabled profile/pool и invalid target приводят к fail-closed ошибке.
+DNS policy компилируется отдельно, но использует DIRECT rule-set bindings для
+`nameserver-policy`.
+
+## 12. Offline database compatibility harness
 
 Harness никогда не ищет production DB самостоятельно и отказывается принимать
 `/var/lib/infiproxy/infiproxy.sqlite`. Сначала создайте согласованную offline
@@ -236,7 +291,7 @@ metadata и historical adapter state. Также проверяются `integri
 При failure working copy сохраняется для ручного анализа. Исходная offline copy
 не мигрируется.
 
-## 12. Миграция существующего сервера
+## 13. Миграция существующего сервера
 
 Перед обновлением остановите auto-update и сделайте backup по
 [разделу 12](12-BACKUP-RESTORE-UNINSTALL). Миграция schema идемпотентна,
@@ -258,7 +313,7 @@ profiles. До него обязательно:
 
 Adoption сам удаляет legacy SQLite value только после проверки root-копии.
 
-## 13. Crash recovery
+## 14. Crash recovery
 
 Перед live mutation worker сохраняет snapshots и durable journal. Если процесс
 прерван до mutation, операция становится `Failed`. После mutation worker
@@ -279,7 +334,7 @@ sudo ss -lntup
 SQLite и units из одного согласованного backup, проверьте native configtest,
 затем включите worker снова.
 
-## 14. Добавление нового адаптера
+## 15. Добавление нового адаптера
 
 Для нового protocol adapter нужны manifest, schema migration, field metadata,
 client/server secret references, client renderer, server fragment и тесты

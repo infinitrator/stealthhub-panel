@@ -10,7 +10,7 @@ TUIC and Telegram MTProxy.
 
 Full Russian operator and networking documentation is available in the
 [`wiki/`](./wiki/Home.md): installation, every web/TUI control, protocols,
-routing, modules, Headscale, backups, security and troubleshooting.
+routing, modules, backups, security and troubleshooting.
 After the one-time GitHub Wiki initialization, the same versioned pages are
 published at the [Infiproxy GitHub Wiki](https://github.com/infinitrator/stealthhub-panel/wiki).
 
@@ -32,8 +32,6 @@ The command installs build dependencies, Rust when needed, clones the project to
 `/opt/infiproxy/source`, builds the release binary, installs systemd units and
 opens the guided SSH TUI. The TUI then walks through panel repair, HTTPS,
 optional core imports, Telegram MTProto and final service checks.
-Headscale can also be configured from the same TUI cycle when a mesh hub is
-needed.
 
 If the guided UI was skipped or the SSH session was interrupted:
 
@@ -104,7 +102,6 @@ It includes:
 - HTTPS and Cloudflare certificate setup.
 - Independent runtime-module manager with installed/latest comparison.
 - Telegram MTProto setup.
-- Headscale mesh hub setup.
 - Panel update scheduler and immediate update trigger.
 - Panel logs.
 - Root-level uninstall and cleanup flows.
@@ -132,7 +129,7 @@ Panel self-updates are split into two layers:
 - The root updater uses `/opt/infiproxy/source`, rebuilds all panel helper binaries and
   reruns the idempotent installer. Before changing the source revision it creates
   fail-closed backups of the panel and control-helper binaries, SQLite database,
-  panel/core/Headscale settings, module manifests and Nginx configuration. A
+  panel/core settings, module manifests and Nginx configuration. A
   failed update restores the previous database, configs, binaries and source
   revision. Root-only logs, backups, build files and applied-version markers live in
   `/var/lib/infiproxy-maintenance`, separate from web-writable state.
@@ -165,8 +162,8 @@ config and creates a root-only backup under
 binary. Core-specific smoke tests validate the executable, but a successful
 binary install does not replace final config and service readiness checks.
 
-The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC,
-Telegram MTProto and Headscale. A root operator can import another compatible
+The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC and
+Telegram MTProto. A root operator can import another compatible
 generic GitHub-release manifest from the SSH manager. Browser sessions can only
 activate manifests already approved in that root-owned catalog; they cannot
 submit repositories, download commands or systemd unit names.
@@ -237,58 +234,20 @@ https://t.me/proxy?server=<host>&port=<port>&secret=<secret>
 
 Refresh Telegram upstream config from the same menu when needed.
 
-## Headscale Mesh Hub
-
-Infiproxy can also install and configure Headscale, a self-hosted Tailscale
-coordination server. In the TUI, choose:
-
-```text
-Headscale hub setup
-```
-
-The guided setup:
-
-- Installs a versioned official Headscale binary through the shared module
-  updater and verifies its SHA256 digest.
-- Writes `/etc/headscale/config.yaml`.
-- Creates a dedicated Nginx HTTPS site at
-  `/etc/nginx/sites-available/infiproxy-headscale.conf`.
-- Issues a Let's Encrypt certificate through Cloudflare DNS-01.
-- Starts `headscale.service`.
-- Can create a Headscale user and pre-auth key for client onboarding.
-
-The owner-admin can also use `/admin/headscale` to inspect users and nodes,
-create users and pre-auth keys, expire a node, and clear the last protected
-result. The web process never executes Headscale: typed requests are consumed
-by the existing root maintenance worker.
-
-Headscale must use a **DNS-only** Cloudflare record. Do not enable Cloudflare
-proxying for the Headscale hostname.
-
-Client example:
-
-```bash
-tailscale up --login-server https://hs.example.com --authkey <key>
-```
-
 ## Port Plan
 
 The default deployment avoids internal port collisions:
 
 ```text
-TCP 80/443              Nginx public edge for panel and Headscale hostnames
+TCP 80/443              Nginx public edge for the panel hostname
 TCP 127.0.0.1:8080      Infiproxy panel
-TCP 127.0.0.1:8088      Headscale control server
-TCP 127.0.0.1:9098      Headscale metrics/debug
-TCP 127.0.0.1:50443     Headscale local gRPC
 TCP 8444                Telegram MTProto proxy
 UDP 443                 Hysteria2 starter config
 UDP 11443               TUIC starter config
 ```
 
 Hysteria2 uses QUIC/UDP on `443`, while Nginx uses TCP `443`; these are separate
-sockets and can coexist. Headscale intentionally does not use its upstream
-example default `127.0.0.1:8080` because that belongs to the panel.
+sockets and can coexist.
 
 ## Updates
 
@@ -340,7 +299,6 @@ cannot prove whether they existed before Infiproxy.
 /usr/local/sbin/infiproxy-manager
 /usr/local/sbin/infiproxy-module-update
 /usr/local/libexec/infiproxy-module-manifest
-/usr/local/libexec/infiproxy-headscale-control
 /etc/infiproxy/infiproxy.env
 /etc/infiproxy-update.conf
 /etc/infiproxy-modules.d

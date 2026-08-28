@@ -36,8 +36,6 @@
 |---|---|---|
 | IP VPS | `203.0.113.10` | DNS A-записи и firewall. |
 | Панельный hostname | `panel.example.com` | HTTPS панели. |
-| Headscale hostname | `hs.example.com` | Отдельный control endpoint mesh-сети. |
-| MagicDNS domain | `tailnet.example.com` | Имена устройств Headscale. |
 | Email Let's Encrypt | `admin@example.com` | Уведомления сертификата. |
 | Cloudflare zone | `example.com` | Поиск зоны через API. |
 | API token | scoped token | Создание DNS и DNS-01 challenge. |
@@ -54,9 +52,6 @@
 |---|---|---|
 | Панель | `127.0.0.1:8080/tcp` | нет |
 | Nginx | `80/tcp`, `443/tcp` | да |
-| Headscale HTTP | `127.0.0.1:8088/tcp` | нет |
-| Headscale metrics | `127.0.0.1:9098/tcp` | нет |
-| Headscale gRPC | `127.0.0.1:50443/tcp` | нет |
 | Hysteria2 starter | `443/udp` | после настройки |
 | TUIC starter | `11443/udp` | после настройки |
 | MTProto starter | `8444/tcp` | после настройки |
@@ -174,12 +169,6 @@ TUI предлагает один цикл, но каждый необязате
 MTProxy, скачать upstream-файлы, создать 32-hex secret, записать env и показать
 import link. Это отдельный сервис и в Mihomo YAML не попадает.
 
-### Headscale
-
-Используйте отдельный hostname. Для Headscale Cloudflare record должен быть
-**DNS-only**, потому что протокол Tailscale использует POST-based upgrade, не
-поддерживаемый Cloudflare proxy. TUI принудительно создает DNS-only A record.
-
 ## 5. Проверьте control plane
 
 ```bash
@@ -234,7 +223,7 @@ ssh -L 8080:127.0.0.1:8080 root@203.0.113.10
 - **Confirm password**: точное повторение;
 - **Create admin**: атомарно создает первую admin-запись — владельца.
 
-Именно owner может управлять panel update, runtime-модулями и Headscale через
+Именно owner может управлять panel update и runtime-модулями через
 веб. Не удаляйте и не изменяйте первую admin-запись напрямую в SQLite без
 проверенного recovery-плана.
 
@@ -322,7 +311,7 @@ sudo ss -lntup
 
 ## Рекомендуемая настройка
 
-- HTTPS hostname панели и отдельный DNS-only hostname Headscale;
+- отдельный HTTPS hostname панели;
 - owner с длинной уникальной passphrase;
 - минимум два транспорта с разными отказными характеристиками: один TCP и один
   UDP/QUIC;

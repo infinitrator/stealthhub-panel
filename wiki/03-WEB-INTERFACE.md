@@ -34,7 +34,6 @@ admin session и CSRF token.
 | Secrets | `/admin/secrets` | Owner-only значения, подставляемые в клиентский YAML. |
 | Routing | `/admin/routing` | Встроенные rule-provider. |
 | Modules | `/admin/cores` | Динамический реестр runtime-модулей. |
-| Headscale | `/admin/headscale` | Пользователи/nodes mesh hub. |
 | IP Check | `/admin/ip` | Локальная диагностика и ссылки на reputation DB. |
 | System | `/admin/system` | Host sensors, services и uninstall preview. |
 | Configs | `/admin/configs` | Allowlist-редактор файлов. |
@@ -212,7 +211,6 @@ payload. Подробно: [Маршрутизация](07-ROUTING).
 | **Check all** | owner, сразу для metadata | Обращается к GitHub API и обновляет known latest state; бинарники не меняет. |
 | Auto **On/Off** + **Save** | owner, сразу | Меняет policy автоматического обновления модуля. |
 | **Check** | owner, сразу для metadata | Проверяет upstream только выбранного модуля. |
-| **Manage** | owner, просмотр | Для Headscale переходит в dedicated page. |
 | **Install latest** | owner, в очередь | Request root-worker для неустановленного runtime. |
 | **Update latest** | owner, в очередь | Request root-worker для установленного runtime. |
 | **Remove** | owner, в очередь | Работает только если в поле набран точный module ID; config сохраняется. |
@@ -227,26 +225,6 @@ payload. Подробно: [Маршрутизация](07-ROUTING).
 command или systemd unit.
 
 Подробно: [Модули и обновления](08-MODULES-AND-UPDATES).
-
-## Headscale
-
-Страница owner-only.
-
-| Кнопка/поле | Тип | Результат |
-|---|---|---|
-| **Refresh users and nodes** | в очередь | Просит helper выполнить `users list` и `nodes list`. |
-| **Open configuration** | просмотр | Переходит в Configs; сам config не меняет. |
-| **Clear result** | в очередь | Стирает last result/pre-auth key из protected snapshot. |
-| Username + **Create user** | в очередь | Создает user с `[A-Za-z0-9._-]`, длина до 63. |
-| User ID | ввод | Числовой owner для pre-auth key. |
-| Expiration | ввод | `1..9999` минут или часов, например `30m`, `24h`. |
-| **Reusable** | флаг | Разрешает использовать key больше одного раза. |
-| **Ephemeral node** | флаг | Помечает зарегистрированный node ephemeral. |
-| **Create pre-auth key** | в очередь | Генерирует key и временно показывает его в snapshot. |
-| Node ID + **Expire node** | в очередь | Expire key выбранного node; ему нужна повторная регистрация. |
-
-Headscale CLI запускает root helper с фиксированным набором argv, timeout 20 с и
-лимитом output 64 КиБ. Подробно: [Headscale](09-HEADSCALE).
 
 ## IP Check
 

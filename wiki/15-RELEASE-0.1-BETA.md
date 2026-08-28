@@ -26,10 +26,9 @@ end-to-end сценарии сведены в одну проверяемую т
 - owner-only secret editor без обратного показа значений;
 - строгий редактор встроенных Mihomo rule-provider;
 - динамические root-owned module manifests и независимые updates;
-- typed Headscale operation queue;
 - host/service health, IP diagnostics и read-only System map;
 - owner-only allowlist Configs с backup, parser check и atomic replace;
-- SSH-TUI, Cloudflare DNS-01/Nginx, MTProxy и Headscale guided setup;
+- SSH-TUI, Cloudflare DNS-01/Nginx и MTProxy guided setup;
 - panel/module backup, rollback, update schedule и uninstall modes;
 - generic protocol/core adapters, desired/applied generations и root reconciler;
 - durable operation journal, verified rollback и crash recovery;
@@ -53,7 +52,7 @@ end-to-end сценарии сведены в одну проверяемую т
 11. Nu HTML Checker для фактически отрендеренных admin pages.
 12. Chromium-based desktop/mobile review: overflow, labels, focus и target sizes.
 13. Bounded concurrency benchmark публичного liveness endpoint.
-14. Сверка форматов Mihomo, Headscale и GitHub Wiki с первичной документацией.
+14. Сверка форматов Mihomo и GitHub Wiki с первичной документацией.
 
 Ни один scanner не доказывает отсутствие уязвимостей. Результат относится к
 проверенной ревизии и меняется вместе с кодом, dependencies и окружением.
@@ -102,8 +101,6 @@ end-to-end сценарии сведены в одну проверяемую т
 
 - web process создает только типизированные request-файлы и не имеет shell;
 - panel/module request replace не следует заранее подложенному symlink;
-- Headscale state вынесен в root-owned maintenance tree; helper проверяет
-  ownership/mode и пишет state атомарно;
 - module manifests и generic service units проходят allowlist validation;
 - release downloads требуют HTTPS, bounded redirects/timeouts и SHA-256/digest;
 - archive installer ограничивает download/extraction и отклоняет path traversal,
@@ -122,7 +119,6 @@ end-to-end сценарии сведены в одну проверяемую т
 - устранен document-wide horizontal overflow на всех сложных таблицах при
   ширине viewport 390 px; прокручивается только локальный table container;
 - все 14 admin pages проверены на desktop и mobile layouts;
-- input Headscale Node ID получил доступное имя;
 - focus indicators заменены на непрозрачный `accent-dark` с контрастом 7.45:1
   к белому фону;
 - малый navigation label и placeholder text получили контраст выше 4.5:1;
@@ -152,8 +148,8 @@ bash deploy/tests/wiki-check.sh
 Workspace запрещает `unsafe` через inherited Cargo lint. Compatible dependency
 update dry-run не должен показывать доступных обновлений на дату release gate.
 
-Контроль Rust dependencies повторен 26 августа 2026; версии внешних runtimes в
-таблице последний раз сверялись 13 августа и при установке заново разрешаются
+Контроль Rust dependencies повторен 28 августа 2026; версии внешних runtimes в
+таблице сверены 28 августа через official GitHub latest-release API и при установке заново разрешаются
 из upstream manifest:
 
 | Компонент | Проверенная stable/latest версия |
@@ -161,10 +157,9 @@ update dry-run не должен показывать доступных обн�
 | Rust toolchain и заявленный MSRV | `1.96.0` |
 | Прямые Rust dependencies | `cargo outdated --root-deps-only`: обновлений нет |
 | Xray-core | `v26.3.27` |
-| sing-box | `v1.13.18` |
-| Hysteria | `app/v2.12.1` |
+| sing-box | `v1.13.19` |
+| Hysteria | `app/v2.12.2` |
 | TUIC server | `tuic-server-1.0.0` |
-| Headscale | `v0.29.3` |
 | Telegram MTProxy | commit `f36d8af769ff` ветки `master` |
 
 Module manifests не фиксируют эти номера: updater каждый раз разрешает latest
@@ -203,15 +198,16 @@ End-to-end harness проверяет:
 - fail-closed YAML до secret/profile configuration;
 - secret non-disclosure, profile generation и удаление secret;
 - routing deny/allow paths;
-- module/panel/headscale typed queues;
+- module/panel typed queues;
 - symlink replacement resistance request-файлов;
 - password rotation, old-password rejection и session revocation;
 - login rate limit и `Retry-After`.
 
-Контрольный запуск дал 93 успешных Rust tests: 53 core, 5 manifest-helper и 35
-panel. В это число входят mandatory failure-injection, migration, stale-SHA,
-domain/frontend, generation и redaction tests. HTTP harness и updater regression
-harness завершились без ошибок.
+Контрольный запуск 28 августа дал 116 успешных Rust tests: 69 core, 5
+manifest-helper, 2 reconciler-helper и 40 panel. В это число входят
+failure-injection, migration, routing/DNS, user observation, listener conflict,
+ETag, password-hash compatibility, generation и redaction tests. HTTP,
+install-state и updater regression harness завершились без ошибок.
 
 Nu HTML Checker `26.8.6` не обнаружил HTML/CSS structural errors на 19
 документах широкого прохода; финальный release rerun повторно проверил 16
@@ -267,7 +263,7 @@ installation scaffold, а не demo account.
 | Secrets не шифруются на уровне приложения | Для генерации YAML нужны plaintext values | FS permissions, encrypted off-host backup, host hardening |
 | Subscription token находится в URL path | Требование совместимого import URL | TLS, `/sub/` log suppression, secure delivery, reset on leak |
 | Нет traffic collector | Runtime-specific accounting не унифицирован | Не обещать quota enforcement; внешний collector |
-| Нет автоматической server/client credential sync | Runtime configs имеют разные schemas | Change checklist и реальный client test |
+| Continuous user-drift polling не вынесен в отдельный per-runtime badge | User observation выполняется как обязательная post-apply verification | Следить за generation/status; запускать reconcile после внешнего изменения runtime и проверять client test |
 | Нет scheduled off-host backup | Storage backend намеренно не навязан | Restic/Borg/provider snapshot и restore drill |
 | Нет immutable admin audit trail | SQLite/journal не являются WORM | Central journal shipping и минимальное число admins |
 
@@ -280,9 +276,8 @@ installation scaffold, а не demo account.
 2. Nginx/Cloudflare DNS-01 с отдельным scoped token и реальным certificate renew.
 3. Один TCP runtime и один UDP runtime с реальным Mihomo client.
 4. MTProxy import из Telegram client.
-5. Headscale user, pre-auth key, node enrollment, MagicDNS и optional routes.
-6. Module update, forced service failure и автоматический rollback.
-7. Panel update на новый commit и rollback при failed readiness.
+5. Module update, forced service failure и автоматический rollback.
+6. Panel update на новый commit и rollback при failed readiness.
 8. Reboot: panel, enabled runtimes, timers/path units возвращаются автоматически.
 9. Encrypted off-host backup и restore на втором чистом host.
 10. Внешний port scan IPv4/IPv6 и проверка отсутствия публичных local listeners.
@@ -312,8 +307,6 @@ Release commit считается beta-candidate только если одно�
 - [RustSec advisory database](https://rustsec.org/)
 - [Nu HTML Checker](https://validator.github.io/validator/)
 - [Mihomo configuration](https://wiki.metacubex.one/en/config/)
-- [Headscale configuration](https://headscale.net/stable/ref/configuration/)
-- [Headscale reverse proxy notes](https://headscale.net/stable/ref/integration/reverse-proxy/)
 - [systemd sandboxing](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html)
 - [Cloudflare API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
 - [Let's Encrypt integration guide](https://letsencrypt.org/docs/integration-guide/)

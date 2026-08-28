@@ -31,13 +31,10 @@ hardening — уменьшить поверхность, ограничить п
 | Listener | Рекомендация |
 |---|---|
 | SSH TCP | Разрешить только административным адресам/VPN, использовать ключи. |
-| Nginx TCP/443 | Публичный HTTPS панели и/или Headscale с разными hostnames. |
+| Nginx TCP/443 | Публичный HTTPS панели. |
 | Nginx TCP/80 | Только redirect/ACME, если нужен. |
 | Proxy TCP/UDP ports | Открывать только реально настроенные protocols. |
 | `127.0.0.1:8080` | Не публиковать; backend панели. |
-| `127.0.0.1:8088` | Не публиковать; Headscale backend. |
-| `127.0.0.1:9098` | Не публиковать; Headscale metrics. |
-| `127.0.0.1:50443` | Не публиковать; Headscale gRPC в текущем template. |
 | MTProto stats `8888` | Держать локальным/закрытым firewall. |
 
 TCP/443 и UDP/443 могут одновременно принадлежать разным процессам: TCP и UDP
@@ -74,8 +71,7 @@ workers, чтобы CPU-intensive hashing не блокировал async runtim
 
 Первый существующий admin определяется как owner не отдельной ролью, а минимальным
 `admins.id`.
-Owner может менять update policy, запускать module/headscale operations и panel
-update.
+Owner может менять update policy, запускать module operations и panel update.
 
 > [!WARNING]
 > Не публикуйте незавершенную установку в Интернет. Создание первого admin
@@ -109,7 +105,7 @@ update.
 текущий пароль и отзывает все его server-side sessions транзакционно.
 
 Поэтому панель не должна быть защищена только формой login. Используйте Nginx
-rate limiting, IP allowlist или административный VPN/Headscale поверх TLS.
+rate limiting, IP allowlist или административный VPN поверх TLS.
 
 ## 4. Сессии и CSRF
 
@@ -183,7 +179,6 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 | Общие settings | Да | Да |
 | Panel update settings/now | Да | Нет |
 | Module check/update/install/remove | Да | Нет |
-| Headscale page/actions | Да | Нет |
 
 UI штатно создает только первого admin, но дополнительные records могут
 появиться через миграцию/ручное администрирование. Не считайте их read-only:
@@ -253,15 +248,11 @@ SQLite панели содержит subscription tokens и `secret_values` бе
 4. Не помещайте production secrets в Git.
 5. Не вставляйте secrets в issue, CI log или support output.
 6. После компрометации ротируйте не только admin password, но и subscription
-   tokens, proxy credentials, REALITY keys, TLS keys, Headscale keys и
+   tokens, proxy credentials, REALITY keys, TLS keys и
    Cloudflare token.
 
 Cloudflare token сохраняется root-only mode `0600`, что правильно. Он должен
 иметь доступ только к одной DNS-zone и только `Zone:Read`, `DNS:Edit`.
-
-Headscale pre-auth key временно записывается root worker в state, доступный
-панели. После копирования нажмите **Clear displayed result**. Не делайте ключи
-reusable без явной необходимости и задавайте короткий expiry.
 
 ## 9. Разделение привилегий
 
@@ -278,13 +269,13 @@ reusable без явной необходимости и задавайте ко
 - ограниченный `ReadWritePaths`.
 
 Это заметно уменьшает последствия web-компрометации, но разрешенные
-`ReadWritePaths` для `/etc/infiproxy-cores` и `/etc/headscale` оставляют owner UI
+`ReadWritePaths` для `/etc/infiproxy-cores` оставляют owner UI
 возможность изменить runtime config. Такая возможность нужна Configs UI и
 является осознанным tradeoff. Nginx и SSH configs остаются read-only для web.
 
 ### 9.2. Root workers
 
-Web-процесс не выполняет module/headscale update напрямую. Он создает файл
+Web-процесс не выполняет module update напрямую. Он создает файл
 строго заданного типа в request directory. systemd path unit запускает root
 worker, который:
 
@@ -354,13 +345,13 @@ Panel backend говорит HTTP только на loopback. TLS заверша
 - backend port нельзя открыть firewall;
 - certificate renewal нужно мониторить;
 - Nginx validation должна предшествовать reload;
-- panel и Headscale лучше разделить hostnames.
+- административный и proxy hostnames лучше разделять.
 
 ### 11.2. Cloudflare modes
 
 Panel hostname можно проксировать через Cloudflare, если это совместимо с вашей
-моделью доверия. Headscale hostname должен быть DNS-only согласно upstream
-рекомендациям: CDN proxy может нарушать protocol upgrade и direct coordination.
+моделью доверия. Proxy listeners не следует направлять через административный
+HTTP virtual host.
 
 DNS-01 позволяет выдать certificate без временного публичного HTTP challenge,
 но API token становится ключом изменения DNS. Не показывайте его в terminal
@@ -383,16 +374,6 @@ recording и ротируйте после подозрения на утечк�
 - firewall и UDP/TCP family.
 
 Placeholder или имя secret, попавшее в YAML, является ошибкой конфигурации.
-
-### 12.2. Headscale ACL
-
-Mesh connectivity не должна автоматически означать доступ каждого node ко
-всему серверу. Настройте ACL policy, route approvals и exit-node права по
-least privilege. Pre-auth keys делайте single-use/short-lived, когда возможно.
-
-Control plane координирует peers, а data plane обычно идет напрямую между
-клиентами или через DERP. Поэтому защита Headscale DB важна, но она не заменяет
-host firewalls внутри mesh.
 
 ## 13. Logging и мониторинг
 
@@ -419,7 +400,6 @@ access logs полезны, но не считаются tamper-proof после
 - `MTPROTO_SECRET`;
 - proxy passwords и UUID;
 - Cloudflare token;
-- Headscale pre-auth keys;
 - TLS private keys;
 - session cookie.
 
@@ -446,8 +426,7 @@ access logs полезны, но не считаются tamper-proof после
 4. Восстановите только проверенные данные, не неизвестные binaries/scripts.
 5. Ротируйте все credentials и private keys.
 6. Замените Cloudflare token и проверьте DNS history.
-7. Отзовите/перерегистрируйте Headscale nodes при необходимости.
-8. Переключите DNS только после внешней проверки нового host.
+7. Переключите DNS только после внешней проверки нового host.
 
 ## 15. Известные ограничения текущей ревизии
 
@@ -457,7 +436,6 @@ access logs полезны, но не считаются tamper-proof после
 | Высокий | Нет MFA и полноценной RBAC; высокорисковые Configs/Secrets ограничены owner, но обычные admins управляют users/protocols/routing. | Один owner, network allowlist/VPN, сильный уникальный пароль. |
 | Высокий | Secrets хранятся локально без application-level encryption. | Host hardening, строгие permissions, encrypted off-host backup. |
 | Средний | Нет immutable admin audit trail и session management UI. | Central journal shipping, минимальное число admins. |
-| Средний | Headscale operation bridge доверяет root-owned helper/state и локальной request queue. | Проверять ownership; не давать `infiproxy` write к maintenance state. |
 | Средний | Subscription URL — bearer secret в path. | TLS, log redaction, secure delivery, reset on leak. |
 | Средний | Нет scheduled off-host backup. | Настроить restic/borg/другой внешний job. |
 | Средний | Нет автоматической server↔Mihomo credential synchronization. | Change checklist и end-to-end test. |
@@ -477,7 +455,6 @@ access logs полезны, но не считаются tamper-proof после
 - [ ] Все starter placeholders заменены.
 - [ ] Mihomo profile совпадает с server inbound.
 - [ ] Cloudflare token ограничен одной zone и mode `0600`.
-- [ ] Headscale hostname DNS-only, ACL/routes настроены явно.
 - [ ] Automatic panel update включен только после выбора trust policy.
 - [ ] Module checksums/digests и smoke tests проходят.
 - [ ] Daily encrypted off-host backup настроен и test restore выполнен.

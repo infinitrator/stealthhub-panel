@@ -41,7 +41,7 @@ systemctl list-timers 'infiproxy-*' --all
 | Unit failed до появления listener | Env, права, SQLite или binary startup. |
 | `/health` 200, `/ready` 503 | SQLite/storage. |
 | Оба local probes 200, снаружи timeout | Firewall, Nginx, DNS или provider network. |
-| HTTPS 502 | Nginx работает, backend panel/Headscale недоступен. |
+| HTTPS 502 | Nginx работает, backend панели недоступен. |
 | Runtime active, но клиент не подключается | Server config, protocol mismatch, TLS/SNI, UDP/firewall. |
 | Module download прошел, symlink не изменился | Checksum, extraction или smoke test. |
 
@@ -567,51 +567,6 @@ generator текущей ревизии может использовать defa
 Rule providers публичны и не требуют user token; секретов в payload быть не
 должно.
 
-## 16. Headscale
-
-### 16.1. Config не проходит проверку
-
-```bash
-sudo headscale -c /etc/headscale/config.yaml configtest
-sudo journalctl -u headscale.service -n 150 --no-pager
-```
-
-Не используйте TUI restart как substitute validation: в текущей реализации
-некоторые пути продолжают restart после неуспешного `configtest`.
-
-### 16.2. Client не регистрируется
-
-Проверьте:
-
-```bash
-curl -I https://hs.example.com/
-getent ahosts hs.example.com
-sudo headscale -c /etc/headscale/config.yaml users list
-sudo headscale -c /etc/headscale/config.yaml nodes list
-```
-
-Типовые причины:
-
-- Headscale DNS record включен в orange-cloud proxy вместо DNS-only;
-- `server_url` не совпадает с hostname certificate;
-- Nginx не передает WebSocket upgrade;
-- pre-auth key истек/уже использован;
-- system time клиента или сервера неверно;
-- client использует неправильный `--login-server`;
-- ACL/routes запрещают ожидаемый доступ после регистрации.
-
-### 16.3. Web request не выполняется
-
-```bash
-sudo systemctl status infiproxy-module-update.path
-sudo find /var/lib/infiproxy/headscale-requests -maxdepth 1 -type f -ls
-sudo ls -la /var/lib/infiproxy-maintenance/headscale-processing
-sudo tail -n 200 /var/lib/infiproxy-maintenance/module-update.log
-```
-
-После получения pre-auth key нажмите **Clear displayed result**. Если worker
-упал, не публикуйте state JSON целиком: он может содержать последний key.
-
 ## 17. Cloudflare, certificate и Nginx
 
 ### 17.1. Zone not found / API error
@@ -649,12 +604,6 @@ sudo journalctl -u nginx.service -n 100 --no-pager
 Если local readiness работает, проверьте `proxy_pass`, SELinux policy и Nginx
 error log. Если не работает, проблема в panel/storage, а не certificate.
 
-### 17.4. Headscale через Nginx
-
-Headscale использует отдельный backend `127.0.0.1:8088` и отдельный hostname.
-Не направляйте оба hostnames на один upstream. Проверьте WebSocket headers и
-DNS-only Cloudflare mode.
-
 ## 18. Configs: Save with backup failed
 
 | Сообщение | Причина |
@@ -682,8 +631,7 @@ user обычно не имеет права `systemctl restart`. Это ожи�
 sudo infiproxy-manager
 ```
 
-Для Headscale вручную запускайте `configtest` до restart. Для Xray/sing-box/
-Hysteria/TUIC валидируйте соответствующим binary.
+Для Xray/sing-box/Hysteria/TUIC валидируйте конфигурацию соответствующим binary.
 
 ## 20. IP Check показывает мало данных
 
@@ -725,7 +673,6 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 | `/var/lib/infiproxy/panel-update-state.env` | Checker state для root updater/UI. |
 | `/var/lib/infiproxy/panel-update-now.request` | Immediate update trigger. |
 | `/var/lib/infiproxy/module-requests` | Typed module queue. |
-| `/var/lib/infiproxy/headscale-requests` | Typed Headscale queue. |
 | `/opt/infiproxy/source` | Managed Git checkout. |
 
 ### 22.2. Root maintenance
@@ -737,12 +684,10 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 | `/usr/local/sbin/infiproxy-module-update` | Module root updater. |
 | `/usr/local/sbin/infiproxy-core-install` | Verified archive installer. |
 | `/usr/local/libexec/infiproxy-module-manifest` | Rust manifest/GitHub JSON helper. |
-| `/usr/local/libexec/infiproxy-headscale-control` | Typed Headscale worker. |
 | `/etc/infiproxy-update.conf` | Root-owned GitHub repo/ref. |
 | `/etc/infiproxy-modules.d` | Active manifests. |
 | `/etc/infiproxy-modules.available.d` | Available catalog. |
 | `/var/lib/infiproxy-maintenance` | Logs, versions, builds, locks metadata и backups. |
-| `/var/lib/infiproxy-maintenance/headscale/state.json` | Root-owned snapshot/last result; иногда временно содержит pre-auth key. |
 
 ### 22.3. Runtime
 
@@ -750,12 +695,9 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 |---|---|
 | `/opt/infiproxy/cores/<id>/<version>` | Versioned proxy binaries. |
 | `/opt/infiproxy/cores/<id>/current` | Atomic active symlink. |
-| `/opt/infiproxy/modules/headscale/<version>` | Versioned Headscale binary. |
 | `/etc/infiproxy-cores/<id>` | Proxy configs. |
 | `/etc/infiproxy-cores/tls` | Starter TLS location для Hysteria/TUIC. |
 | `/var/log/infiproxy-cores` | Runtime log directory, если unit/config его использует. |
-| `/etc/headscale/config.yaml` | Headscale config. |
-| `/var/lib/headscale/db.sqlite` | Headscale state DB. |
 
 ## 23. systemd units
 
@@ -765,7 +707,7 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 | `infiproxy-panel-update.service` | oneshot root | Panel update when due/requested. |
 | `infiproxy-panel-update.timer` | timer | Проверка due каждые 15 минут. |
 | `infiproxy-panel-update.path` | path | Immediate request watcher. |
-| `infiproxy-module-update.service` | oneshot root | Queue + automatic module/Headscale work. |
+| `infiproxy-module-update.service` | oneshot root | Queue + automatic runtime-module work. |
 | `infiproxy-module-update.timer` | timer | Due work каждые 15 минут. |
 | `infiproxy-module-update.path` | path | Queue watcher. |
 | `infiproxy-xray.service` | long-running | Xray current binary. |
@@ -773,7 +715,6 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 | `infiproxy-hysteria.service` | long-running | Hysteria current binary. |
 | `infiproxy-tuic.service` | long-running | TUIC current binary. |
 | `infiproxy-mtproto.service` | long-running | Telegram MTProxy current binary. |
-| `headscale.service` | long-running | Headscale current binary. |
 
 Команды:
 
@@ -791,12 +732,9 @@ journalctl -u UNIT -n 120 --no-pager
 |---|---|---:|
 | TCP `22` | SSH, если distro default не изменен | Ограниченно. |
 | TCP `80` | Nginx redirect | Да, optional. |
-| TCP `443` | Nginx panel/Headscale virtual hosts | Да. |
+| TCP `443` | Nginx panel virtual host | Да. |
 | UDP `443` | Hysteria starter | Только если настроен. |
 | TCP `127.0.0.1:8080` | Infiproxy | Нет. |
-| TCP `127.0.0.1:8088` | Headscale HTTP control | Нет. |
-| TCP `127.0.0.1:9098` | Headscale metrics | Нет. |
-| TCP `127.0.0.1:50443` | Headscale gRPC | Нет. |
 | TCP `8443` | VLESS XHTTP starter profile | Да, после настройки Xray inbound. |
 | TCP `8444` | MTProxy starter | Да, если настроен. |
 | TCP `8888` | MTProxy stats согласно runtime args/unit | Нет. |
@@ -825,7 +763,6 @@ sudo ss -lntup
 | `/admin/secrets*` | Owner-only + CSRF для POST | Write-only secret value lifecycle. |
 | `/admin/routing*` | Admin + CSRF | Rule sets. |
 | `/admin/cores*` | View admin; actions owner-only | Runtime module catalog. |
-| `/admin/headscale*` | Owner-only | Typed Headscale control. |
 | `/admin/ip` | Admin | Local IP diagnosis/external links. |
 | `/admin/system*` | View admin; preview owner-only + CSRF | Sensors, command map, uninstall preview. |
 | `/admin/configs` | Owner-only + CSRF save | Allowlist config editor. |
@@ -915,7 +852,7 @@ cargo deny check
 
 Release smoke test дополнительно должен включать clean Ubuntu/Debian VPS,
 first-owner setup, HTTPS, один TCP runtime, один UDP runtime, subscription import,
-module update/rollback, Headscale enrollment, reboot/autostart и restore test.
+module update/rollback, reboot/autostart и restore test.
 
 ## 28. Безопасный support bundle
 
