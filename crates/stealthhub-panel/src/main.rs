@@ -12,6 +12,7 @@ mod ip;
 mod modules;
 mod ops;
 mod reconcile_request;
+mod rule_sources;
 mod ui;
 mod update;
 mod views;
@@ -32,7 +33,7 @@ use argon2::{
 };
 use axum::{
     body::Body,
-    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Form, MatchedPath, Path, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Form, MatchedPath, Path, Query, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
@@ -46,7 +47,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
@@ -57,27 +58,35 @@ use stealthhub_core::{
     mihomo::{generate_mihomo_yaml_with_registry, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
     policy::{parse_role, PoolKind, PoolMember, RoutingPolicyRule, TransportPool},
-    rules::routing_rule_payload_yaml,
+    rules::{
+        routing_rule_payload_yaml, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
+        RuleSourceFormat,
+    },
     storage::{
-        admin_count, create_admin_session, create_first_admin, create_user, delete_admin_session,
-        delete_expired_admin_sessions, delete_routing_policy, delete_secret, delete_transport_pool,
-        delete_user, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
-        ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
-        get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
-        is_owner_admin_id, list_protocol_profiles_decoded, list_secret_names, list_users,
-        load_client_policy, load_dns_policy, load_panel_settings, load_routing_rule_sets,
+        admin_count, bulk_add_rule_entries, clone_routing_rule_set, compiled_rule_set_payload,
+        create_admin_session, create_first_admin, create_routing_rule_set, create_user,
+        deduplicate_rule_entries, delete_admin_session, delete_expired_admin_sessions,
+        delete_routing_policy, delete_routing_rule_set, delete_rule_entry, delete_rule_source,
+        delete_secret, delete_transport_pool, delete_user, ensure_default_protocol_profiles,
+        ensure_default_routing_rule_sets, ensure_default_settings, get_admin_by_id,
+        get_admin_by_username, get_reconcile_state, get_secret, get_user_by_id, get_user_by_token,
+        get_valid_admin_session, init_db, is_owner_admin_id, list_protocol_profiles_decoded,
+        list_secret_names, list_users, load_client_policy, load_dns_policy, load_panel_settings,
+        load_routing_rule_sets, load_rule_entries, load_rule_sources,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
-        reset_user_subscription_token, set_user_enabled, touch_admin_session,
-        update_admin_password_and_revoke_sessions, update_dns_policy, update_protocol_profile,
-        update_routing_rule_set, upsert_routing_policy, upsert_secret, upsert_setting,
-        upsert_settings_with_runtime_keys, upsert_transport_pool, AdminRecord, NewUser,
-        UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
+        reset_user_subscription_token, save_routing_rule_set, set_user_enabled,
+        touch_admin_session, update_admin_password_and_revoke_sessions, update_dns_policy,
+        update_protocol_profile, update_routing_rule_set, upsert_routing_policy, upsert_rule_entry,
+        upsert_rule_source, upsert_secret, upsert_setting, upsert_settings_with_runtime_keys,
+        upsert_transport_pool, AdminRecord, NewUser, UpdateProtocolProfile, UpdateRoutingRuleSet,
+        UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
+use uuid::Uuid;
 
 const ADMIN_SESSION_COOKIE: &str = "infiproxy_admin_session";
 const ADMIN_SESSION_TTL_DAYS: i64 = 7;
@@ -241,6 +250,91 @@ struct DeleteRoutingPolicyForm {
 }
 
 #[derive(Debug, Deserialize)]
+struct RuleSetForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    create: String,
+    slug: String,
+    title: String,
+    effect: String,
+    target: String,
+    #[serde(default)]
+    enabled: String,
+    #[serde(default)]
+    payload: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleSetIdentityForm {
+    #[serde(default)]
+    csrf_token: String,
+    slug: String,
+    #[serde(default)]
+    new_slug: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleEntryForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    id: String,
+    rule_set_id: String,
+    #[serde(default)]
+    enabled: String,
+    kind: String,
+    value: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    source_tag: String,
+    priority: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleEntryIdentityForm {
+    #[serde(default)]
+    csrf_token: String,
+    id: String,
+    #[serde(default)]
+    rule_set_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BulkRuleEntryForm {
+    #[serde(default)]
+    csrf_token: String,
+    rule_set_id: String,
+    kind: String,
+    input: String,
+    #[serde(default)]
+    source_tag: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleSourceForm {
+    #[serde(default)]
+    csrf_token: String,
+    #[serde(default)]
+    id: String,
+    rule_set_id: String,
+    url: String,
+    format: String,
+    #[serde(default)]
+    enabled: String,
+    refresh_interval_seconds: u32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RoutingFilter {
+    #[serde(default)]
+    search: String,
+    #[serde(default)]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct UninstallPreviewForm {
     #[serde(default)]
     csrf_token: String,
@@ -360,6 +454,7 @@ async fn main() -> anyhow::Result<()> {
     }
     update::spawn_checker(pool.clone());
     modules::spawn_checker(pool.clone());
+    rule_sources::spawn_checker(pool.clone());
 
     let state = AppState {
         pool,
@@ -448,6 +543,37 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/routing/policies/delete",
             post(delete_routing_policy_action),
+        )
+        .route("/admin/routing/rule-sets/save", post(save_rule_set_action))
+        .route(
+            "/admin/routing/rule-sets/delete",
+            post(delete_rule_set_action),
+        )
+        .route(
+            "/admin/routing/rule-sets/clone",
+            post(clone_rule_set_action),
+        )
+        .route("/admin/routing/entries/save", post(save_rule_entry_action))
+        .route(
+            "/admin/routing/entries/delete",
+            post(delete_rule_entry_action),
+        )
+        .route(
+            "/admin/routing/entries/bulk",
+            post(bulk_rule_entries_action),
+        )
+        .route(
+            "/admin/routing/entries/deduplicate",
+            post(deduplicate_rule_entries_action),
+        )
+        .route("/admin/routing/sources/save", post(save_rule_source_action))
+        .route(
+            "/admin/routing/sources/delete",
+            post(delete_rule_source_action),
+        )
+        .route(
+            "/admin/routing/sources/refresh",
+            post(refresh_rule_source_action),
         )
         .route("/admin/system", get(system_page))
         .route(
@@ -616,6 +742,13 @@ async fn rule_provider(
     Path(name): Path<String>,
     request_headers: HeaderMap,
 ) -> Response {
+    if name.ends_with(".mrs") {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "MRS generation is unsupported for mixed classical rule sets; use the YAML provider\n",
+        )
+            .into_response();
+    }
     let slug = name.trim_end_matches(".yaml");
     let rule_sets = match load_routing_rule_sets(&state.pool).await {
         Ok(value) => value,
@@ -629,7 +762,11 @@ async fn rule_provider(
         return (StatusCode::NOT_FOUND, "rule not found\n").into_response();
     };
 
-    let body = match routing_rule_payload_yaml(&rule_set.payload) {
+    let compiled = match compiled_rule_set_payload(&state.pool, &rule_set).await {
+        Ok(value) => value,
+        Err(error) => return subscription_internal_error("compile routing provider", error),
+    };
+    let body = match routing_rule_payload_yaml(&compiled) {
         Ok(value) => value,
         Err(error) => return subscription_internal_error("render routing provider", error),
     };
@@ -1531,7 +1668,11 @@ async fn runtime_service_action(
     Redirect::to("/admin/cores").into_response()
 }
 
-async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn routing_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(filter): Query<RoutingFilter>,
+) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -1583,8 +1724,45 @@ async fn routing_page(State(state): State<AppState>, headers: HeaderMap) -> Resp
         Ok(value) => value,
         Err(error) => return internal_error("load routing profiles", error),
     };
+    let mut entries = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for rule_set in &rule_sets {
+        let mut rule_entries = match load_rule_entries(&state.pool, &rule_set.slug).await {
+            Ok(value) => value,
+            Err(error) => return internal_error("load normalized rules", error),
+        };
+        let search = filter.search.trim().to_ascii_lowercase();
+        let kind = filter.kind.trim().to_ascii_uppercase();
+        rule_entries.retain(|entry| {
+            (search.is_empty()
+                || entry.value.to_ascii_lowercase().contains(&search)
+                || entry
+                    .comment
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&search)))
+                && (kind.is_empty() || entry.kind.mihomo_name() == kind)
+        });
+        let rule_sources = match load_rule_sources(&state.pool, &rule_set.slug).await {
+            Ok(value) => value,
+            Err(error) => return internal_error("load remote rule sources", error),
+        };
+        entries.insert(rule_set.slug.clone(), rule_entries);
+        sources.insert(rule_set.slug.clone(), rule_sources);
+    }
 
-    views::routing::render(&auth, &rule_sets, &policy, &dns_policy, &profiles)
+    views::routing::render(
+        &auth,
+        views::routing::RoutingPageData {
+            rule_sets: &rule_sets,
+            policy: &policy,
+            dns: &dns_policy,
+            profiles: &profiles,
+            entries: &entries,
+            sources: &sources,
+            search: &filter.search,
+            kind_filter: &filter.kind,
+        },
+    )
 }
 
 async fn update_routing_rule_action(
@@ -1865,6 +2043,287 @@ fn routing_input_error(title: &'static str, error: anyhow::Error) -> Response {
         "/admin/routing",
         "Back to Routing",
     )
+}
+
+async fn save_rule_set_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleSetForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let value = RoutingRuleSet {
+        slug: form.slug.trim().to_string(),
+        title: form.title.trim().to_string(),
+        effect: form.effect.trim().to_string(),
+        target: form.target.trim().to_string(),
+        enabled: checkbox_enabled(&form.enabled),
+        payload: form.payload,
+    };
+    let result = if checkbox_enabled(&form.create) {
+        create_routing_rule_set(&state.pool, &value).await
+    } else {
+        save_routing_rule_set(&state.pool, &value).await
+    };
+    match result {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule set rejected", error),
+    }
+}
+
+async fn delete_rule_set_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleSetIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match delete_routing_rule_set(&state.pool, form.slug.trim()).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule set deletion rejected", error),
+    }
+}
+
+async fn clone_rule_set_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleSetIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match clone_routing_rule_set(&state.pool, form.slug.trim(), form.new_slug.trim()).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule set clone rejected", error),
+    }
+}
+
+async fn save_rule_entry_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleEntryForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let kind = match RuleKind::parse(&form.kind) {
+        Ok(value) => value,
+        Err(error) => return routing_input_error("Rule entry rejected", error),
+    };
+    let entry = RuleEntry {
+        id: if form.id.trim().is_empty() {
+            Uuid::new_v4().simple().to_string()
+        } else {
+            form.id.trim().to_string()
+        },
+        rule_set_id: form.rule_set_id.trim().to_string(),
+        enabled: checkbox_enabled(&form.enabled),
+        kind,
+        value: form.value.trim().to_string(),
+        comment: nonempty(&form.comment),
+        source_tag: nonempty(&form.source_tag),
+        priority: form.priority,
+    };
+    match upsert_rule_entry(&state.pool, &entry).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule entry rejected", error),
+    }
+}
+
+async fn delete_rule_entry_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleEntryIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let _ = &form.rule_set_id;
+    match delete_rule_entry(&state.pool, form.id.trim()).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule entry deletion rejected", error),
+    }
+}
+
+async fn bulk_rule_entries_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<BulkRuleEntryForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let kind = match RuleKind::parse(&form.kind) {
+        Ok(value) => value,
+        Err(error) => return routing_input_error("Bulk rules rejected", error),
+    };
+    match bulk_add_rule_entries(
+        &state.pool,
+        form.rule_set_id.trim(),
+        kind,
+        &form.input,
+        nonempty(&form.source_tag).as_deref(),
+    )
+    .await
+    {
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Bulk rules rejected", error),
+    }
+}
+
+async fn deduplicate_rule_entries_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleEntryIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match deduplicate_rule_entries(&state.pool, form.rule_set_id.trim()).await {
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule deduplication rejected", error),
+    }
+}
+
+async fn save_rule_source_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleSourceForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let format = match RuleSourceFormat::parse(&form.format) {
+        Ok(value) => value,
+        Err(error) => return routing_input_error("Rule source rejected", error),
+    };
+    let source = RuleSetSource {
+        id: if form.id.trim().is_empty() {
+            Uuid::new_v4().simple().to_string()
+        } else {
+            form.id.trim().to_string()
+        },
+        rule_set_id: form.rule_set_id.trim().to_string(),
+        url: form.url.trim().to_string(),
+        format,
+        enabled: checkbox_enabled(&form.enabled),
+        refresh_interval_seconds: form.refresh_interval_seconds,
+        etag: None,
+        last_modified: None,
+        last_successful_fetch: None,
+        checksum: None,
+        entry_count: 0,
+        last_error: None,
+        cached_payload: String::new(),
+    };
+    match upsert_rule_source(&state.pool, &source).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule source rejected", error),
+    }
+}
+
+async fn delete_rule_source_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleEntryIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match delete_rule_source(&state.pool, form.id.trim()).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule source deletion rejected", error),
+    }
+}
+
+async fn refresh_rule_source_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RuleEntryIdentityForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    match rule_sources::refresh(&state.pool, form.id.trim()).await {
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
+        Err(error) => routing_input_error("Rule source refresh failed", error),
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.trim().to_string())
 }
 
 async fn system_page(State(state): State<AppState>, headers: HeaderMap) -> Response {

@@ -26,8 +26,9 @@ use crate::{
         PoolKind, PoolMember, RoutingPolicyRule, TransportPool,
     },
     rules::{
-        default_routing_rule_sets, is_valid_routing_target, validate_classical_rule_payload,
-        RoutingRuleSet,
+        compile_rule_set_payload, default_routing_rule_sets, is_valid_routing_target,
+        validate_classical_rule_payload, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
+        RuleSourceFormat,
     },
 };
 
@@ -568,6 +569,7 @@ const ACTIVE_RUNTIME_IDS_MIGRATION: i64 = 2;
 const CLIENT_POLICY_MIGRATION: i64 = 3;
 const DNS_POLICY_MIGRATION: i64 = 4;
 const EDITABLE_CLIENT_POLICY_MIGRATION: i64 = 5;
+const NORMALIZED_RULES_MIGRATION: i64 = 6;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -718,6 +720,56 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(EDITABLE_CLIENT_POLICY_MIGRATION)
             .bind("make transport pools and routing policies fully editable")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(NORMALIZED_RULES_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            r"CREATE TABLE routing_rule_entries (
+                id TEXT PRIMARY KEY,
+                rule_set_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                comment TEXT NULL,
+                source_tag TEXT NULL,
+                priority INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(rule_set_id) REFERENCES routing_rule_sets(slug) ON DELETE CASCADE
+            )",
+            r"CREATE TABLE routing_rule_sources (
+                id TEXT PRIMARY KEY,
+                rule_set_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                format TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                refresh_interval_seconds INTEGER NOT NULL,
+                etag TEXT NULL,
+                last_modified TEXT NULL,
+                last_successful_fetch TEXT NULL,
+                checksum TEXT NULL,
+                entry_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NULL,
+                cached_payload TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(rule_set_id) REFERENCES routing_rule_sets(slug) ON DELETE CASCADE
+            )",
+            "CREATE INDEX idx_routing_rule_entries_set_order ON routing_rule_entries(rule_set_id,priority,id)",
+            "CREATE INDEX idx_routing_rule_sources_set ON routing_rule_sources(rule_set_id,id)",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(NORMALIZED_RULES_MIGRATION)
+            .bind("add normalized rules and bounded remote sources")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -1934,6 +1986,425 @@ pub async fn update_routing_rule_set(pool: &SqlitePool, input: UpdateRoutingRule
     Ok(())
 }
 
+/// Creates an arbitrary rule set without changing bootstrap rows.
+pub async fn create_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) -> Result<()> {
+    validate_rule_set_metadata(pool, value).await?;
+    if value.enabled && value.payload.trim().is_empty() {
+        bail!("an enabled new rule set requires an initial local payload");
+    }
+    let payload = if value.payload.trim().is_empty() {
+        String::new()
+    } else {
+        validate_classical_rule_payload(&value.payload)?.join("\n")
+    };
+    sqlx::query("INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?)")
+        .bind(value.slug.trim()).bind(value.title.trim()).bind(value.effect.trim())
+        .bind(value.target.trim()).bind(value.enabled).bind(payload).bind(Utc::now())
+        .execute(pool).await?;
+    Ok(())
+}
+
+/// Updates editable rule-set metadata and its optional raw local layer.
+pub async fn save_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) -> Result<()> {
+    validate_rule_set_metadata(pool, value).await?;
+    let payload = if value.payload.trim().is_empty() {
+        String::new()
+    } else {
+        validate_classical_rule_payload(&value.payload)?.join("\n")
+    };
+    if value.enabled {
+        compile_rule_set_payload(
+            &load_rule_entries(pool, &value.slug).await?,
+            &payload,
+            &load_rule_sources(pool, &value.slug).await?,
+        )?;
+    }
+    let result = sqlx::query("UPDATE routing_rule_sets SET title=?,effect=?,target=?,enabled=?,payload=?,updated_at=? WHERE slug=?")
+        .bind(value.title.trim()).bind(value.effect.trim()).bind(value.target.trim())
+        .bind(value.enabled).bind(payload).bind(Utc::now()).bind(value.slug.trim())
+        .execute(pool).await?;
+    if result.rows_affected() != 1 {
+        bail!("unknown rule set");
+    }
+    Ok(())
+}
+
+pub async fn delete_routing_rule_set(pool: &SqlitePool, slug: &str) -> Result<()> {
+    let result = sqlx::query("DELETE FROM routing_rule_sets WHERE slug=?")
+        .bind(slug.trim())
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("unknown rule set");
+    }
+    Ok(())
+}
+
+pub async fn clone_routing_rule_set(pool: &SqlitePool, source: &str, new_slug: &str) -> Result<()> {
+    let source_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|rule_set| rule_set.slug == source)
+        .ok_or_else(|| anyhow::anyhow!("unknown source rule set"))?;
+    let mut clone = source_set;
+    clone.slug = new_slug.trim().to_string();
+    clone.title = format!("{} copy", clone.title);
+    create_routing_rule_set(pool, &clone).await?;
+    let entries = load_rule_entries(pool, source).await?;
+    for mut entry in entries {
+        entry.id = Uuid::new_v4().simple().to_string();
+        entry.rule_set_id = clone.slug.clone();
+        upsert_rule_entry(pool, &entry).await?;
+    }
+    let sources = load_rule_sources(pool, source).await?;
+    for mut source in sources {
+        source.id = Uuid::new_v4().simple().to_string();
+        source.rule_set_id = clone.slug.clone();
+        upsert_rule_source(pool, &source).await?;
+    }
+    Ok(())
+}
+
+async fn validate_rule_set_metadata(pool: &SqlitePool, value: &RoutingRuleSet) -> Result<()> {
+    if !valid_rule_object_id(&value.slug)
+        || value.title.trim().is_empty()
+        || value.title.len() > 80
+        || value.effect.len() > 256
+        || value.title.chars().any(char::is_control)
+        || value.effect.chars().any(char::is_control)
+    {
+        bail!("invalid rule-set metadata");
+    }
+    let policy = load_client_policy(pool).await?;
+    if !is_valid_routing_target(value.target.trim())
+        && !policy
+            .pools
+            .iter()
+            .any(|candidate| candidate.enabled && candidate.id == value.target.trim())
+    {
+        bail!("unsupported routing target");
+    }
+    Ok(())
+}
+
+pub async fn load_rule_entries(pool: &SqlitePool, rule_set_id: &str) -> Result<Vec<RuleEntry>> {
+    sqlx::query("SELECT id,rule_set_id,enabled,kind,value,comment,source_tag,priority FROM routing_rule_entries WHERE rule_set_id=? ORDER BY priority,id")
+        .bind(rule_set_id).fetch_all(pool).await?.into_iter().map(|row| {
+            Ok(RuleEntry {
+                id: row.try_get("id")?, rule_set_id: row.try_get("rule_set_id")?,
+                enabled: row.try_get("enabled")?, kind: RuleKind::parse(&row.try_get::<String, _>("kind")?)?,
+                value: row.try_get("value")?, comment: row.try_get("comment")?,
+                source_tag: row.try_get("source_tag")?, priority: row.try_get("priority")?,
+            })
+        }).collect()
+}
+
+pub async fn upsert_rule_entry(pool: &SqlitePool, entry: &RuleEntry) -> Result<()> {
+    entry.validate()?;
+    let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routing_rule_sets WHERE slug=?")
+        .bind(&entry.rule_set_id)
+        .fetch_one(pool)
+        .await?;
+    if exists != 1 {
+        bail!("unknown rule set");
+    }
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == entry.rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        let mut entries = load_rule_entries(pool, &entry.rule_set_id).await?;
+        if let Some(index) = entries.iter().position(|value| value.id == entry.id) {
+            entries[index] = entry.clone();
+        } else {
+            entries.push(entry.clone());
+        }
+        compile_rule_set_payload(
+            &entries,
+            &rule_set.payload,
+            &load_rule_sources(pool, &entry.rule_set_id).await?,
+        )?;
+    }
+    sqlx::query("INSERT INTO routing_rule_entries (id,rule_set_id,enabled,kind,value,comment,source_tag,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET rule_set_id=excluded.rule_set_id,enabled=excluded.enabled,kind=excluded.kind,value=excluded.value,comment=excluded.comment,source_tag=excluded.source_tag,priority=excluded.priority,updated_at=excluded.updated_at")
+        .bind(&entry.id).bind(&entry.rule_set_id).bind(entry.enabled).bind(entry.kind.mihomo_name())
+        .bind(entry.value.trim()).bind(&entry.comment).bind(&entry.source_tag).bind(entry.priority)
+        .bind(Utc::now()).bind(Utc::now()).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn delete_rule_entry(pool: &SqlitePool, id: &str) -> Result<()> {
+    let row = sqlx::query("SELECT rule_set_id FROM routing_rule_entries WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        bail!("unknown rule entry");
+    };
+    let rule_set_id: String = row.try_get("rule_set_id")?;
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        let entries = load_rule_entries(pool, &rule_set.slug)
+            .await?
+            .into_iter()
+            .filter(|entry| entry.id != id)
+            .collect::<Vec<_>>();
+        compile_rule_set_payload(
+            &entries,
+            &rule_set.payload,
+            &load_rule_sources(pool, &rule_set.slug).await?,
+        )?;
+    }
+    let result = sqlx::query("DELETE FROM routing_rule_entries WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("unknown rule entry");
+    }
+    Ok(())
+}
+
+pub async fn bulk_add_rule_entries(
+    pool: &SqlitePool,
+    rule_set_id: &str,
+    kind: RuleKind,
+    input: &str,
+    source_tag: Option<&str>,
+) -> Result<usize> {
+    let mut values = input
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.len() > 10_000 {
+        bail!("bulk rule input exceeds 10000 lines");
+    }
+    if kind == RuleKind::Classical {
+        values = validate_classical_rule_payload(input)?;
+    }
+    let existing = load_rule_entries(pool, rule_set_id).await?;
+    let mut seen = existing
+        .iter()
+        .map(|entry| {
+            format!("{}:{}", entry.kind.mihomo_name(), entry.value.trim()).to_ascii_lowercase()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut priority = existing
+        .iter()
+        .map(|entry| entry.priority)
+        .max()
+        .unwrap_or(0);
+    let mut inserted = 0;
+    for value in values {
+        let key = format!("{}:{value}", kind.mihomo_name()).to_ascii_lowercase();
+        if !seen.insert(key) {
+            continue;
+        }
+        priority = priority.saturating_add(10);
+        upsert_rule_entry(
+            pool,
+            &RuleEntry {
+                id: Uuid::new_v4().simple().to_string(),
+                rule_set_id: rule_set_id.to_string(),
+                enabled: true,
+                kind,
+                value,
+                comment: None,
+                source_tag: source_tag.map(str::to_string),
+                priority,
+            },
+        )
+        .await?;
+        inserted += 1;
+    }
+    Ok(inserted)
+}
+
+pub async fn deduplicate_rule_entries(pool: &SqlitePool, rule_set_id: &str) -> Result<usize> {
+    let entries = load_rule_entries(pool, rule_set_id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let duplicates = entries
+        .into_iter()
+        .filter(|entry| {
+            !seen.insert(
+                format!("{}:{}", entry.kind.mihomo_name(), entry.value.trim()).to_ascii_lowercase(),
+            )
+        })
+        .map(|entry| entry.id)
+        .collect::<Vec<_>>();
+    for id in &duplicates {
+        delete_rule_entry(pool, id).await?;
+    }
+    Ok(duplicates.len())
+}
+
+pub async fn load_rule_sources(pool: &SqlitePool, rule_set_id: &str) -> Result<Vec<RuleSetSource>> {
+    sqlx::query("SELECT id,rule_set_id,url,format,enabled,refresh_interval_seconds,etag,last_modified,last_successful_fetch,checksum,entry_count,last_error,cached_payload FROM routing_rule_sources WHERE rule_set_id=? ORDER BY id")
+        .bind(rule_set_id).fetch_all(pool).await?.into_iter().map(|row| Ok(RuleSetSource {
+            id: row.try_get("id")?, rule_set_id: row.try_get("rule_set_id")?, url: row.try_get("url")?,
+            format: RuleSourceFormat::parse(&row.try_get::<String, _>("format")?)?, enabled: row.try_get("enabled")?,
+            refresh_interval_seconds: u32::try_from(row.try_get::<i64, _>("refresh_interval_seconds")?)?,
+            etag: row.try_get("etag")?, last_modified: row.try_get("last_modified")?,
+            last_successful_fetch: row.try_get("last_successful_fetch")?, checksum: row.try_get("checksum")?,
+            entry_count: u32::try_from(row.try_get::<i64, _>("entry_count")?)?, last_error: row.try_get("last_error")?,
+            cached_payload: row.try_get("cached_payload")?,
+        })).collect()
+}
+
+pub async fn list_rule_sources(pool: &SqlitePool) -> Result<Vec<RuleSetSource>> {
+    let rule_sets = load_routing_rule_sets(pool).await?;
+    let mut sources = Vec::new();
+    for rule_set in rule_sets {
+        sources.extend(load_rule_sources(pool, &rule_set.slug).await?);
+    }
+    Ok(sources)
+}
+
+pub async fn get_rule_source(pool: &SqlitePool, id: &str) -> Result<Option<RuleSetSource>> {
+    let row = sqlx::query("SELECT rule_set_id FROM routing_rule_sources WHERE id=?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let rule_set_id: String = row.try_get("rule_set_id")?;
+    Ok(load_rule_sources(pool, &rule_set_id)
+        .await?
+        .into_iter()
+        .find(|source| source.id == id))
+}
+
+pub async fn upsert_rule_source(pool: &SqlitePool, source: &RuleSetSource) -> Result<()> {
+    if !valid_rule_object_id(&source.id)
+        || !valid_rule_object_id(&source.rule_set_id)
+        || !source.url.starts_with("https://")
+        || source.url.len() > 2048
+        || !(300..=604_800).contains(&source.refresh_interval_seconds)
+    {
+        bail!("invalid remote rule source");
+    }
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == source.rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        let mut effective = source.clone();
+        if let Some(current) = get_rule_source(pool, &source.id).await? {
+            effective.etag = current.etag;
+            effective.last_modified = current.last_modified;
+            effective.last_successful_fetch = current.last_successful_fetch;
+            effective.checksum = current.checksum;
+            effective.entry_count = current.entry_count;
+            effective.last_error = current.last_error;
+            effective.cached_payload = current.cached_payload;
+        }
+        let mut sources = load_rule_sources(pool, &source.rule_set_id).await?;
+        if let Some(index) = sources.iter().position(|value| value.id == source.id) {
+            sources[index] = effective;
+        } else {
+            sources.push(effective);
+        }
+        compile_rule_set_payload(
+            &load_rule_entries(pool, &source.rule_set_id).await?,
+            &rule_set.payload,
+            &sources,
+        )?;
+    }
+    sqlx::query("INSERT INTO routing_rule_sources (id,rule_set_id,url,format,enabled,refresh_interval_seconds,etag,last_modified,last_successful_fetch,checksum,entry_count,last_error,cached_payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET rule_set_id=excluded.rule_set_id,url=excluded.url,format=excluded.format,enabled=excluded.enabled,refresh_interval_seconds=excluded.refresh_interval_seconds,updated_at=excluded.updated_at")
+        .bind(&source.id).bind(&source.rule_set_id).bind(&source.url).bind(rule_source_format_name(source.format))
+        .bind(source.enabled).bind(i64::from(source.refresh_interval_seconds)).bind(&source.etag)
+        .bind(&source.last_modified).bind(&source.last_successful_fetch).bind(&source.checksum)
+        .bind(i64::from(source.entry_count)).bind(&source.last_error).bind(&source.cached_payload)
+        .bind(Utc::now()).bind(Utc::now()).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn update_rule_source_success(pool: &SqlitePool, source: &RuleSetSource) -> Result<()> {
+    sqlx::query("UPDATE routing_rule_sources SET etag=?,last_modified=?,last_successful_fetch=?,checksum=?,entry_count=?,last_error=NULL,cached_payload=?,updated_at=? WHERE id=?")
+        .bind(&source.etag).bind(&source.last_modified).bind(&source.last_successful_fetch)
+        .bind(&source.checksum).bind(i64::from(source.entry_count)).bind(&source.cached_payload)
+        .bind(Utc::now()).bind(&source.id).execute(pool).await?;
+    Ok(())
+}
+
+pub async fn update_rule_source_error(pool: &SqlitePool, id: &str, error: &str) -> Result<()> {
+    let bounded = error.chars().take(512).collect::<String>();
+    sqlx::query("UPDATE routing_rule_sources SET last_error=?,updated_at=? WHERE id=?")
+        .bind(bounded)
+        .bind(Utc::now())
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_rule_source(pool: &SqlitePool, id: &str) -> Result<()> {
+    let source = get_rule_source(pool, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("unknown rule source"))?;
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == source.rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        let sources = load_rule_sources(pool, &rule_set.slug)
+            .await?
+            .into_iter()
+            .filter(|value| value.id != id)
+            .collect::<Vec<_>>();
+        compile_rule_set_payload(
+            &load_rule_entries(pool, &rule_set.slug).await?,
+            &rule_set.payload,
+            &sources,
+        )?;
+    }
+    let result = sqlx::query("DELETE FROM routing_rule_sources WHERE id=?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("unknown rule source");
+    }
+    Ok(())
+}
+
+pub async fn compiled_rule_set_payload(
+    pool: &SqlitePool,
+    rule_set: &RoutingRuleSet,
+) -> Result<String> {
+    compile_rule_set_payload(
+        &load_rule_entries(pool, &rule_set.slug).await?,
+        &rule_set.payload,
+        &load_rule_sources(pool, &rule_set.slug).await?,
+    )
+}
+
+fn valid_rule_object_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+const fn rule_source_format_name(value: RuleSourceFormat) -> &'static str {
+    match value {
+        RuleSourceFormat::Text => "text",
+        RuleSourceFormat::Yaml => "yaml",
+        RuleSourceFormat::MihomoClassical => "mihomo-classical",
+    }
+}
+
 async fn ensure_default_client_policy(pool: &SqlitePool) -> Result<()> {
     let policy = default_client_policy();
     let mut transaction = pool.begin().await?;
@@ -2635,7 +3106,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 5);
+        assert_eq!(migrations, 6);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -3405,6 +3876,74 @@ mod tests {
             Some("AUTO-SAFE")
         );
         delete_routing_policy(&pool, "custom-domain").await?;
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn normalized_rules_and_sources_preserve_manual_and_cached_layers() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_routing_rule_sets(&pool).await?;
+        let rule_set = RoutingRuleSet {
+            slug: "operator-rules".to_string(),
+            title: "Operator rules".to_string(),
+            effect: "Test normalized storage".to_string(),
+            target: "DIRECT".to_string(),
+            enabled: true,
+            payload: "DOMAIN,local.test".to_string(),
+        };
+        create_routing_rule_set(&pool, &rule_set).await?;
+        assert_eq!(
+            bulk_add_rule_entries(
+                &pool,
+                &rule_set.slug,
+                RuleKind::DomainSuffix,
+                "example.com\nexample.com\nmanual.test",
+                Some("manual"),
+            )
+            .await?,
+            2
+        );
+        let source = RuleSetSource {
+            id: "source-one".to_string(),
+            rule_set_id: rule_set.slug.clone(),
+            url: "https://example.test/rules.yaml".to_string(),
+            format: RuleSourceFormat::Yaml,
+            enabled: true,
+            refresh_interval_seconds: 3600,
+            etag: Some("etag-one".to_string()),
+            last_modified: None,
+            last_successful_fetch: Some(Utc::now().to_rfc3339()),
+            checksum: Some("checksum".to_string()),
+            entry_count: 2,
+            last_error: None,
+            cached_payload: "DOMAIN-SUFFIX,example.com\nDOMAIN,imported.test".to_string(),
+        };
+        upsert_rule_source(&pool, &source).await?;
+        assert_eq!(
+            compiled_rule_set_payload(&pool, &rule_set).await?,
+            "DOMAIN-SUFFIX,example.com\nDOMAIN-SUFFIX,manual.test\nDOMAIN,local.test\nDOMAIN,imported.test"
+        );
+        update_rule_source_error(&pool, &source.id, "network failed").await?;
+        let after_error = get_rule_source(&pool, &source.id)
+            .await?
+            .expect("source remains available");
+        assert_eq!(after_error.cached_payload, source.cached_payload);
+        assert_eq!(load_rule_entries(&pool, &rule_set.slug).await?.len(), 2);
+
+        clone_routing_rule_set(&pool, &rule_set.slug, "operator-rules-copy").await?;
+        assert_eq!(
+            load_rule_entries(&pool, "operator-rules-copy").await?.len(),
+            2
+        );
+        assert_eq!(
+            load_rule_sources(&pool, "operator-rules-copy").await?.len(),
+            1
+        );
+        delete_routing_rule_set(&pool, &rule_set.slug).await?;
+        assert!(load_rule_entries(&pool, &rule_set.slug).await?.is_empty());
+        assert!(load_rule_sources(&pool, &rule_set.slug).await?.is_empty());
 
         close_and_remove(pool, &path).await;
         Ok(())

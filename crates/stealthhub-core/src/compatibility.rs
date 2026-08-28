@@ -32,6 +32,8 @@ const DURABLE_TABLES: &[&str] = &[
     "client_transport_pool_members",
     "client_routing_rules",
     "routing_rule_sets",
+    "routing_rule_entries",
+    "routing_rule_sources",
     "client_dns_policy",
 ];
 
@@ -106,6 +108,8 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
         "client_transport_pool_members",
         "client_routing_rules",
         "routing_rule_sets",
+        "routing_rule_entries",
+        "routing_rule_sources",
         "client_dns_policy",
     ]
     .iter()

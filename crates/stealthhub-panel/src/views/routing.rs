@@ -3,19 +3,35 @@
 use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
+use std::collections::BTreeMap;
 use stealthhub_core::{
     models::ProtocolProfile,
     policy::{role_name, ClientPolicy, DnsPolicy, PoolMember, RoutingPolicyRule, TransportPool},
-    rules::RoutingRuleSet,
+    rules::{RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource, RuleSourceFormat},
 };
 
-pub(crate) fn render(
-    auth: &AuthenticatedAdmin,
-    rule_sets: &[RoutingRuleSet],
-    policy: &ClientPolicy,
-    dns: &DnsPolicy,
-    profiles: &[ProtocolProfile],
-) -> Response {
+pub(crate) struct RoutingPageData<'a> {
+    pub(crate) rule_sets: &'a [RoutingRuleSet],
+    pub(crate) policy: &'a ClientPolicy,
+    pub(crate) dns: &'a DnsPolicy,
+    pub(crate) profiles: &'a [ProtocolProfile],
+    pub(crate) entries: &'a BTreeMap<String, Vec<RuleEntry>>,
+    pub(crate) sources: &'a BTreeMap<String, Vec<RuleSetSource>>,
+    pub(crate) search: &'a str,
+    pub(crate) kind_filter: &'a str,
+}
+
+pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Response {
+    let RoutingPageData {
+        rule_sets,
+        policy,
+        dns,
+        profiles,
+        entries,
+        sources,
+        search,
+        kind_filter,
+    } = data;
     let targets = ["DIRECT".to_string(), "REJECT".to_string()]
         .into_iter()
         .chain(
@@ -53,6 +69,16 @@ pub(crate) fn render(
                         div class="metric" {
                             span { "Transport pools" }
                             strong { (policy.pools.iter().filter(|pool| pool.enabled).count()) }
+                        }
+                    }
+
+                    section {
+                        h2 { "Normalized rule filter" }
+                        form method="get" action="/admin/routing" class="inline-form" {
+                            input type="search" name="search" value=(search) placeholder="value or comment" maxlength="128";
+                            (rule_kind_filter(kind_filter))
+                            button class="secondary compact" type="submit" { "Filter" }
+                            a class="button secondary compact" href="/admin/routing" { "Clear" }
                         }
                     }
 
@@ -152,8 +178,15 @@ pub(crate) fn render(
                         h2 { "Rule parameters" }
                         div class="config-list" {
                             @for rule_set in rule_sets {
-                                (routing_rule_editor(rule_set, auth, &targets))
+                                (routing_rule_editor(
+                                    rule_set,
+                                    auth,
+                                    &targets,
+                                    entries.get(&rule_set.slug).map(Vec::as_slice).unwrap_or_default(),
+                                    sources.get(&rule_set.slug).map(Vec::as_slice).unwrap_or_default(),
+                                ))
                             }
+                            (new_rule_set_editor(auth, &targets))
                         }
                     }
                 },
@@ -332,6 +365,8 @@ fn routing_rule_editor(
     rule_set: &stealthhub_core::rules::RoutingRuleSet,
     auth: &AuthenticatedAdmin,
     targets: &[String],
+    entries: &[RuleEntry],
+    sources: &[RuleSetSource],
 ) -> Markup {
     html! {
         section class="config-row" {
@@ -345,9 +380,12 @@ fn routing_rule_editor(
                     code { (format!("/rules/{}.yaml", rule_set.slug)) }
                 }
             }
-            form method="post" action="/admin/routing" class="config-form wide" {
+            form method="post" action="/admin/routing/rule-sets/save" class="config-form wide" {
                 (csrf_field(&auth.csrf_token))
                 input type="hidden" name="slug" value=(&rule_set.slug);
+                input type="hidden" name="create" value="false";
+                label { span { "Display name" } input name="title" value=(&rule_set.title) required maxlength="80"; }
+                label { span { "Description" } input name="effect" value=(&rule_set.effect) maxlength="256"; }
                 label class="switch-field" {
                     input type="checkbox" name="enabled" checked[rule_set.enabled];
                     span class="switch-ui" {}
@@ -366,12 +404,179 @@ fn routing_rule_editor(
                     small { (&rule_set.effect) }
                 }
                 label class="full-span" {
-                    span { "Classical payload" }
+                    span { "Local advanced classical layer" }
                     textarea name="payload" rows="10" spellcheck="false" { (&rule_set.payload) }
-                    small { "One Mihomo classical rule per line, for example DOMAIN-SUFFIX,example.com or IP-CIDR,10.0.0.0/8,no-resolve." }
+                    small { "Normalized entries take precedence; imported source data is appended last. Empty is allowed when normalized entries or a source provide data." }
                 }
                 button type="submit" { "Save rule set" }
             }
+            div class="module-actions" {
+                a class="button secondary compact" href=(format!("/rules/{}.yaml", rule_set.slug)) { "Export / preview YAML" }
+                form method="post" action="/admin/routing/rule-sets/clone" class="inline-form" {
+                    (csrf_field(&auth.csrf_token)) input type="hidden" name="slug" value=(&rule_set.slug);
+                    input name="new_slug" placeholder="new-stable-id" required maxlength="64";
+                    button class="secondary compact" type="submit" { "Clone" }
+                }
+                form method="post" action="/admin/routing/rule-sets/delete" class="inline-form" {
+                    (csrf_field(&auth.csrf_token)) input type="hidden" name="slug" value=(&rule_set.slug);
+                    button class="danger compact" type="submit" { "Delete rule set" }
+                }
+            }
+
+            h4 { "Normalized entries" }
+            p { (entries.len()) " entries. The first 200 are rendered to keep this page bounded." }
+            div class="table-wrap" { table {
+                thead { tr { th { "Order" } th { "Kind / value" } th { "Metadata" } th { "State" } th { "Action" } } }
+                tbody {
+                    @for entry in entries.iter().take(200) {
+                        tr {
+                            td { (entry.priority) }
+                            td { code { (entry.kind.mihomo_name()) "," (&entry.value) } }
+                            td { (entry.comment.as_deref().unwrap_or("")) br; small { (entry.source_tag.as_deref().unwrap_or("manual")) } }
+                            td { @if entry.enabled { span class="badge ok" { "enabled" } } @else { span class="badge off" { "disabled" } } }
+                            td class="module-actions" {
+                                details { summary { "Edit" } form method="post" action="/admin/routing/entries/save" class="config-form" {
+                                    (csrf_field(&auth.csrf_token)) input type="hidden" name="id" value=(&entry.id);
+                                    input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                                    label class="switch-field" { input type="checkbox" name="enabled" checked[entry.enabled]; span class="switch-ui" {} span { "Enabled" } }
+                                    label { span { "Kind" } (rule_kind_select("kind", entry.kind)) }
+                                    label { span { "Value" } input name="value" value=(&entry.value) required maxlength="1024"; }
+                                    label { span { "Comment" } input name="comment" value=(entry.comment.as_deref().unwrap_or("")) maxlength="256"; }
+                                    label { span { "Source tag" } input name="source_tag" value=(entry.source_tag.as_deref().unwrap_or("")) maxlength="64"; }
+                                    label { span { "Priority" } input type="number" name="priority" value=(entry.priority) required; }
+                                    button class="compact" type="submit" { "Save" }
+                                } }
+                                form method="post" action="/admin/routing/entries/delete" class="inline-form" {
+                                    (csrf_field(&auth.csrf_token)) input type="hidden" name="id" value=(&entry.id);
+                                    input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                                    button class="danger compact" type="submit" { "Delete" }
+                                }
+                            }
+                        }
+                    }
+                }
+            } }
+            form method="post" action="/admin/routing/entries/save" class="config-form wide" {
+                (csrf_field(&auth.csrf_token)) input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                input type="hidden" name="enabled" value="true";
+                label { span { "Kind" } (rule_kind_select("kind", RuleKind::DomainSuffix)) }
+                label { span { "Value" } input name="value" required maxlength="1024" placeholder="example.com"; }
+                label { span { "Comment" } input name="comment" maxlength="256"; }
+                label { span { "Source tag" } input name="source_tag" maxlength="64" placeholder="manual"; }
+                label { span { "Priority" } input type="number" name="priority" value="500" required; }
+                button type="submit" { "Add normalized entry" }
+            }
+            form method="post" action="/admin/routing/entries/bulk" class="config-form wide" {
+                (csrf_field(&auth.csrf_token)) input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                label { span { "Bulk kind" } (rule_kind_select("kind", RuleKind::DomainSuffix)) }
+                label { span { "Source tag" } input name="source_tag" maxlength="64" placeholder="bulk-manual"; }
+                label class="full-span" { span { "Bulk values" } textarea name="input" rows="7" required {} small { "One value per line, or choose CLASSICAL for complete rules. Duplicate normalized entries are skipped." } }
+                button type="submit" { "Import entries" }
+            }
+            form method="post" action="/admin/routing/entries/deduplicate" class="inline-form" {
+                (csrf_field(&auth.csrf_token)) input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                input type="hidden" name="id" value="unused";
+                button class="secondary compact" type="submit" { "Deduplicate entries" }
+            }
+
+            h4 { "Remote data sources" }
+            div class="table-wrap" { table {
+                thead { tr { th { "Source" } th { "Format" } th { "Last success" } th { "Entries" } th { "Status" } th { "Actions" } } }
+                tbody { @for source in sources { tr {
+                    td { code { (&source.url) } br; small { (&source.id) } }
+                    td { (rule_source_format_name(source.format)) br; (source.refresh_interval_seconds) " s" }
+                    td { (source.last_successful_fetch.as_deref().unwrap_or("never")) }
+                    td { (source.entry_count) }
+                    td { @if let Some(error) = &source.last_error { span class="badge off" { "failed" } br; small { (error) } } @else { span class="badge ok" { "ready" } } }
+                    td class="module-actions" {
+                        details { summary { "Edit" } form method="post" action="/admin/routing/sources/save" class="config-form" {
+                            (csrf_field(&auth.csrf_token)) input type="hidden" name="id" value=(&source.id);
+                            input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                            label class="switch-field" { input type="checkbox" name="enabled" checked[source.enabled]; span class="switch-ui" {} span { "Enabled" } }
+                            label { span { "URL" } input type="url" name="url" value=(&source.url) required maxlength="2048"; }
+                            label { span { "Format" } select name="format" {
+                                option value="text" selected[source.format == RuleSourceFormat::Text] { "HTTP text" }
+                                option value="yaml" selected[source.format == RuleSourceFormat::Yaml] { "HTTP YAML" }
+                                option value="mihomo-classical" selected[source.format == RuleSourceFormat::MihomoClassical] { "Mihomo classical" }
+                            } }
+                            label { span { "Refresh seconds" } input type="number" name="refresh_interval_seconds" min="300" max="604800" value=(source.refresh_interval_seconds) required; }
+                            button class="compact" type="submit" { "Save" }
+                        } }
+                        form method="post" action="/admin/routing/sources/refresh" class="inline-form" { (csrf_field(&auth.csrf_token)) input type="hidden" name="id" value=(&source.id); button class="compact" type="submit" { "Refresh" } }
+                        form method="post" action="/admin/routing/sources/delete" class="inline-form" { (csrf_field(&auth.csrf_token)) input type="hidden" name="id" value=(&source.id); button class="danger compact" type="submit" { "Delete" } }
+                    }
+                } } }
+            } }
+            form method="post" action="/admin/routing/sources/save" class="config-form wide" {
+                (csrf_field(&auth.csrf_token)) input type="hidden" name="rule_set_id" value=(&rule_set.slug);
+                input type="hidden" name="enabled" value="true";
+                label class="full-span" { span { "HTTPS source URL" } input type="url" name="url" required maxlength="2048" placeholder="https://example.org/rules.yaml"; }
+                label { span { "Format" } select name="format" { option value="text" { "HTTP text" } option value="yaml" { "HTTP YAML" } option value="mihomo-classical" { "Mihomo classical provider" } } }
+                label { span { "Refresh interval (seconds)" } input type="number" name="refresh_interval_seconds" min="300" max="604800" value="3600" required; }
+                button type="submit" { "Add source" }
+            }
         }
     }
+}
+
+fn new_rule_set_editor(auth: &AuthenticatedAdmin, targets: &[String]) -> Markup {
+    html! { section class="config-row" {
+        div class="config-row-head" { h3 { "Create rule set" } }
+        form method="post" action="/admin/routing/rule-sets/save" class="config-form wide" {
+            (csrf_field(&auth.csrf_token)) input type="hidden" name="create" value="true";
+            label { span { "Stable ID" } input name="slug" required maxlength="64" placeholder="custom-rules"; }
+            label { span { "Display name" } input name="title" required maxlength="80"; }
+            label class="full-span" { span { "Description" } input name="effect" maxlength="256"; }
+            label { span { "Target" } select name="target" { @for target in targets { option value=(target) { (target) } } } }
+            label class="switch-field" { input type="checkbox" name="enabled"; span class="switch-ui" {} span { strong { "Enabled" } small { "Enable after at least one valid rule is present." } } }
+            label class="full-span" { span { "Optional classical import" } textarea name="payload" rows="6" {} }
+            button type="submit" { "Create rule set" }
+        }
+    } }
+}
+
+fn rule_kind_select(name: &str, selected: RuleKind) -> Markup {
+    let kinds = [
+        RuleKind::Domain,
+        RuleKind::DomainSuffix,
+        RuleKind::DomainKeyword,
+        RuleKind::IpCidr,
+        RuleKind::IpCidr6,
+        RuleKind::Geoip,
+        RuleKind::Geosite,
+        RuleKind::Asn,
+        RuleKind::ProcessName,
+        RuleKind::DstPort,
+        RuleKind::SrcPort,
+        RuleKind::Network,
+        RuleKind::Classical,
+    ];
+    html! { select name=(name) { @for kind in kinds { option value=(kind.mihomo_name()) selected[kind == selected] { (kind.mihomo_name()) } } } }
+}
+
+const fn rule_source_format_name(format: RuleSourceFormat) -> &'static str {
+    match format {
+        RuleSourceFormat::Text => "text",
+        RuleSourceFormat::Yaml => "yaml",
+        RuleSourceFormat::MihomoClassical => "mihomo classical",
+    }
+}
+
+fn rule_kind_filter(selected: &str) -> Markup {
+    let kinds = [
+        RuleKind::Domain,
+        RuleKind::DomainSuffix,
+        RuleKind::DomainKeyword,
+        RuleKind::IpCidr,
+        RuleKind::IpCidr6,
+        RuleKind::Geoip,
+        RuleKind::Geosite,
+        RuleKind::Asn,
+        RuleKind::ProcessName,
+        RuleKind::DstPort,
+        RuleKind::SrcPort,
+        RuleKind::Network,
+        RuleKind::Classical,
+    ];
+    html! { select name="kind" aria-label="Rule kind filter" { option value="" { "All kinds" } @for kind in kinds { option value=(kind.mihomo_name()) selected[selected == kind.mihomo_name()] { (kind.mihomo_name()) } } } }
 }
