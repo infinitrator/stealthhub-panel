@@ -9,13 +9,17 @@ use chrono::Utc;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 pub(crate) use stealthhub_core::module_manifest::{ModuleSpec, UpstreamKind};
 use stealthhub_core::{
+    adapter::{
+        RuntimeHealthState, RuntimeLifecycle, RuntimeLifecycleAction, RuntimeLifecycleStatus,
+        RuntimeServiceState, RuntimeUpstreamMetadata,
+    },
     module_manifest::{load_registry, valid_id, ReadOptions},
     storage::{get_setting, upsert_setting, upsert_settings},
 };
@@ -39,6 +43,75 @@ pub(crate) struct ModuleStatus {
     pub(crate) auto_update: bool,
     pub(crate) checked_at: String,
     pub(crate) status: String,
+}
+
+/// Runtime lifecycle adapter backed by one validated root-owned manifest.
+struct ManifestRuntimeLifecycle {
+    spec: ModuleSpec,
+    active_manifest: bool,
+    upstream: RuntimeUpstreamMetadata,
+}
+
+impl ManifestRuntimeLifecycle {
+    fn new(spec: ModuleSpec, active_manifest: bool) -> Self {
+        let release_channel = match &spec.upstream {
+            UpstreamKind::Release => "stable-release".to_string(),
+            UpstreamKind::Commit { git_ref } => format!("commit:{git_ref}"),
+        };
+        Self {
+            upstream: RuntimeUpstreamMetadata {
+                repository: spec.repo.clone(),
+                release_channel,
+                supported_platforms: BTreeSet::from(["linux".to_string()]),
+                supported_architectures: BTreeSet::from(["amd64".to_string(), "arm64".to_string()]),
+            },
+            spec,
+            active_manifest,
+        }
+    }
+}
+
+impl RuntimeLifecycle for ManifestRuntimeLifecycle {
+    fn runtime_id(&self) -> &str {
+        &self.spec.id
+    }
+
+    fn upstream(&self) -> &RuntimeUpstreamMetadata {
+        &self.upstream
+    }
+
+    fn status(&self) -> RuntimeLifecycleStatus {
+        let installed = Path::new(&self.spec.binary_path).is_file();
+        let version = installed_version(&self.spec);
+        let installed_version = (version != "unknown").then_some(version);
+        RuntimeLifecycleStatus {
+            available: self.active_manifest || !installed,
+            installed,
+            installed_version,
+            available_version: None,
+            update_available: false,
+            service_state: RuntimeServiceState::Unknown,
+            health: if installed {
+                RuntimeHealthState::Unknown
+            } else {
+                RuntimeHealthState::Unavailable
+            },
+        }
+    }
+
+    fn request(&self, action: RuntimeLifecycleAction) -> anyhow::Result<()> {
+        if action == RuntimeLifecycleAction::Install && self.active_manifest {
+            anyhow::bail!("runtime already exists");
+        }
+        if action != RuntimeLifecycleAction::Install && !self.active_manifest {
+            anyhow::bail!("runtime is not active in the registry");
+        }
+        write_request(
+            self.runtime_id(),
+            action.request_suffix(),
+            &format!("requested_at={}\n", Utc::now().to_rfc3339()),
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,40 +251,42 @@ pub(crate) fn find(module_id: &str) -> anyhow::Result<Option<ModuleSpec>> {
 
 /// Creates an update request consumed by the root-owned module worker.
 pub(crate) fn request_update(module_id: &str) -> anyhow::Result<()> {
-    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
-    write_request(
-        &spec.id,
-        "request",
-        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
-    )
+    request_lifecycle(module_id, RuntimeLifecycleAction::Update)
 }
 
 /// Requests safe removal of a registered runtime while preserving its config.
 pub(crate) fn request_remove(module_id: &str) -> anyhow::Result<()> {
-    let spec = find(module_id)?.ok_or_else(|| anyhow::anyhow!("unknown module"))?;
-    write_request(
-        &spec.id,
-        "remove",
-        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
-    )
+    request_lifecycle(module_id, RuntimeLifecycleAction::Remove)
 }
 
 /// Queues activation of a root-owned catalog manifest.
 pub(crate) fn request_register(module_id: &str) -> anyhow::Result<()> {
-    if !valid_id(module_id) || find(module_id)?.is_some() {
-        anyhow::bail!("module already exists");
+    request_lifecycle(module_id, RuntimeLifecycleAction::Install)
+}
+
+/// Queues one adapter-owned operation for the root worker.
+///
+/// Only a stable runtime ID and a closed action enum cross the privilege
+/// boundary. Runtime manifests supply every executable and service detail.
+pub(crate) fn request_lifecycle(
+    module_id: &str,
+    action: RuntimeLifecycleAction,
+) -> anyhow::Result<()> {
+    if !valid_id(module_id) {
+        anyhow::bail!("invalid runtime ID");
     }
-    let available = available()?
-        .into_iter()
-        .any(|module| module.id == module_id);
-    if !available {
-        anyhow::bail!("module is not present in the root-owned catalog");
-    }
-    write_request(
-        module_id,
-        "register",
-        &format!("requested_at={}\n", Utc::now().to_rfc3339()),
-    )
+    let active = find(module_id)?;
+    let (spec, active_manifest) = if let Some(spec) = active {
+        (spec, true)
+    } else {
+        let spec = available()?
+            .into_iter()
+            .find(|module| module.id == module_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime is not present in the root-owned catalog"))?;
+        (spec, false)
+    };
+    let lifecycle = ManifestRuntimeLifecycle::new(spec, active_manifest);
+    lifecycle.request(action)
 }
 
 pub(crate) fn short_version(value: &str) -> String {
@@ -241,7 +316,12 @@ pub(crate) fn status_class(status: &ModuleStatus) -> &'static str {
 }
 
 fn write_request(module_id: &str, extension: &str, content: &str) -> anyhow::Result<()> {
-    if !valid_id(module_id) || !matches!(extension, "request" | "register" | "remove") {
+    if !valid_id(module_id)
+        || !matches!(
+            extension,
+            "request" | "register" | "remove" | "start" | "stop" | "restart"
+        )
+    {
         anyhow::bail!("invalid module request");
     }
     let directory = request_dir();

@@ -305,6 +305,128 @@ pub struct CoreRuntimeProbe {
     pub detail: Option<String>,
 }
 
+/// Fixed runtime lifecycle operations accepted by the privileged worker.
+///
+/// The browser can select only one of these values; it cannot provide a
+/// command, executable path, URL, or shell fragment.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeLifecycleAction {
+    Install,
+    Update,
+    Remove,
+    Start,
+    Stop,
+    Restart,
+}
+
+impl RuntimeLifecycleAction {
+    /// Stable request-file suffix consumed by the root-owned worker.
+    #[must_use]
+    pub const fn request_suffix(self) -> &'static str {
+        match self {
+            Self::Install => "register",
+            Self::Update => "request",
+            Self::Remove => "remove",
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_lifecycle_tests {
+    use super::RuntimeLifecycleAction;
+
+    #[test]
+    fn lifecycle_actions_map_only_to_fixed_worker_requests() {
+        assert_eq!(RuntimeLifecycleAction::Install.request_suffix(), "register");
+        assert_eq!(RuntimeLifecycleAction::Update.request_suffix(), "request");
+        assert_eq!(RuntimeLifecycleAction::Remove.request_suffix(), "remove");
+        assert_eq!(RuntimeLifecycleAction::Start.request_suffix(), "start");
+        assert_eq!(RuntimeLifecycleAction::Stop.request_suffix(), "stop");
+        assert_eq!(RuntimeLifecycleAction::Restart.request_suffix(), "restart");
+    }
+}
+
+/// Declarative upstream and platform information for one runtime package.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeUpstreamMetadata {
+    pub repository: String,
+    pub release_channel: String,
+    pub supported_platforms: BTreeSet<String>,
+    pub supported_architectures: BTreeSet<String>,
+}
+
+/// Complete non-secret lifecycle observation rendered by generic UI code.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeLifecycleStatus {
+    pub available: bool,
+    pub installed: bool,
+    pub installed_version: Option<String>,
+    pub available_version: Option<String>,
+    pub update_available: bool,
+    pub service_state: RuntimeServiceState,
+    pub health: RuntimeHealthState,
+}
+
+/// Coarse service state independent of a specific init implementation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeServiceState {
+    Active,
+    Inactive,
+    Failed,
+    Unknown,
+}
+
+/// Coarse health state suitable for generic runtime management.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeHealthState {
+    Healthy,
+    Degraded,
+    Unavailable,
+    Unknown,
+}
+
+/// Adapter-owned runtime package lifecycle.
+///
+/// Implementations may only enqueue typed requests for a separately
+/// privileged executor. Configuration reconciliation remains on
+/// [`CoreAdapter`] and is intentionally not part of this contract.
+pub trait RuntimeLifecycle: Send + Sync {
+    fn runtime_id(&self) -> &str;
+    fn upstream(&self) -> &RuntimeUpstreamMetadata;
+    fn status(&self) -> RuntimeLifecycleStatus;
+    fn request(&self, action: RuntimeLifecycleAction) -> Result<()>;
+
+    fn install_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Install)
+    }
+
+    fn update_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Update)
+    }
+
+    fn remove_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Remove)
+    }
+
+    fn start_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Start)
+    }
+
+    fn stop_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Stop)
+    }
+
+    fn restart_runtime(&self) -> Result<()> {
+        self.request(RuntimeLifecycleAction::Restart)
+    }
+}
+
 /// Result of comparing desired per-user identities with a live runtime config.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "status")]
@@ -378,18 +500,18 @@ pub trait CoreAdapter: Send + Sync {
             },
         }
     }
-    fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf>;
-    fn validate(&self, candidate: &Path) -> Result<()>;
-    fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot>;
-    fn install(&self, candidate: &Path) -> Result<()>;
-    fn activate(&self, plan: &CorePlan) -> Result<()>;
+    fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf>;
+    fn validate_config(&self, candidate: &Path) -> Result<()>;
+    fn snapshot_config(&self, transaction_dir: &Path) -> Result<CoreSnapshot>;
+    fn install_config(&self, candidate: &Path) -> Result<()>;
+    fn activate_config(&self, plan: &CorePlan) -> Result<()>;
     fn healthcheck(&self, plan: &CorePlan) -> Result<()>;
     fn verify_listeners(&self, plan: &CorePlan) -> Result<()>;
     /// Verifies individual user authorization in the installed live config.
     fn observe_users(&self, _plan: &CorePlan) -> Result<UserSyncObservation> {
         Ok(UserSyncObservation::Unsupported)
     }
-    fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()>;
+    fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()>;
 }
 
 /// Registry populated by adapter packages, manifests, or tests.

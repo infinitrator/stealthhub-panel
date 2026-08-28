@@ -220,7 +220,7 @@ impl Reconciler {
             journal.current_core_id = Some(core_id.clone());
             let core_dir = transaction_dir.join(core_id);
             fs::create_dir_all(&core_dir)?;
-            let candidate = match core.stage(plan, &core_dir) {
+            let candidate = match core.stage_config(plan, &core_dir) {
                 Ok(candidate) => candidate,
                 Err(_) => return self.fail_without_mutation(journal, "candidate staging failed"),
             };
@@ -230,7 +230,7 @@ impl Reconciler {
         }
         for (core, _, candidate) in &prepared {
             journal.current_core_id = Some(core.manifest().id.clone());
-            if core.validate(candidate).is_err() {
+            if core.validate_config(candidate).is_err() {
                 return self.fail_without_mutation(journal, "candidate validation failed");
             }
         }
@@ -241,7 +241,7 @@ impl Reconciler {
         for (core, plan, candidate) in prepared {
             journal.current_core_id = Some(core.manifest().id.clone());
             let core_dir = transaction_dir.join(&plan.core_id);
-            let snapshot = match core.snapshot(&core_dir) {
+            let snapshot = match core.snapshot_config(&core_dir) {
                 Ok(snapshot) => snapshot,
                 Err(_) => return self.fail_without_mutation(journal, "runtime snapshot failed"),
             };
@@ -282,7 +282,7 @@ impl Reconciler {
             self.store.save_journal(&journal)?;
             if prepared_core
                 .core
-                .install(&prepared_core.candidate)
+                .install_config(&prepared_core.candidate)
                 .is_err()
             {
                 return self.rollback(
@@ -295,7 +295,11 @@ impl Reconciler {
             journal.phase = JournalPhase::Installed;
             self.store.save_journal(&journal)?;
             let required = !prepared_core.plan.fragments.is_empty();
-            if prepared_core.core.activate(&prepared_core.plan).is_err() {
+            if prepared_core
+                .core
+                .activate_config(&prepared_core.plan)
+                .is_err()
+            {
                 return self.rollback(
                     desired.generation,
                     snapshotted,
@@ -498,7 +502,7 @@ impl Reconciler {
                 service_was_enabled: resource.service_was_enabled,
                 service_was_active: resource.service_was_active,
             };
-            if core.rollback(&snapshot).is_err() {
+            if core.rollback_config(&snapshot).is_err() {
                 failed = true;
             }
         }
@@ -697,7 +701,7 @@ impl Reconciler {
         self.store.save_journal(&journal)?;
         let mut rollback_error = None;
         for prepared in snapshots.into_iter().rev() {
-            if let Err(error) = prepared.core.rollback(&prepared.snapshot) {
+            if let Err(error) = prepared.core.rollback_config(&prepared.snapshot) {
                 rollback_error = Some(error);
             }
         }
@@ -928,7 +932,7 @@ mod tests {
             Ok(true)
         }
 
-        fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
+        fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
             let (failure, delay_ms) = {
                 let state = self.state.lock().unwrap();
                 (state.failure, state.delay_ms)
@@ -949,14 +953,14 @@ mod tests {
             Ok(candidate)
         }
 
-        fn validate(&self, _candidate: &Path) -> Result<()> {
+        fn validate_config(&self, _candidate: &Path) -> Result<()> {
             if self.state.lock().unwrap().failure == Failure::Validate {
                 bail!("validate canary-secret-value");
             }
             Ok(())
         }
 
-        fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
+        fn snapshot_config(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
             let state = self.state.lock().unwrap();
             if state.failure == Failure::Snapshot {
                 bail!("snapshot canary-secret-value");
@@ -970,7 +974,7 @@ mod tests {
             })
         }
 
-        fn install(&self, candidate: &Path) -> Result<()> {
+        fn install_config(&self, candidate: &Path) -> Result<()> {
             let candidate = fs::read_to_string(candidate)?;
             let mut state = self.state.lock().unwrap();
             state.current = candidate;
@@ -981,7 +985,7 @@ mod tests {
             Ok(())
         }
 
-        fn activate(&self, plan: &CorePlan) -> Result<()> {
+        fn activate_config(&self, plan: &CorePlan) -> Result<()> {
             let required = !plan.fragments.is_empty();
             let mut state = self.state.lock().unwrap();
             if state.failure == Failure::Activate {
@@ -1030,7 +1034,7 @@ mod tests {
             })
         }
 
-        fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()> {
+        fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()> {
             let mut state = self.state.lock().unwrap();
             state.rollbacks += 1;
             if state.failure == Failure::Rollback {

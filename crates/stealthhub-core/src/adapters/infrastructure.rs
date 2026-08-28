@@ -215,7 +215,7 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         Ok(Path::new("/usr/sbin/nginx").is_file())
     }
 
-    fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
+    fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
         let candidate = transaction_dir.join("subscription.conf");
         if let Some(domain) = self.domain(plan)? {
             self.validate_certificate(domain)?;
@@ -225,14 +225,14 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         Ok(candidate)
     }
 
-    fn validate(&self, candidate: &Path) -> Result<()> {
+    fn validate_config(&self, candidate: &Path) -> Result<()> {
         if fs::metadata(candidate)?.len() == 0 {
             return Ok(());
         }
         Self::nginx_test(candidate)
     }
 
-    fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
+    fn snapshot_config(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
         Ok(CoreSnapshot {
             path: self.snapshot_owned_files(transaction_dir)?,
             service_was_enabled: systemctl_is("is-enabled", "nginx.service"),
@@ -240,7 +240,7 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         })
     }
 
-    fn install(&self, candidate: &Path) -> Result<()> {
+    fn install_config(&self, candidate: &Path) -> Result<()> {
         if fs::metadata(candidate)?.len() == 0 {
             remove_non_directory(&self.paths.enabled)?;
             remove_non_directory(&self.paths.site)?;
@@ -251,7 +251,7 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         self.install_enabled_link()
     }
 
-    fn activate(&self, _plan: &CorePlan) -> Result<()> {
+    fn activate_config(&self, _plan: &CorePlan) -> Result<()> {
         systemctl(&["enable"], "nginx.service")?;
         if systemctl_is("is-active", "nginx.service") {
             reload_nginx()
@@ -296,7 +296,7 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         }
     }
 
-    fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()> {
+    fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()> {
         self.restore_owned_files(&snapshot.path)?;
         let test = Command::new("/usr/sbin/nginx").arg("-t").status()?;
         if !test.success() {
@@ -350,13 +350,13 @@ impl CoreAdapter for NodeReadinessAdapter {
         Ok(Path::new("/usr/bin/getent").is_file())
     }
 
-    fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
+    fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
         let candidate = transaction_dir.join("node-domain");
         fs::write(&candidate, self.domain(plan)?.unwrap_or_default())?;
         Ok(candidate)
     }
 
-    fn validate(&self, candidate: &Path) -> Result<()> {
+    fn validate_config(&self, candidate: &Path) -> Result<()> {
         let value = fs::read_to_string(candidate)?;
         if !value.is_empty() {
             validate_domain(&value)?;
@@ -364,7 +364,7 @@ impl CoreAdapter for NodeReadinessAdapter {
         Ok(())
     }
 
-    fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
+    fn snapshot_config(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
         let snapshot = transaction_dir.join("snapshot");
         fs::create_dir_all(&snapshot)?;
         Ok(CoreSnapshot {
@@ -374,10 +374,10 @@ impl CoreAdapter for NodeReadinessAdapter {
         })
     }
 
-    fn install(&self, _candidate: &Path) -> Result<()> {
+    fn install_config(&self, _candidate: &Path) -> Result<()> {
         Ok(())
     }
-    fn activate(&self, _plan: &CorePlan) -> Result<()> {
+    fn activate_config(&self, _plan: &CorePlan) -> Result<()> {
         Ok(())
     }
 
@@ -395,7 +395,7 @@ impl CoreAdapter for NodeReadinessAdapter {
     fn verify_listeners(&self, _plan: &CorePlan) -> Result<()> {
         Ok(())
     }
-    fn rollback(&self, _snapshot: &CoreSnapshot) -> Result<()> {
+    fn rollback_config(&self, _snapshot: &CoreSnapshot) -> Result<()> {
         Ok(())
     }
 }
@@ -721,7 +721,7 @@ mod tests {
         let transaction = root.join("transaction");
         fs::create_dir_all(&transaction)?;
         assert!(adapter
-            .stage(&plan("siberia.example.test"), &transaction)
+            .stage_config(&plan("siberia.example.test"), &transaction)
             .is_err());
         assert_eq!(fs::read(&adapter.paths.site)?, b"known-good-live-config");
         assert!(!transaction.join("subscription.conf").exists());

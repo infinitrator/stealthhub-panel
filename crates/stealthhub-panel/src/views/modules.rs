@@ -27,10 +27,10 @@ pub(crate) fn render(
 
     Html(
             layout(
-                "Modules",
+                "Runtimes",
                 html! {
                     (admin_bar(auth))
-                    h1 { "Modules" }
+                    h1 { "Runtimes" }
 
                     @for diagnostic in diagnostics {
                         div class="notice warning" { (diagnostic) }
@@ -56,15 +56,15 @@ pub(crate) fn render(
                     }
 
                     section {
-                        h2 { "Runtime inventory" }
+                        h2 { "Adapter inventory" }
                         (runtime_inventory_table(inventory))
                     }
 
                     section {
                         div class="section-heading" {
                             div {
-                                h2 { "Runtime registry" }
-                                p { "Each runtime keeps its own binary, configuration, systemd state and update history." }
+                                h2 { "Runtime lifecycle" }
+                                p { "Typed lifecycle operations are executed by the root-owned worker; the panel never accepts commands or package URLs." }
                             }
                             @if is_owner_admin(auth) {
                                 form method="post" action="/admin/modules/check" class="inline-form" {
@@ -79,20 +79,36 @@ pub(crate) fn render(
                                     tr {
                                         th { "Module" }
                                         th { "Role" }
+                                        th { "Capabilities / dependents" }
                                         th { "Installed" }
                                         th { "Latest" }
-                                        th { "State" }
+                                        th { "Runtime state" }
                                         th { "Automatic" }
                                         th { "Actions" }
                                     }
                                 }
                                 tbody {
                                     @for status in statuses {
+                                        @let runtime = inventory.runtimes.iter().find(|runtime| runtime.id == status.spec.id);
+                                        @let dependent_count = inventory.resources.iter().filter(|resource| resource.enabled && resource.desired && resource.runtime_id.as_deref() == Some(status.spec.id.as_str())).count();
                                         tr {
                                             td {
                                                 strong { (status.spec.name) }
                                                 br;
                                                 small { (status.spec.kind) " / " (status.spec.repo) }
+                                            }
+                                            td {
+                                                @if let Some(runtime) = runtime {
+                                                    @if runtime.capabilities.is_empty() {
+                                                        small { "none declared" }
+                                                    } @else {
+                                                        @for capability in &runtime.capabilities {
+                                                            code { (capability) " " }
+                                                        }
+                                                    }
+                                                }
+                                                br;
+                                                small { (dependent_count) " enabled resource(s)" }
                                             }
                                             td {
                                                 (status.spec.role)
@@ -109,6 +125,23 @@ pub(crate) fn render(
                                                 }
                                                 br;
                                                 small { "checked " (&status.checked_at) }
+                                                @if let Some(runtime) = runtime {
+                                                    br;
+                                                    small {
+                                                        "service "
+                                                        @match runtime.active {
+                                                            Some(true) => { "active" }
+                                                            Some(false) => { "inactive" }
+                                                            None => { "unknown" }
+                                                        }
+                                                        ", health "
+                                                        @match runtime.healthy {
+                                                            Some(true) => { "healthy" }
+                                                            Some(false) => { "degraded" }
+                                                            None => { "unknown" }
+                                                        }
+                                                    }
+                                                }
                                             }
                                             td {
                                                 @if is_owner_admin(auth) {
@@ -140,10 +173,24 @@ pub(crate) fn render(
                                                             }
                                                         }
                                                     }
+                                                    @if status.installed {
+                                                        form method="post" action=(format!("/admin/modules/{}/start", status.spec.id)) class="inline-form" {
+                                                            (csrf_field(&auth.csrf_token))
+                                                            button class="compact secondary" type="submit" { "Start" }
+                                                        }
+                                                        form method="post" action=(format!("/admin/modules/{}/stop", status.spec.id)) class="inline-form" {
+                                                            (csrf_field(&auth.csrf_token))
+                                                            button class="compact secondary" type="submit" { "Stop" }
+                                                        }
+                                                        form method="post" action=(format!("/admin/modules/{}/restart", status.spec.id)) class="inline-form" {
+                                                            (csrf_field(&auth.csrf_token))
+                                                            button class="compact secondary" type="submit" { "Restart" }
+                                                        }
+                                                    }
                                                     form method="post" action=(format!("/admin/modules/{}/remove", status.spec.id)) class="inline-form" {
                                                         (csrf_field(&auth.csrf_token))
                                                         input name="confirm" aria-label=(format!("Type {} to remove", status.spec.id)) placeholder=(&status.spec.id) required;
-                                                        button class="compact danger" type="submit" { "Remove" }
+                                                        button class="compact danger" type="submit" disabled[dependent_count > 0] { "Remove" }
                                                     }
                                                 }
                                             }
@@ -182,7 +229,7 @@ pub(crate) fn render(
                     }
 
                     section {
-                        h2 { "Module contract" }
+                        h2 { "Runtime contract" }
                         dl class="details" {
                             dt { "Proxy runtimes" }
                             dd { code { "/opt/infiproxy/cores/{core}/{version}" } }

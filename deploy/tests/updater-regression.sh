@@ -202,6 +202,38 @@ chmod +x "${FAKE_BIN}/systemctl"
 
 (
     export PATH="${FAKE_BIN}:${PATH}"
+    export INFIPROXY_STATE_DIR="${TMP_DIR}/lifecycle-state"
+    export INFIPROXY_ROOT_STATE_DIR="${TMP_DIR}/lifecycle-root-state"
+    export SYSTEMCTL_LOG="${TMP_DIR}/lifecycle-systemctl.log"
+    mkdir -p "${INFIPROXY_STATE_DIR}/module-requests" "${TMP_DIR}/lifecycle-runtime"
+    chmod 0750 "${INFIPROXY_STATE_DIR}/module-requests"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${TMP_DIR}/lifecycle-runtime/runtime"
+    chmod +x "${TMP_DIR}/lifecycle-runtime/runtime"
+    printf 'requested_at=test\n' \
+        >"${INFIPROXY_STATE_DIR}/module-requests/demo.restart"
+    chmod 0640 "${INFIPROXY_STATE_DIR}/module-requests/demo.restart"
+    # shellcheck source=deploy/module-update.sh
+    source "${ROOT_DIR}/deploy/module-update.sh"
+    safe_request_file() {
+        [[ -f "$1" && ! -L "$1" ]]
+    }
+    load_module() {
+        [[ "$1" == "demo" ]] || return 1
+        M_ID="demo"
+        M_SERVICE="infiproxy-demo.service"
+    }
+    module_binary() {
+        printf '%s' "${TMP_DIR}/lifecycle-runtime/runtime"
+    }
+    lifecycle_requested
+    grep -Fq 'restart infiproxy-demo.service' "$SYSTEMCTL_LOG" \
+        || fail "typed lifecycle request did not use the manifest service"
+    [[ ! -e "${REQUEST_DIR}/demo.restart" ]] \
+        || fail "successful lifecycle request was not consumed"
+)
+
+(
+    export PATH="${FAKE_BIN}:${PATH}"
     export INFIPROXY_STATE_DIR="${TMP_DIR}/headscale-panel-state"
     export INFIPROXY_ROOT_STATE_DIR="${TMP_DIR}/headscale-root-state"
     export INFIPROXY_MODULE_ROOT="${TMP_DIR}/headscale-modules"

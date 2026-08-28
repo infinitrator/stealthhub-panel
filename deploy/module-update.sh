@@ -745,6 +745,37 @@ run_requested() {
   return "$failed"
 }
 
+lifecycle_requested() {
+  local action request id failed=0
+  for action in start stop restart; do
+    shopt -s nullglob
+    for request in "$REQUEST_DIR"/*."$action"; do
+      if ! safe_request_file "$request"; then
+        discard_unsafe_request "$request"
+        failed=1
+        continue
+      fi
+      id="$(basename "$request" ".${action}")"
+      if ! load_module "$id" || [[ ! -x "$(module_binary)" ]]; then
+        mv -f "$request" "${request}.failed"
+        log "${action} rejected for unavailable runtime ${id}"
+        failed=1
+        continue
+      fi
+      if systemctl "$action" "$M_SERVICE"; then
+        rm -f "$request" "${request}.failed"
+        log "${action} completed for ${id}"
+      else
+        mv -f "$request" "${request}.failed"
+        log "${action} failed for ${id}"
+        failed=1
+      fi
+    done
+    shopt -u nullglob
+  done
+  return "$failed"
+}
+
 run_automatic() {
   local schedule_time hour minute current_hour current_minute schedule_total current_total
   local today marker marker_tmp module state_file enabled installed failed=0
@@ -785,6 +816,7 @@ run_due() {
   local failed=0
   register_requested || failed=1
   remove_requested || failed=1
+  lifecycle_requested || failed=1
   run_requested || failed=1
   run_automatic || failed=1
   return "$failed"

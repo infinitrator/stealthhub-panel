@@ -52,7 +52,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 use stealthhub_core::{
-    adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, SecretRef},
+    adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, RuntimeLifecycleAction, SecretRef},
     adapters::{core_registry, protocol_registry},
     mihomo::{generate_mihomo_yaml_with_registry, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
@@ -345,6 +345,15 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/modules/{module_id}/install",
             post(register_module_action),
+        )
+        .route(
+            "/admin/modules/{module_id}/start",
+            post(start_module_action),
+        )
+        .route("/admin/modules/{module_id}/stop", post(stop_module_action))
+        .route(
+            "/admin/modules/{module_id}/restart",
+            post(restart_module_action),
         )
         .route("/admin/protocols", get(protocols_page))
         .route("/admin/secrets", get(secrets_page).post(secret_save_action))
@@ -1309,6 +1318,44 @@ async fn remove_module_action(
             "Back to Modules",
         );
     }
+    let page =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(page) => page,
+            Err(error) => {
+                return logged_error_with_back(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "validate runtime dependencies",
+                    error,
+                    "Runtime removal not requested",
+                    "Dependencies could not be verified, so removal was blocked.",
+                    "/admin/cores",
+                    "Back to Runtimes",
+                );
+            }
+        };
+    let dependent_resources = page
+        .inventory
+        .resources
+        .iter()
+        .filter(|resource| {
+            resource.enabled
+                && resource.desired
+                && resource.runtime_id.as_deref() == Some(module_id.as_str())
+        })
+        .map(|resource| resource.display_name.as_str())
+        .collect::<Vec<_>>();
+    if !dependent_resources.is_empty() {
+        return html_error_response_with_back(
+            StatusCode::CONFLICT,
+            "Runtime is still required",
+            format!(
+                "Migrate or disable these desired resources first: {}",
+                dependent_resources.join(", ")
+            ),
+            "/admin/cores",
+            "Back to Runtimes",
+        );
+    }
     if let Err(error) = modules::request_remove(&module_id) {
         return logged_error_with_back(
             StatusCode::BAD_REQUEST,
@@ -1318,6 +1365,85 @@ async fn remove_module_action(
             "The module is unavailable or its removal request could not be written.",
             "/admin/cores",
             "Back to Modules",
+        );
+    }
+    Redirect::to("/admin/cores").into_response()
+}
+
+async fn start_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    runtime_service_action(
+        &state,
+        &headers,
+        &module_id,
+        &form.csrf_token,
+        RuntimeLifecycleAction::Start,
+    )
+    .await
+}
+
+async fn stop_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    runtime_service_action(
+        &state,
+        &headers,
+        &module_id,
+        &form.csrf_token,
+        RuntimeLifecycleAction::Stop,
+    )
+    .await
+}
+
+async fn restart_module_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(module_id): Path<String>,
+    Form(form): Form<CsrfForm>,
+) -> Response {
+    runtime_service_action(
+        &state,
+        &headers,
+        &module_id,
+        &form.csrf_token,
+        RuntimeLifecycleAction::Restart,
+    )
+    .await
+}
+
+async fn runtime_service_action(
+    state: &AppState,
+    headers: &HeaderMap,
+    module_id: &str,
+    csrf_token: &str,
+    action: RuntimeLifecycleAction,
+) -> Response {
+    let auth = match require_admin(state, headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, csrf_token) {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if let Err(error) = modules::request_lifecycle(module_id, action) {
+        return logged_error_with_back(
+            StatusCode::BAD_REQUEST,
+            "queue runtime service action",
+            error,
+            "Runtime action rejected",
+            "The runtime is unavailable or the typed request could not be queued.",
+            "/admin/cores",
+            "Back to Runtimes",
         );
     }
     Redirect::to("/admin/cores").into_response()

@@ -258,7 +258,7 @@ impl CoreAdapter for ManagedCoreAdapter {
         Ok(self.binary.is_file())
     }
 
-    fn stage(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
+    fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
         let candidate = transaction_dir.join(match self.flavor {
             Flavor::Hysteria => "candidate.yaml",
             _ => "candidate.json",
@@ -288,12 +288,12 @@ impl CoreAdapter for ManagedCoreAdapter {
         Ok(candidate)
     }
 
-    fn validate(&self, candidate: &Path) -> Result<()> {
+    fn validate_config(&self, candidate: &Path) -> Result<()> {
         self.validate_structure(candidate)?;
         self.validation_command(candidate)
     }
 
-    fn snapshot(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
+    fn snapshot_config(&self, transaction_dir: &Path) -> Result<CoreSnapshot> {
         let snapshot_dir = transaction_dir.join("snapshot");
         fs::create_dir_all(&snapshot_dir)?;
         if let Some(config) = self.read_current_config()? {
@@ -308,11 +308,11 @@ impl CoreAdapter for ManagedCoreAdapter {
         })
     }
 
-    fn install(&self, candidate: &Path) -> Result<()> {
+    fn install_config(&self, candidate: &Path) -> Result<()> {
         self.atomic_install(candidate)
     }
 
-    fn activate(&self, plan: &CorePlan) -> Result<()> {
+    fn activate_config(&self, plan: &CorePlan) -> Result<()> {
         if plan.fragments.is_empty() {
             self.systemctl(&["disable", "--now"])
         } else {
@@ -368,7 +368,7 @@ impl CoreAdapter for ManagedCoreAdapter {
         Ok(UserSyncObservation::compare(&expected, &observed))
     }
 
-    fn rollback(&self, snapshot: &CoreSnapshot) -> Result<()> {
+    fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()> {
         let config = snapshot.path.join("config");
         if config.is_file() {
             self.atomic_install(&config)?;
