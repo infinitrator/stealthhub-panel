@@ -17,7 +17,8 @@ use stealthhub_core::{
     reconcile::{FileReconcileStore, ReconcileStore, Reconciler},
     storage::{
         delete_secret, get_secret, init_db, load_desired_state, mark_reconcile_result,
-        migrate_available_adapter_states, open_pool, ReconcileResultUpdate,
+        migrate_available_adapter_states, open_pool, replace_runtime_user_sync,
+        ReconcileResultUpdate,
     },
 };
 
@@ -186,26 +187,35 @@ async fn process(request_path: Option<&Path>) -> Result<()> {
             bail!("automatic reconcile recovery requires operator attention");
         }
     }
-    if desired.generation <= store.load_applied()?.generation {
-        return Ok(());
-    }
     let secrets = load_privileged_secrets(&pool, &secret_protocols, &desired).await?;
-    let outcome = reconciler.reconcile(&desired, &secrets)?;
-    persist_status(
-        &pool,
-        store.as_ref(),
-        outcome.status,
-        outcome.message.as_deref(),
-    )
-    .await?;
-    if matches!(
-        outcome.status,
-        ReconcileStatus::Applied | ReconcileStatus::RolledBack
-    ) {
-        Ok(())
+    let outcome = if desired.generation > store.load_applied()?.generation {
+        let outcome = reconciler.reconcile(&desired, &secrets)?;
+        persist_status(
+            &pool,
+            store.as_ref(),
+            outcome.status,
+            outcome.message.as_deref(),
+        )
+        .await?;
+        Some(outcome)
     } else {
-        bail!("desired state was not applied; consult sanitized reconcile status")
+        None
+    };
+
+    match reconciler.observe_user_sync(&desired, &secrets) {
+        Ok(observations) => replace_runtime_user_sync(&pool, &observations).await?,
+        Err(_) => eprintln!("runtime user synchronization observation failed"),
     }
+
+    if outcome.as_ref().is_some_and(|outcome| {
+        !matches!(
+            outcome.status,
+            ReconcileStatus::Applied | ReconcileStatus::RolledBack
+        )
+    }) {
+        bail!("desired state was not applied; consult sanitized reconcile status");
+    }
+    Ok(())
 }
 
 async fn persist_status(

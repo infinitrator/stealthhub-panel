@@ -1,7 +1,9 @@
 //! Protocols-page presentation and form components.
 
 use crate::{
-    admin_bar, csrf_field, ui::layout, views::components::adapter_inventory_table,
+    admin_bar, csrf_field,
+    ui::layout,
+    views::components::{adapter_inventory_table, user_sync_badges},
     AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
@@ -10,6 +12,7 @@ use stealthhub_core::{
     adapter::{ConfigField, ConfigFieldKind, ProtocolRegistry},
     inventory::{adapter_kind, AdapterInventory},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
+    storage::UserSyncStatusRecord,
 };
 
 pub(crate) fn render(
@@ -19,6 +22,7 @@ pub(crate) fn render(
     secret_names: &[String],
     registry: &ProtocolRegistry,
     inventory: &AdapterInventory,
+    user_sync: &[UserSyncStatusRecord],
 ) -> Response {
     Html(
             layout(
@@ -76,6 +80,7 @@ pub(crate) fn render(
                                             th { "Enabled" }
                                             th { "Endpoint" }
                                             th { "Secrets" }
+                                            th { "User sync" }
                                         }
                                     }
                                     tbody {
@@ -113,6 +118,7 @@ pub(crate) fn render(
                                                         }
                                                     }
                                                 }
+                                                td { (user_sync_badges(user_sync, Some(&profile.name), None)) }
                                             }
                                         }
                                     }

@@ -12,8 +12,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::{
     adapter::{
-        CoreAdapter, CorePlan, CoreRegistry, CoreSnapshot, ProtocolRegistry, SecretResolver,
-        ServerRenderContext,
+        CoreAdapter, CorePlan, CoreRegistry, CoreSnapshot, ProfileUserSyncObservation,
+        ProtocolRegistry, SecretResolver, ServerRenderContext, UserSyncObservation, UserSyncStatus,
     },
     desired::{
         AppliedState, DesiredState, JournalEntry, JournalPhase, JournalResource, ReconcileStatus,
@@ -575,6 +575,73 @@ impl Reconciler {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// Compares desired and live runtime users without mutating either side.
+    pub fn observe_user_sync(
+        &self,
+        desired: &DesiredState,
+        secrets: &dyn SecretResolver,
+    ) -> Result<Vec<ProfileUserSyncObservation>> {
+        let applied = self.store.load_applied()?;
+        let plans = self.build_plans(desired, secrets, &applied)?;
+        let checked_at = chrono::Utc::now().to_rfc3339();
+        let mut result = Vec::new();
+
+        for (runtime_id, (core, plan)) in plans {
+            let applicable = plan
+                .fragments
+                .iter()
+                .filter_map(|fragment| {
+                    fragment
+                        .expected_user_ids
+                        .as_ref()
+                        .map(|users| (fragment.profile_id.clone(), users.len()))
+                })
+                .collect::<Vec<_>>();
+            if applicable.is_empty() {
+                continue;
+            }
+
+            let observation = core.observe_users(&plan);
+            let probe = core.probe();
+            for (profile_id, desired_count) in applicable {
+                let (status, observed_count, missing_count, unexpected_count) = match &observation {
+                    Ok(UserSyncObservation::InSync { user_count }) => {
+                        (UserSyncStatus::Synced, Some(*user_count), Some(0), Some(0))
+                    }
+                    Ok(UserSyncObservation::Drift {
+                        observed_count,
+                        missing_count,
+                        unexpected_count,
+                        ..
+                    }) => (
+                        UserSyncStatus::Drifted,
+                        Some(*observed_count),
+                        Some(*missing_count),
+                        Some(*unexpected_count),
+                    ),
+                    Ok(UserSyncObservation::Unsupported) => {
+                        (UserSyncStatus::UnsupportedObservation, None, None, None)
+                    }
+                    Err(_) if probe.installed == Some(false) || probe.active == Some(false) => {
+                        (UserSyncStatus::RuntimeUnavailable, None, None, None)
+                    }
+                    Err(_) => (UserSyncStatus::Failed, None, None, None),
+                };
+                result.push(ProfileUserSyncObservation {
+                    profile_id,
+                    runtime_id: runtime_id.clone(),
+                    status,
+                    desired_count,
+                    observed_count,
+                    missing_count,
+                    unexpected_count,
+                    checked_at: checked_at.clone(),
+                });
+            }
+        }
+        Ok(result)
     }
 
     fn build_plans(
@@ -1689,6 +1756,36 @@ mod tests {
             )
             .unwrap();
         assert!(!core.state.lock().unwrap().current.contains("alice"));
+    }
+
+    #[test]
+    fn user_sync_observation_is_count_only_and_reports_drift() {
+        let protocol = FakeProtocol::new("fake-protocol", "fake-capability");
+        let core = FakeCore::new("fake-core", &["fake-capability"]);
+        let (protocols, cores) = registries(vec![protocol], vec![core.clone()]);
+        let store = FakeStore::new(1);
+        let reconciler = Reconciler::new(protocols, cores, store, temp_dir());
+        let desired = desired(
+            1,
+            vec![profile("fake-protocol", None, true)],
+            &["alice", "bob"],
+        );
+
+        let synced = reconciler
+            .observe_user_sync(&desired, &resolver(&[]))
+            .unwrap();
+        assert_eq!(synced.len(), 1);
+        assert_eq!(synced[0].status, UserSyncStatus::Synced);
+        assert_eq!(synced[0].desired_count, 2);
+        assert_eq!(synced[0].observed_count, Some(2));
+
+        core.fail_at(Failure::UserDrift);
+        let drifted = reconciler
+            .observe_user_sync(&desired, &resolver(&[]))
+            .unwrap();
+        assert_eq!(drifted[0].status, UserSyncStatus::Drifted);
+        assert_eq!(drifted[0].missing_count, Some(1));
+        assert_eq!(desired.users.len(), 2);
     }
 
     #[test]

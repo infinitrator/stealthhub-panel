@@ -2,19 +2,29 @@
 
 use crate::{
     admin_bar, csrf_field, format_bytes, format_user_expiry, format_user_traffic, ui::layout,
-    AuthenticatedAdmin,
+    views::components::user_sync_badges, AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
-use stealthhub_core::storage::UserRecord;
+use stealthhub_core::storage::{UserRecord, UserSyncStatusRecord};
 
-pub(crate) fn render_index(auth: &AuthenticatedAdmin, users: &[UserRecord]) -> Response {
+pub(crate) fn render_index(
+    auth: &AuthenticatedAdmin,
+    users: &[UserRecord],
+    user_sync: &[UserSyncStatusRecord],
+) -> Response {
     Html(
             layout(
                 "Users",
                 html! {
                     (admin_bar(auth))
                     h1 { "Users" }
+
+                    section {
+                        h2 { "Runtime authorization" }
+                        p { "Count-only comparison of desired users and active runtime configurations." }
+                        (user_sync_badges(user_sync, None, None))
+                    }
 
                     section {
                         h2 { "Create user" }

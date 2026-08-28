@@ -71,8 +71,8 @@ use stealthhub_core::{
         ensure_default_routing_rule_sets, ensure_default_settings, get_admin_by_id,
         get_admin_by_username, get_reconcile_state, get_secret, get_user_by_id, get_user_by_token,
         get_valid_admin_session, init_db, is_owner_admin_id, list_protocol_profiles_decoded,
-        list_secret_names, list_users, load_client_policy, load_dns_policy, load_panel_settings,
-        load_routing_rule_sets, load_rule_entries, load_rule_sources,
+        list_runtime_user_sync, list_secret_names, list_users, load_client_policy, load_dns_policy,
+        load_panel_settings, load_routing_rule_sets, load_rule_entries, load_rule_sources,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
         reset_user_subscription_token, save_routing_rule_set, set_user_enabled,
         touch_admin_session, update_admin_password_and_revoke_sessions, update_dns_policy,
@@ -1320,12 +1320,17 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 );
             }
         };
+    let user_sync = match list_runtime_user_sync(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load runtime user synchronization", error),
+    };
     views::modules::render(
         &auth,
         &page.inventory,
         &page.module_statuses,
         &page.available_modules,
         &page.diagnostics,
+        &user_sync,
     )
 }
 
@@ -2641,6 +2646,10 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
             Ok(value) => value.inventory,
             Err(error) => return internal_error("load protocol inventory", error),
         };
+    let user_sync = match list_runtime_user_sync(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load protocol user synchronization", error),
+    };
 
     views::protocols::render(
         &auth,
@@ -2649,6 +2658,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         &secret_names,
         &state.protocol_registry,
         &inventory,
+        &user_sync,
     )
 }
 
@@ -2940,8 +2950,12 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
             );
         }
     };
+    let user_sync = match list_runtime_user_sync(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load user synchronization summary", error),
+    };
 
-    views::users::render_index(&auth, &users)
+    views::users::render_index(&auth, &users, &user_sync)
 }
 
 async fn create_user_action(

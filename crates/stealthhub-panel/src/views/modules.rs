@@ -4,12 +4,12 @@ use crate::{
     admin_bar, csrf_field, is_owner_admin,
     modules::{self, ModuleSpec, ModuleStatus},
     ui::layout,
-    views::components::runtime_inventory_table,
+    views::components::{runtime_inventory_table, user_sync_badges},
     AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
-use stealthhub_core::inventory::AdapterInventory;
+use stealthhub_core::{inventory::AdapterInventory, storage::UserSyncStatusRecord};
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
@@ -17,6 +17,7 @@ pub(crate) fn render(
     statuses: &[ModuleStatus],
     available: &[ModuleSpec],
     diagnostics: &[String],
+    user_sync: &[UserSyncStatusRecord],
 ) -> Response {
     let installed_count = statuses.iter().filter(|status| status.installed).count();
     let updates_count = statuses
@@ -83,6 +84,7 @@ pub(crate) fn render(
                                         th { "Installed" }
                                         th { "Latest" }
                                         th { "Runtime state" }
+                                        th { "User sync" }
                                         th { "Automatic" }
                                         th { "Actions" }
                                     }
@@ -98,6 +100,13 @@ pub(crate) fn render(
                                                 small { (status.spec.kind) " / " (status.spec.repo) }
                                             }
                                             td {
+                                                (status.spec.role)
+                                                br;
+                                                small { (status.spec.service) }
+                                                br;
+                                                small { (status.spec.config_path) }
+                                            }
+                                            td {
                                                 @if let Some(runtime) = runtime {
                                                     @if runtime.capabilities.is_empty() {
                                                         small { "none declared" }
@@ -109,13 +118,6 @@ pub(crate) fn render(
                                                 }
                                                 br;
                                                 small { (dependent_count) " enabled resource(s)" }
-                                            }
-                                            td {
-                                                (status.spec.role)
-                                                br;
-                                                small { (status.spec.service) }
-                                                br;
-                                                small { (status.spec.config_path) }
                                             }
                                             td { code { (modules::short_version(&status.installed_version)) } }
                                             td { code { (modules::short_version(&status.latest_version)) } }
@@ -143,6 +145,7 @@ pub(crate) fn render(
                                                     }
                                                 }
                                             }
+                                            td { (user_sync_badges(user_sync, None, Some(&status.spec.id))) }
                                             td {
                                                 @if is_owner_admin(auth) {
                                                     form method="post" action=(format!("/admin/modules/{}/auto", status.spec.id)) class="inline-form" {

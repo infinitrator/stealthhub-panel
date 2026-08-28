@@ -14,6 +14,7 @@ use maud::{html, Markup};
 use stealthhub_core::inventory::{
     AdapterInventory, AdapterInventoryState, ResourceInventoryState, RuntimeInventoryState,
 };
+use stealthhub_core::storage::UserSyncStatusRecord;
 
 pub(crate) fn csrf_field(token: &str) -> Markup {
     html! { input type="hidden" name="csrf_token" value=(token); }
@@ -38,6 +39,39 @@ pub(crate) fn meter_bar(percent: Option<u8>) -> Markup {
     html! {
         progress class="meter" max="100" value=(value)
             title=(percent.map_or_else(|| "unknown".to_string(), |value| format!("{value}%"))) {}
+    }
+}
+
+pub(crate) fn user_sync_badges(
+    records: &[UserSyncStatusRecord],
+    profile_id: Option<&str>,
+    runtime_id: Option<&str>,
+) -> Markup {
+    let matches = records
+        .iter()
+        .filter(|record| profile_id.is_none_or(|value| record.profile_id == value))
+        .filter(|record| runtime_id.is_none_or(|value| record.runtime_id == value))
+        .collect::<Vec<_>>();
+    html! {
+        @if matches.is_empty() {
+            span class="badge neutral" { "not applicable" }
+        } @else {
+            @for record in matches {
+                @let class = match record.status.as_str() {
+                    "synced" => "ok",
+                    "pending" => "neutral",
+                    _ => "off",
+                };
+                span class=(format!("badge {class}")) { (&record.status) }
+                " "
+                small {
+                    (record.desired_count) " desired"
+                    @if let Some(observed) = record.observed_count { ", " (observed) " observed" }
+                    " / " code { (&record.runtime_id) }
+                }
+                br;
+            }
+        }
     }
 }
 

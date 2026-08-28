@@ -17,7 +17,10 @@ use std::{fmt, str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
 use crate::{
-    adapter::{valid_adapter_id, CoreRegistry, ProtocolRegistry},
+    adapter::{
+        valid_adapter_id, CoreRegistry, ProfileUserSyncObservation, ProtocolRegistry,
+        UserSyncStatus,
+    },
     desired::DesiredState,
     inventory::{adapter_kind, PersistedAdapterState},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
@@ -139,6 +142,19 @@ pub struct ReconcileStateRecord {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Count-only synchronization status; no runtime user identity is persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UserSyncStatusRecord {
+    pub profile_id: String,
+    pub runtime_id: String,
+    pub status: String,
+    pub desired_count: i64,
+    pub observed_count: Option<i64>,
+    pub missing_count: Option<i64>,
+    pub unexpected_count: Option<i64>,
+    pub checked_at: DateTime<Utc>,
 }
 
 /// Opaque durable state retained even while its adapter package is absent.
@@ -570,6 +586,7 @@ const CLIENT_POLICY_MIGRATION: i64 = 3;
 const DNS_POLICY_MIGRATION: i64 = 4;
 const EDITABLE_CLIENT_POLICY_MIGRATION: i64 = 5;
 const NORMALIZED_RULES_MIGRATION: i64 = 6;
+const USER_SYNC_STATUS_MIGRATION: i64 = 7;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -610,6 +627,38 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(ADAPTER_STATE_MIGRATION)
             .bind("add opaque durable adapter state")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(USER_SYNC_STATUS_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        sqlx::query(
+            r"CREATE TABLE runtime_user_sync (
+                profile_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                desired_count INTEGER NOT NULL CHECK(desired_count >= 0),
+                observed_count INTEGER NULL CHECK(observed_count IS NULL OR observed_count >= 0),
+                missing_count INTEGER NULL CHECK(missing_count IS NULL OR missing_count >= 0),
+                unexpected_count INTEGER NULL CHECK(unexpected_count IS NULL OR unexpected_count >= 0),
+                checked_at TEXT NOT NULL,
+                PRIMARY KEY(profile_id, runtime_id),
+                FOREIGN KEY(profile_id) REFERENCES protocol_profiles(name) ON DELETE CASCADE
+            )",
+        )
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("CREATE INDEX idx_runtime_user_sync_runtime ON runtime_user_sync(runtime_id)")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(USER_SYNC_STATUS_MIGRATION)
+            .bind("persist count-only runtime user synchronization")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -817,6 +866,10 @@ async fn bump_desired_generation(transaction: &mut Transaction<'_, Sqlite>) -> R
     .bind(now)
     .execute(&mut **transaction)
     .await?;
+    sqlx::query("UPDATE runtime_user_sync SET status='pending', checked_at=?")
+        .bind(now)
+        .execute(&mut **transaction)
+        .await?;
     let (generation,): (i64,) =
         sqlx::query_as("SELECT desired_generation FROM reconcile_state WHERE singleton = 1")
             .fetch_one(&mut **transaction)
@@ -873,6 +926,74 @@ pub async fn mark_reconcile_result(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Atomically replaces count-only observations produced by the root worker.
+pub async fn replace_runtime_user_sync(
+    pool: &SqlitePool,
+    observations: &[ProfileUserSyncObservation],
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("DELETE FROM runtime_user_sync")
+        .execute(&mut *transaction)
+        .await?;
+    for observation in observations {
+        if !valid_adapter_resource_id(&observation.profile_id)
+            || !valid_adapter_id(&observation.runtime_id)
+            || observation.status == UserSyncStatus::Pending
+        {
+            bail!("invalid runtime user synchronization observation");
+        }
+        let checked_at = DateTime::parse_from_rfc3339(&observation.checked_at)?.with_timezone(&Utc);
+        sqlx::query(
+            r"INSERT INTO runtime_user_sync (
+                profile_id,runtime_id,status,desired_count,observed_count,
+                missing_count,unexpected_count,checked_at
+            ) VALUES (?,?,?,?,?,?,?,?)",
+        )
+        .bind(&observation.profile_id)
+        .bind(&observation.runtime_id)
+        .bind(observation.status.as_str())
+        .bind(i64::try_from(observation.desired_count)?)
+        .bind(observation.observed_count.map(i64::try_from).transpose()?)
+        .bind(observation.missing_count.map(i64::try_from).transpose()?)
+        .bind(
+            observation
+                .unexpected_count
+                .map(i64::try_from)
+                .transpose()?,
+        )
+        .bind(checked_at)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Lists sanitized synchronization records for operator presentation.
+pub async fn list_runtime_user_sync(pool: &SqlitePool) -> Result<Vec<UserSyncStatusRecord>> {
+    sqlx::query(
+        r"SELECT profile_id,runtime_id,status,desired_count,observed_count,
+                  missing_count,unexpected_count,checked_at
+           FROM runtime_user_sync ORDER BY profile_id,runtime_id",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok(UserSyncStatusRecord {
+            profile_id: row.try_get("profile_id")?,
+            runtime_id: row.try_get("runtime_id")?,
+            status: row.try_get("status")?,
+            desired_count: row.try_get("desired_count")?,
+            observed_count: row.try_get("observed_count")?,
+            missing_count: row.try_get("missing_count")?,
+            unexpected_count: row.try_get("unexpected_count")?,
+            checked_at: row.try_get("checked_at")?,
+        })
+    })
+    .collect()
 }
 
 async fn ensure_protocol_profile_columns(pool: &SqlitePool) -> Result<()> {
@@ -3106,12 +3227,57 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 6);
+        assert_eq!(migrations, 7);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
             .await?;
         assert_eq!(integrity, "ok");
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_user_sync_persists_counts_without_identities() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        sqlx::query(
+            r"INSERT INTO protocol_profiles
+               (name,kind,role,enabled,server,port,config_json,schema_version,
+                preferred_core_id,managed_resource_id,created_at,updated_at)
+               VALUES ('profile-a','adapter-a','manual',1,'example.test',443,'{}',1,
+                       NULL,NULL,?,?)",
+        )
+        .bind(Utc::now())
+        .bind(Utc::now())
+        .execute(&pool)
+        .await?;
+        replace_runtime_user_sync(
+            &pool,
+            &[ProfileUserSyncObservation {
+                profile_id: "profile-a".to_string(),
+                runtime_id: "runtime-a".to_string(),
+                status: UserSyncStatus::Drifted,
+                desired_count: 3,
+                observed_count: Some(2),
+                missing_count: Some(1),
+                unexpected_count: Some(0),
+                checked_at: Utc::now().to_rfc3339(),
+            }],
+        )
+        .await?;
+
+        let records = list_runtime_user_sync(&pool).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "drifted");
+        assert_eq!(records[0].desired_count, 3);
+        let columns = sqlx::query("PRAGMA table_info(runtime_user_sync)")
+            .fetch_all(&pool)
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert!(!columns.iter().any(|name| name.contains("user_id")));
 
         close_and_remove(pool, &path).await;
         Ok(())

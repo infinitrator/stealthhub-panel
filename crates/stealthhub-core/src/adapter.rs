@@ -443,6 +443,45 @@ pub enum UserSyncObservation {
     },
 }
 
+/// Durable, count-only user synchronization state for one profile/runtime pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileUserSyncObservation {
+    pub profile_id: String,
+    pub runtime_id: String,
+    pub status: UserSyncStatus,
+    pub desired_count: usize,
+    pub observed_count: Option<usize>,
+    pub missing_count: Option<usize>,
+    pub unexpected_count: Option<usize>,
+    pub checked_at: String,
+}
+
+/// Operator-facing state derived without retaining runtime user identities.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum UserSyncStatus {
+    Synced,
+    Pending,
+    Drifted,
+    RuntimeUnavailable,
+    UnsupportedObservation,
+    Failed,
+}
+
+impl UserSyncStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Synced => "synced",
+            Self::Pending => "pending",
+            Self::Drifted => "drifted",
+            Self::RuntimeUnavailable => "runtime-unavailable",
+            Self::UnsupportedObservation => "unsupported-observation",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 impl UserSyncObservation {
     /// Builds a count-only observation without persisting user identifiers.
     #[must_use]
