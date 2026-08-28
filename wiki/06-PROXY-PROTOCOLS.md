@@ -121,8 +121,10 @@ sudo journalctl -u infiproxy-xray.service -n 100 --no-pager
 sudo ss -lntp | grep ':8443'
 ```
 
-Если generator использует UUID каждого subscription user, server clients list
-нужно обновлять при создании/удалении user. Панель этого пока не делает.
+Для профилей с `PerUserUuid` root reconciler пересобирает server clients list
+при создании, отключении и удалении user. После активации core adapter повторно
+читает live config; несовпадение UUID-set вызывает rollback. В UI сохраняются
+только counts, но не UUID.
 
 ### XHTTP или TCP/RAW
 
@@ -253,7 +255,7 @@ sudo journalctl -u infiproxy-hysteria.service -n 100 --no-pager
 sudo ss -lnup | grep ':443'
 ```
 
-Hysteria `2.12.1` не предоставляет отдельный `--check`. Панель проверяет YAML,
+Если установленная Hysteria не предоставляет отдельный `--check`, панель проверяет YAML,
 но семантическую проверку выполняйте контролируемым рестартом с готовым rollback;
 для foreground-диагностики сначала остановите unit, чтобы не открыть второй
 server на том же UDP-порту.
@@ -295,8 +297,8 @@ Starter config:
 ### Users map
 
 Mihomo profile отправляет `uuid` Infiproxy user и shared `tuic.password`.
-Добавьте каждый UUID в TUIC users map с тем же password. После создания нового
-panel user его TUIC-доступ не заработает, пока server map не обновлен.
+TUIC adapter строит users map из enabled desired users; live observation после
+активации сравнивает ключи map и откатывает поколение при drift.
 
 ### Проверка
 
@@ -368,6 +370,49 @@ Official upstream описывает prefix `dd` для random padding в client
 генерирует базовые 32 hex и валидирует именно эту длину; advanced variants
 требуют ручной проверки совместимости и не должны вводиться в это поле как
 34+ символа без изменения manager contract.
+
+## Декларативные композиции и исследованные кандидаты
+
+Каждый selectable adapter объявляет `protocol`, `transport`, `security`,
+optional `flow` и maturity. GUI показывает только целые зарегистрированные
+комбинации; произвольное смешивание несовместимых слоёв не предлагается.
+
+| Selectable adapter | Композиция | Готовность |
+|---|---|---|
+| `vless-reality-xhttp` | VLESS + XHTTP + REALITY | Stable |
+| `vless-reality-tcp` | VLESS + TCP + REALITY | Stable |
+| `shadowsocks2022-shadow-tls` | SS2022 + TCP + ShadowTLS v3 | Stable |
+| `hysteria2` | Hysteria2 + QUIC + TLS/optional Salamander | Stable |
+| `any-tls` | AnyTLS + TCP + TLS | Experimental |
+| `tuic` | TUIC v5 + QUIC + TLS | Stable |
+
+Таблица ниже фиксирует ecosystem support, а не обещает готовый Infiproxy
+adapter. Baseline исследования — stable Mihomo `v1.19.30`. Если upstream не
+указывает первую версию поля, minimum намеренно не угадывается: требуется
+документация и config canary установленного binary.
+
+| Кандидат | Client / server | Auth и ресурсы | Maturity | В Infiproxy |
+|---|---|---|---|---|
+| AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Unsupported: нет Mihomo server runtime adapter |
+| AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Unsupported: нет Mihomo server runtime adapter |
+| VLESS + JLS | Mihomo outbound + inbound | UUID users, JLS user/password/destination | Experimental | Unsupported: renderer не реализован |
+| VLESS + ResTLS | Mihomo outbound + inbound | UUID users, ResTLS password/destination | Experimental | Unsupported: renderer не реализован |
+| Trojan TLS/uTLS | Mihomo outbound + inbound; uTLS fingerprint документирован | password users, domain, certificate/private key | Stable | Unsupported: renderer не реализован |
+| ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | username/password, QUIC/TLS/JLS, optional domain | Experimental | Unsupported: runtime canary не реализован |
+| Snell v4/v5 | Mihomo outbound + inbound; v4/v5 с Mihomo 1.19.26 | shared PSK, optional JLS/ResTLS/ShadowTLS | Stable | Unsupported: renderer не реализован |
+| Mieru | Mihomo outbound + inbound | username/password, TCP или UDP, optional traffic pattern | Stable | Unsupported: renderer не реализован |
+| MASQUE | Mihomo outbound; matching public inbound не подтверждён | ECDSA key pair, tunnel CIDR, optional SNI | Unsupported | Не предлагается |
+| TrustTunnel | Mihomo outbound + inbound | username/password, domain, certificate/key, HTTP/2 и optional HTTP/3 | Experimental | Unsupported: runtime canary не реализован |
+
+Первичные источники: [AnyTLS outbound](https://wiki.metacubex.one/en/config/proxies/anytls/),
+[AnyTLS inbound](https://wiki.metacubex.one/en/config/inbound/listeners/anytls/),
+[VLESS inbound](https://wiki.metacubex.one/en/config/inbound/listeners/vless/),
+[TLS/uTLS](https://wiki.metacubex.one/en/config/proxies/tls/),
+[ShadowQUIC](https://wiki.metacubex.one/en/config/proxies/shadowquic/),
+[Snell](https://wiki.metacubex.one/en/config/proxies/snell/),
+[Mieru](https://wiki.metacubex.one/en/config/proxies/mieru/),
+[MASQUE](https://wiki.metacubex.one/en/config/proxies/masque/) и
+[TrustTunnel](https://wiki.metacubex.one/en/config/proxies/trusttunnel/).
 
 ## Маскировка: практические оговорки
 

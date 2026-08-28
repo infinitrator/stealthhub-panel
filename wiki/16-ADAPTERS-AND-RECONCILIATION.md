@@ -126,6 +126,14 @@ counts и тип drift, но не UUID или credential values. Если обя
 наблюдение не поддерживается, identities отличаются или runtime config не
 читается, операция откатывается и applied generation не продвигается.
 
+Manifest также содержит декларативную композицию `protocol + transport +
+security + optional flow` и maturity. UI выводит только комбинации, для которых
+один adapter реализует client render, server fragment и runtime capability.
+
+После reconcile root-worker выполняет read-only observation и атомарно заменяет
+`runtime_user_sync`. Статусы видны на Protocols, Runtimes и Users. Таблица
+содержит только profile/runtime ID, counts и время; observation не меняет users.
+
 ## 6. Контракт core adapter
 
 Core adapter владеет сборкой полного server config, native validation,
@@ -140,9 +148,10 @@ snapshot/rollback, atomic install, systemd lifecycle, health и listener checks.
 Каждый server fragment также объявляет `ListenerClaim`: network (`tcp`/`udp`) и
 порт. Reconciler собирает весь listener plan и отклоняет повторяющуюся пару
 `(network, port)` до stage, snapshot или live mutation. TCP и UDP на одном
-числовом порту считаются разными sockets. Явная модель shared frontend пока не
-реализована, поэтому совместное владение одним TCP listener нужно представлять
-одним infrastructure adapter, а не двумя claims.
+числовом порту считаются разными sockets. Shared frontend представлен stable-ID
+ресурсами `Domain`, `Certificate`, `TlsFrontend`, `DecoyTarget`, `Listener` и
+`PortAllocation`. Generic reconciler проверяет dependencies, cycles и listener
+collisions до mutation; один adapter владеет всем Nginx-набором.
 
 ## 7. Server secrets
 
@@ -245,9 +254,13 @@ baseline имеют монотонный integer ID в `schema_migrations` и в
 - v3: `client_transport_pools`, ordered members, `client_routing_rules` и
   сохранение существующих `routing_rule_sets`;
 - v4: singleton `client_dns_policy`, независимый от transport policy.
+- v5: редактируемые metadata и health-параметры pools/policies;
+- v6: normalized rule entries и bounded remote rule sources;
+- v7: count-only `runtime_user_sync`;
+- v8: one-time bootstrap markers, не восстанавливающие удалённые defaults.
 
-Bootstrap выполняется через `INSERT ... ON CONFLICT DO NOTHING`, поэтому
-повторная инициализация не возвращает операторские значения к defaults.
+Bootstrap завершается durable marker-ом. Повторный startup не изменяет
+отредактированные строки и не создаёт заново удалённые оператором defaults.
 
 ## 11. Client routing pipeline
 
