@@ -27,7 +27,6 @@ const RUNTIME_GROUP: &str = "infiproxy-runtime";
 const XRAY_CAPABILITIES: &[&str] = &["vless-reality-tcp", "vless-reality-xhttp"];
 const SING_BOX_CAPABILITIES: &[&str] = &[
     "vless-reality-tcp",
-    "vless-reality-xhttp",
     "shadowsocks2022-shadow-tls",
     "hysteria2",
     "any-tls",
@@ -35,7 +34,42 @@ const SING_BOX_CAPABILITIES: &[&str] = &[
 ];
 const HYSTERIA_CAPABILITIES: &[&str] = &["hysteria2"];
 const TUIC_CAPABILITIES: &[&str] = &["tuic"];
-const MIHOMO_CAPABILITIES: &[&str] = &["trojan-tls", "snell-v5", "mieru"];
+const MIHOMO_CAPABILITIES: &[&str] = &[
+    "vless-reality-tcp",
+    "vless-reality-xhttp",
+    "anytls-tls",
+    "anytls-shadowtls-v3",
+    "anytls-restls",
+    "anytls-jls",
+    "trojan-tls",
+    "trojan-shadowtls-v3",
+    "trojan-restls",
+    "trojan-jls",
+    "trojan-reality",
+    "snell-v5",
+    "snell-v5-shadowtls-v3",
+    "snell-v5-restls",
+    "snell-v5-jls",
+    "mieru",
+];
+#[cfg(test)]
+const MIHOMO_EXCLUSIVE_CAPABILITIES: &[&str] = &[
+    "vless-reality-xhttp",
+    "anytls-tls",
+    "anytls-shadowtls-v3",
+    "anytls-restls",
+    "anytls-jls",
+    "trojan-tls",
+    "trojan-shadowtls-v3",
+    "trojan-restls",
+    "trojan-jls",
+    "trojan-reality",
+    "snell-v5",
+    "snell-v5-shadowtls-v3",
+    "snell-v5-restls",
+    "snell-v5-jls",
+    "mieru",
+];
 
 #[derive(Clone, Copy)]
 enum Flavor {
@@ -57,6 +91,8 @@ struct ManagedCoreAdapter {
     flavor: Flavor,
     binary: PathBuf,
     config: PathBuf,
+    validated_version: &'static str,
+    version_file: PathBuf,
     listeners: Mutex<ListenerState>,
 }
 
@@ -69,6 +105,8 @@ struct ManagedCoreSpec<'a> {
     config: &'a str,
     capabilities: &'a [&'a str],
     selection_priority: i32,
+    validated_version: &'static str,
+    version_file: Option<&'a str>,
 }
 
 impl ManagedCoreAdapter {
@@ -89,6 +127,16 @@ impl ManagedCoreAdapter {
             flavor: spec.flavor,
             binary: PathBuf::from(spec.binary),
             config: PathBuf::from(spec.config),
+            validated_version: spec.validated_version,
+            version_file: spec.version_file.map_or_else(
+                || {
+                    PathBuf::from(format!(
+                        "/var/lib/infiproxy-maintenance/module-versions/{}.version",
+                        spec.id
+                    ))
+                },
+                PathBuf::from,
+            ),
             listeners: Mutex::new(ListenerState::default()),
         }
     }
@@ -276,6 +324,15 @@ impl CoreAdapter for ManagedCoreAdapter {
 
     fn installed(&self) -> Result<bool> {
         Ok(self.binary.is_file())
+    }
+
+    fn compatible(&self, _required: &std::collections::BTreeSet<String>) -> Result<bool> {
+        let installed = match fs::read_to_string(&self.version_file) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(installed.trim() == self.validated_version)
     }
 
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
@@ -482,7 +539,13 @@ fn compose_xray(plan: &CorePlan) -> Result<Value> {
         let config = payload_config(payload)?;
         let user_entries = users(payload)?
             .iter()
-            .map(|user| json!({"id": user["uuid"], "email": user["username"]}))
+            .map(|user| {
+                let mut entry = json!({"id": user["uuid"], "email": user["username"]});
+                if fragment.capability == "vless-reality-tcp" {
+                    entry["flow"] = json!("xtls-rprx-vision");
+                }
+                entry
+            })
             .collect::<Vec<_>>();
         let mut stream = json!({
             "network": "tcp",
@@ -524,21 +587,16 @@ fn compose_sing_box(plan: &CorePlan) -> Result<Value> {
         let listen_port = port(payload)?;
         let tag = &fragment.profile_id;
         let inbound = match fragment.capability.as_str() {
-            "vless-reality-tcp" | "vless-reality-xhttp" => {
+            "vless-reality-tcp" => {
                 let user_entries = users(payload)?
                     .iter()
                     .map(|user| json!({"name":user["username"],"uuid":user["uuid"]}))
                     .collect::<Vec<_>>();
-                let mut inbound = json!({
+                json!({
                     "type":"vless","tag":tag,"listen":"::","listen_port":listen_port,
                     "users":user_entries,
                     "tls":{"enabled":true,"server_name":config_text(config,"server_name")?,"reality":{"enabled":true,"handshake":{"server":config_text(config,"server_name")?,"server_port":443},"private_key":resolved_secret(payload,"private_key_secret")?,"short_id":[resolved_secret(payload,"short_id_secret")?]}}
-                });
-                if fragment.capability == "vless-reality-xhttp" {
-                    inbound["transport"] =
-                        json!({"type":"xhttp","path":config_text(config,"path")?});
-                }
-                inbound
+                })
             }
             "shadowsocks2022-shadow-tls" => {
                 let inner_tag = format!("{tag}-inner");
@@ -636,23 +694,85 @@ fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
     let mut listeners = Vec::new();
     for fragment in &plan.fragments {
         let payload = payload_object(fragment)?;
+        let config = payload_config(payload)?;
         let listen_port = port(payload)?;
         let name = &fragment.profile_id;
         let listener = match fragment.capability.as_str() {
-            "trojan-tls" => {
+            "vless-reality-tcp" | "vless-reality-xhttp" => {
+                let vision = fragment.capability == "vless-reality-tcp";
+                let user_entries = users(payload)?
+                    .iter()
+                    .map(|user| {
+                        let mut entry = json!({
+                            "username": user["username"],
+                            "uuid": user["uuid"]
+                        });
+                        if vision {
+                            entry["flow"] = json!("xtls-rprx-vision");
+                        }
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                let mut listener = json!({
+                    "name":name,"type":"vless","listen":"::","port":listen_port,
+                    "users":user_entries,
+                    "reality-config":reality_server_options(payload, config)?
+                });
+                if !vision {
+                    listener["xhttp-config"] = json!({
+                        "path": config_text(config, "path")?,
+                        "host": config_text(config, "server_name")?,
+                        "mode": "auto"
+                    });
+                }
+                listener
+            }
+            capability if capability.starts_with("anytls-") => {
+                let password = resolved_secret(payload, "password_secret")?;
+                let mut listener = json!({
+                    "name":name,"type":"anytls","listen":"::","port":listen_port,
+                    "users":{"shared":password}
+                });
+                apply_mihomo_server_wrapper(
+                    &mut listener,
+                    payload,
+                    config,
+                    wrapper_for_capability(capability)?,
+                )?;
+                listener
+            }
+            capability if capability.starts_with("trojan-") => {
                 let user_entries = users(payload)?
                     .iter()
                     .map(|user| json!({"username":user["uuid"],"password":user["uuid"]}))
                     .collect::<Vec<_>>();
-                json!({
+                let mut listener = json!({
                     "name":name,"type":"trojan","listen":"::","port":listen_port,
-                    "users":user_entries,"certificate":CERTIFICATE_PATH,"private-key":PRIVATE_KEY_PATH
-                })
+                    "users":user_entries
+                });
+                apply_mihomo_server_wrapper(
+                    &mut listener,
+                    payload,
+                    config,
+                    wrapper_for_capability(capability)?,
+                )?;
+                listener
             }
-            "snell-v5" => json!({
-                "name":name,"type":"snell","listen":"::","port":listen_port,
-                "psk":resolved_secret(payload,"psk_secret")?,"version":5,"udp":true
-            }),
+            capability if capability == "snell-v5" || capability.starts_with("snell-v5-") => {
+                let mut listener = json!({
+                    "name":name,"type":"snell","listen":"::","port":listen_port,
+                    "psk":resolved_secret(payload,"psk_secret")?,"version":5,"udp":true
+                });
+                if capability != "snell-v5" {
+                    apply_mihomo_server_wrapper(
+                        &mut listener,
+                        payload,
+                        config,
+                        wrapper_for_capability(capability)?,
+                    )?;
+                }
+                listener
+            }
             "mieru" => {
                 let password = resolved_secret(payload, "password_secret")?;
                 let user_entries = users(payload)?
@@ -675,6 +795,87 @@ fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
         "listeners":listeners,
         "rules":["MATCH,DIRECT"]
     }))
+}
+
+#[derive(Clone, Copy)]
+enum MihomoSecurityWrapper {
+    StandardTls,
+    Reality,
+    ShadowTlsV3,
+    ResTls,
+    Jls,
+}
+
+fn wrapper_for_capability(capability: &str) -> Result<MihomoSecurityWrapper> {
+    if capability.ends_with("-tls") || capability == "anytls-tls" {
+        Ok(MihomoSecurityWrapper::StandardTls)
+    } else if capability.ends_with("-reality") {
+        Ok(MihomoSecurityWrapper::Reality)
+    } else if capability.ends_with("-shadowtls-v3") {
+        Ok(MihomoSecurityWrapper::ShadowTlsV3)
+    } else if capability.ends_with("-restls") {
+        Ok(MihomoSecurityWrapper::ResTls)
+    } else if capability.ends_with("-jls") {
+        Ok(MihomoSecurityWrapper::Jls)
+    } else {
+        bail!("unsupported Mihomo security wrapper")
+    }
+}
+
+fn reality_server_options(
+    payload: &Map<String, Value>,
+    config: &Map<String, Value>,
+) -> Result<Value> {
+    Ok(json!({
+        "dest": format!("{}:443", config_text(config, "sni").or_else(|_| config_text(config, "server_name"))?),
+        "private-key": resolved_secret(payload, "private_key_secret")?,
+        "short-id": [resolved_secret(payload, "short_id_secret")?],
+        "server-names": [config_text(config, "sni").or_else(|_| config_text(config, "server_name"))?]
+    }))
+}
+
+fn apply_mihomo_server_wrapper(
+    listener: &mut Value,
+    payload: &Map<String, Value>,
+    config: &Map<String, Value>,
+    wrapper: MihomoSecurityWrapper,
+) -> Result<()> {
+    let destination = || -> Result<String> { Ok(format!("{}:443", config_text(config, "sni")?)) };
+    match wrapper {
+        MihomoSecurityWrapper::StandardTls => {
+            listener["certificate"] = json!(CERTIFICATE_PATH);
+            listener["private-key"] = json!(PRIVATE_KEY_PATH);
+        }
+        MihomoSecurityWrapper::Reality => {
+            listener["reality-config"] = reality_server_options(payload, config)?;
+        }
+        MihomoSecurityWrapper::ShadowTlsV3 => {
+            listener["shadow-tls"] = json!({
+                "enable": true,
+                "version": 3,
+                "users": [{"name":"shared","password":resolved_secret(payload,"shadow_tls_password_secret")?}],
+                "handshake": {"dest":destination()?}
+            });
+        }
+        MihomoSecurityWrapper::ResTls => {
+            listener["res-tls"] = json!({
+                "enable": true,
+                "dest": destination()?,
+                "password": resolved_secret(payload,"restls_password_secret")?
+            });
+        }
+        MihomoSecurityWrapper::Jls => {
+            listener["jls-config"] = json!({
+                "enable": true,
+                "users": [{
+                    "username":resolved_secret(payload,"jls_username_secret")?,
+                    "password":resolved_secret(payload,"jls_password_secret")?
+                }],
+                "dest": destination()?
+            });
+        }
+    }
+    Ok(())
 }
 
 fn listener_line_has_port(line: &str, port: u16) -> bool {
@@ -865,6 +1066,8 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             config: "/etc/infiproxy-cores/xray/config.json",
             capabilities: XRAY_CAPABILITIES,
             selection_priority: 100,
+            validated_version: "v26.3.27",
+            version_file: None,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "mihomo",
@@ -874,7 +1077,9 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             binary: "/opt/infiproxy/cores/mihomo/current/mihomo",
             config: "/etc/infiproxy-cores/mihomo/config.yaml",
             capabilities: MIHOMO_CAPABILITIES,
-            selection_priority: 100,
+            selection_priority: 200,
+            validated_version: "v1.19.30",
+            version_file: None,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "sing-box",
@@ -884,7 +1089,9 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             binary: "/opt/infiproxy/cores/sing-box/current/sing-box",
             config: "/etc/infiproxy-cores/sing-box/config.json",
             capabilities: SING_BOX_CAPABILITIES,
-            selection_priority: 10,
+            selection_priority: 50,
+            validated_version: "v1.13.20",
+            version_file: None,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "hysteria",
@@ -894,7 +1101,9 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             binary: "/opt/infiproxy/cores/hysteria/current/hysteria",
             config: "/etc/infiproxy-cores/hysteria/config.yaml",
             capabilities: HYSTERIA_CAPABILITIES,
-            selection_priority: 100,
+            selection_priority: 200,
+            validated_version: "app/v2.12.2",
+            version_file: None,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "tuic",
@@ -904,7 +1113,9 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             binary: "/opt/infiproxy/cores/tuic/current/tuic-server",
             config: "/etc/infiproxy-cores/tuic/config.json",
             capabilities: TUIC_CAPABILITIES,
-            selection_priority: 100,
+            selection_priority: 200,
+            validated_version: "tuic-server-1.0.0",
+            version_file: None,
         }),
     ]
 }
@@ -919,7 +1130,7 @@ pub(super) fn registry() -> Result<CoreRegistry> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, process::Command, thread, time::Duration};
 
     use super::*;
 
@@ -934,19 +1145,26 @@ mod tests {
                     "port": 24443,
                     "config": {
                         "server_name": "example.com",
+                        "sni": "example.com",
                         "path": "/proxy",
                         "private_key_secret": "secret.private-key",
                         "short_id_secret": "secret.short-id",
                         "password_secret": "secret.password",
                         "shadow_tls_password_secret": "secret.shadow-tls",
+                        "restls_password_secret": "secret.restls",
+                        "jls_username_secret": "secret.jls-username",
+                        "jls_password_secret": "secret.jls-password",
                         "psk_secret": "secret.psk"
                     },
                     "users": [{"username": "alice", "uuid": "11111111-1111-4111-8111-111111111111"}],
                     "resolved_secrets": {
                         "secret.private-key": "private-key",
                         "secret.short-id": "0123456789abcdef",
-                        "secret.password": "password",
+                        "secret.password": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
                         "secret.shadow-tls": "shadow-tls-password",
+                        "secret.restls": "restls-password",
+                        "secret.jls-username": "jls-user",
+                        "secret.jls-password": "jls-password",
                         "secret.psk": "pre-shared-key"
                     }
                 }),
@@ -1096,7 +1314,7 @@ mod tests {
             .find(|manifest| manifest.id == "sing-box")
             .context("sing-box manifest is missing")?;
 
-        for capability in MIHOMO_CAPABILITIES {
+        for capability in MIHOMO_EXCLUSIVE_CAPABILITIES {
             assert!(mihomo.capabilities.contains(*capability));
             assert!(!sing_box.capabilities.contains(*capability));
         }
@@ -1116,13 +1334,300 @@ mod tests {
             config: "/tmp/infiproxy-unused-sing-box-config.json",
             capabilities: SING_BOX_CAPABILITIES,
             selection_priority: 10,
+            validated_version: "v1.13.20",
+            version_file: None,
         })))?;
 
-        for capability in MIHOMO_CAPABILITIES {
+        for capability in MIHOMO_EXCLUSIVE_CAPABILITIES {
             let required = BTreeSet::from([(*capability).to_string()]);
             assert!(selection_registry.select(&required, None)?.is_none());
         }
         fs::remove_file(binary)?;
+        Ok(())
+    }
+
+    #[test]
+    fn core_selection_refuses_an_installed_runtime_outside_its_exact_contract() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let binary = std::env::temp_dir().join(format!("infiproxy-core-{suffix}"));
+        let version_file = std::env::temp_dir().join(format!("infiproxy-version-{suffix}"));
+        fs::write(&binary, b"installed")?;
+        fs::write(&version_file, b"v26.7.11\n")?;
+
+        let mut registry = CoreRegistry::default();
+        registry.register(Arc::new(ManagedCoreAdapter::new(ManagedCoreSpec {
+            id: "xray",
+            display_name: "Xray",
+            service: "infiproxy-xray.service",
+            flavor: Flavor::Xray,
+            binary: binary.to_str().context("temporary path is not UTF-8")?,
+            config: "/tmp/infiproxy-unused-xray-config.json",
+            capabilities: XRAY_CAPABILITIES,
+            selection_priority: 100,
+            validated_version: "v26.3.27",
+            version_file: Some(
+                version_file
+                    .to_str()
+                    .context("temporary path is not UTF-8")?,
+            ),
+        })))?;
+        let required = BTreeSet::from(["vless-reality-tcp".to_string()]);
+        assert!(registry.select(&required, None)?.is_none());
+        assert!(registry.select(&required, Some("xray")).is_err());
+
+        fs::remove_file(binary)?;
+        fs::remove_file(version_file)?;
+        Ok(())
+    }
+
+    fn replace_string(value: &mut Value, target: &str, replacement: &str) {
+        match value {
+            Value::String(text) if text == target => *text = replacement.to_string(),
+            Value::Array(values) => {
+                for value in values {
+                    replace_string(value, target, replacement);
+                }
+            }
+            Value::Object(values) => {
+                for value in values.values_mut() {
+                    replace_string(value, target, replacement);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn exact_mihomo_parser_accepts_every_advertised_server_capability() -> Result<()> {
+        let Some(binary) = std::env::var_os("INFIPROXY_TEST_MIHOMO_BIN") else {
+            return Ok(());
+        };
+        let directory =
+            std::env::temp_dir().join(format!("infiproxy-mihomo-server-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let certificate = directory.join("certificate.pem");
+        let private_key = directory.join("private-key.pem");
+        let certificate_status = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+            .args(["-subj", "/CN=example.com", "-days", "1"])
+            .arg("-keyout")
+            .arg(&private_key)
+            .arg("-out")
+            .arg(&certificate)
+            .output()?;
+        if !certificate_status.status.success() {
+            bail!("could not generate isolated compatibility certificate");
+        }
+
+        for capability in MIHOMO_CAPABILITIES {
+            let mut plan = minimal_plan("mihomo", capability);
+            plan.fragments[0].payload["resolved_secrets"]["secret.private-key"] =
+                json!("AG07sMd7f9K5EKNYf3tuSH3cc6AwZSBEX4t26cng-Vk");
+            let mut rendered = compose_mihomo(&plan)?;
+            replace_string(
+                &mut rendered,
+                CERTIFICATE_PATH,
+                certificate
+                    .to_str()
+                    .context("certificate path is not UTF-8")?,
+            );
+            replace_string(
+                &mut rendered,
+                PRIVATE_KEY_PATH,
+                private_key
+                    .to_str()
+                    .context("private key path is not UTF-8")?,
+            );
+            let candidate = directory.join(format!("{capability}.yaml"));
+            fs::write(&candidate, serde_norway::to_string(&rendered)?)?;
+            let output = Command::new(&binary)
+                .args(["-t", "-f"])
+                .arg(&candidate)
+                .output()?;
+            if !output.status.success() {
+                bail!(
+                    "Mihomo v1.19.30 rejected server capability {capability}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_xray_and_sing_box_parsers_accept_advertised_capabilities() -> Result<()> {
+        let xray = std::env::var_os("INFIPROXY_TEST_XRAY_BIN");
+        let sing_box = std::env::var_os("INFIPROXY_TEST_SING_BOX_BIN");
+        if xray.is_none() && sing_box.is_none() {
+            return Ok(());
+        }
+        let directory =
+            std::env::temp_dir().join(format!("infiproxy-pinned-cores-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let certificate = directory.join("certificate.pem");
+        let private_key = directory.join("private-key.pem");
+        let certificate_status = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+            .args(["-subj", "/CN=example.com", "-days", "1"])
+            .arg("-keyout")
+            .arg(&private_key)
+            .arg("-out")
+            .arg(&certificate)
+            .output()?;
+        if !certificate_status.status.success() {
+            bail!("could not generate isolated compatibility certificate");
+        }
+
+        if let Some(binary) = xray {
+            for capability in XRAY_CAPABILITIES {
+                let mut plan = minimal_plan("xray", capability);
+                plan.fragments[0].payload["resolved_secrets"]["secret.private-key"] =
+                    json!("AG07sMd7f9K5EKNYf3tuSH3cc6AwZSBEX4t26cng-Vk");
+                let candidate = directory.join(format!("xray-{capability}.json"));
+                fs::write(
+                    &candidate,
+                    serde_json::to_vec_pretty(&compose_xray(&plan)?)?,
+                )?;
+                let output = Command::new(&binary)
+                    .args(["run", "-test", "-config"])
+                    .arg(&candidate)
+                    .output()?;
+                if !output.status.success() {
+                    bail!(
+                        "Xray v26.3.27 rejected {capability}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        if let Some(binary) = sing_box {
+            for capability in SING_BOX_CAPABILITIES {
+                let mut plan = minimal_plan("sing-box", capability);
+                plan.fragments[0].payload["resolved_secrets"]["secret.private-key"] =
+                    json!("AG07sMd7f9K5EKNYf3tuSH3cc6AwZSBEX4t26cng-Vk");
+                let mut rendered = compose_sing_box(&plan)?;
+                replace_string(
+                    &mut rendered,
+                    CERTIFICATE_PATH,
+                    certificate
+                        .to_str()
+                        .context("certificate path is not UTF-8")?,
+                );
+                replace_string(
+                    &mut rendered,
+                    PRIVATE_KEY_PATH,
+                    private_key
+                        .to_str()
+                        .context("private key path is not UTF-8")?,
+                );
+                let candidate = directory.join(format!("sing-box-{capability}.json"));
+                fs::write(&candidate, serde_json::to_vec_pretty(&rendered)?)?;
+                let output = Command::new(&binary)
+                    .args(["check", "-c"])
+                    .arg(&candidate)
+                    .output()?;
+                if !output.status.success() {
+                    bail!(
+                        "sing-box v1.13.20 rejected {capability}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+            }
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_hysteria_and_tuic_accept_isolated_generated_configs() -> Result<()> {
+        let hysteria = std::env::var_os("INFIPROXY_TEST_HYSTERIA_BIN");
+        let tuic = std::env::var_os("INFIPROXY_TEST_TUIC_BIN");
+        if hysteria.is_none() && tuic.is_none() {
+            return Ok(());
+        }
+        let directory =
+            std::env::temp_dir().join(format!("infiproxy-native-cores-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&directory)?;
+        let certificate = directory.join("certificate.pem");
+        let private_key = directory.join("private-key.pem");
+        let certificate_status = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+            .args(["-subj", "/CN=example.com", "-days", "1"])
+            .arg("-keyout")
+            .arg(&private_key)
+            .arg("-out")
+            .arg(&certificate)
+            .output()?;
+        if !certificate_status.status.success() {
+            bail!("could not generate isolated compatibility certificate");
+        }
+
+        if let Some(binary) = hysteria {
+            let mut rendered = compose_hysteria(&minimal_plan("hysteria", "hysteria2"))?;
+            replace_string(
+                &mut rendered,
+                CERTIFICATE_PATH,
+                certificate
+                    .to_str()
+                    .context("certificate path is not UTF-8")?,
+            );
+            replace_string(
+                &mut rendered,
+                PRIVATE_KEY_PATH,
+                private_key
+                    .to_str()
+                    .context("private key path is not UTF-8")?,
+            );
+            rendered["listen"] = json!("127.0.0.1:0");
+            let candidate = directory.join("hysteria.yaml");
+            fs::write(&candidate, serde_norway::to_string(&rendered)?)?;
+            assert_starts_under_timeout(
+                Command::new(binary)
+                    .args(["server", "--disable-update-check", "-c"])
+                    .arg(candidate),
+                "Hysteria app/v2.12.2",
+            )?;
+        }
+        if let Some(binary) = tuic {
+            let mut rendered = compose_tuic(&minimal_plan("tuic", "tuic"))?;
+            replace_string(
+                &mut rendered,
+                CERTIFICATE_PATH,
+                certificate
+                    .to_str()
+                    .context("certificate path is not UTF-8")?,
+            );
+            replace_string(
+                &mut rendered,
+                PRIVATE_KEY_PATH,
+                private_key
+                    .to_str()
+                    .context("private key path is not UTF-8")?,
+            );
+            rendered["server"] = json!("127.0.0.1:0");
+            let candidate = directory.join("tuic.json");
+            fs::write(&candidate, serde_json::to_vec_pretty(&rendered)?)?;
+            assert_starts_under_timeout(
+                Command::new(binary).arg("-c").arg(candidate),
+                "TUIC server 1.0.0",
+            )?;
+        }
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    fn assert_starts_under_timeout(command: &mut Command, runtime: &str) -> Result<()> {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn()?;
+        thread::sleep(Duration::from_millis(500));
+        if child.try_wait()?.is_some() {
+            bail!("{runtime} rejected or could not start the isolated config");
+        }
+        child.kill()?;
+        child.wait()?;
         Ok(())
     }
 }

@@ -10,7 +10,7 @@ use crate::{
         AdapterMaturity, ClientRenderContext, ConfigField, ConfigFieldKind, ListenerClaim,
         ListenerNetwork, ProtocolAdapter, ProtocolAdapterManifest, ProtocolComposition,
         ProtocolRegistry, SecretRef, ServerFragment, ServerRenderContext, UserParticipation,
-        ADAPTER_API_VERSION,
+        ValidatedRuntime, ADAPTER_API_VERSION,
     },
     models::{ProtocolProfile, ProxyRole},
 };
@@ -21,11 +21,21 @@ enum Implementation {
     VlessTcp,
     ShadowsocksShadowTls,
     Hysteria,
-    AnyTls,
+    AnyTlsLegacy,
+    AnyTls(SecurityWrapper),
     Tuic,
-    TrojanTls,
-    SnellV5,
+    Trojan(SecurityWrapper),
+    SnellV5(Option<SecurityWrapper>),
     MieruTcp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SecurityWrapper {
+    StandardTls,
+    Reality,
+    ShadowTlsV3,
+    ResTls,
+    Jls,
 }
 
 struct JsonProtocolAdapter {
@@ -96,7 +106,13 @@ impl JsonProtocolAdapter {
 fn composition(implementation: Implementation) -> ProtocolComposition {
     let (protocol, transport, security, flow, maturity) = match implementation {
         Implementation::VlessXhttp => ("vless", "xhttp", "reality", None, AdapterMaturity::Stable),
-        Implementation::VlessTcp => ("vless", "tcp", "reality", None, AdapterMaturity::Stable),
+        Implementation::VlessTcp => (
+            "vless",
+            "tcp",
+            "reality",
+            Some("xtls-rprx-vision"),
+            AdapterMaturity::Stable,
+        ),
         Implementation::ShadowsocksShadowTls => (
             "shadowsocks-2022",
             "tcp",
@@ -111,10 +127,23 @@ fn composition(implementation: Implementation) -> ProtocolComposition {
             None,
             AdapterMaturity::Stable,
         ),
-        Implementation::AnyTls => ("anytls", "tcp", "tls", None, AdapterMaturity::Experimental),
+        Implementation::AnyTlsLegacy => {
+            ("anytls", "tcp", "tls", None, AdapterMaturity::Experimental)
+        }
+        Implementation::AnyTls(wrapper) => {
+            ("anytls", "tcp", wrapper.label(), None, wrapper.maturity())
+        }
         Implementation::Tuic => ("tuic-v5", "quic", "tls", None, AdapterMaturity::Stable),
-        Implementation::TrojanTls => ("trojan", "tcp", "tls+utls", None, AdapterMaturity::Stable),
-        Implementation::SnellV5 => ("snell-v5", "tcp", "psk", None, AdapterMaturity::Stable),
+        Implementation::Trojan(wrapper) => {
+            ("trojan", "tcp", wrapper.label(), None, wrapper.maturity())
+        }
+        Implementation::SnellV5(wrapper) => (
+            "snell-v5",
+            "tcp",
+            wrapper.map_or("psk", SecurityWrapper::label),
+            None,
+            wrapper.map_or(AdapterMaturity::Stable, SecurityWrapper::maturity),
+        ),
         Implementation::MieruTcp => (
             "mieru",
             "tcp",
@@ -129,6 +158,70 @@ fn composition(implementation: Implementation) -> ProtocolComposition {
         security: security.to_string(),
         flow: flow.map(str::to_string),
         maturity,
+        client_baseline: Some("Mihomo v1.19.30".to_string()),
+        preferred_runtime: Some(validated_runtime(implementation)),
+        fallback_runtime: fallback_runtime(implementation),
+        compatibility_note: compatibility_note(implementation).map(str::to_string),
+    }
+}
+
+impl SecurityWrapper {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::StandardTls => "tls",
+            Self::Reality => "reality",
+            Self::ShadowTlsV3 => "shadow-tls-v3",
+            Self::ResTls => "restls",
+            Self::Jls => "jls",
+        }
+    }
+
+    const fn maturity(self) -> AdapterMaturity {
+        match self {
+            Self::StandardTls | Self::Reality | Self::ShadowTlsV3 => AdapterMaturity::Stable,
+            Self::ResTls | Self::Jls => AdapterMaturity::Experimental,
+        }
+    }
+}
+
+fn validated_runtime(implementation: Implementation) -> ValidatedRuntime {
+    let (adapter_id, version, incompatible_from) = match implementation {
+        Implementation::ShadowsocksShadowTls | Implementation::AnyTlsLegacy => {
+            ("sing-box", "v1.13.20", None)
+        }
+        Implementation::Hysteria => ("hysteria", "app/v2.12.2", None),
+        Implementation::Tuic => ("tuic", "tuic-server-1.0.0", None),
+        _ => ("mihomo", "v1.19.30", None),
+    };
+    ValidatedRuntime {
+        adapter_id: adapter_id.to_string(),
+        version: version.to_string(),
+        exact_pin: true,
+        incompatible_from: incompatible_from.map(str::to_string),
+    }
+}
+
+fn fallback_runtime(implementation: Implementation) -> Option<ValidatedRuntime> {
+    matches!(
+        implementation,
+        Implementation::VlessTcp | Implementation::VlessXhttp
+    )
+    .then(|| ValidatedRuntime {
+        adapter_id: "xray".to_string(),
+        version: "v26.3.27".to_string(),
+        exact_pin: true,
+        incompatible_from: Some("v26.7.11".to_string()),
+    })
+}
+
+const fn compatibility_note(implementation: Implementation) -> Option<&'static str> {
+    match implementation {
+        Implementation::VlessXhttp => Some("XHTTP must not use Vision flow."),
+        Implementation::VlessTcp => Some("Vision and XUDP are required by this profile."),
+        Implementation::AnyTlsLegacy | Implementation::AnyTls(_) => {
+            Some("AnyTLS with REALITY is unsupported by Mihomo.")
+        }
+        _ => None,
     }
 }
 
@@ -169,7 +262,9 @@ impl ProtocolAdapter for JsonProtocolAdapter {
             .context("adapter configuration must be an object")?;
         if matches!(
             self.implementation,
-            Implementation::VlessXhttp | Implementation::VlessTcp
+            Implementation::VlessXhttp
+                | Implementation::VlessTcp
+                | Implementation::Trojan(SecurityWrapper::Reality)
         ) {
             object
                 .entry("private_key_secret")
@@ -207,7 +302,9 @@ impl ProtocolAdapter for JsonProtocolAdapter {
         self.validate_config(self.manifest.schema_version, config)?;
         if matches!(
             self.implementation,
-            Implementation::VlessXhttp | Implementation::VlessTcp
+            Implementation::VlessXhttp
+                | Implementation::VlessTcp
+                | Implementation::Trojan(SecurityWrapper::Reality)
         ) {
             return Ok(vec![SecretRef::parse(
                 self.required_text(config, "private_key_secret")?,
@@ -253,6 +350,9 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                     ("udp".to_string(), json!(true)),
                     ("uuid".to_string(), json!(context.user.uuid)),
                     ("encryption".to_string(), json!("")),
+                    ("network".to_string(), json!("tcp")),
+                    ("flow".to_string(), json!("xtls-rprx-vision")),
+                    ("packet-encoding".to_string(), json!("xudp")),
                     ("tls".to_string(), json!(true)),
                     (
                         "servername".to_string(),
@@ -317,7 +417,7 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 }
                 Value::Object(proxy)
             }
-            Implementation::AnyTls => {
+            Implementation::AnyTlsLegacy => {
                 let mut proxy = self.base(context, "anytls");
                 proxy.extend(Map::from_iter([
                     (
@@ -331,6 +431,23 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                         json!(self.required_text(&context.profile.config, "sni")?),
                     ),
                 ]));
+                Value::Object(proxy)
+            }
+            Implementation::AnyTls(wrapper) => {
+                let mut proxy = self.base(context, "anytls");
+                proxy.extend(Map::from_iter([
+                    (
+                        "password".to_string(),
+                        json!(self.secret(context, "password_secret")?),
+                    ),
+                    ("client-fingerprint".to_string(), json!("chrome")),
+                    ("udp".to_string(), json!(true)),
+                    (
+                        "sni".to_string(),
+                        json!(self.required_text(&context.profile.config, "sni")?),
+                    ),
+                ]));
+                apply_client_wrapper(self, context, &mut proxy, wrapper)?;
                 Value::Object(proxy)
             }
             Implementation::Tuic => {
@@ -350,11 +467,12 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 ]));
                 Value::Object(proxy)
             }
-            Implementation::TrojanTls => {
+            Implementation::Trojan(wrapper) => {
                 let mut proxy = self.base(context, "trojan");
                 proxy.extend(Map::from_iter([
                     ("password".to_string(), json!(context.user.uuid)),
                     ("udp".to_string(), json!(true)),
+                    ("network".to_string(), json!("tcp")),
                     (
                         "sni".to_string(),
                         json!(self.required_text(&context.profile.config, "sni")?),
@@ -362,9 +480,10 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                     ("alpn".to_string(), json!(["h2", "http/1.1"])),
                     ("client-fingerprint".to_string(), json!("chrome")),
                 ]));
+                apply_client_wrapper(self, context, &mut proxy, wrapper)?;
                 Value::Object(proxy)
             }
-            Implementation::SnellV5 => {
+            Implementation::SnellV5(wrapper) => {
                 let mut proxy = self.base(context, "snell");
                 proxy.extend(Map::from_iter([
                     (
@@ -374,6 +493,9 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                     ("version".to_string(), json!(5)),
                     ("udp".to_string(), json!(true)),
                 ]));
+                if let Some(wrapper) = wrapper {
+                    apply_snell_client_wrapper(self, context, &mut proxy, wrapper)?;
+                }
                 Value::Object(proxy)
             }
             Implementation::MieruTcp => {
@@ -437,6 +559,83 @@ impl ProtocolAdapter for JsonProtocolAdapter {
     }
 }
 
+fn apply_client_wrapper(
+    adapter: &JsonProtocolAdapter,
+    context: &ClientRenderContext<'_>,
+    proxy: &mut Map<String, Value>,
+    wrapper: SecurityWrapper,
+) -> Result<()> {
+    match wrapper {
+        SecurityWrapper::StandardTls => {}
+        SecurityWrapper::Reality => {
+            proxy.insert(
+                "reality-opts".to_string(),
+                json!({
+                    "public-key": adapter.secret(context, "public_key_secret")?,
+                    "short-id": adapter.secret(context, "short_id_secret")?
+                }),
+            );
+        }
+        SecurityWrapper::ShadowTlsV3 => {
+            proxy.insert(
+                "shadow-tls-opts".to_string(),
+                json!({
+                    "version": 3,
+                    "password": adapter.secret(context, "shadow_tls_password_secret")?
+                }),
+            );
+        }
+        SecurityWrapper::ResTls => {
+            proxy.insert(
+                "restls-opts".to_string(),
+                json!({
+                    "password": adapter.secret(context, "restls_password_secret")?,
+                    "version-hint": "tls13"
+                }),
+            );
+        }
+        SecurityWrapper::Jls => {
+            proxy.insert(
+                "jls-opts".to_string(),
+                json!({
+                    "username": adapter.secret(context, "jls_username_secret")?,
+                    "password": adapter.secret(context, "jls_password_secret")?
+                }),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_snell_client_wrapper(
+    adapter: &JsonProtocolAdapter,
+    context: &ClientRenderContext<'_>,
+    proxy: &mut Map<String, Value>,
+    wrapper: SecurityWrapper,
+) -> Result<()> {
+    let host = adapter.required_text(&context.profile.config, "sni")?;
+    let options = match wrapper {
+        SecurityWrapper::ShadowTlsV3 => json!({
+            "mode": "shadow-tls", "host": host, "version": 3,
+            "password": adapter.secret(context, "shadow_tls_password_secret")?
+        }),
+        SecurityWrapper::ResTls => json!({
+            "mode": "restls", "host": host, "version-hint": "tls13",
+            "password": adapter.secret(context, "restls_password_secret")?
+        }),
+        SecurityWrapper::Jls => json!({
+            "mode": "jls", "host": host,
+            "username": adapter.secret(context, "jls_username_secret")?,
+            "password": adapter.secret(context, "jls_password_secret")?
+        }),
+        SecurityWrapper::StandardTls | SecurityWrapper::Reality => {
+            bail!("unsupported Snell security wrapper")
+        }
+    };
+    proxy.insert("obfs-opts".to_string(), options);
+    Ok(())
+}
+
 fn text(name: &str, label: &str, help: &str) -> ConfigField {
     ConfigField {
         name: name.to_string(),
@@ -455,6 +654,75 @@ fn secret(name: &str, label: &str, help: &str, required: bool) -> ConfigField {
         kind: ConfigFieldKind::SecretRef,
         required,
     }
+}
+
+fn password_and_sni_fields() -> Vec<ConfigField> {
+    vec![
+        secret(
+            "password_secret",
+            "Password",
+            "Secret reference containing the shared protocol password.",
+            true,
+        ),
+        text("sni", "SNI", "TLS or camouflage destination hostname."),
+    ]
+}
+
+fn wrapper_fields(wrapper: SecurityWrapper) -> Vec<ConfigField> {
+    match wrapper {
+        SecurityWrapper::StandardTls => Vec::new(),
+        SecurityWrapper::Reality => vec![
+            secret(
+                "public_key_secret",
+                "REALITY public key",
+                "Client-visible REALITY public key reference.",
+                true,
+            ),
+            secret(
+                "short_id_secret",
+                "REALITY short ID",
+                "Client-visible REALITY short ID reference.",
+                true,
+            ),
+            secret(
+                "private_key_secret",
+                "REALITY private key",
+                "Root-resolved server-only private key reference.",
+                true,
+            ),
+        ],
+        SecurityWrapper::ShadowTlsV3 => vec![secret(
+            "shadow_tls_password_secret",
+            "ShadowTLS v3 password",
+            "Shared ShadowTLS v3 credential reference.",
+            true,
+        )],
+        SecurityWrapper::ResTls => vec![secret(
+            "restls_password_secret",
+            "ResTLS password",
+            "Shared ResTLS credential reference.",
+            true,
+        )],
+        SecurityWrapper::Jls => vec![
+            secret(
+                "jls_username_secret",
+                "JLS username",
+                "Shared JLS username reference.",
+                true,
+            ),
+            secret(
+                "jls_password_secret",
+                "JLS password",
+                "Shared JLS password reference.",
+                true,
+            ),
+        ],
+    }
+}
+
+fn wrapped_fields(mut base: Vec<ConfigField>, wrapper: SecurityWrapper) -> Vec<ConfigField> {
+    base.extend(wrapper_fields(wrapper));
+    base
 }
 
 pub(super) fn registry() -> Result<ProtocolRegistry> {
@@ -567,17 +835,41 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
         ),
         JsonProtocolAdapter::new(
             "any-tls",
-            "AnyTLS",
-            Implementation::AnyTls,
-            vec![
-                secret(
-                    "password_secret",
-                    "Password",
-                    "Secret reference containing the authentication password.",
-                    true,
-                ),
-                text("sni", "SNI", "TLS certificate hostname."),
-            ],
+            "AnyTLS TLS (legacy ID)",
+            Implementation::AnyTlsLegacy,
+            password_and_sni_fields(),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "anytls-tls",
+            "AnyTLS TLS",
+            Implementation::AnyTls(SecurityWrapper::StandardTls),
+            password_and_sni_fields(),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "anytls-shadowtls-v3",
+            "AnyTLS + ShadowTLS v3",
+            Implementation::AnyTls(SecurityWrapper::ShadowTlsV3),
+            wrapped_fields(password_and_sni_fields(), SecurityWrapper::ShadowTlsV3),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "anytls-restls",
+            "AnyTLS + ResTLS",
+            Implementation::AnyTls(SecurityWrapper::ResTls),
+            wrapped_fields(password_and_sni_fields(), SecurityWrapper::ResTls),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "anytls-jls",
+            "AnyTLS + JLS",
+            Implementation::AnyTls(SecurityWrapper::Jls),
+            wrapped_fields(password_and_sni_fields(), SecurityWrapper::Jls),
             UserParticipation::SharedCredential,
             ListenerNetwork::Tcp,
         ),
@@ -600,21 +892,122 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
         JsonProtocolAdapter::new(
             "trojan-tls",
             "Trojan TLS/uTLS",
-            Implementation::TrojanTls,
+            Implementation::Trojan(SecurityWrapper::StandardTls),
             vec![text("sni", "SNI", "TLS certificate hostname.")],
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "trojan-shadowtls-v3",
+            "Trojan + ShadowTLS v3",
+            Implementation::Trojan(SecurityWrapper::ShadowTlsV3),
+            wrapped_fields(
+                vec![text("sni", "SNI", "ShadowTLS destination hostname.")],
+                SecurityWrapper::ShadowTlsV3,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "trojan-restls",
+            "Trojan + ResTLS",
+            Implementation::Trojan(SecurityWrapper::ResTls),
+            wrapped_fields(
+                vec![text("sni", "SNI", "ResTLS destination hostname.")],
+                SecurityWrapper::ResTls,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "trojan-jls",
+            "Trojan + JLS",
+            Implementation::Trojan(SecurityWrapper::Jls),
+            wrapped_fields(
+                vec![text("sni", "SNI", "JLS destination hostname.")],
+                SecurityWrapper::Jls,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "trojan-reality",
+            "Trojan + REALITY",
+            Implementation::Trojan(SecurityWrapper::Reality),
+            wrapped_fields(
+                vec![text("sni", "SNI", "REALITY destination hostname.")],
+                SecurityWrapper::Reality,
+            ),
             UserParticipation::PerUserUuid,
             ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
             "snell-v5",
             "Snell v5",
-            Implementation::SnellV5,
+            Implementation::SnellV5(None),
             vec![secret(
                 "psk_secret",
                 "Pre-shared key",
                 "Secret reference containing the shared Snell key.",
                 true,
             )],
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "snell-v5-shadowtls-v3",
+            "Snell v5 + ShadowTLS v3",
+            Implementation::SnellV5(Some(SecurityWrapper::ShadowTlsV3)),
+            wrapped_fields(
+                vec![
+                    secret(
+                        "psk_secret",
+                        "Pre-shared key",
+                        "Shared Snell key reference.",
+                        true,
+                    ),
+                    text("sni", "SNI", "ShadowTLS destination hostname."),
+                ],
+                SecurityWrapper::ShadowTlsV3,
+            ),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "snell-v5-restls",
+            "Snell v5 + ResTLS",
+            Implementation::SnellV5(Some(SecurityWrapper::ResTls)),
+            wrapped_fields(
+                vec![
+                    secret(
+                        "psk_secret",
+                        "Pre-shared key",
+                        "Shared Snell key reference.",
+                        true,
+                    ),
+                    text("sni", "SNI", "ResTLS destination hostname."),
+                ],
+                SecurityWrapper::ResTls,
+            ),
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "snell-v5-jls",
+            "Snell v5 + JLS",
+            Implementation::SnellV5(Some(SecurityWrapper::Jls)),
+            wrapped_fields(
+                vec![
+                    secret(
+                        "psk_secret",
+                        "Pre-shared key",
+                        "Shared Snell key reference.",
+                        true,
+                    ),
+                    text("sni", "SNI", "JLS destination hostname."),
+                ],
+                SecurityWrapper::Jls,
+            ),
             UserParticipation::SharedCredential,
             ListenerNetwork::Tcp,
         ),
@@ -670,6 +1063,34 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
             json!({"password_secret":"anytls.password","sni":"www.apple.com"}),
         ),
         profile(
+            "ANYTLS-TLS",
+            "anytls-tls",
+            ProxyRole::Compatibility,
+            10543,
+            json!({"password_secret":"anytls.password","sni":"node.infiproxy.local"}),
+        ),
+        profile(
+            "ANYTLS-SHADOWTLS-V3",
+            "anytls-shadowtls-v3",
+            ProxyRole::Compatibility,
+            10643,
+            json!({"password_secret":"anytls.password","sni":"www.apple.com","shadow_tls_password_secret":"shadowtls.password"}),
+        ),
+        profile(
+            "ANYTLS-RESTLS-EXPERIMENTAL",
+            "anytls-restls",
+            ProxyRole::Compatibility,
+            10743,
+            json!({"password_secret":"anytls.password","sni":"www.apple.com","restls_password_secret":"restls.password"}),
+        ),
+        profile(
+            "ANYTLS-JLS-EXPERIMENTAL",
+            "anytls-jls",
+            ProxyRole::Compatibility,
+            10843,
+            json!({"password_secret":"anytls.password","sni":"www.apple.com","jls_username_secret":"jls.username","jls_password_secret":"jls.password"}),
+        ),
+        profile(
             "HYSTERIA2-SPEED",
             "hysteria2",
             ProxyRole::Speed,
@@ -691,11 +1112,60 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
             json!({"sni":"node.infiproxy.local"}),
         ),
         profile(
+            "TROJAN-SHADOWTLS-V3",
+            "trojan-shadowtls-v3",
+            ProxyRole::Compatibility,
+            12543,
+            json!({"sni":"www.apple.com","shadow_tls_password_secret":"shadowtls.password"}),
+        ),
+        profile(
+            "TROJAN-RESTLS-EXPERIMENTAL",
+            "trojan-restls",
+            ProxyRole::Compatibility,
+            12643,
+            json!({"sni":"www.apple.com","restls_password_secret":"restls.password"}),
+        ),
+        profile(
+            "TROJAN-JLS-EXPERIMENTAL",
+            "trojan-jls",
+            ProxyRole::Compatibility,
+            12743,
+            json!({"sni":"www.apple.com","jls_username_secret":"jls.username","jls_password_secret":"jls.password"}),
+        ),
+        profile(
+            "TROJAN-REALITY",
+            "trojan-reality",
+            ProxyRole::Compatibility,
+            12843,
+            json!({"sni":"www.microsoft.com","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id","private_key_secret":"xray.reality.private_key"}),
+        ),
+        profile(
             "SNELL-V5-COMPATIBILITY",
             "snell-v5",
             ProxyRole::Compatibility,
             13443,
             json!({"psk_secret":"snell.psk"}),
+        ),
+        profile(
+            "SNELL-V5-SHADOWTLS-V3",
+            "snell-v5-shadowtls-v3",
+            ProxyRole::Compatibility,
+            13543,
+            json!({"psk_secret":"snell.psk","sni":"www.apple.com","shadow_tls_password_secret":"shadowtls.password"}),
+        ),
+        profile(
+            "SNELL-V5-RESTLS-EXPERIMENTAL",
+            "snell-v5-restls",
+            ProxyRole::Compatibility,
+            13643,
+            json!({"psk_secret":"snell.psk","sni":"www.apple.com","restls_password_secret":"restls.password"}),
+        ),
+        profile(
+            "SNELL-V5-JLS-EXPERIMENTAL",
+            "snell-v5-jls",
+            ProxyRole::Compatibility,
+            13743,
+            json!({"psk_secret":"snell.psk","sni":"www.apple.com","jls_username_secret":"jls.username","jls_password_secret":"jls.password"}),
         ),
         profile(
             "MIERU-TCP-COMPATIBILITY",
@@ -711,11 +1181,25 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
 #[must_use]
 pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
     match protocol_id {
-        "vless-reality-xhttp" | "vless-reality-tcp" => Some("xray"),
         "shadowsocks2022-shadow-tls" | "any-tls" => Some("sing-box"),
         "hysteria2" => Some("hysteria"),
         "tuic" => Some("tuic"),
-        "trojan-tls" | "snell-v5" | "mieru" => Some("mihomo"),
+        "vless-reality-xhttp"
+        | "vless-reality-tcp"
+        | "anytls-tls"
+        | "anytls-shadowtls-v3"
+        | "anytls-restls"
+        | "anytls-jls"
+        | "trojan-tls"
+        | "trojan-shadowtls-v3"
+        | "trojan-restls"
+        | "trojan-jls"
+        | "trojan-reality"
+        | "snell-v5"
+        | "snell-v5-shadowtls-v3"
+        | "snell-v5-restls"
+        | "snell-v5-jls"
+        | "mieru" => Some("mihomo"),
         _ => None,
     }
 }
@@ -743,7 +1227,7 @@ fn profile(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, fs, process::Command};
 
     use super::*;
     use crate::{
@@ -832,5 +1316,145 @@ mod tests {
             assert_eq!(rendered["type"], expected_type);
             serde_norway::to_string(&rendered).unwrap();
         }
+    }
+
+    fn test_secrets() -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "xray.reality.public_key".into(),
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            ),
+            ("xray.reality.short_id".into(), "0123456789abcdef".into()),
+            ("xray.reality.private_key".into(), "server-only".into()),
+            (
+                "shadowsocks.2022.password".into(),
+                "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=".into(),
+            ),
+            ("shadowtls.password".into(), "shadow-tls-password".into()),
+            ("anytls.password".into(), "anytls-password".into()),
+            ("restls.password".into(), "restls-password".into()),
+            ("jls.username".into(), "jls-user".into()),
+            ("jls.password".into(), "jls-password".into()),
+            ("hysteria2.password".into(), "hysteria-password".into()),
+            (
+                "hysteria2.obfs_password".into(),
+                "salamander-password".into(),
+            ),
+            ("tuic.password".into(), "tuic-password".into()),
+            ("snell.psk".into(), "snell-password".into()),
+            ("mieru.password".into(), "mieru-password".into()),
+        ])
+    }
+
+    #[test]
+    fn every_default_client_composition_renders_without_conflicting_security() {
+        let registry = registry().unwrap();
+        let user = SubscriptionUser {
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "token".to_string(),
+        };
+        let secrets = test_secrets();
+        let resolver = MapSecretResolver::new(&secrets);
+        for profile in default_profiles() {
+            let rendered = registry
+                .get(&profile.protocol_id)
+                .unwrap()
+                .render_client(&ClientRenderContext {
+                    profile: &profile,
+                    user: &user,
+                    secrets: &resolver,
+                })
+                .unwrap_or_else(|error| panic!("{}: {error:#}", profile.protocol_id));
+            let wrappers = ["reality-opts", "shadow-tls-opts", "restls-opts", "jls-opts"]
+                .into_iter()
+                .filter(|field| rendered.get(field).is_some())
+                .count();
+            assert!(
+                wrappers <= 1,
+                "{} has conflicting wrappers",
+                profile.protocol_id
+            );
+            if profile.protocol_id == "vless-reality-tcp" {
+                assert_eq!(rendered["network"], "tcp");
+                assert_eq!(rendered["flow"], "xtls-rprx-vision");
+                assert_eq!(rendered["packet-encoding"], "xudp");
+            }
+            if profile.protocol_id == "vless-reality-xhttp" {
+                assert_eq!(rendered["network"], "xhttp");
+                assert!(rendered.get("flow").is_none());
+            }
+            if profile.protocol_id == "anytls-jls" {
+                assert!(rendered.get("jls-opts").is_some());
+                assert!(rendered.get("reality-opts").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn anytls_reality_is_not_an_exposed_capability() {
+        let manifests = registry().unwrap().manifests();
+        assert!(manifests
+            .iter()
+            .all(|manifest| manifest.id != "anytls-reality"));
+    }
+
+    #[test]
+    fn exact_mihomo_client_parser_accepts_all_generated_compositions() {
+        let Some(binary) = std::env::var_os("INFIPROXY_TEST_MIHOMO_BIN") else {
+            return;
+        };
+        let registry = registry().unwrap();
+        let user = SubscriptionUser {
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "token".to_string(),
+        };
+        let mut secrets = test_secrets();
+        secrets.insert(
+            "xray.reality.public_key".to_string(),
+            "w1LlLliIbRGiRssXh-yKrLONwRaYlezwfihTFaCEaUw".to_string(),
+        );
+        let resolver = MapSecretResolver::new(&secrets);
+        let proxies = default_profiles()
+            .iter()
+            .map(|profile| {
+                registry
+                    .get(&profile.protocol_id)
+                    .unwrap()
+                    .render_client(&ClientRenderContext {
+                        profile,
+                        user: &user,
+                        secrets: &resolver,
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let names = proxies
+            .iter()
+            .filter_map(|proxy| proxy.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let config = json!({
+            "mode": "rule",
+            "proxies": proxies,
+            "proxy-groups": [{"name":"COMPATIBILITY","type":"select","proxies":names}],
+            "rules": ["MATCH,COMPATIBILITY"]
+        });
+        let path = std::env::temp_dir().join(format!(
+            "infiproxy-mihomo-client-{}.yaml",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&path, serde_norway::to_string(&config).unwrap()).unwrap();
+        let output = Command::new(binary)
+            .args(["-t", "-f"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        fs::remove_file(path).unwrap();
+        assert!(
+            output.status.success(),
+            "Mihomo v1.19.30 rejected generated client config: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

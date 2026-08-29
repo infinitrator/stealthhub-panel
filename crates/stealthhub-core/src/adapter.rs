@@ -148,6 +148,23 @@ pub struct ProtocolComposition {
     pub security: String,
     pub flow: Option<String>,
     pub maturity: AdapterMaturity,
+    /// Exact Mihomo client parser baseline used for this composition.
+    pub client_baseline: Option<String>,
+    /// Preferred server adapter and its validated exact release.
+    pub preferred_runtime: Option<ValidatedRuntime>,
+    /// Optional compatibility runtime and its validated exact release.
+    pub fallback_runtime: Option<ValidatedRuntime>,
+    /// Sanitized operator-facing compatibility constraint or rationale.
+    pub compatibility_note: Option<String>,
+}
+
+/// Non-secret exact runtime contract attached to a protocol composition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidatedRuntime {
+    pub adapter_id: String,
+    pub version: String,
+    pub exact_pin: bool,
+    pub incompatible_from: Option<String>,
 }
 
 impl ProtocolComposition {
@@ -160,6 +177,10 @@ impl ProtocolComposition {
             security: "adapter-defined".to_string(),
             flow: None,
             maturity: AdapterMaturity::Experimental,
+            client_baseline: None,
+            preferred_runtime: None,
+            fallback_runtime: None,
+            compatibility_note: None,
         }
     }
 }
@@ -549,6 +570,10 @@ pub struct CoreAdapterObservation {
 pub trait CoreAdapter: Send + Sync {
     fn manifest(&self) -> &CoreAdapterManifest;
     fn installed(&self) -> Result<bool>;
+    /// Applies adapter-owned runtime-version constraints for selected capabilities.
+    fn compatible(&self, _required: &BTreeSet<String>) -> Result<bool> {
+        Ok(true)
+    }
     /// Current schema for optional adapter-owned durable settings.
     fn state_schema_version(&self) -> u32 {
         1
@@ -656,7 +681,10 @@ impl CoreRegistry {
                 .adapters
                 .get(preferred)
                 .ok_or_else(|| anyhow::anyhow!("preferred core adapter is missing"))?;
-            if required.is_subset(&adapter.manifest().capabilities) && adapter.installed()? {
+            if required.is_subset(&adapter.manifest().capabilities)
+                && adapter.compatible(required)?
+                && adapter.installed()?
+            {
                 return Ok(Some(adapter.clone()));
             }
             bail!("preferred core adapter is incompatible or not installed");
@@ -670,7 +698,7 @@ impl CoreRegistry {
             .collect::<Vec<_>>();
         compatible.sort_by_key(|adapter| std::cmp::Reverse(adapter.manifest().selection_priority));
         for adapter in compatible {
-            if adapter.installed()? {
+            if adapter.compatible(required)? && adapter.installed()? {
                 return Ok(Some(adapter));
             }
         }
@@ -693,7 +721,7 @@ impl CoreRegistry {
             .collect::<Vec<_>>();
         compatible.sort_by_key(|adapter| std::cmp::Reverse(adapter.manifest().selection_priority));
         for adapter in compatible {
-            if adapter.installed()? {
+            if adapter.compatible(required)? && adapter.installed()? {
                 return Ok(Some(adapter));
             }
         }

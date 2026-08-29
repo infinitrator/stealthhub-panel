@@ -1139,6 +1139,12 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
         }
         mark_bootstrap_complete(pool, "mihomo-protocol-profiles-v1").await?;
     }
+    if !bootstrap_complete(pool, "modern-security-compositions-v1").await? {
+        for profile in crate::adapters::default_profiles() {
+            ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
+        }
+        mark_bootstrap_complete(pool, "modern-security-compositions-v1").await?;
+    }
     Ok(())
 }
 
@@ -3196,6 +3202,7 @@ mod tests {
         ClientRenderContext, ConfigField, ProtocolAdapter, ProtocolAdapterManifest, ServerFragment,
         ServerRenderContext, ADAPTER_API_VERSION,
     };
+    use anyhow::Context;
     use std::{
         collections::BTreeSet,
         path::{Path, PathBuf},
@@ -3901,6 +3908,69 @@ mod tests {
             .await?
             .iter()
             .any(|profile| profile.protocol_id == "snell-v5"));
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modern_compositions_upgrade_is_idempotent_and_preserves_existing_profiles(
+    ) -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        update_protocol_profile(
+            &pool,
+            UpdateProtocolProfile {
+                name: "VLESS-XHTTP-SAFE".to_string(),
+                enabled: true,
+                server: "preserved.example.test".to_string(),
+                port: 19443,
+                preferred_core_id: Some("xray".to_string()),
+                managed_resource_id: None,
+                config: serde_json::json!({"server_name":"www.example.com","path":"/preserved","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id","private_key_secret":"xray.reality.private_key"}),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "DELETE FROM protocol_profiles WHERE kind IN ('anytls-tls','anytls-shadowtls-v3','anytls-restls','anytls-jls','trojan-shadowtls-v3','trojan-restls','trojan-jls','trojan-reality','snell-v5-shadowtls-v3','snell-v5-restls','snell-v5-jls')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM bootstrap_state WHERE key='modern-security-compositions-v1'")
+            .execute(&pool)
+            .await?;
+
+        ensure_default_protocol_profiles(&pool).await?;
+        let first = list_protocol_profiles_decoded(&pool).await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        let second = list_protocol_profiles_decoded(&pool).await?;
+        assert_eq!(first, second);
+        let preserved = first
+            .iter()
+            .find(|profile| profile.name == "VLESS-XHTTP-SAFE")
+            .context("preserved profile is missing")?;
+        assert!(preserved.enabled);
+        assert_eq!(preserved.server, "preserved.example.test");
+        assert_eq!(preserved.port, 19443);
+        assert_eq!(preserved.preferred_core_id.as_deref(), Some("xray"));
+        for profile in first.iter().filter(|profile| {
+            matches!(
+                profile.protocol_id.as_str(),
+                "anytls-tls"
+                    | "anytls-shadowtls-v3"
+                    | "anytls-restls"
+                    | "anytls-jls"
+                    | "trojan-shadowtls-v3"
+                    | "trojan-restls"
+                    | "trojan-jls"
+                    | "trojan-reality"
+                    | "snell-v5-shadowtls-v3"
+                    | "snell-v5-restls"
+                    | "snell-v5-jls"
+            )
+        }) {
+            assert!(!profile.enabled, "new composition was enabled by migration");
+        }
 
         close_and_remove(pool, &path).await;
         Ok(())

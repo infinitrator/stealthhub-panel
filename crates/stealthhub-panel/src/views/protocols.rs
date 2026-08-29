@@ -77,6 +77,8 @@ pub(crate) fn render(
                                             th { "Name" }
                                             th { "Kind" }
                                             th { "Composition" }
+                                            th { "Runtime contract" }
+                                            th { "Compatibility" }
                                             th { "Role" }
                                             th { "Enabled" }
                                             th { "Endpoint" }
@@ -90,6 +92,8 @@ pub(crate) fn render(
                                                 td { code { (&profile.name) } }
                                                 td { (protocol_label(profile, registry)) }
                                                 td { (protocol_composition(profile, registry)) }
+                                                td { (runtime_contract(profile, registry, inventory)) }
+                                                td { (compatibility_status(profile, registry, inventory)) }
                                                 td { (proxy_role_label(&profile.role)) }
                                                 td {
                                                     @if profile.enabled {
@@ -284,6 +288,75 @@ fn protocol_composition(profile: &ProtocolProfile, registry: &ProtocolRegistry) 
         }
         br;
         span class=(format!("badge {class}")) { (maturity) }
+    }
+}
+
+fn runtime_contract(
+    profile: &ProtocolProfile,
+    registry: &ProtocolRegistry,
+    inventory: &AdapterInventory,
+) -> Markup {
+    let Some(adapter) = registry.get(&profile.protocol_id) else {
+        return html! { span class="badge off" { "unavailable" } };
+    };
+    let composition = &adapter.manifest().composition;
+    let Some(runtime) = &composition.preferred_runtime else {
+        return html! { span class="badge neutral" { "adapter-defined" } };
+    };
+    let installed = inventory
+        .runtimes
+        .iter()
+        .find(|candidate| candidate.id == runtime.adapter_id)
+        .and_then(|candidate| candidate.version.as_deref())
+        .unwrap_or("not installed");
+    html! {
+        strong { (&runtime.adapter_id) }
+        br;
+        small { "installed " code { (installed) } }
+        br;
+        small { "validated " code { (&runtime.version) } }
+        @if let Some(fallback) = &composition.fallback_runtime {
+            br;
+            small { "fallback " code { (&fallback.adapter_id) " " (&fallback.version) } }
+        }
+    }
+}
+
+fn compatibility_status(
+    profile: &ProtocolProfile,
+    registry: &ProtocolRegistry,
+    inventory: &AdapterInventory,
+) -> Markup {
+    let Some(adapter) = registry.get(&profile.protocol_id) else {
+        return html! { span class="badge off" { "adapter missing" } };
+    };
+    let composition = &adapter.manifest().composition;
+    let status = composition.preferred_runtime.as_ref().and_then(|contract| {
+        inventory
+            .runtimes
+            .iter()
+            .find(|runtime| runtime.id == contract.adapter_id)
+            .map(|runtime| {
+                if runtime.version.as_deref() == Some(contract.version.as_str()) {
+                    ("ok", "validated")
+                } else if runtime.installed == Some(true) {
+                    ("off", "outside contract")
+                } else {
+                    ("neutral", "pending runtime")
+                }
+            })
+    });
+    let (class, label) = status.unwrap_or(("neutral", "not observed"));
+    html! {
+        span class=(format!("badge {class}")) { (label) }
+        @if let Some(baseline) = &composition.client_baseline {
+            br;
+            small { "client " code { (baseline) } }
+        }
+        @if let Some(note) = &composition.compatibility_note {
+            br;
+            small { (note) }
+        }
     }
 }
 
