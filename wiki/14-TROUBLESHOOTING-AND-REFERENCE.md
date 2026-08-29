@@ -402,7 +402,7 @@ readlink -f /opt/infiproxy/cores/MODULE/current
 | Hysteria | `hysteria version` |
 | Xray | `xray version`, fallback `xray --version` |
 | TUIC | `tuic-server --version` |
-| MTProxy | `--help`/`-h` и поиск ожидаемой usage-строки |
+| Mihomo | `mihomo -v` |
 
 Пример:
 
@@ -645,8 +645,8 @@ PTR, BGP origin и конкретный blocklist; не сводите реше�
 
 ## 21. Нехватка памяти или медленная сборка
 
-Runtime panel легкий, но Rust release build и MTProxy source build требуют
-больше RAM/CPU, чем работа готового binary.
+Runtime panel легкий, но Rust release build требует больше RAM/CPU, чем работа
+готового binary.
 
 Проверьте:
 
@@ -714,7 +714,7 @@ journalctl -k -g 'Out of memory\|Killed process' --no-pager
 | `infiproxy-sing-box.service` | long-running | sing-box current binary. |
 | `infiproxy-hysteria.service` | long-running | Hysteria current binary. |
 | `infiproxy-tuic.service` | long-running | TUIC current binary. |
-| `infiproxy-mtproto.service` | long-running | Telegram MTProxy current binary. |
+| `infiproxy-mihomo.service` | long-running | Mihomo current binary. |
 
 Команды:
 
@@ -736,8 +736,9 @@ journalctl -u UNIT -n 120 --no-pager
 | UDP `443` | Hysteria starter | Только если настроен. |
 | TCP `127.0.0.1:8080` | Infiproxy | Нет. |
 | TCP `8443` | VLESS XHTTP starter profile | Да, после настройки Xray inbound. |
-| TCP `8444` | MTProxy starter | Да, если настроен. |
-| TCP `8888` | MTProxy stats согласно runtime args/unit | Нет. |
+| TCP `12443` | Trojan TLS starter | Да, если настроен. |
+| TCP `13443` | Snell v5 starter | Да, если настроен. |
+| TCP `14443` | Mieru TCP starter | Да, если настроен. |
 | UDP `11443` | TUIC starter | Да, если настроен. |
 | Configurable | Xray/sing-box inbounds | По конфигу. |
 
@@ -878,7 +879,7 @@ sudo /usr/local/sbin/infiproxy-module-update --check-all \
 - usernames/IP, если они чувствительны;
 - cookies и authorization headers;
 - UUID/password/REALITY data;
-- Cloudflare/pre-auth/MTProto secrets;
+- Cloudflare и proxy secrets;
 - private keys;
 - полный config и SQLite dumps.
 

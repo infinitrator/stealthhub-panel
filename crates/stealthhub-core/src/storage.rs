@@ -1119,13 +1119,26 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
-    if bootstrap_complete(pool, "protocol-profiles").await? {
-        return Ok(());
+    if !bootstrap_complete(pool, "protocol-profiles").await? {
+        for profile in crate::adapters::default_profiles() {
+            ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
+        }
+        mark_bootstrap_complete(pool, "protocol-profiles").await?;
     }
-    for profile in crate::adapters::default_profiles() {
-        ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
+    if !bootstrap_complete(pool, "mihomo-protocol-profiles-v1").await? {
+        for profile in crate::adapters::default_profiles()
+            .into_iter()
+            .filter(|profile| {
+                matches!(
+                    profile.protocol_id.as_str(),
+                    "trojan-tls" | "snell-v5" | "mieru"
+                )
+            })
+        {
+            ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
+        }
+        mark_bootstrap_complete(pool, "mihomo-protocol-profiles-v1").await?;
     }
-    mark_bootstrap_complete(pool, "protocol-profiles").await?;
     Ok(())
 }
 
@@ -3810,7 +3823,8 @@ mod tests {
 
         ensure_default_protocol_profiles(&pool).await?;
         let profiles = list_protocol_profiles_decoded(&pool).await?;
-        assert_eq!(profiles.len(), 6);
+        let default_count = crate::adapters::default_profiles().len();
+        assert_eq!(profiles.len(), default_count);
         assert!(profiles
             .iter()
             .any(|profile| profile.protocol_id == "vless-reality-tcp"));
@@ -3831,7 +3845,7 @@ mod tests {
 
         ensure_default_protocol_profiles(&pool).await?;
         let profiles = list_protocol_profiles_decoded(&pool).await?;
-        assert_eq!(profiles.len(), 6);
+        assert_eq!(profiles.len(), default_count);
         let customized = profiles
             .iter()
             .find(|profile| profile.name == "VLESS-XHTTP-SAFE")
@@ -3844,7 +3858,49 @@ mod tests {
             .execute(&pool)
             .await?;
         ensure_default_protocol_profiles(&pool).await?;
-        assert_eq!(list_protocol_profiles_decoded(&pool).await?.len(), 5);
+        assert_eq!(
+            list_protocol_profiles_decoded(&pool).await?.len(),
+            default_count - 1
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mihomo_profiles_are_bootstrapped_once_on_existing_databases() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        sqlx::query(
+            "DELETE FROM protocol_profiles WHERE kind IN ('trojan-tls','snell-v5','mieru')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM bootstrap_state WHERE key='mihomo-protocol-profiles-v1'")
+            .execute(&pool)
+            .await?;
+
+        ensure_default_protocol_profiles(&pool).await?;
+        let profiles = list_protocol_profiles_decoded(&pool).await?;
+        assert_eq!(
+            profiles
+                .iter()
+                .filter(|profile| matches!(
+                    profile.protocol_id.as_str(),
+                    "trojan-tls" | "snell-v5" | "mieru"
+                ))
+                .count(),
+            3
+        );
+
+        sqlx::query("DELETE FROM protocol_profiles WHERE kind='snell-v5'")
+            .execute(&pool)
+            .await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        assert!(!list_protocol_profiles_decoded(&pool)
+            .await?
+            .iter()
+            .any(|profile| profile.protocol_id == "snell-v5"));
 
         close_and_remove(pool, &path).await;
         Ok(())
@@ -3856,7 +3912,8 @@ mod tests {
         let (pool, path) = test_pool().await?;
         ensure_default_protocol_profiles(&pool).await?;
         let original = list_protocol_profiles(&pool).await?;
-        assert_eq!(original.len(), 6);
+        let default_count = crate::adapters::default_profiles().len();
+        assert_eq!(original.len(), default_count);
         let mut expected_enabled = std::collections::BTreeMap::new();
 
         for (index, record) in original.iter().enumerate() {
@@ -3906,7 +3963,7 @@ mod tests {
         migrate_protocol_adapter_configs(&pool, &registry).await?;
         let second = list_protocol_profiles(&pool).await?;
 
-        assert_eq!(first.len(), 7);
+        assert_eq!(first.len(), default_count + 1);
         assert_eq!(first, second);
         for record in first
             .iter()

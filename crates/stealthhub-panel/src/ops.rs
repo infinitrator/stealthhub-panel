@@ -617,7 +617,7 @@ pub(crate) fn uninstall_plan(mode: &str) -> Option<UninstallPlan> {
     match mode {
         "panel" => Some(UninstallPlan {
             title: "Panel-only removal",
-            warning: "Removes the HTTP panel, its database, updater and Nginx site. The module updater, proxy runtimes, Headscale, their configs and the shared service account are preserved.",
+            warning: "Removes the HTTP panel, its database, updater and Nginx site. Runtime modules, their configs and the shared service account are preserved.",
             commands: vec![
                 "# Review paths before running as root.",
                 "systemctl disable --now infiproxy.service infiproxy-panel-update.timer infiproxy-panel-update.path infiproxy-reconcile.timer infiproxy-reconcile.path || true",

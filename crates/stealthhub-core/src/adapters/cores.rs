@@ -31,6 +31,7 @@ enum Flavor {
     SingBox,
     Hysteria,
     Tuic,
+    Mihomo,
 }
 
 #[derive(Default)]
@@ -86,6 +87,7 @@ impl ManagedCoreAdapter {
             Flavor::SingBox => Ok(serde_json::to_vec_pretty(&compose_sing_box(plan)?)?),
             Flavor::Hysteria => Ok(serde_norway::to_string(&compose_hysteria(plan)?)?.into_bytes()),
             Flavor::Tuic => Ok(serde_json::to_vec_pretty(&compose_tuic(plan)?)?),
+            Flavor::Mihomo => Ok(serde_norway::to_string(&compose_mihomo(plan)?)?.into_bytes()),
         }
     }
 
@@ -97,7 +99,7 @@ impl ManagedCoreAdapter {
                     bail!("candidate root must be an object");
                 }
             }
-            Flavor::Hysteria => {
+            Flavor::Hysteria | Flavor::Mihomo => {
                 let value: serde_norway::Value = serde_norway::from_slice(&fs::read(candidate)?)?;
                 if !value.is_mapping() {
                     bail!("candidate root must be a mapping");
@@ -118,6 +120,12 @@ impl ManagedCoreAdapter {
             Flavor::SingBox => Some(
                 Command::new(&self.binary)
                     .args(["check", "-c"])
+                    .arg(candidate)
+                    .status()?,
+            ),
+            Flavor::Mihomo => Some(
+                Command::new(&self.binary)
+                    .args(["-t", "-f"])
                     .arg(candidate)
                     .status()?,
             ),
@@ -260,7 +268,7 @@ impl CoreAdapter for ManagedCoreAdapter {
 
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
         let candidate = transaction_dir.join(match self.flavor {
-            Flavor::Hysteria => "candidate.yaml",
+            Flavor::Hysteria | Flavor::Mihomo => "candidate.yaml",
             _ => "candidate.json",
         });
         fs::write(&candidate, self.compose(plan)?)?;
@@ -612,6 +620,51 @@ fn compose_tuic(plan: &CorePlan) -> Result<Value> {
     )
 }
 
+fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
+    let mut listeners = Vec::new();
+    for fragment in &plan.fragments {
+        let payload = payload_object(fragment)?;
+        let listen_port = port(payload)?;
+        let name = &fragment.profile_id;
+        let listener = match fragment.capability.as_str() {
+            "trojan-tls" => {
+                let user_entries = users(payload)?
+                    .iter()
+                    .map(|user| json!({"username":user["uuid"],"password":user["uuid"]}))
+                    .collect::<Vec<_>>();
+                json!({
+                    "name":name,"type":"trojan","listen":"::","port":listen_port,
+                    "users":user_entries,"certificate":CERTIFICATE_PATH,"private-key":PRIVATE_KEY_PATH
+                })
+            }
+            "snell-v5" => json!({
+                "name":name,"type":"snell","listen":"::","port":listen_port,
+                "psk":resolved_secret(payload,"psk_secret")?,"version":5,"udp":true
+            }),
+            "mieru" => {
+                let password = resolved_secret(payload, "password_secret")?;
+                let user_entries = users(payload)?
+                    .iter()
+                    .filter_map(|user| user.get("uuid").and_then(Value::as_str))
+                    .map(|uuid| (uuid.to_string(), json!(password)))
+                    .collect::<Map<_, _>>();
+                json!({
+                    "name":name,"type":"mieru","listen":"::","port":listen_port,
+                    "transport":"TCP","users":user_entries,"user-hint-is-mandatory":true
+                })
+            }
+            _ => bail!("mihomo adapter received an unsupported capability"),
+        };
+        listeners.push(listener);
+    }
+    Ok(json!({
+        "log-level":"warning",
+        "mode":"rule",
+        "listeners":listeners,
+        "rules":["MATCH,DIRECT"]
+    }))
+}
+
 fn listener_line_has_port(line: &str, port: u16) -> bool {
     let marker = format!(":{port}");
     line.split_whitespace()
@@ -685,6 +738,23 @@ fn discover_config_ports(flavor: Flavor, bytes: &[u8]) -> Result<Vec<(u16, bool)
                 }
             }
         }
+        Flavor::Mihomo => {
+            let value: Value = serde_norway::from_slice(bytes)?;
+            for listener in value
+                .get("listeners")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(port) = listener
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+                {
+                    ports.push((port, false));
+                }
+            }
+        }
     }
     Ok(ports)
 }
@@ -746,6 +816,28 @@ fn discover_config_users(
             );
         }
         Flavor::Hysteria => {}
+        Flavor::Mihomo => {
+            let value: Value = serde_norway::from_slice(bytes)?;
+            for listener in value
+                .get("listeners")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                match listener.get("users") {
+                    Some(Value::Array(entries)) => {
+                        users.extend(entries.iter().filter_map(|entry| {
+                            entry
+                                .get("username")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        }));
+                    }
+                    Some(Value::Object(entries)) => users.extend(entries.keys().cloned()),
+                    _ => {}
+                }
+            }
+        }
     }
     Ok(users)
 }
@@ -758,6 +850,9 @@ pub(super) fn registry() -> Result<CoreRegistry> {
         "hysteria2",
         "any-tls",
         "tuic",
+        "trojan-tls",
+        "snell-v5",
+        "mieru",
     ];
     let adapters = [
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -768,6 +863,16 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             binary: "/opt/infiproxy/cores/xray/current/xray",
             config: "/etc/infiproxy-cores/xray/config.json",
             capabilities: &all[..2],
+            selection_priority: 100,
+        }),
+        ManagedCoreAdapter::new(ManagedCoreSpec {
+            id: "mihomo",
+            display_name: "Mihomo",
+            service: "infiproxy-mihomo.service",
+            flavor: Flavor::Mihomo,
+            binary: "/opt/infiproxy/cores/mihomo/current/mihomo",
+            config: "/etc/infiproxy-cores/mihomo/config.yaml",
+            capabilities: &all[6..9],
             selection_priority: 100,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -839,6 +944,67 @@ mod tests {
             discover_config_users(Flavor::Tuic, tuic).unwrap(),
             BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
         );
+
+        let mihomo = br#"listeners:
+  - type: trojan
+    users:
+      - username: user-a
+        password: user-a
+  - type: mieru
+    users:
+      user-b: secret
+"#;
+        assert_eq!(
+            discover_config_users(Flavor::Mihomo, mihomo).unwrap(),
+            BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
+        );
+    }
+
+    #[test]
+    fn mihomo_composer_emits_valid_listener_yaml() {
+        let fragment = |capability: &str, port: u16, config: Value, users: Vec<Value>| {
+            crate::adapter::ServerFragment {
+                profile_id: capability.to_string(),
+                capability: capability.to_string(),
+                payload: json!({
+                    "port":port,"config":config,"users":users,
+                    "resolved_secrets":{"snell.psk":"snell-secret","mieru.password":"mieru-secret"}
+                }),
+                expected_user_ids: None,
+                listeners: Vec::new(),
+            }
+        };
+        let identity = json!({"username":"alice","uuid":"user-a"});
+        let plan = CorePlan {
+            generation: 1,
+            core_id: "mihomo".to_string(),
+            fragments: vec![
+                fragment(
+                    "trojan-tls",
+                    12443,
+                    json!({"sni":"example.com"}),
+                    vec![identity.clone()],
+                ),
+                fragment(
+                    "snell-v5",
+                    13443,
+                    json!({"psk_secret":"snell.psk"}),
+                    Vec::new(),
+                ),
+                fragment(
+                    "mieru",
+                    14443,
+                    json!({"password_secret":"mieru.password"}),
+                    vec![identity],
+                ),
+            ],
+        };
+        let rendered = compose_mihomo(&plan).unwrap();
+        let yaml = serde_norway::to_string(&rendered).unwrap();
+        let reparsed: Value = serde_norway::from_str(&yaml).unwrap();
+        assert_eq!(reparsed["listeners"][0]["type"], "trojan");
+        assert_eq!(reparsed["listeners"][1]["version"], 5);
+        assert_eq!(reparsed["listeners"][2]["transport"], "TCP");
     }
 
     #[test]
@@ -856,6 +1022,9 @@ mod tests {
             "hysteria2",
             "any-tls",
             "tuic",
+            "trojan-tls",
+            "snell-v5",
+            "mieru",
         ] {
             assert!(capabilities.contains(capability));
         }

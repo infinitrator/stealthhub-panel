@@ -313,63 +313,39 @@ TUIC server `1.0.0` не предоставляет отдельную кома�
 JSON; полная проверка — controlled restart, active UDP listener и реальный
 client handshake. Пустой `users` starter map намеренно не запускается.
 
-## Telegram MTProxy
+## Mihomo: Trojan, Snell и Mieru
 
-### Чем отличается
-
-MTProxy обслуживает только Telegram MTProto clients. Он не является generic
-Mihomo proxy и не появляется в subscription YAML.
-
-Official upstream использует:
-
-- `proxy-secret` для связи с Telegram infrastructure;
-- `proxy-multi.conf`, который Telegram рекомендует периодически обновлять;
-- 16-byte/32-hex client secret;
-- public client port;
-- local stats port;
-- число worker processes.
-
-См. [TelegramMessenger/MTProxy](https://github.com/TelegramMessenger/MTProxy).
-
-### Файлы и unit
+Один `mihomo` runtime обслуживает три независимых TCP listener. Config строится
+атомарно из enabled profiles, проверяется командой `mihomo -t -f`, а после
+restart reconciler проверяет PID-owned listeners и user set.
 
 ```text
-/opt/infiproxy/cores/mtproto/current/mtproto-proxy
-/etc/infiproxy-cores/mtproto/mtproto.env
-/etc/infiproxy-cores/mtproto/proxy-secret
-/etc/infiproxy-cores/mtproto/proxy-multi.conf
-infiproxy-mtproto.service
+/opt/infiproxy/cores/mihomo/current/mihomo
+/etc/infiproxy-cores/mihomo/config.yaml
+infiproxy-mihomo.service
 ```
 
-TUI **Guided initial setup**:
+| Профиль | Auth | TLS | Starter port |
+|---|---|---|---|
+| `trojan-tls` | UUID пользователя как уникальный Trojan password | certificate/key, SNI, uTLS fingerprint клиента | TCP 12443 |
+| `snell-v5` | общий `snell.psk` | не используется базовой композицией | TCP 13443, UDP передается внутри TCP |
+| `mieru` | UUID как username и общий `mieru.password` | protocol-native transport | TCP 14443 |
 
-1. определяет/спрашивает public host;
-2. предлагает public port `8444`, который не пересекается со встроенным
-   профилем VLESS XHTTP на TCP `8443`;
-3. предлагает stats port `8888`;
-4. предлагает 2 workers (`1..16`);
-5. генерирует secret или принимает ровно 32 hex;
-6. скачивает два official upstream файла;
-7. backup-ит env и пишет новый;
-8. печатает `https://t.me/proxy?...`;
-9. отдельно спрашивает, enable/start ли unit.
+Trojan и Mieru участвуют в user reconciliation: отключенный пользователь
+исчезает из server config. Snell использует shared PSK и поэтому не даёт
+индивидуального отзыва без смены ключа.
 
-Stats listener не открывайте наружу. В текущем systemd argv secret находится в
-process arguments после expansion env; ограничьте локальный доступ к process
-metadata и не публикуйте diagnostic dumps.
+Перед включением Trojan положите certificate и private key в общий TLS tree и
+задайте SNI, совпадающий с сертификатом. Для Snell и Mieru создайте secret refs
+в панели. После установки runtime выполните:
 
-### Refresh upstream config
-
-Telegram upstream README рекомендует обновлять `proxy-multi.conf` примерно раз в
-день. Используйте TUI **Refresh Telegram upstream config**, затем controlled
-restart и проверку журнала.
-
-### Секреты с prefix
-
-Official upstream описывает prefix `dd` для random padding в client secret. TUI
-генерирует базовые 32 hex и валидирует именно эту длину; advanced variants
-требуют ручной проверки совместимости и не должны вводиться в это поле как
-34+ символа без изменения manager contract.
+```bash
+sudo /opt/infiproxy/cores/mihomo/current/mihomo -t \
+  -f /etc/infiproxy-cores/mihomo/config.yaml
+sudo systemctl start infiproxy-reconcile.service
+sudo systemctl status infiproxy-mihomo.service --no-pager
+sudo ss -lntp | grep -E ':(12443|13443|14443)\b'
+```
 
 ## Декларативные композиции и исследованные кандидаты
 
@@ -385,6 +361,9 @@ optional `flow` и maturity. GUI показывает только целые з
 | `hysteria2` | Hysteria2 + QUIC + TLS/optional Salamander | Stable |
 | `any-tls` | AnyTLS + TCP + TLS | Experimental |
 | `tuic` | TUIC v5 + QUIC + TLS | Stable |
+| `trojan-tls` | Trojan + TCP + TLS/uTLS | Stable |
+| `snell-v5` | Snell v5 + TCP + PSK | Stable |
+| `mieru` | Mieru + TCP + protocol auth | Stable |
 
 Таблица ниже фиксирует ecosystem support, а не обещает готовый Infiproxy
 adapter. Baseline исследования — stable Mihomo `v1.19.30`. Если upstream не
@@ -393,14 +372,14 @@ adapter. Baseline исследования — stable Mihomo `v1.19.30`. Есл�
 
 | Кандидат | Client / server | Auth и ресурсы | Maturity | В Infiproxy |
 |---|---|---|---|---|
-| AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Unsupported: нет Mihomo server runtime adapter |
-| AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Unsupported: нет Mihomo server runtime adapter |
-| VLESS + JLS | Mihomo outbound + inbound | UUID users, JLS user/password/destination | Experimental | Unsupported: renderer не реализован |
-| VLESS + ResTLS | Mihomo outbound + inbound | UUID users, ResTLS password/destination | Experimental | Unsupported: renderer не реализован |
-| Trojan TLS/uTLS | Mihomo outbound + inbound; uTLS fingerprint документирован | password users, domain, certificate/private key | Stable | Unsupported: renderer не реализован |
-| ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | username/password, QUIC/TLS/JLS, optional domain | Experimental | Unsupported: runtime canary не реализован |
-| Snell v4/v5 | Mihomo outbound + inbound; v4/v5 с Mihomo 1.19.26 | shared PSK, optional JLS/ResTLS/ShadowTLS | Stable | Unsupported: renderer не реализован |
-| Mieru | Mihomo outbound + inbound | username/password, TCP или UDP, optional traffic pattern | Stable | Unsupported: renderer не реализован |
+| AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Unsupported: отдельные JLS fields/renderers/golden canary не реализованы |
+| AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Unsupported: отдельные ResTLS fields/renderers/golden canary не реализованы |
+| VLESS + JLS | Mihomo outbound + inbound | UUID users, JLS user/password/destination | Experimental | Unsupported: JLS auth lifecycle и renderer не реализованы |
+| VLESS + ResTLS | Mihomo outbound + inbound | UUID users, ResTLS password/destination | Experimental | Unsupported: ResTLS secret lifecycle и renderer не реализованы |
+| Trojan TLS/uTLS | Mihomo outbound + inbound | UUID password, domain, certificate/private key | Stable | Реализован `trojan-tls` |
+| ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | username/password, QUIC/TLS/JLS, optional domain | Experimental | Unsupported: QUIC/JLS listener ownership и canary не реализованы |
+| Snell v5 | Mihomo outbound + inbound | shared PSK | Stable | Реализован `snell-v5` |
+| Mieru TCP | Mihomo outbound + inbound | username/password | Stable | Реализован `mieru` |
 | MASQUE | Mihomo outbound; matching public inbound не подтверждён | ECDSA key pair, tunnel CIDR, optional SNI | Unsupported | Не предлагается |
 | TrustTunnel | Mihomo outbound + inbound | username/password, domain, certificate/key, HTTP/2 и optional HTTP/3 | Experimental | Unsupported: runtime canary не реализован |
 
@@ -433,7 +412,7 @@ certificate mismatch или активный probe могут выдать се�
 
 - VLESS REALITY XHTTP/RAW как основной TCP transport;
 - Hysteria2 или TUIC как QUIC speed fallback, но не оба без необходимости;
-- MTProto только для Telegram;
+- Trojan/Snell/Mieru через отдельный Mihomo runtime при необходимости TCP fallback;
 - отдельные hostnames для административного HTTPS и proxy endpoints;
 - server credentials per user там, где runtime поддерживает;
 - inactive/unused units disabled и ports закрыты.

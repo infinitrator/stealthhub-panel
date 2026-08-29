@@ -10,8 +10,8 @@ Infiproxy хранит состояние в трех разных местах,
 
 Для поддержанных protocol/core adapters SQLite является desired state, а
 root-reconciler генерирует runtime config. Ручное изменение managed Xray,
-sing-box, Hysteria или TUIC config не обновляет SQLite и будет заменено следующим
-поколением. Nginx, SSH и MTProto имеют отдельные контракты управления.
+sing-box, Hysteria, TUIC или Mihomo config не обновляет SQLite и будет заменено
+следующим поколением. Nginx и SSH имеют отдельные контракты управления.
 
 ## 1. Вкладка Configs
 
@@ -83,7 +83,7 @@ config.json.infiproxy-bak-1786289123456
 | `sing-box-core` | `/etc/infiproxy-cores/sing-box/config.json` | 256 KiB | Да. |
 | `hysteria-core` | `/etc/infiproxy-cores/hysteria/config.yaml` | 128 KiB | Да. |
 | `tuic-core` | `/etc/infiproxy-cores/tuic/config.json` | 128 KiB | Да. |
-| `mtproto-core` | `/etc/infiproxy-cores/mtproto/mtproto.env` | 16 KiB | Да. |
+| `mihomo-core` | `/etc/infiproxy-cores/mihomo/config.yaml` | 256 KiB | Да. |
 
 Для динамического модуля добавляется `module-<id>`, если его `config_path` еще
 не представлен фиксированным allowlist. Максимум динамического файла — 256 KiB;
@@ -388,22 +388,11 @@ sudo journalctl -u infiproxy-tuic.service -n 100 --no-pager
 sudo ss -lunp | grep ':11443'
 ```
 
-## 10. Telegram MTProxy env
+## 10. Mihomo runtime YAML
 
-Файл: `/etc/infiproxy-cores/mtproto/mtproto.env`.
-
-| Переменная | Назначение | Безопасное значение |
-|---|---|---|
-| `MTPROTO_PORT` | Публичный TCP-порт proxy. | `8444`; TCP `8443` зарезервирован стартовым профилем VLESS XHTTP. |
-| `MTPROTO_STATS_PORT` | Локальный stats listener. | `8888`; не публиковать firewall. |
-| `MTPROTO_SECRET` | 16 bytes в виде ровно 32 hex symbols. | Генерируется из CSPRNG в TUI. |
-| `MTPROTO_WORKERS` | Число worker processes. | `2`, допустимо `1..16`; на слабом VPS начать с `1`. |
-| `MTPROTO_AES_PWD` | Telegram `proxy-secret`. | `/etc/infiproxy-cores/mtproto/proxy-secret`. |
-| `MTPROTO_PROXY_CONFIG` | Telegram upstream topology config. | `/etc/infiproxy-cores/mtproto/proxy-multi.conf`. |
-
-Template secret из нулей является placeholder. Не запускайте публичный proxy с
-ним. Используйте TUI **Guided initial setup**, который делает backup старого env,
-скачивает оба upstream-файла и генерирует secret.
+Файл `/etc/infiproxy-cores/mihomo/config.yaml` генерируется reconciler из
+enabled Trojan/Snell/Mieru profiles. Не редактируйте managed listeners вручную:
+следующее поколение заменит изменения. Проверка: `mihomo -t -f <path>`.
 
 ## 11. TLS-материалы proxy-runtime
 

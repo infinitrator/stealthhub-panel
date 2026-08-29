@@ -6,7 +6,7 @@ subscriptions, routing rules, protocol profiles and supervised proxy runtimes.
 It is built for a simple VPS deployment model: **bare metal Linux + systemd +
 SQLite + one SSH TUI**. The panel does not implement proxy protocols itself.
 Network traffic is handled by external cores such as Xray, sing-box, Hysteria,
-TUIC and Telegram MTProxy.
+TUIC and Mihomo.
 
 Full Russian operator and networking documentation is available in the
 [`wiki/`](./wiki/Home.md): installation, every web/TUI control, protocols,
@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/
 The command installs build dependencies, Rust when needed, clones the project to
 `/opt/infiproxy/source`, builds the release binary, installs systemd units and
 opens the guided SSH TUI. The TUI then walks through panel repair, HTTPS,
-optional core imports, Telegram MTProto and final service checks.
+optional core imports and final service checks.
 
 If the guided UI was skipped or the SSH session was interrupted:
 
@@ -59,7 +59,6 @@ Guided deployment cycle
 Panel install/repair
 HTTPS with Cloudflare DNS-01
 Verified core archive import
-Telegram MTProto setup
 Final service status
 ```
 
@@ -101,7 +100,6 @@ It includes:
 - Panel environment editor.
 - HTTPS and Cloudflare certificate setup.
 - Independent runtime-module manager with installed/latest comparison.
-- Telegram MTProto setup.
 - Panel update scheduler and immediate update trigger.
 - Panel logs.
 - Root-level uninstall and cleanup flows.
@@ -163,7 +161,7 @@ binary. Core-specific smoke tests validate the executable, but a successful
 binary install does not replace final config and service readiness checks.
 
 The installer provides catalog manifests for Xray, sing-box, Hysteria, TUIC and
-Telegram MTProto. A root operator can import another compatible
+Mihomo. A root operator can import another compatible
 generic GitHub-release manifest from the SSH manager. Browser sessions can only
 activate manifests already approved in that root-owned catalog; they cannot
 submit repositories, download commands or systemd unit names.
@@ -181,7 +179,7 @@ Runtime paths:
 /opt/infiproxy/cores/sing-box/current/sing-box
 /opt/infiproxy/cores/hysteria/current/hysteria
 /opt/infiproxy/cores/tuic/current/tuic-server
-/opt/infiproxy/cores/mtproto/current/mtproto-proxy
+/opt/infiproxy/cores/mihomo/current/mihomo
 ```
 
 Systemd units:
@@ -191,7 +189,7 @@ infiproxy-xray.service
 infiproxy-sing-box.service
 infiproxy-hysteria.service
 infiproxy-tuic.service
-infiproxy-mtproto.service
+infiproxy-mihomo.service
 ```
 
 The normal TUI flow is:
@@ -210,30 +208,6 @@ control only `infiproxy-<module-id>.service` and its own
 fails after restart, the updater restores the previous symlink and service.
 Config files are never replaced by a module update.
 
-## Telegram MTProto
-
-Telegram MTProto is managed as a separate server runtime, not as a Mihomo
-outbound. In the TUI, choose:
-
-```text
-Telegram MTProto setup
-```
-
-The guided setup downloads Telegram `proxy-secret` and `proxy-multi.conf`,
-generates a 32-hex client secret, writes:
-
-```text
-/etc/infiproxy-cores/mtproto/mtproto.env
-```
-
-and prints an import link:
-
-```text
-https://t.me/proxy?server=<host>&port=<port>&secret=<secret>
-```
-
-Refresh Telegram upstream config from the same menu when needed.
-
 ## Port Plan
 
 The default deployment avoids internal port collisions:
@@ -241,7 +215,9 @@ The default deployment avoids internal port collisions:
 ```text
 TCP 80/443              Nginx public edge for the panel hostname
 TCP 127.0.0.1:8080      Infiproxy panel
-TCP 8444                Telegram MTProto proxy
+TCP 12443               Trojan TLS/uTLS starter profile
+TCP 13443               Snell v5 starter profile
+TCP 14443               Mieru TCP starter profile
 UDP 443                 Hysteria2 starter config
 UDP 11443               TUIC starter config
 ```

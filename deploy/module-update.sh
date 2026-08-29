@@ -11,10 +11,7 @@ MODULE_STATE_DIR="${STATE_DIR}/modules"
 MODULE_VERSION_DIR="${INFIPROXY_MODULE_VERSION_DIR:-${ROOT_STATE_DIR}/module-versions}"
 REQUEST_DIR="${STATE_DIR}/module-requests"
 DISABLED_DIR="${ROOT_STATE_DIR}/module-disabled"
-BUILD_DIR="${ROOT_STATE_DIR}/module-build"
 MODULE_BACKUP_ROOT="${INFIPROXY_MODULE_BACKUP_ROOT:-${ROOT_STATE_DIR}/module-backups}"
-HEADSCALE_DATA_DIR="${INFIPROXY_HEADSCALE_DATA_DIR:-/var/lib/headscale}"
-HEADSCALE_LINK="${INFIPROXY_HEADSCALE_LINK:-/usr/local/bin/headscale}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
 MAX_DOWNLOAD_BYTES="${INFIPROXY_MODULE_MAX_DOWNLOAD_BYTES:-536870912}"
@@ -30,10 +27,9 @@ APP_USER="${INFIPROXY_USER:-infiproxy}"
 APP_GROUP="${INFIPROXY_GROUP:-infiproxy}"
 RUNTIME_GROUP="${INFIPROXY_RUNTIME_GROUP:-infiproxy-runtime}"
 RECONCILE_APPLIED_FILE="${INFIPROXY_RECONCILE_APPLIED_FILE:-${ROOT_STATE_DIR}/reconcile/applied.json}"
-LAST_MODULE_BACKUP=""
 
 module_is_retired() {
-  [[ "$1" == "headscale" ]]
+  [[ "$1" == "headscale" || "$1" == "mtproto" ]]
 }
 
 require_active_product_module() {
@@ -117,7 +113,7 @@ load_module() {
   local id="$1" record
   valid_id "$id" || return 1
   record="$("$MANIFEST_HELPER" read "$(manifest_file "$id")" --root-owned)" || return 1
-  IFS='|' read -r M_ID _ _ _ M_REPO M_UPSTREAM M_REF M_DRIVER \
+  IFS='|' read -r M_ID _ _ _ M_REPO M_UPSTREAM _ M_DRIVER \
     M_ROOT M_BINARY M_SERVICE M_CONFIG M_ASSET_AMD64 M_ASSET_ARM64 <<<"$record"
   [[ "$M_ID" == "$id" ]]
 }
@@ -152,13 +148,9 @@ state_value() {
 }
 
 installed_version() {
-  local file="${MODULE_VERSION_DIR}/$1.version" detected
+  local file="${MODULE_VERSION_DIR}/$1.version"
   if [[ -s "$file" ]]; then
     tr -d '[:space:]' <"$file"
-  elif [[ "$1" == "headscale" && -x "$(module_binary)" ]]; then
-    detected="$("$(module_binary)" version 2>/dev/null \
-      | grep -Eo 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 || true)"
-    [[ -n "$detected" ]] && printf '%s\n' "$detected" || echo "unknown"
   else
     echo "unknown"
   fi
@@ -231,13 +223,6 @@ release_metadata() {
   "$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json"
 }
 
-headscale_step_metadata() {
-  local arch="$1" current="$2" pattern api_json
-  pattern="$(asset_pattern "$arch")"
-  api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases?per_page=100")"
-  "$MANIFEST_HELPER" headscale-step-metadata "$pattern" "$current" <<<"$api_json"
-}
-
 resolve_checksum() {
   local expected_asset="$1" digest="$2" checksum_url="$3" checksum_file checksum
   if [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]]; then
@@ -277,18 +262,12 @@ remember_version() {
 
 backup_module_config() {
   local was_enabled="$1" was_active="$2"
-  local module_dir backup_dir current_target timestamp staging sqlite_source sqlite_target
+  local module_dir backup_dir current_target timestamp
   local -a backup_paths=()
-  LAST_MODULE_BACKUP=""
   if [[ -e "$M_CONFIG" || -L "$M_CONFIG" ]]; then
     [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]] \
       || die "refusing to back up unsafe module config: ${M_CONFIG}"
     backup_paths+=("${M_CONFIG#/}")
-  fi
-  if [[ "${M_DRIVER:-}" == "headscale" && ( -e "$HEADSCALE_DATA_DIR" || -L "$HEADSCALE_DATA_DIR" ) ]]; then
-    [[ -d "$HEADSCALE_DATA_DIR" && ! -L "$HEADSCALE_DATA_DIR" ]] \
-      || die "refusing to back up unsafe Headscale data path: ${HEADSCALE_DATA_DIR}"
-    backup_paths+=("${HEADSCALE_DATA_DIR#/}")
   fi
   [[ "${#backup_paths[@]}" -gt 0 ]] || {
     log "no existing config to back up for ${M_ID}: ${M_CONFIG}"
@@ -303,33 +282,7 @@ backup_module_config() {
   current_target="$(readlink -f "$(runtime_root)/current" 2>/dev/null || true)"
   install -d -o root -g root -m 0700 "$backup_dir" \
     || die "failed to create module backup directory"
-  if [[ "${M_DRIVER:-}" == "headscale" ]]; then
-    staging="${backup_dir}/root"
-    install -d -o root -g root -m 0700 "$staging"
-    if [[ -f "$M_CONFIG" ]]; then
-      install -d -o root -g root -m 0700 "${staging}/$(dirname "${M_CONFIG#/}")"
-      cp -a -- "$M_CONFIG" "${staging}/${M_CONFIG#/}"
-    fi
-    if [[ -d "$HEADSCALE_DATA_DIR" ]]; then
-      install -d -o root -g root -m 0700 "${staging}/${HEADSCALE_DATA_DIR#/}"
-      cp -a -- "$HEADSCALE_DATA_DIR"/. "${staging}/${HEADSCALE_DATA_DIR#/}/"
-      sqlite_source="${HEADSCALE_DATA_DIR}/db.sqlite"
-      sqlite_target="${staging}/${HEADSCALE_DATA_DIR#/}/db.sqlite"
-      if [[ -e "$sqlite_source" || -L "$sqlite_source" ]]; then
-        [[ -f "$sqlite_source" && ! -L "$sqlite_source" ]] \
-          || die "refusing unsafe Headscale SQLite path: ${sqlite_source}"
-        need_cmd sqlite3
-        rm -f -- "$sqlite_target" "${sqlite_target}-wal" "${sqlite_target}-shm"
-        sqlite3 "$sqlite_source" ".backup '${sqlite_target}'" \
-          || die "failed to create a consistent Headscale SQLite backup"
-      fi
-    fi
-    if ! tar -C "$staging" -czf "${backup_dir}/config.tar.gz" -- "${backup_paths[@]}"; then
-      rm -rf -- "$backup_dir"
-      die "failed to back up ${M_ID} config and state"
-    fi
-    rm -rf -- "$staging"
-  elif ! tar -C / -czf "${backup_dir}/config.tar.gz" -- "${backup_paths[@]}"; then
+  if ! tar -C / -czf "${backup_dir}/config.tar.gz" -- "${backup_paths[@]}"; then
     rm -rf -- "$backup_dir"
     die "failed to back up ${M_ID} config"
   fi
@@ -348,35 +301,7 @@ backup_module_config() {
   find "$module_dir" -mindepth 1 -maxdepth 1 -type d \
     -mtime "+${BACKUP_RETENTION_DAYS}" -exec rm -rf -- {} + \
     || die "failed to prune old module backups"
-  LAST_MODULE_BACKUP="$backup_dir"
   log "backed up ${M_ID} config and state to ${backup_dir}"
-}
-
-restore_headscale_backup() {
-  local backup_dir="$1" entry listing unsafe=0
-  [[ -n "$backup_dir" && -f "${backup_dir}/config.tar.gz" ]] \
-    || return 1
-  listing="$(mktemp)" || return 1
-  if ! tar -tzf "${backup_dir}/config.tar.gz" >"$listing"; then
-    rm -f -- "$listing"
-    return 1
-  fi
-  while IFS= read -r entry; do
-    case "$entry" in
-      "${M_CONFIG#/}"|"${HEADSCALE_DATA_DIR#/}"|"${HEADSCALE_DATA_DIR#/}/"*) ;;
-      *)
-        log "unsafe path in Headscale backup: ${entry}"
-        unsafe=1
-        break
-        ;;
-    esac
-  done <"$listing"
-  rm -f -- "$listing"
-  [[ "$unsafe" -eq 0 ]] || return 1
-  systemctl stop "$M_SERVICE" 2>/dev/null || true
-  rm -rf -- "$HEADSCALE_DATA_DIR" || return 1
-  tar -C / -xzf "${backup_dir}/config.tar.gz" || return 1
-  log "restored Headscale config and state from ${backup_dir}"
 }
 
 restore_service_state() {
@@ -409,125 +334,10 @@ rollback_symlink() {
   log "rolled back ${service} to ${previous_target}"
 }
 
-rollback_headscale_install() {
-  local current_link="$1" previous_target="$2" was_enabled="$3" was_active="$4"
-  systemctl stop "$M_SERVICE" 2>/dev/null || true
-  if [[ -n "$previous_target" ]]; then
-    rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" 0 || return 1
-  else
-    rm -f -- "$current_link" "$HEADSCALE_LINK"
-  fi
-  if [[ -n "$LAST_MODULE_BACKUP" ]]; then
-    restore_headscale_backup "$LAST_MODULE_BACKUP" || return 1
-  fi
-  restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"
-}
-
-ensure_headscale_unit() {
-  if ! id -u headscale >/dev/null 2>&1; then
-    useradd --system --home-dir /var/lib/headscale --create-home \
-      --shell /usr/sbin/nologin headscale
-  fi
-  install -d -o headscale -g headscale -m 0750 /var/lib/headscale
-  if ! systemctl cat "$M_SERVICE" >/dev/null 2>&1; then
-    [[ "$M_ID" == "headscale" && "$M_SERVICE" == "headscale.service" ]] \
-      || die "service unit is missing for ${M_ID}: ${M_SERVICE}"
-    install -d -m 0755 /etc/systemd/system
-    install -m 0644 /dev/stdin /etc/systemd/system/headscale.service <<'EOF'
-[Unit]
-Description=Headscale coordination server
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-Type=simple
-User=headscale
-Group=headscale
-ExecStart=/opt/infiproxy/modules/headscale/current/headscale serve -c /etc/headscale/config.yaml
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadOnlyPaths=/etc/headscale /opt/infiproxy/modules/headscale
-ReadWritePaths=/var/lib/headscale
-RuntimeDirectory=headscale
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-RestrictSUIDSGID=true
-RestrictRealtime=true
-RestrictNamespaces=true
-RemoveIPC=true
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-LockPersonality=true
-MemoryDenyWriteExecute=true
-SystemCallArchitectures=native
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  fi
-}
-
-install_headscale_binary() {
-  local version="$1" archive="$2" was_enabled="$3" was_active="$4"
-  local normalized target next current_link previous_target
-  normalized="$(normalize_version "$version")"
-  target="$(runtime_root)/${normalized}"
-  next="$(runtime_root)/.current.${normalized}.next"
-  current_link="$(runtime_root)/current"
-  previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
-  install -d -m 0755 "$target"
-  install -m 0755 "$archive" "${target}/${M_BINARY}"
-  "${target}/${M_BINARY}" version >/dev/null
-  ensure_headscale_unit
-  if [[ -f "$M_CONFIG" && ! -L "$M_CONFIG" ]]; then
-    if [[ "$was_active" -eq 1 ]]; then
-      systemctl stop "$M_SERVICE" \
-        || die "could not stop ${M_SERVICE} before its database migration canary"
-    fi
-    if ! "${target}/${M_BINARY}" -c "$M_CONFIG" configtest >/dev/null; then
-      if rollback_headscale_install \
-          "$current_link" "$previous_target" "$was_enabled" "$was_active"; then
-        die "Headscale ${version} rejected the current configuration; previous state was restored"
-      fi
-      die "Headscale ${version} config canary failed and automatic rollback was incomplete"
-    fi
-  fi
-  if ! ln -sfn "$target" "$next" \
-    || ! mv -Tf "$next" "$current_link" \
-    || ! ln -sfn "${current_link}/${M_BINARY}" "$HEADSCALE_LINK"; then
-    rm -f -- "$next"
-    rollback_headscale_install \
-      "$current_link" "$previous_target" "$was_enabled" "$was_active" || true
-    die "could not activate Headscale ${version}; previous state was restored where possible"
-  fi
-  if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
-    if rollback_headscale_install \
-        "$current_link" "$previous_target" "$was_enabled" "$was_active"; then
-      die "${M_SERVICE} failed after update; previous binary and state were restored"
-    fi
-    die "${M_SERVICE} failed after update and automatic rollback was incomplete; service was stopped"
-  fi
-}
-
 install_release_module() {
-  local metadata tag asset url digest checksum_url checksum tmp normalized current
+  local metadata tag asset url digest checksum_url checksum tmp normalized
   local was_enabled=0 was_active=0 current_link previous_target
-  if [[ "$M_DRIVER" == "headscale" && -x "$(module_binary)" ]]; then
-    current="$(installed_version "$M_ID")"
-    [[ "$current" != "unknown" ]] \
-      || die "cannot determine installed Headscale version; refusing an unsafe version jump"
-    metadata="$(headscale_step_metadata "$(host_arch)" "$current")"
-  else
-    metadata="$(release_metadata "$(host_arch)")"
-  fi
+  metadata="$(release_metadata "$(host_arch)")"
   IFS='|' read -r tag asset url digest checksum_url <<<"$metadata"
   [[ "$url" == "https://github.com/${M_REPO}/releases/download/"* ]] \
     || die "refusing unexpected release URL for ${M_ID}"
@@ -551,83 +361,25 @@ install_release_module() {
   systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
   backup_module_config "$was_enabled" "$was_active"
 
-  if [[ "$M_DRIVER" == "headscale" ]]; then
-    install_headscale_binary "$tag" "${tmp}/${asset}" "$was_enabled" "$was_active"
-  else
-    [[ "$M_DRIVER" == "release" && "$M_ROOT" == "cores" ]] \
-      || die "unsupported generic release contract for ${M_ID}"
-    current_link="$(runtime_root)/current"
-    previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
-    "$CORE_INSTALLER" --core "$M_ID" --version "$normalized" \
-      --archive "${tmp}/${asset}" --sha256 "$checksum" --binary "$M_BINARY"
-    if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
-      if rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active"; then
-        die "${M_SERVICE} failed after update; previous binary and service were restored"
-      fi
-      die "${M_SERVICE} failed after update and automatic rollback was incomplete"
-    fi
-  fi
-  remember_version "$M_ID" "$tag"
-  log "updated ${M_ID}: ${tag}"
-}
-
-latest_commit() {
-  github_json "${GITHUB_API}/${M_REPO}/commits/${M_REF}" \
-    | "$MANIFEST_HELPER" commit-sha
-}
-
-install_source_module() {
-  local commit source binary checksum current_link previous_target
-  local build_jobs="${INFIPROXY_BUILD_JOBS:-2}"
-  local was_enabled=0 was_active=0
-  [[ "$M_DRIVER" == "mtproto-source" ]] || die "unsupported source driver"
-  commit="$(latest_commit)"
-  [[ "$commit" =~ ^[A-Fa-f0-9]{40}$ ]] || die "invalid commit returned by GitHub"
-  if [[ -x "$(module_binary)" && "$(installed_version "$M_ID")" == "$commit" ]]; then
-    log "${M_ID} is already current (${commit:0:12})"
-    return
-  fi
-  need_cmd git
-  need_cmd make
-  source="${BUILD_DIR}/${M_ID}/source"
-  install -d -m 0750 "$(dirname "$source")"
-  if [[ -d "${source}/.git" ]]; then
-    git -C "$source" remote set-url origin "https://github.com/${M_REPO}.git"
-    git -C "$source" fetch --force --prune origin "$M_REF"
-  else
-    git clone --filter=blob:none "https://github.com/${M_REPO}.git" "$source"
-  fi
-  git -C "$source" checkout --force --detach "$commit"
-  git -C "$source" clean -fdx
-  [[ "$build_jobs" =~ ^[1-9][0-9]?$ && "$build_jobs" -le 16 ]] \
-    || die "INFIPROXY_BUILD_JOBS must be between 1 and 16"
-  make -C "$source" -j"$build_jobs"
-  binary="${source}/objs/bin/${M_BINARY}"
-  [[ -x "$binary" ]] || die "source build did not produce ${binary}"
-  checksum="$(sha256sum "$binary" | awk '{print $1}')"
-  systemctl is-enabled --quiet "$M_SERVICE" 2>/dev/null && was_enabled=1
-  systemctl is-active --quiet "$M_SERVICE" 2>/dev/null && was_active=1
-  backup_module_config "$was_enabled" "$was_active"
+  [[ "$M_DRIVER" == "release" && "$M_ROOT" == "cores" ]] \
+    || die "unsupported generic release contract for ${M_ID}"
   current_link="$(runtime_root)/current"
   previous_target="$(readlink -f "$current_link" 2>/dev/null || true)"
-  "$CORE_INSTALLER" --core "$M_ID" --version "$commit" --archive "$binary" \
-    --sha256 "$checksum" --binary "$M_BINARY"
+  "$CORE_INSTALLER" --core "$M_ID" --version "$normalized" \
+    --archive "${tmp}/${asset}" --sha256 "$checksum" --binary "$M_BINARY"
   if ! restore_service_state "$M_SERVICE" "$was_enabled" "$was_active"; then
     if rollback_symlink "$current_link" "$previous_target" "$M_SERVICE" "$was_active"; then
       die "${M_SERVICE} failed after update; previous binary and service were restored"
     fi
     die "${M_SERVICE} failed after update and automatic rollback was incomplete"
   fi
-  remember_version "$M_ID" "$commit"
-  log "updated ${M_ID}: ${commit:0:12}"
+  remember_version "$M_ID" "$tag"
+  log "updated ${M_ID}: ${tag}"
 }
 
 latest_version() {
-  if [[ "$M_UPSTREAM" == "commit" ]]; then
-    latest_commit
-  else
-    release_metadata "$(host_arch)" | cut -d'|' -f1
-  fi
+  [[ "$M_UPSTREAM" == "release" ]] || die "retired source modules support removal only"
+  release_metadata "$(host_arch)" | cut -d'|' -f1
 }
 
 check_module() {
@@ -646,11 +398,8 @@ update_module() {
   local module="$1"
   load_module "$module" || die "unknown or invalid module: $module"
   log "checking ${module}"
-  if [[ "$M_UPSTREAM" == "commit" ]]; then
-    install_source_module
-  else
-    install_release_module
-  fi
+  [[ "$M_UPSTREAM" == "release" ]] || die "retired source modules support removal only"
+  install_release_module
 }
 
 register_requested() {
@@ -694,7 +443,7 @@ register_requested() {
 }
 
 remove_requested() {
-  local request id failed=0
+  local request id legacy_dir failed=0
   install -d -o root -g root -m 0750 "$DISABLED_DIR"
   install -d -o root -g root -m 0755 "$AVAILABLE_DIR"
   shopt -s nullglob
@@ -714,7 +463,13 @@ remove_requested() {
         failed=1
         continue
       fi
-      if [[ ! -e "${AVAILABLE_DIR}/${id}.module" ]]; then
+      if module_is_retired "$id"; then
+        legacy_dir="${ROOT_STATE_DIR}/legacy-modules/${id}"
+        install -d -o root -g root -m 0700 "$legacy_dir"
+        install -o root -g root -m 0600 "$(manifest_file "$id")" \
+          "${legacy_dir}/removed.module"
+        rm -f -- "${AVAILABLE_DIR}/${id}.module"
+      elif [[ ! -e "${AVAILABLE_DIR}/${id}.module" ]]; then
         install -o root -g root -m 0644 "$(manifest_file "$id")" "${AVAILABLE_DIR}/${id}.module"
       fi
       systemctl disable --now "$M_SERVICE" 2>/dev/null || true

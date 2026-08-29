@@ -23,6 +23,9 @@ enum Implementation {
     Hysteria,
     AnyTls,
     Tuic,
+    TrojanTls,
+    SnellV5,
+    MieruTcp,
 }
 
 struct JsonProtocolAdapter {
@@ -110,6 +113,15 @@ fn composition(implementation: Implementation) -> ProtocolComposition {
         ),
         Implementation::AnyTls => ("anytls", "tcp", "tls", None, AdapterMaturity::Experimental),
         Implementation::Tuic => ("tuic-v5", "quic", "tls", None, AdapterMaturity::Stable),
+        Implementation::TrojanTls => ("trojan", "tcp", "tls+utls", None, AdapterMaturity::Stable),
+        Implementation::SnellV5 => ("snell-v5", "tcp", "psk", None, AdapterMaturity::Stable),
+        Implementation::MieruTcp => (
+            "mieru",
+            "tcp",
+            "protocol-auth",
+            None,
+            AdapterMaturity::Stable,
+        ),
     };
     ProtocolComposition {
         protocol: protocol.to_string(),
@@ -338,6 +350,46 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 ]));
                 Value::Object(proxy)
             }
+            Implementation::TrojanTls => {
+                let mut proxy = self.base(context, "trojan");
+                proxy.extend(Map::from_iter([
+                    ("password".to_string(), json!(context.user.uuid)),
+                    ("udp".to_string(), json!(true)),
+                    (
+                        "sni".to_string(),
+                        json!(self.required_text(&context.profile.config, "sni")?),
+                    ),
+                    ("alpn".to_string(), json!(["h2", "http/1.1"])),
+                    ("client-fingerprint".to_string(), json!("chrome")),
+                ]));
+                Value::Object(proxy)
+            }
+            Implementation::SnellV5 => {
+                let mut proxy = self.base(context, "snell");
+                proxy.extend(Map::from_iter([
+                    (
+                        "psk".to_string(),
+                        json!(self.secret(context, "psk_secret")?),
+                    ),
+                    ("version".to_string(), json!(5)),
+                    ("udp".to_string(), json!(true)),
+                ]));
+                Value::Object(proxy)
+            }
+            Implementation::MieruTcp => {
+                let mut proxy = self.base(context, "mieru");
+                proxy.extend(Map::from_iter([
+                    ("transport".to_string(), json!("TCP")),
+                    ("username".to_string(), json!(context.user.uuid)),
+                    (
+                        "password".to_string(),
+                        json!(self.secret(context, "password_secret")?),
+                    ),
+                    ("multiplexing".to_string(), json!("MULTIPLEXING_LOW")),
+                    ("handshake-mode".to_string(), json!("HANDSHAKE_STANDARD")),
+                ]));
+                Value::Object(proxy)
+            }
         };
         Ok(value)
     }
@@ -545,6 +597,40 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
             UserParticipation::PerUserUuid,
             ListenerNetwork::Udp,
         ),
+        JsonProtocolAdapter::new(
+            "trojan-tls",
+            "Trojan TLS/uTLS",
+            Implementation::TrojanTls,
+            vec![text("sni", "SNI", "TLS certificate hostname.")],
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "snell-v5",
+            "Snell v5",
+            Implementation::SnellV5,
+            vec![secret(
+                "psk_secret",
+                "Pre-shared key",
+                "Secret reference containing the shared Snell key.",
+                true,
+            )],
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "mieru",
+            "Mieru TCP",
+            Implementation::MieruTcp,
+            vec![secret(
+                "password_secret",
+                "Password",
+                "Shared password paired with each user's UUID username.",
+                true,
+            )],
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
     ];
     for adapter in adapters {
         registry.register(Arc::new(adapter))?;
@@ -597,6 +683,27 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
             11443,
             json!({"password_secret":"tuic.password","sni":"www.github.com"}),
         ),
+        profile(
+            "TROJAN-TLS-COMPATIBILITY",
+            "trojan-tls",
+            ProxyRole::Compatibility,
+            12443,
+            json!({"sni":"node.infiproxy.local"}),
+        ),
+        profile(
+            "SNELL-V5-COMPATIBILITY",
+            "snell-v5",
+            ProxyRole::Compatibility,
+            13443,
+            json!({"psk_secret":"snell.psk"}),
+        ),
+        profile(
+            "MIERU-TCP-COMPATIBILITY",
+            "mieru",
+            ProxyRole::Compatibility,
+            14443,
+            json!({"password_secret":"mieru.password"}),
+        ),
     ]
 }
 
@@ -608,6 +715,7 @@ pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
         "shadowsocks2022-shadow-tls" | "any-tls" => Some("sing-box"),
         "hysteria2" => Some("hysteria"),
         "tuic" => Some("tuic"),
+        "trojan-tls" | "snell-v5" | "mieru" => Some("mihomo"),
         _ => None,
     }
 }
@@ -688,5 +796,41 @@ mod tests {
         assert_eq!(rendered["type"], "vless");
         assert_eq!(rendered["network"], "xhttp");
         assert_eq!(rendered["reality-opts"]["public-key"], "public-key");
+    }
+
+    #[test]
+    fn mihomo_protocols_render_parseable_subscription_objects() {
+        let registry = registry().unwrap();
+        let user = SubscriptionUser {
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "token".to_string(),
+        };
+        let secrets = BTreeMap::from([
+            ("snell.psk".to_string(), "snell-secret".to_string()),
+            ("mieru.password".to_string(), "mieru-secret".to_string()),
+        ]);
+        let resolver = MapSecretResolver::new(&secrets);
+        for (protocol_id, expected_type) in [
+            ("trojan-tls", "trojan"),
+            ("snell-v5", "snell"),
+            ("mieru", "mieru"),
+        ] {
+            let profile = default_profiles()
+                .into_iter()
+                .find(|profile| profile.protocol_id == protocol_id)
+                .unwrap();
+            let rendered = registry
+                .get(protocol_id)
+                .unwrap()
+                .render_client(&ClientRenderContext {
+                    profile: &profile,
+                    user: &user,
+                    secrets: &resolver,
+                })
+                .unwrap();
+            assert_eq!(rendered["type"], expected_type);
+            serde_norway::to_string(&rendered).unwrap();
+        }
     }
 }

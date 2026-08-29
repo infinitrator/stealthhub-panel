@@ -1,10 +1,10 @@
 # Бэкапы, восстановление и удаление
 
 > [!IMPORTANT]
-> Headscale удален из активного продукта. Упоминания Headscale ниже относятся
-> только к сохранению, ручному восстановлению или удалению данных, оставшихся от
+> Headscale и MTProto/MTProxy удалены из активного продукта. Их упоминания ниже
+> относятся только к сохранению, ручному восстановлению или удалению данных от
 > прежних установок. Панель, installer и TUI больше не устанавливают и не
-> управляют этим сервисом.
+> управляют этими сервисами.
 
 Резервная копия Infiproxy должна защищать не только бинарник панели. На сервере
 есть как минимум две независимые базы данных, runtime-конфиги, TLS-ключи,
@@ -24,7 +24,7 @@ module manifests, systemd units и DNS/certificate state.
 | База Headscale | `/var/lib/headscale/db.sqlite` | Узлы, users, routes, pre-auth state и координационные данные. |
 | Panel env | `/etc/infiproxy/infiproxy.env` | Bind, DB URL, cookie flags и logging. |
 | Private server secrets | `/etc/infiproxy/secrets.d` | Private keys/passwords, недоступные web-процессу. |
-| Proxy configs | `/etc/infiproxy-cores` | Server inbounds, credentials, TLS paths и MTProto env/upstream files. |
+| Proxy configs | `/etc/infiproxy-cores` | Server inbounds, credentials, TLS paths и legacy MTProto files. |
 | Headscale config | `/etc/headscale` | Public URL, prefixes, MagicDNS, ACL path и keys. |
 | Module registry | `/etc/infiproxy-modules.d` | Какие модули зарегистрированы и как обновляются. |
 | Module catalog | `/etc/infiproxy-modules.available.d` | Доступные manifests, включая импортированные. |
@@ -124,7 +124,7 @@ symlink `current` переключается атомарно. Если восс
 
 - **Force env template rewrite** копирует старый env в
   `infiproxy.env.bak.YYYYMMDDHHMMSS`.
-- MTProto setup копирует старый `mtproto.env` в `.bak.<timestamp>`.
+- Legacy MTProto `.bak.<timestamp>` может присутствовать после старой версии.
 - Headscale config writer копирует старый YAML в `.bak.<timestamp>`.
 
 Эти backups локальные и не имеют retention.

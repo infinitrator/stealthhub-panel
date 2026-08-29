@@ -35,7 +35,6 @@ hardening — уменьшить поверхность, ограничить п
 | Nginx TCP/80 | Только redirect/ACME, если нужен. |
 | Proxy TCP/UDP ports | Открывать только реально настроенные protocols. |
 | `127.0.0.1:8080` | Не публиковать; backend панели. |
-| MTProto stats `8888` | Держать локальным/закрытым firewall. |
 
 TCP/443 и UDP/443 могут одновременно принадлежать разным процессам: TCP и UDP
 — разные transport sockets. Поэтому Nginx TCP/443 и Hysteria UDP/443 не
@@ -330,7 +329,6 @@ upstream digest/checksum, HTTPS-only download, лимиты 512 MiB для downl
 Если обязательный digest отсутствует/null или не совпадает, установка должна
 останавливаться fail closed.
 
-Build-from-source MTProto дополнительно зависит от Git commit и build toolchain.
 Generic manifest import выполняйте только для официального проекта после review
 manifest и systemd unit. Проверки unit уменьшают риск, но не делают неизвестный
 binary доверенным.
@@ -397,7 +395,6 @@ access logs полезны, но не считаются tamper-proof после
 При сборе logs удаляйте:
 
 - `/sub/<token>` paths;
-- `MTPROTO_SECRET`;
 - proxy passwords и UUID;
 - Cloudflare token;
 - TLS private keys;

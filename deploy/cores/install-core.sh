@@ -274,6 +274,21 @@ case "$ARCHIVE_PATH" in
             || { echo "Archive links and special files are not allowed" >&2; exit 1; }
         unzip -q "$ARCHIVE_PATH" -d "$EXTRACT_DIR"
         ;;
+    *.gz)
+        need_cmd dd
+        need_cmd gzip
+        # Read at most one MiB beyond the configured ceiling. This bounds a
+        # gzip bomb before its output can consume unbounded disk space.
+        gzip -cd -- "$ARCHIVE_PATH" \
+            | dd bs=1048576 count=1025 of="${EXTRACT_DIR}/${BINARY}" 2>/dev/null
+        extracted_size="$(wc -c <"${EXTRACT_DIR}/${BINARY}" | tr -d '[:space:]')"
+        if [[ ! "$extracted_size" =~ ^[0-9]+$ ]] \
+            || ((extracted_size > MAX_EXTRACTED_BYTES)); then
+            echo "Compressed binary exceeds extraction safety limits" >&2
+            exit 1
+        fi
+        chmod 0755 "${EXTRACT_DIR}/${BINARY}"
+        ;;
     *)
         install -m 0755 "$ARCHIVE_PATH" "${EXTRACT_DIR}/${BINARY}"
         ;;
@@ -297,9 +312,8 @@ smoke_test_binary() {
     local binary_path="$1"
 
     case "$CORE" in
-        mtproto)
-            ("$binary_path" --help 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage' \
-                || ("$binary_path" -h 2>&1 || true) | grep -Eiq 'mtproto|proxy|usage'
+        mihomo)
+            "$binary_path" -v >/dev/null 2>&1
             ;;
         sing-box|hysteria)
             "$binary_path" version >/dev/null 2>&1

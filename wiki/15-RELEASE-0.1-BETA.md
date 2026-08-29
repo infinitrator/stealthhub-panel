@@ -28,7 +28,7 @@ end-to-end сценарии сведены в одну проверяемую т
 - динамические root-owned module manifests и независимые updates;
 - host/service health, IP diagnostics и read-only System map;
 - owner-only allowlist Configs с backup, parser check и atomic replace;
-- SSH-TUI, Cloudflare DNS-01/Nginx и MTProxy guided setup;
+- SSH-TUI и Cloudflare DNS-01/Nginx guided setup;
 - panel/module backup, rollback, update schedule и uninstall modes;
 - generic protocol/core adapters, desired/applied generations и root reconciler;
 - durable operation journal, verified rollback и crash recovery;
@@ -111,7 +111,7 @@ end-to-end сценарии сведены в одну проверяемую т
 - panel update не принимает non-fast-forward branch history относительно уже
   примененного commit без явного root-level override;
 - fixed HTTPS API/download calls в SSH-TUI используют TLS 1.2+, HTTPS-only
-  redirects, retries и timeouts; MTProto metadata ограничены 8 MiB;
+  redirects, retries и timeouts;
 - logs/backups имеют retention bounds и находятся вне web-writable state.
 
 ### 4.5. Интерфейс и доступность
@@ -148,8 +148,8 @@ bash deploy/tests/wiki-check.sh
 Workspace запрещает `unsafe` через inherited Cargo lint. Compatible dependency
 update dry-run не должен показывать доступных обновлений на дату release gate.
 
-Контроль Rust dependencies повторен 28 августа 2026; версии внешних runtimes в
-таблице сверены 28 августа через official GitHub latest-release API и при установке заново разрешаются
+Контроль Rust dependencies повторен 29 августа 2026; версии внешних runtimes в
+таблице сверены 29 августа через official GitHub latest-release API и при установке заново разрешаются
 из upstream manifest:
 
 | Компонент | Проверенная stable/latest версия |
@@ -160,10 +160,10 @@ update dry-run не должен показывать доступных обн�
 | sing-box | `v1.13.19` |
 | Hysteria | `app/v2.12.2` |
 | TUIC server | `tuic-server-1.0.0` |
-| Telegram MTProxy | commit `f36d8af769ff` ветки `master` |
+| Mihomo | `v1.19.30` |
 
 Module manifests не фиксируют эти номера: updater каждый раз разрешает latest
-release/commit из указанного root-owned manifest, проверяет asset/digest и лишь
+release из указанного root-owned manifest, проверяет asset/digest и лишь
 затем переключает `current`. Транзитивные дубликаты crates остаются только там,
 где независимые upstream libraries требуют разные совместимые API-линии; проект
 не подменяет их вручную и проверяет обе линии через RustSec и `cargo-deny`.
@@ -203,8 +203,8 @@ End-to-end harness проверяет:
 - password rotation, old-password rejection и session revocation;
 - login rate limit и `Retry-After`.
 
-Контрольный запуск 28 августа дал 116 успешных Rust tests: 69 core, 5
-manifest-helper, 2 reconciler-helper и 40 panel. В это число входят
+Контрольный запуск 29 августа дал 130 успешных Rust tests: 80 core, 4
+manifest-helper, 2 reconciler-helper и 44 panel. В это число входят
 failure-injection, migration, routing/DNS, user observation, listener conflict,
 ETag, password-hash compatibility, generation и redaction tests. HTTP,
 install-state и updater regression harness завершились без ошибок.
@@ -275,7 +275,7 @@ installation scaffold, а не demo account.
 1. One-command bootstrap и first-owner setup через SSH tunnel.
 2. Nginx/Cloudflare DNS-01 с отдельным scoped token и реальным certificate renew.
 3. Один TCP runtime и один UDP runtime с реальным Mihomo client.
-4. MTProxy import из Telegram client.
+4. Trojan/Snell/Mieru handshake через реальный Mihomo client.
 5. Module update, forced service failure и автоматический rollback.
 6. Panel update на новый commit и rollback при failed readiness.
 8. Reboot: panel, enabled runtimes, timers/path units возвращаются автоматически.

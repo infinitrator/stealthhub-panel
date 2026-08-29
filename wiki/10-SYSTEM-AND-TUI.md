@@ -20,7 +20,7 @@
 | Panel updater | `root` | Получение исходников, сборка, backup, установка бинарника и rollback. |
 | Desired-state reconciler | `root` | Candidate validation, snapshot, runtime apply, health/listener checks и rollback. |
 | Module updater | `root` | Загрузка, проверка и атомарное переключение runtime-модулей. |
-| SSH-TUI | `root` | Установка, HTTPS, systemd, runtime-модули, MTProto и удаление. |
+| SSH-TUI | `root` | Установка, HTTPS, systemd, runtime-модули и удаление. |
 | Proxy-runtime | Обычно `infiproxy` | Передача proxy-трафика по своему серверному конфигу. |
 
 Веб-панель намеренно не содержит произвольного терминала. Все команды в ней
@@ -276,8 +276,7 @@ legacy SQLite row. Значение не отображается и не поп
 2. При необходимости установить шаблон Nginx и заменить env с backup.
 3. Настроить HTTPS через Cloudflare DNS-01.
 4. Установить выбранные release-модули с проверкой целостности.
-5. Собрать и настроить Telegram MTProxy.
-6. Показать URL и итоговое состояние units.
+5. Показать URL и итоговое состояние units.
 
 Отказ от необязательного шага не отменяет уже выполненные шаги. Мастер можно
 запускать повторно; конфиги в большинстве путей сохраняются или предварительно
@@ -294,21 +293,7 @@ sudo infiproxy-manager --guided
 | Пункт | Назначение |
 |---|---|
 | **Install or repair panel** | Повторно запускает `deploy/install.sh --build`; можно добавить Nginx template либо принудительно заменить env с backup. |
-| **Telegram MTProto configuration** | Первичная настройка, обновление upstream-файлов, import link и управление unit. |
 | **Manual verified archive import** | Запрашивает module, version, URL и SHA-256 и передает их безопасному core installer. |
-
-#### Telegram MTProto configuration
-
-| Кнопка | Что делает |
-|---|---|
-| **Guided initial setup** | Запрашивает публичный host, порт, локальный stats port, 1–16 workers и optional 32-hex secret; скачивает Telegram upstream-файлы, пишет env и печатает import URL. |
-| **Refresh Telegram upstream config** | Обновляет `proxy-secret` и `proxy-multi.conf` с официальных Telegram endpoints. |
-| **Show Telegram import link** | Читает порт и secret из env и формирует `https://t.me/proxy?...`. |
-| **Enable and start service** | Выполняет `systemctl enable --now infiproxy-mtproto.service`. |
-| **Restart service** | Перезапускает unit и показывает status. |
-
-Если MTProxy binary еще не установлен, мастер сохраняет конфиг, но не запускает
-service. Сначала обновите module `mtproto`, затем повторите запуск.
 
 ### 4.12. Danger zone
 

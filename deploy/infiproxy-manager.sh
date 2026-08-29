@@ -26,12 +26,6 @@ NGINX_SITE="${INFIPROXY_NGINX_SITE:-/etc/nginx/sites-available/infiproxy.conf}"
 NGINX_ENABLED="${INFIPROXY_NGINX_ENABLED:-/etc/nginx/sites-enabled/infiproxy.conf}"
 CLOUDFLARE_CREDENTIALS="${INFIPROXY_CF_CREDENTIALS:-/etc/letsencrypt/cloudflare.ini}"
 CF_API="https://api.cloudflare.com/client/v4"
-MTPROTO_DIR="${INFIPROXY_MTPROTO_DIR:-/etc/infiproxy-cores/mtproto}"
-MTPROTO_ENV="${INFIPROXY_MTPROTO_ENV:-${MTPROTO_DIR}/mtproto.env}"
-MTPROTO_BINARY="${INFIPROXY_MTPROTO_BINARY:-/opt/infiproxy/cores/mtproto/current/mtproto-proxy}"
-MTPROTO_SECRET_URL="https://core.telegram.org/getProxySecret"
-MTPROTO_CONFIG_URL="https://core.telegram.org/getProxyConfig"
-MAX_MTPROTO_CONFIG_BYTES=8388608
 
 green=$'\033[38;5;71m'
 soft=$'\033[38;5;250m'
@@ -348,24 +342,12 @@ write_module_request() {
   fi
 }
 
-valid_mtproto_secret() {
-  [[ "$1" =~ ^[A-Fa-f0-9]{32}$ ]]
-}
-
 valid_cloudflare_token() {
   [[ "$1" =~ ^[A-Za-z0-9_-]{20,200}$ ]]
 }
 
 public_ip() {
   https_curl --max-time 10 https://api.ipify.org
-}
-
-random_mtproto_secret() {
-  if have_cmd openssl; then
-    openssl rand -hex 16
-  else
-    od -An -N16 -tx1 /dev/urandom | tr -d ' \n'
-  fi
 }
 
 env_value() {
@@ -664,171 +646,6 @@ core_helper() {
   pause
 }
 
-secure_mtproto_dir() {
-  install -d -m 0770 -o root -g "$APP_GROUP" "$MTPROTO_DIR"
-  chown root:"$APP_GROUP" "$MTPROTO_DIR" 2>/dev/null || true
-  chmod 0770 "$MTPROTO_DIR" 2>/dev/null || true
-}
-
-# MTProxy needs Telegram-maintained upstream files in addition to its binary.
-# Keep them owned by root/infiproxy so the panel can display/edit metadata while
-# the runtime service only reads the resulting files.
-download_mtproto_upstream_config() {
-  need_root
-  require_cmd curl || return 1
-  secure_mtproto_dir
-
-  local secret_tmp config_tmp
-  secret_tmp="$(mktemp)"
-  config_tmp="$(mktemp)"
-
-  if ! https_curl --max-filesize "$MAX_MTPROTO_CONFIG_BYTES" \
-    "$MTPROTO_SECRET_URL" -o "$secret_tmp"; then
-    rm -f "$secret_tmp" "$config_tmp"
-    echo "${danger}Failed to download Telegram proxy-secret.${reset}" >&2
-    return 1
-  fi
-  if ! https_curl --max-filesize "$MAX_MTPROTO_CONFIG_BYTES" \
-    "$MTPROTO_CONFIG_URL" -o "$config_tmp"; then
-    rm -f "$secret_tmp" "$config_tmp"
-    echo "${danger}Failed to download Telegram proxy-multi.conf.${reset}" >&2
-    return 1
-  fi
-  local secret_size config_size
-  secret_size="$(wc -c <"$secret_tmp" | tr -d '[:space:]')"
-  config_size="$(wc -c <"$config_tmp" | tr -d '[:space:]')"
-  if [[ ! "$secret_size" =~ ^[0-9]+$ || ! "$config_size" =~ ^[0-9]+$ ]] \
-    || ((secret_size < 1 || secret_size > MAX_MTPROTO_CONFIG_BYTES)) \
-    || ((config_size < 1 || config_size > MAX_MTPROTO_CONFIG_BYTES)); then
-    rm -f "$secret_tmp" "$config_tmp"
-    echo "${danger}Telegram upstream config is empty or exceeds the safety limit.${reset}" >&2
-    return 1
-  fi
-  install -m 0640 -o root -g "$APP_GROUP" "$secret_tmp" "$MTPROTO_DIR/proxy-secret"
-  install -m 0640 -o root -g "$APP_GROUP" "$config_tmp" "$MTPROTO_DIR/proxy-multi.conf"
-  rm -f "$secret_tmp" "$config_tmp"
-  echo "${green}Telegram upstream config refreshed.${reset}"
-}
-
-write_mtproto_env() {
-  local port="$1"
-  local stats_port="$2"
-  local secret="$3"
-  local workers="$4"
-
-  valid_port "$port" || { echo "${danger}Invalid MTProto port: $port${reset}" >&2; return 1; }
-  valid_port "$stats_port" || { echo "${danger}Invalid stats port: $stats_port${reset}" >&2; return 1; }
-  valid_mtproto_secret "$secret" || { echo "${danger}Secret must be exactly 32 hex characters.${reset}" >&2; return 1; }
-  if [[ ! "$workers" =~ ^[0-9]{1,2}$ ]] || ((10#$workers < 1 || 10#$workers > 16)); then
-    echo "${danger}Workers must be between 1 and 16.${reset}" >&2
-    return 1
-  fi
-
-  secure_mtproto_dir
-  if [[ -f "$MTPROTO_ENV" ]]; then
-    cp -a "$MTPROTO_ENV" "${MTPROTO_ENV}.bak.$(date +%Y%m%d%H%M%S)"
-  fi
-  cat >"$MTPROTO_ENV" <<EOF
-# Telegram MTProxy runtime configuration managed by Infiproxy.
-MTPROTO_PORT=${port}
-MTPROTO_STATS_PORT=${stats_port}
-MTPROTO_SECRET=${secret}
-MTPROTO_WORKERS=${workers}
-MTPROTO_AES_PWD=${MTPROTO_DIR}/proxy-secret
-MTPROTO_PROXY_CONFIG=${MTPROTO_DIR}/proxy-multi.conf
-EOF
-  chown root:"$APP_GROUP" "$MTPROTO_ENV" 2>/dev/null || true
-  chmod 0660 "$MTPROTO_ENV" 2>/dev/null || true
-  echo "${green}MTProto env written: ${MTPROTO_ENV}${reset}"
-}
-
-print_mtproto_link() {
-  local host="$1"
-  local port="$2"
-  local secret="$3"
-
-  valid_public_host "$host" || { echo "${danger}Invalid public host: $host${reset}" >&2; return 1; }
-  valid_port "$port" || { echo "${danger}Invalid MTProto port: $port${reset}" >&2; return 1; }
-  valid_mtproto_secret "$secret" || { echo "${danger}Secret must be exactly 32 hex characters.${reset}" >&2; return 1; }
-  echo
-  echo "${green}${bold}Telegram import link:${reset}"
-  echo "https://t.me/proxy?server=${host}&port=${port}&secret=${secret}"
-}
-
-# Generate the client-facing Telegram link from validated host, port and secret
-# values. The service is started only when the operator has already installed a
-# verified mtproto-proxy binary.
-guided_mtproto_setup() {
-  local host port stats_port workers secret custom_secret
-
-  prompt_value host "Telegram MTProto" "Public hostname or IPv4 (blank: detect automatically)" || return
-  if [[ -z "$host" ]]; then
-    host="$(public_ip || true)"
-  fi
-  prompt_value port "Telegram MTProto" "Public proxy port" "8444" || return
-  prompt_value stats_port "Telegram MTProto" "Local statistics port" "8888" || return
-  prompt_value workers "Telegram MTProto" "Worker processes" "2" || return
-  secret="$(random_mtproto_secret)"
-  prompt_value custom_secret "Telegram MTProto" "Custom 32-hex secret (blank: generate securely)" "" 1 || return
-  if [[ -n "$custom_secret" ]]; then
-    secret="$custom_secret"
-  fi
-  download_mtproto_upstream_config || return
-  write_mtproto_env "$port" "$stats_port" "$secret" "$workers" || return
-  run_cmd systemctl daemon-reload
-  print_mtproto_link "$host" "$port" "$secret" || return
-  if [[ -x "$MTPROTO_BINARY" ]]; then
-    if confirm_yes "Enable and start infiproxy-mtproto.service now?" "N"; then
-      run_cmd systemctl enable --now infiproxy-mtproto.service
-      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
-    fi
-  else
-    echo "${muted}Binary is not installed yet: ${MTPROTO_BINARY}${reset}"
-    echo "${muted}Use Runtime modules to build the latest official MTProto commit, then start the service.${reset}"
-  fi
-}
-
-mtproto_setup_menu() {
-  need_root
-  choice="$(tui_menu "Telegram MTProto" "Module configuration and service control" \
-    1 "Guided initial setup" \
-    2 "Refresh Telegram upstream config" \
-    3 "Show Telegram import link" \
-    4 "Enable and start service" \
-    5 "Restart service" \
-    0 "Back")" || return
-  case "$choice" in
-    1)
-      guided_mtproto_setup || true
-      ;;
-    2)
-      download_mtproto_upstream_config || return
-      ;;
-    3)
-      local host port secret
-      read -r -p "Public hostname or IPv4 [auto public IPv4]: " host
-      if [[ -z "$host" ]]; then
-        host="$(public_ip || true)"
-      fi
-      port="$(env_value "$MTPROTO_ENV" MTPROTO_PORT)"
-      secret="$(env_value "$MTPROTO_ENV" MTPROTO_SECRET)"
-      print_mtproto_link "$host" "$port" "$secret" || return
-      ;;
-    4)
-      run_cmd systemctl daemon-reload
-      run_cmd systemctl enable --now infiproxy-mtproto.service || true
-      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
-      ;;
-    5)
-      run_cmd systemctl restart infiproxy-mtproto.service || true
-      run_cmd systemctl --no-pager --full status infiproxy-mtproto.service || true
-      ;;
-    0) return ;;
-    *) invalid_choice; return ;;
-  esac
-  pause
-}
-
 install_https_deps() {
   need_root
   header
@@ -1038,12 +855,12 @@ guided_deployment() {
   need_root
   if tui_available; then
     whiptail --title "Infiproxy guided deployment" --msgbox \
-      "One installation cycle will:\n\n1. Install or repair the panel\n2. Configure optional HTTPS\n3. Install verified runtime modules\n4. Configure optional MTProto\n5. Verify final service state" \
+      "One installation cycle will:\n\n1. Install or repair the panel\n2. Configure optional HTTPS\n3. Install verified runtime modules\n4. Verify final service state" \
       18 72
   else
     header
     echo "${bold}Guided deployment cycle${reset}"
-    echo "Panel, HTTPS, verified modules, MTProto and final checks."
+    echo "Panel, HTTPS, verified modules and final checks."
     echo
   fi
 
@@ -1080,19 +897,6 @@ guided_deployment() {
         }
       fi
     done < <(registered_module_records)
-  fi
-
-  echo
-  if confirm_yes "Configure Telegram MTProto module now?" "N"; then
-    if [[ ! -x "$MTPROTO_BINARY" ]]; then
-      echo "${muted}MTProto binary is not installed yet.${reset}"
-      if confirm_yes "Build and install it from the latest official commit?" "Y"; then
-        "$MODULE_UPDATE_BIN" --update mtproto || true
-      fi
-    fi
-    guided_mtproto_setup || {
-      echo "${danger}MTProto setup did not complete. You can rerun Telegram MTProto setup later.${reset}" >&2
-    }
   fi
 
   echo
@@ -1341,15 +1145,13 @@ panel_update_menu() {
 
 advanced_menu() {
   while true; do
-    choice="$(tui_menu "Advanced tools" "Installation and specialized modules" \
+    choice="$(tui_menu "Advanced tools" "Installation and runtime tools" \
       1 "Install or repair panel" \
-      2 "Telegram MTProto configuration" \
-      3 "Manual verified archive import" \
+      2 "Manual verified archive import" \
       0 "Back")" || return
     case "$choice" in
       1) install_or_repair ;;
-      2) mtproto_setup_menu ;;
-      3) core_helper ;;
+      2) core_helper ;;
       0) return ;;
       *) invalid_choice ;;
     esac

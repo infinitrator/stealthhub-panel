@@ -1,0 +1,14 @@
+id=mihomo
+name=Mihomo
+kind=proxy core
+role=Trojan TLS, Snell v5 and Mieru server runtime
+repo=MetaCubeX/mihomo
+upstream=release
+ref=
+driver=release
+root=cores
+binary=mihomo
+service=infiproxy-mihomo.service
+config=/etc/infiproxy-cores/mihomo/config.yaml
+asset_amd64=mihomo-linux-amd64-v{version}.gz
+asset_arm64=mihomo-linux-arm64-v{version}.gz

@@ -18,7 +18,7 @@ Nginx -> Infiproxy panel -> SQLite
                          root maintenance workers
                               |
                               v
-              registered proxy runtimes / MTProxy
+                 registered proxy runtimes
 ```
 
 - **Control plane**: панель, SQLite, TUI, manifests, updater и systemd. Он решает,
@@ -212,7 +212,7 @@ Firewall решает, какие входящие/исходящие packets р
 2. разрешить SSH с доверенных адресов, если возможно;
 3. разрешить `80/tcp`, `443/tcp` для Nginx;
 4. разрешить только порты включенных proxy-runtime;
-5. не публиковать `8080` и MTProto stats;
+5. не публиковать `8080`;
 6. запретить остальное входящее.
 
 Веб-страница только показывает команды проверки firewall. Reload и изменение

@@ -25,6 +25,7 @@ ROOT_STATE_DIR="${INFIPROXY_ROOT_STATE_DIR:-/var/lib/infiproxy-maintenance}"
 APPLIED_SHA_FILE="${INFIPROXY_PANEL_APPLIED_SHA:-${ROOT_STATE_DIR}/panel-last-applied.sha}"
 MODULE_MANIFEST_DIR="${INFIPROXY_MODULE_MANIFEST_DIR:-/etc/infiproxy-modules.d}"
 MODULE_AVAILABLE_DIR="${INFIPROXY_MODULE_AVAILABLE_DIR:-/etc/infiproxy-modules.available.d}"
+LEGACY_MODULE_DIR="${INFIPROXY_LEGACY_MODULE_DIR:-${ROOT_STATE_DIR}/legacy-modules}"
 CORE_DIR="${INFIPROXY_CORE_DIR:-${STEALTHHUB_CORE_DIR:-/opt/infiproxy/cores}}"
 CORE_CONFIG_DIR="${INFIPROXY_CORE_CONFIG_DIR:-${STEALTHHUB_CORE_CONFIG_DIR:-/etc/infiproxy-cores}}"
 CORE_LOG_DIR="${INFIPROXY_CORE_LOG_DIR:-${STEALTHHUB_CORE_LOG_DIR:-/var/log/infiproxy-cores}}"
@@ -144,6 +145,25 @@ record_current_commit() {
         return
     fi
     record_source_commit "$ENV_FILE" "$commit" root "$APP_GROUP"
+}
+
+retire_legacy_module() {
+    local module_id="$1" service="$2" directory source label
+    directory="${LEGACY_MODULE_DIR}/${module_id}"
+    install -d -o root -g root -m 0700 "$directory"
+    for label in active available; do
+        if [[ "$label" == "active" ]]; then
+            source="${MODULE_MANIFEST_DIR}/${module_id}.module"
+        else
+            source="${MODULE_AVAILABLE_DIR}/${module_id}.module"
+        fi
+        if [[ -f "$source" && ! -L "$source" ]]; then
+            install -m 0600 -o root -g root "$source" "$directory/${label}.module"
+        fi
+        rm -f -- "$source"
+    done
+    systemctl disable --now "$service" >/dev/null 2>&1 || true
+    rm -f -- "/etc/systemd/system/${service}"
 }
 
 wait_panel_ready() {
@@ -318,6 +338,7 @@ install -d -o root -g root -m 0751 "$ROOT_STATE_DIR"
 install -d -o root -g root -m 0700 "$ROOT_STATE_DIR/reconcile" "$ROOT_STATE_DIR/reconcile/transactions"
 install -d -o root -g "$APP_GROUP" -m 0750 "$ROOT_STATE_DIR/module-versions"
 install -d -o root -g root -m 0750 "$ROOT_STATE_DIR/module-disabled"
+install -d -o root -g root -m 0700 "$LEGACY_MODULE_DIR"
 install -d -o root -g root -m 0755 "$MODULE_MANIFEST_DIR"
 install -d -o root -g root -m 0755 "$MODULE_AVAILABLE_DIR"
 install -d -o root -g root -m 0755 "$(dirname "$INSTALL_BIN")"
@@ -354,6 +375,10 @@ install -m 0644 -o root -g root /dev/stdin "$UPDATE_CONFIG_FILE" <<EOF
 REPO=${UPDATE_REPO}
 REF=${UPDATE_REF}
 EOF
+
+# Upgrades retain historical files but cannot resurrect retired products in
+# either the active registry or the installable catalog.
+retire_legacy_module mtproto infiproxy-mtproto.service
 
 for manifest in "${bundled_manifests[@]}"; do
     module_id="$(basename "$manifest" .module)"
@@ -396,7 +421,7 @@ install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/xray"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/sing-box"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/hysteria"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tuic"
-install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mtproto"
+install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mihomo"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
@@ -411,15 +436,15 @@ fi
 if [[ ! -f "$CORE_CONFIG_DIR/tuic/config.json" ]]; then
     install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/tuic.config.example.json" "$CORE_CONFIG_DIR/tuic/config.json"
 fi
-if [[ ! -f "$CORE_CONFIG_DIR/mtproto/mtproto.env" ]]; then
-    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/mtproto.env.example" "$CORE_CONFIG_DIR/mtproto/mtproto.env"
+if [[ ! -f "$CORE_CONFIG_DIR/mihomo/config.yaml" ]]; then
+    install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/mihomo.config.example.yaml" "$CORE_CONFIG_DIR/mihomo/config.yaml"
 fi
 for config in \
     "$CORE_CONFIG_DIR/xray/config.json" \
     "$CORE_CONFIG_DIR/sing-box/config.json" \
     "$CORE_CONFIG_DIR/hysteria/config.yaml" \
     "$CORE_CONFIG_DIR/tuic/config.json" \
-    "$CORE_CONFIG_DIR/mtproto/mtproto.env"
+    "$CORE_CONFIG_DIR/mihomo/config.yaml"
 do
     chown root:"$RUNTIME_GROUP" "$config"
     chmod 0640 "$config"

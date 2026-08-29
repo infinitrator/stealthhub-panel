@@ -254,6 +254,8 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
                 anyhow::bail!("generic modules must use their own core service and config tree");
             }
         }
+        // Retired drivers remain parseable only so a stale root-owned manifest
+        // can enter the privileged removal path during an upgrade.
         "headscale" => {
             if spec.id != "headscale"
                 || spec.root != "modules"

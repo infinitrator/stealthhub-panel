@@ -8,7 +8,7 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 > [!IMPORTANT]
 > Infiproxy является панелью управления и генератором клиентских подписок.
 > Она не передает пользовательский трафик сама. Xray, sing-box, Hysteria,
-> TUIC и Telegram MTProxy работают отдельными процессами. Для
+> TUIC и Mihomo работают отдельными процессами. Для
 > поддержанных protocol/core adapters вкладка **Protocols** формирует desired
 > state, а отдельный root reconciler атомарно применяет server config только
 > после validation, health/listener checks и с rollback.
@@ -59,7 +59,7 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - проверяемые обновления бинарников с атомарным переключением версии;
 - обновление самой панели с pre-update backup и rollback;
 - Cloudflare DNS-01, Let's Encrypt и Nginx через root-TUI;
-- установка и базовая настройка Telegram MTProxy;
+- установка и атомарная настройка Trojan, Snell и Mieru через Mihomo;
 - owner-only хранилище client-side secret values без обратного показа значений;
 - root-only хранилище private server secrets через SSH-TUI;
 - allowlist-редактор конфигов, health/readiness и локальная IP-диагностика;
@@ -114,7 +114,6 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 - [sing-box documentation](https://sing-box.sagernet.org/)
 - [Hysteria 2 documentation](https://v2.hysteria.network/docs/)
 - [TUIC protocol repository](https://github.com/tuic-protocol/tuic)
-- [Telegram MTProxy repository](https://github.com/TelegramMessenger/MTProxy)
 - [Cloudflare API documentation](https://developers.cloudflare.com/fundamentals/api/)
 
 При расхождении wiki с установленной версией runtime приоритет имеют

@@ -93,8 +93,24 @@ CORE_ROOT="${TMP_DIR}/cores"
 install_fake_core sing-box version "$CORE_ROOT"
 install_fake_core hysteria version "$CORE_ROOT"
 install_fake_core tuic --version "$CORE_ROOT"
-install_fake_core mtproto --help "$CORE_ROOT"
+install_fake_core mihomo -v "$CORE_ROOT"
 install_fake_core custom --version "$CORE_ROOT"
+
+MIHOMO_GZIP_SOURCE="${TMP_DIR}/mihomo-gzip-source"
+MIHOMO_GZIP_ARCHIVE="${TMP_DIR}/mihomo-release.gz"
+MIHOMO_GZIP_ARGS="${TMP_DIR}/mihomo-gzip-smoke.args"
+: >"$MIHOMO_GZIP_ARGS"
+make_fake_core "$MIHOMO_GZIP_SOURCE"
+gzip -c "$MIHOMO_GZIP_SOURCE" >"$MIHOMO_GZIP_ARCHIVE"
+MIHOMO_GZIP_SHA="$(sha256sum "$MIHOMO_GZIP_ARCHIVE" | awk '{print $1}')"
+PATH="${FAKE_BIN}:${PATH}" \
+    INFIPROXY_CORE_ROOT="${TMP_DIR}/gzip-cores" \
+    INFIPROXY_CORE_STAGING="${TMP_DIR}/gzip-staging" \
+    SMOKE_ARGS_FILE="$MIHOMO_GZIP_ARGS" SMOKE_ACCEPT="-v" \
+    bash "${ROOT_DIR}/deploy/cores/install-core.sh" \
+        --core mihomo --version test-gzip --archive "$MIHOMO_GZIP_ARCHIVE" \
+        --sha256 "$MIHOMO_GZIP_SHA" --binary mihomo >/dev/null
+assert_file_contains "$MIHOMO_GZIP_ARGS" -v
 
 install_fake_core xray --version "$CORE_ROOT"
 assert_file_contains "${TMP_DIR}/xray-smoke.args" version
@@ -234,64 +250,24 @@ chmod +x "${FAKE_BIN}/systemctl"
 
 (
     export PATH="${FAKE_BIN}:${PATH}"
-    export INFIPROXY_STATE_DIR="${TMP_DIR}/headscale-panel-state"
-    export INFIPROXY_ROOT_STATE_DIR="${TMP_DIR}/headscale-root-state"
-    export INFIPROXY_MODULE_ROOT="${TMP_DIR}/headscale-modules"
-    export INFIPROXY_HEADSCALE_DATA_DIR="${TMP_DIR}/headscale-data"
-    export INFIPROXY_HEADSCALE_LINK="${TMP_DIR}/headscale-link"
-    export SYSTEMCTL_LOG="${TMP_DIR}/headscale-systemctl.log"
+    export INFIPROXY_STATE_DIR="${TMP_DIR}/retired-panel-state"
+    export INFIPROXY_ROOT_STATE_DIR="${TMP_DIR}/retired-root-state"
     # shellcheck source=deploy/module-update.sh
     source "${ROOT_DIR}/deploy/module-update.sh"
-    M_ID="headscale"
-    M_DRIVER="headscale"
-    M_ROOT="modules"
-    M_BINARY="headscale"
-    M_SERVICE="headscale.service"
-    M_CONFIG="${TMP_DIR}/headscale-config/config.yaml"
-    mkdir -p "$(dirname "$M_CONFIG")" "$HEADSCALE_DATA_DIR" \
-        "$(runtime_root)/old"
-    printf 'server_url: https://hs.example.test\n' >"$M_CONFIG"
-    printf 'consistent database\n' >"${HEADSCALE_DATA_DIR}/db.sqlite"
-    printf 'transient wal\n' >"${HEADSCALE_DATA_DIR}/db.sqlite-wal"
-    cat >"$(runtime_root)/old/headscale" <<'EOF'
-#!/usr/bin/env bash
-echo 'headscale version v0.28.2 (audit fixture)'
-EOF
-    chmod +x "$(runtime_root)/old/headscale"
-    ln -s "$(runtime_root)/old" "$(runtime_root)/current"
-    [[ "$(installed_version headscale)" == "v0.28.2" ]] \
-        || fail "Headscale binary version fallback did not return one version line"
-
-    backup_module_config 1 1
-    [[ -n "$LAST_MODULE_BACKUP" ]] || fail "Headscale backup path was not recorded"
-    tar -tzf "${LAST_MODULE_BACKUP}/config.tar.gz" \
-        | grep -Fq "${HEADSCALE_DATA_DIR#/}/db.sqlite" \
-        || fail "Headscale SQLite snapshot is missing from the backup"
-    if tar -tzf "${LAST_MODULE_BACKUP}/config.tar.gz" \
-        | grep -Fq "${HEADSCALE_DATA_DIR#/}/db.sqlite-wal"; then
-        fail "Headscale WAL leaked into the consistent backup"
+    module_is_retired headscale || fail "Headscale is not retired"
+    module_is_retired mtproto || fail "MTProto is not retired"
+    if (require_active_product_module mtproto >/dev/null 2>&1); then
+        fail "MTProto entered an active updater path"
     fi
-
-    NEW_HEADSCALE="${TMP_DIR}/headscale-candidate"
-    cat >"$NEW_HEADSCALE" <<'EOF'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "version" ]]; then
-    exit 0
-fi
-printf 'migrated database\n' >"$HEADSCALE_TEST_DB"
-exit 1
-EOF
-    chmod +x "$NEW_HEADSCALE"
-    export HEADSCALE_TEST_DB="${HEADSCALE_DATA_DIR}/db.sqlite"
-    ensure_headscale_unit() { :; }
-    if (install_headscale_binary v0.29.3 "$NEW_HEADSCALE" 1 1); then
-        fail "failed Headscale config canary unexpectedly succeeded"
+    [[ ! -e "${ROOT_DIR}/deploy/modules.d/mtproto.module" ]] \
+        || fail "installer still bundles MTProto"
+    if [[ "$(grep -ci 'mtproto' "${ROOT_DIR}/deploy/install.sh")" -ne 1 ]] \
+        || ! grep -Fq 'retire_legacy_module mtproto infiproxy-mtproto.service' \
+            "${ROOT_DIR}/deploy/install.sh"; then
+        fail "installer has a non-retirement MTProto path"
     fi
-    [[ "$(readlink "$(runtime_root)/current")" == "$(runtime_root)/old" ]] \
-        || fail "Headscale canary failure did not restore the previous symlink"
-    assert_file_contains "${HEADSCALE_DATA_DIR}/db.sqlite" "consistent database"
-    grep -Fq 'restart headscale.service' "$SYSTEMCTL_LOG" \
-        || fail "Headscale rollback did not restore the active service"
+    ! grep -Fq 'infiproxy-mtproto.service' "${ROOT_DIR}/deploy/infiproxy-manager.sh" \
+        || fail "normal TUI still exposes MTProto"
 )
 
 (

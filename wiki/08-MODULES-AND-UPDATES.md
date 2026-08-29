@@ -36,10 +36,10 @@ module updater -> version directory -> atomic current symlink -> service restore
 | `sing-box` | `SagerNet/sing-box` latest release | release | cores | `infiproxy-sing-box.service` |
 | `hysteria` | `apernet/hysteria` latest release | release | cores | `infiproxy-hysteria.service` |
 | `tuic` | `tuic-protocol/tuic` latest release | release | cores | `infiproxy-tuic.service` |
-| `mtproto` | `TelegramMessenger/MTProxy` `master` commit | source build | cores | `infiproxy-mtproto.service` |
+| `mihomo` | `MetaCubeX/mihomo` latest release | release | cores | `infiproxy-mihomo.service` |
 
-MTProto version — commit SHA, потому что updater компилирует source. Остальные
-версии — GitHub release tags.
+Все активные bundled modules используют GitHub release tags и проверяемые
+release assets. Source-build drivers в активном продукте отсутствуют.
 
 ## Manifest contract
 

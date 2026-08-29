@@ -373,26 +373,19 @@ fn config_editor_targets_are_allowlisted_and_unique() {
 }
 
 #[test]
-fn mtproto_runtime_is_wired_into_panel_contracts() {
-    assert!(modules::registry()
-        .unwrap()
-        .iter()
-        .any(|module| module.service == "infiproxy-mtproto.service"
-            && module.binary_path.ends_with("/mtproto-proxy")));
-    assert!(config_files()
-        .iter()
-        .any(|spec| { spec.path == "/etc/infiproxy-cores/mtproto/mtproto.env" && !spec.editable }));
-}
-
-#[test]
-fn retired_headscale_surface_is_absent_from_normal_ui_and_routes() {
+fn retired_product_surfaces_are_absent_from_normal_ui_and_routes() {
     let shell = ui::layout("test", maud::html! { p { "content" } }).into_string();
-    assert!(!shell.to_ascii_lowercase().contains("headscale"));
-    assert!(!include_str!("main.rs").contains("/admin/headscale"));
-    assert!(!modules::registry()
-        .unwrap()
-        .iter()
-        .any(|module| module.id == "headscale"));
+    let source = include_str!("main.rs").to_ascii_lowercase();
+    let configs = config_files();
+    for retired in ["headscale", "mtproto"] {
+        assert!(!shell.to_ascii_lowercase().contains(retired));
+        assert!(!source.contains(&format!("/admin/{retired}")));
+        assert!(!modules::registry()
+            .unwrap()
+            .iter()
+            .any(|module| module.id == retired));
+        assert!(!configs.iter().any(|spec| spec.slug.contains(retired)));
+    }
 }
 
 #[test]

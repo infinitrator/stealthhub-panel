@@ -54,8 +54,9 @@
 | Nginx | `80/tcp`, `443/tcp` | да |
 | Hysteria2 starter | `443/udp` | после настройки |
 | TUIC starter | `11443/udp` | после настройки |
-| MTProto starter | `8444/tcp` | после настройки |
-| MTProto stats | `8888/tcp` | только loopback по модели upstream |
+| Trojan TLS starter | `12443/tcp` | после настройки |
+| Snell v5 starter | `13443/tcp` | после настройки |
+| Mieru TCP starter | `14443/tcp` | после настройки |
 
 `443/tcp` Nginx и `443/udp` Hysteria не конфликтуют: протокол транспорта входит
 в идентификатор сокета. Два процесса конфликтуют только при совпадении IP,
@@ -159,15 +160,10 @@ TUI предлагает один цикл, но каждый необязате
 2. Hysteria2 как отдельный UDP/QUIC fallback;
 3. TUIC как второй QUIC fallback;
 4. sing-box только после подготовки полного inbound для SS2022/ShadowTLS/AnyTLS.
+5. Mihomo для Trojan TLS, Snell v5 и Mieru TCP.
 
 Не включайте systemd unit, пока placeholder-конфиг не заменен и не прошел
 валидатор конкретного ядра.
-
-### Telegram MTProto
-
-Выберите только если нужен нативный Telegram proxy. TUI может собрать официальный
-MTProxy, скачать upstream-файлы, создать 32-hex secret, записать env и показать
-import link. Это отдельный сервис и в Mihomo YAML не попадает.
 
 ## 5. Проверьте control plane
 

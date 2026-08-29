@@ -26,9 +26,9 @@ service = "infiproxy-tuic.service"
 active = "/opt/infiproxy/cores/tuic/current"
 config = "/etc/infiproxy-cores/tuic/config.json"
 
-[mtproto]
-repo = "TelegramMessenger/MTProxy"
-binary = "mtproto-proxy"
-service = "infiproxy-mtproto.service"
-active = "/opt/infiproxy/cores/mtproto/current"
-config = "/etc/infiproxy-cores/mtproto/mtproto.env"
+[mihomo]
+repo = "MetaCubeX/mihomo"
+binary = "mihomo"
+service = "infiproxy-mihomo.service"
+active = "/opt/infiproxy/cores/mihomo/current"
+config = "/etc/infiproxy-cores/mihomo/config.yaml"

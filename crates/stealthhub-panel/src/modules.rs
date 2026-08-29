@@ -31,7 +31,7 @@ const DEFAULT_AVAILABLE_DIR: &str = "/etc/infiproxy-modules.available.d";
 const DEFAULT_STATE_DIR: &str = "/var/lib/infiproxy/modules";
 const DEFAULT_REQUEST_DIR: &str = "/var/lib/infiproxy/module-requests";
 const DEFAULT_VERSION_DIR: &str = "/var/lib/infiproxy-maintenance/module-versions";
-const RETIRED_PRODUCT_MODULE_IDS: &[&str] = &["headscale"];
+const RETIRED_PRODUCT_MODULE_IDS: &[&str] = &["headscale", "mtproto"];
 /// Persisted and locally observed module update state.
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleStatus {
@@ -140,10 +140,10 @@ pub(crate) fn spawn_checker(pool: SqlitePool) {
 /// Loads every valid manifest in deterministic ID order.
 pub(crate) fn registry() -> anyhow::Result<Vec<ModuleSpec>> {
     let directory = manifest_dir();
-    Ok(load_registry(&directory, registry_options(&directory))?
-        .into_iter()
-        .filter(|spec| !is_retired_product_module(&spec.id))
-        .collect())
+    Ok(visible_product_modules(load_registry(
+        &directory,
+        registry_options(&directory),
+    )?))
 }
 
 /// Loads catalog entries that are not currently active.
@@ -301,6 +301,13 @@ pub(crate) fn short_version(value: &str) -> String {
 // privileged cleanup path can remove their historical footprint.
 fn is_retired_product_module(module_id: &str) -> bool {
     RETIRED_PRODUCT_MODULE_IDS.contains(&module_id)
+}
+
+fn visible_product_modules(specs: Vec<ModuleSpec>) -> Vec<ModuleSpec> {
+    specs
+        .into_iter()
+        .filter(|spec| !is_retired_product_module(&spec.id))
+        .collect()
 }
 
 pub(crate) fn status_class(status: &ModuleStatus) -> &'static str {
@@ -623,12 +630,40 @@ mod tests {
         assert!(specs.len() >= 5);
         assert!(specs.iter().any(|spec| spec.id == "xray"));
         assert!(!specs.iter().any(|spec| spec.id == "headscale"));
+        assert!(!specs.iter().any(|spec| spec.id == "mtproto"));
     }
 
     #[test]
     fn retired_product_modules_are_not_eligible_for_panel_inventory() {
         assert!(is_retired_product_module("headscale"));
+        assert!(is_retired_product_module("mtproto"));
         assert!(!is_retired_product_module("xray"));
+    }
+
+    #[test]
+    fn stale_mtproto_manifests_are_filtered_from_active_and_available_catalogs() {
+        let root = std::env::temp_dir().join(format!(
+            "infiproxy-retired-manifest-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("mtproto.module"),
+            concat!(
+                "id=mtproto\nname=Legacy MTProto\nkind=legacy\nrole=removal only\n",
+                "repo=TelegramMessenger/MTProxy\nupstream=commit\nref=master\n",
+                "driver=mtproto-source\nroot=cores\nbinary=mtproto-proxy\n",
+                "service=infiproxy-mtproto.service\n",
+                "config=/etc/infiproxy-cores/mtproto/mtproto.env\n",
+                "asset_amd64=unused\nasset_arm64=unused\n"
+            ),
+        )
+        .unwrap();
+        let stale = load_registry(&root, ReadOptions::default()).unwrap();
+        assert!(visible_product_modules(stale.clone()).is_empty());
+        assert!(visible_product_modules(stale).is_empty());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

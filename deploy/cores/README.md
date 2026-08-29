@@ -19,13 +19,11 @@ The panel should generate and validate configs, then let systemd supervise each 
 /opt/infiproxy/cores/tuic/{version}/tuic-server
 /opt/infiproxy/cores/tuic/current -> /opt/infiproxy/cores/tuic/{version}
 
-/opt/infiproxy/cores/mtproto/{version}/mtproto-proxy
-/opt/infiproxy/cores/mtproto/current -> /opt/infiproxy/cores/mtproto/{version}
+/opt/infiproxy/cores/mihomo/{version}/mihomo
+/opt/infiproxy/cores/mihomo/current -> /opt/infiproxy/cores/mihomo/{version}
 
 /etc/infiproxy-cores/{core}/config.*
-/etc/infiproxy-cores/mtproto/mtproto.env
-/etc/infiproxy-cores/mtproto/proxy-secret
-/etc/infiproxy-cores/mtproto/proxy-multi.conf
+/etc/infiproxy-cores/mihomo/config.yaml
 /var/lib/infiproxy-maintenance/core-updates/{core}/{version}
 ```
 
@@ -78,20 +76,6 @@ sudo deploy/cores/install-core.sh \
 ```
 
 The script refuses to switch `current` if checksum verification fails or the
-staged binary does not answer `--version`.
-
-Telegram MTProto is the exception to the `--version` probe because the official
-`mtproto-proxy` binary is not shaped like the Go/Rust proxy cores. For that
-core, the installer runs a bounded help/usage smoke test, then leaves service
-startup to systemd.
-
-After installing the MTProxy binary, run:
-
-```bash
-sudo infiproxy-manager
-```
-
-Choose `Telegram MTProto setup` to download Telegram's `proxy-secret` and
-`proxy-multi.conf`, generate a 32-hex client secret, write
-`/etc/infiproxy-cores/mtproto/mtproto.env`, and print the `t.me/proxy` import
-link.
+staged binary does not answer its runtime-specific version command. Mihomo uses
+`-v`; its single-file `.gz` release is decompressed under the same bounded
+extraction policy as archive-based cores.
