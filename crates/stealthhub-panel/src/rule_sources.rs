@@ -221,16 +221,11 @@ async fn validate_remote_url(url: &Url) -> Result<Vec<SocketAddr>> {
 
 fn forbidden_address(address: IpAddr) -> bool {
     match address {
-        IpAddr::V4(address) => {
-            address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_unspecified()
-                || address.is_multicast()
-        }
+        IpAddr::V4(address) => forbidden_ipv4(address),
         IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return forbidden_ipv4(mapped);
+            }
             address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
@@ -238,6 +233,21 @@ fn forbidden_address(address: IpAddr) -> bool {
                 || address.is_unicast_link_local()
         }
     }
+}
+
+fn forbidden_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let value = u32::from(address);
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_broadcast()
+        || address.is_documentation()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || value >> 24 == 0
+        || value & 0xffc0_0000 == 0x6440_0000 // 100.64.0.0/10 shared address space
+        || value & 0xfffe_0000 == 0xc612_0000 // 198.18.0.0/15 benchmarking
+        || value & 0xf000_0000 == 0xf000_0000 // 240.0.0.0/4 reserved
 }
 
 fn bounded_header(value: Option<&reqwest::header::HeaderValue>) -> Option<String> {
@@ -268,6 +278,18 @@ mod tests {
     fn private_and_local_addresses_are_forbidden() {
         assert!(forbidden_address("127.0.0.1".parse().unwrap()));
         assert!(forbidden_address("10.0.0.1".parse().unwrap()));
+        assert!(forbidden_address("100.64.0.1".parse().unwrap()));
+        assert!(forbidden_address("198.18.0.1".parse().unwrap()));
         assert!(!forbidden_address("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn mapped_ipv4_addresses_follow_ipv4_policy() {
+        assert!(forbidden_address("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(forbidden_address("::ffff:10.0.0.1".parse().unwrap()));
+        assert!(forbidden_address("::ffff:169.254.1.1".parse().unwrap()));
+        assert!(forbidden_address("::ffff:100.64.0.1".parse().unwrap()));
+        assert!(forbidden_address("::ffff:198.18.0.1".parse().unwrap()));
+        assert!(!forbidden_address("::ffff:1.1.1.1".parse().unwrap()));
     }
 }
