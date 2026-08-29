@@ -467,7 +467,7 @@ async fn persist_check_error(pool: &SqlitePool, spec: &ModuleSpec) -> anyhow::Re
 async fn load_auto_update(pool: &SqlitePool, module_id: &str) -> anyhow::Result<bool> {
     Ok(get_setting(pool, &setting_key(module_id, "auto_update"))
         .await?
-        .is_none_or(|setting| crate::update::parse_bool_setting(&setting.value)))
+        .is_some_and(|setting| crate::update::parse_bool_setting(&setting.value)))
 }
 
 async fn setting_or_default(
@@ -511,7 +511,14 @@ fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
     let directory = state_dir();
     fs::create_dir_all(&directory)?;
     secure_private_directory(&directory)?;
-    let content = format!(
+    let content = state_file_content(status);
+    let path = directory.join(format!("{}.env", status.spec.id));
+    atomic_file::replace(&path, content.as_bytes(), 0o640)?;
+    Ok(())
+}
+
+fn state_file_content(status: &ModuleStatus) -> String {
+    format!(
         concat!(
             "AUTO_ENABLED={}\nINSTALLED={}\nUPDATE_AVAILABLE={}\n",
             "INSTALLED_VERSION={}\nLATEST_VERSION={}\nCHECKED_AT={}\n"
@@ -522,10 +529,7 @@ fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
         safe_state_value(&status.installed_version),
         safe_state_value(&status.latest_version),
         safe_state_value(&status.checked_at),
-    );
-    let path = directory.join(format!("{}.env", status.spec.id));
-    atomic_file::replace(&path, content.as_bytes(), 0o640)?;
-    Ok(())
+    )
 }
 
 fn secure_private_directory(directory: &Path) -> anyhow::Result<()> {
@@ -623,6 +627,27 @@ fn safe_state_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stealthhub_core::storage::{init_db, open_pool};
+
+    async fn temporary_pool(label: &str) -> (SqlitePool, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "infiproxy-{label}-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let pool = open_pool(&format!("sqlite://{}", path.display()))
+            .await
+            .expect("temporary database should open");
+        init_db(&pool)
+            .await
+            .expect("temporary database should initialize");
+        (pool, path)
+    }
+
+    async fn close_pool(pool: SqlitePool, path: PathBuf) {
+        pool.close().await;
+        fs::remove_file(path).expect("temporary database should be removed");
+    }
 
     #[test]
     fn bundled_registry_is_dynamic_and_valid() {
@@ -676,6 +701,46 @@ mod tests {
     #[test]
     fn unsafe_module_inputs_are_rejected() {
         assert!(!valid_id("../root"));
+    }
+
+    #[tokio::test]
+    async fn runtime_auto_update_is_explicit_opt_in_on_fresh_and_upgraded_databases() {
+        let (pool, path) = temporary_pool("module-auto-update").await;
+        assert!(!load_auto_update(&pool, "xray").await.unwrap());
+
+        upsert_setting(&pool, "module_xray_auto_update", "false")
+            .await
+            .unwrap();
+        assert!(!load_auto_update(&pool, "xray").await.unwrap());
+
+        upsert_setting(&pool, "module_xray_auto_update", "true")
+            .await
+            .unwrap();
+        init_db(&pool).await.unwrap();
+        assert!(load_auto_update(&pool, "xray").await.unwrap());
+
+        close_pool(pool, path).await;
+    }
+
+    #[test]
+    fn mirrored_module_state_preserves_explicit_auto_update_policy() {
+        let spec = registry()
+            .unwrap()
+            .into_iter()
+            .find(|spec| spec.id == "xray")
+            .unwrap();
+        let status = |auto_update| ModuleStatus {
+            spec: spec.clone(),
+            installed: false,
+            installed_version: "unknown".to_string(),
+            latest_version: "v26.3.27".to_string(),
+            update_available: false,
+            auto_update,
+            checked_at: "never".to_string(),
+            status: "not installed".to_string(),
+        };
+        assert!(state_file_content(&status(false)).starts_with("AUTO_ENABLED=false\n"));
+        assert!(state_file_content(&status(true)).starts_with("AUTO_ENABLED=true\n"));
     }
 
     #[cfg(unix)]
