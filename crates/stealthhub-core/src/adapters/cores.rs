@@ -24,6 +24,18 @@ use crate::adapter::{
 const CERTIFICATE_PATH: &str = "/etc/infiproxy-cores/tls/fullchain.pem";
 const PRIVATE_KEY_PATH: &str = "/etc/infiproxy-cores/tls/privkey.pem";
 const RUNTIME_GROUP: &str = "infiproxy-runtime";
+const XRAY_CAPABILITIES: &[&str] = &["vless-reality-tcp", "vless-reality-xhttp"];
+const SING_BOX_CAPABILITIES: &[&str] = &[
+    "vless-reality-tcp",
+    "vless-reality-xhttp",
+    "shadowsocks2022-shadow-tls",
+    "hysteria2",
+    "any-tls",
+    "tuic",
+];
+const HYSTERIA_CAPABILITIES: &[&str] = &["hysteria2"];
+const TUIC_CAPABILITIES: &[&str] = &["tuic"];
+const MIHOMO_CAPABILITIES: &[&str] = &["trojan-tls", "snell-v5", "mieru"];
 
 #[derive(Clone, Copy)]
 enum Flavor {
@@ -842,19 +854,8 @@ fn discover_config_users(
     Ok(users)
 }
 
-pub(super) fn registry() -> Result<CoreRegistry> {
-    let all = [
-        "vless-reality-tcp",
-        "vless-reality-xhttp",
-        "shadowsocks2022-shadow-tls",
-        "hysteria2",
-        "any-tls",
-        "tuic",
-        "trojan-tls",
-        "snell-v5",
-        "mieru",
-    ];
-    let adapters = [
+fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
+    [
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "xray",
             display_name: "Xray",
@@ -862,7 +863,7 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             flavor: Flavor::Xray,
             binary: "/opt/infiproxy/cores/xray/current/xray",
             config: "/etc/infiproxy-cores/xray/config.json",
-            capabilities: &all[..2],
+            capabilities: XRAY_CAPABILITIES,
             selection_priority: 100,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -872,7 +873,7 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             flavor: Flavor::Mihomo,
             binary: "/opt/infiproxy/cores/mihomo/current/mihomo",
             config: "/etc/infiproxy-cores/mihomo/config.yaml",
-            capabilities: &all[6..9],
+            capabilities: MIHOMO_CAPABILITIES,
             selection_priority: 100,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -882,7 +883,7 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             flavor: Flavor::SingBox,
             binary: "/opt/infiproxy/cores/sing-box/current/sing-box",
             config: "/etc/infiproxy-cores/sing-box/config.json",
-            capabilities: &all,
+            capabilities: SING_BOX_CAPABILITIES,
             selection_priority: 10,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -892,7 +893,7 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             flavor: Flavor::Hysteria,
             binary: "/opt/infiproxy/cores/hysteria/current/hysteria",
             config: "/etc/infiproxy-cores/hysteria/config.yaml",
-            capabilities: &all[3..4],
+            capabilities: HYSTERIA_CAPABILITIES,
             selection_priority: 100,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
@@ -902,12 +903,15 @@ pub(super) fn registry() -> Result<CoreRegistry> {
             flavor: Flavor::Tuic,
             binary: "/opt/infiproxy/cores/tuic/current/tuic-server",
             config: "/etc/infiproxy-cores/tuic/config.json",
-            capabilities: &all[5..6],
+            capabilities: TUIC_CAPABILITIES,
             selection_priority: 100,
         }),
-    ];
+    ]
+}
+
+pub(super) fn registry() -> Result<CoreRegistry> {
     let mut registry = CoreRegistry::default();
-    for adapter in adapters {
+    for adapter in built_in_adapters() {
         registry.register(Arc::new(adapter))?;
     }
     Ok(registry)
@@ -918,6 +922,39 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    fn minimal_plan(core_id: &str, capability: &str) -> CorePlan {
+        CorePlan {
+            generation: 1,
+            core_id: core_id.to_string(),
+            fragments: vec![crate::adapter::ServerFragment {
+                profile_id: format!("test-{capability}"),
+                capability: capability.to_string(),
+                payload: json!({
+                    "port": 24443,
+                    "config": {
+                        "server_name": "example.com",
+                        "path": "/proxy",
+                        "private_key_secret": "secret.private-key",
+                        "short_id_secret": "secret.short-id",
+                        "password_secret": "secret.password",
+                        "shadow_tls_password_secret": "secret.shadow-tls",
+                        "psk_secret": "secret.psk"
+                    },
+                    "users": [{"username": "alice", "uuid": "11111111-1111-4111-8111-111111111111"}],
+                    "resolved_secrets": {
+                        "secret.private-key": "private-key",
+                        "secret.short-id": "0123456789abcdef",
+                        "secret.password": "password",
+                        "secret.shadow-tls": "shadow-tls-password",
+                        "secret.psk": "pre-shared-key"
+                    }
+                }),
+                expected_user_ids: None,
+                listeners: Vec::new(),
+            }],
+        }
+    }
 
     #[test]
     fn listener_matching_does_not_confuse_port_suffixes() {
@@ -1028,5 +1065,64 @@ mod tests {
         ] {
             assert!(capabilities.contains(capability));
         }
+    }
+
+    #[test]
+    fn built_in_capability_manifests_match_their_composers() {
+        for adapter in built_in_adapters() {
+            for capability in &adapter.manifest.capabilities {
+                adapter
+                    .compose(&minimal_plan(&adapter.manifest.id, capability))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} advertises unsupported capability {capability}: {error:#}",
+                            adapter.manifest.id
+                        )
+                    });
+            }
+        }
+    }
+
+    #[test]
+    fn mihomo_only_capabilities_are_not_advertised_or_selected_by_sing_box() -> Result<()> {
+        let built_ins = registry()?;
+        let manifests = built_ins.manifests();
+        let mihomo = manifests
+            .iter()
+            .find(|manifest| manifest.id == "mihomo")
+            .context("Mihomo manifest is missing")?;
+        let sing_box = manifests
+            .iter()
+            .find(|manifest| manifest.id == "sing-box")
+            .context("sing-box manifest is missing")?;
+
+        for capability in MIHOMO_CAPABILITIES {
+            assert!(mihomo.capabilities.contains(*capability));
+            assert!(!sing_box.capabilities.contains(*capability));
+        }
+
+        let binary = std::env::temp_dir().join(format!(
+            "infiproxy-installed-sing-box-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&binary, b"installed")?;
+        let mut selection_registry = CoreRegistry::default();
+        selection_registry.register(Arc::new(ManagedCoreAdapter::new(ManagedCoreSpec {
+            id: "sing-box",
+            display_name: "sing-box",
+            service: "infiproxy-sing-box.service",
+            flavor: Flavor::SingBox,
+            binary: binary.to_str().context("temporary path is not UTF-8")?,
+            config: "/tmp/infiproxy-unused-sing-box-config.json",
+            capabilities: SING_BOX_CAPABILITIES,
+            selection_priority: 10,
+        })))?;
+
+        for capability in MIHOMO_CAPABILITIES {
+            let required = BTreeSet::from([(*capability).to_string()]);
+            assert!(selection_registry.select(&required, None)?.is_none());
+        }
+        fs::remove_file(binary)?;
+        Ok(())
     }
 }
