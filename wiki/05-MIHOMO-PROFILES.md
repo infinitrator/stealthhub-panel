@@ -64,10 +64,15 @@ Protocol profiles + secret_values + routing sets + subscription user UUID
 | `VLESS-REALITY-TCP-FALLBACK` | VLESS + REALITY + TCP/RAW | COMPAT | disabled | `node.infiproxy.local:7443` | `xray.reality.public_key`, `xray.reality.short_id` |
 | `SS2022-SHADOWTLS-FALLBACK` | SS2022 + ShadowTLS v3 | COMPAT | disabled | `node.infiproxy.local:9443` | `shadowsocks.2022.password`, `shadowtls.password` |
 | `ANYTLS-EXPERIMENTAL` | AnyTLS | COMPAT | disabled | `node.infiproxy.local:10443` | `anytls.password` |
+| `ANYTLS-TLS` / `ANYTLS-SHADOWTLS-V3` | AnyTLS explicit stable variants | COMPAT | disabled | TCP `10543` / `10643` | AnyTLS password; wrapper password for ShadowTLS |
+| `ANYTLS-RESTLS-EXPERIMENTAL` / `ANYTLS-JLS-EXPERIMENTAL` | AnyTLS camouflage variants | COMPAT | disabled | TCP `10743` / `10843` | AnyTLS and selected wrapper credentials |
 | `HYSTERIA2-SPEED` | Hysteria2 | SPEED | disabled | `node.infiproxy.local:443/udp` | `hysteria2.password`, optional `hysteria2.obfs_password` |
 | `TUIC-SPEED` | TUIC | SPEED | disabled | `node.infiproxy.local:11443/udp` | `tuic.password` |
+| `TROJAN-*` | TLS, ShadowTLS v3, ResTLS, JLS, REALITY | COMPAT | disabled | TCP `12443`-`12843` | Per-user UUID plus selected wrapper references |
+| `SNELL-V5-*` | plain, ShadowTLS v3, ResTLS, JLS | COMPAT | disabled | TCP `13443`-`13743` | `snell.psk` plus selected wrapper references |
+| `MIERU-TCP-COMPATIBILITY` | Mieru TCP | COMPAT | disabled | TCP `14443` | `mieru.password` |
 
-При первом запуске все шесть profiles выключены. Schema v8 помечает bootstrap
+При первом запуске все profiles выключены. Bootstrap marker помечает каталог
 завершенным, поэтому повторный запуск или обновление не восстанавливает удаленные
 profiles и не перезаписывает endpoint, параметры или switch. GUI редактирует
 встроенные records; новые protocol kinds появляются только вместе с доверенным
@@ -259,9 +264,11 @@ adapter добавит obfs и в client, и в generated server config. Выб�
 ## AnyTLS
 
 Generated object включает password, SNI, `client-fingerprint: chrome`, `udp:
-true`. Server sing-box должен иметь AnyTLS inbound с тем же password и TLS
-certificate. AnyTLS появился в sing-box 1.12, поэтому перед включением проверьте
-installed version и поддержку client Mihomo.
+true`. Legacy `any-tls` использует проверенный sing-box fallback. Новые
+`anytls-*` профили предпочитают native Mihomo `v1.19.30`: TLS использует общий
+certificate resource, а ShadowTLS/ResTLS/JLS вместо certificate mode получают
+ровно одну соответствующую server wrapper. AnyTLS+REALITY отсутствует, потому
+что Mihomo явно не поддерживает эту комбинацию.
 
 `udp: true` на клиентском object не превращает underlying AnyTLS TCP listener в
 QUIC; это разрешение проксировать UDP-сессии механизмом протокола.

@@ -32,11 +32,11 @@ module updater -> version directory -> atomic current symlink -> service restore
 
 | ID | Upstream | Driver | Runtime root | Unit |
 |---|---|---|---|---|
-| `xray` | `XTLS/Xray-core` latest release | release | cores | `infiproxy-xray.service` |
-| `sing-box` | `SagerNet/sing-box` latest release | release | cores | `infiproxy-sing-box.service` |
-| `hysteria` | `apernet/hysteria` latest release | release | cores | `infiproxy-hysteria.service` |
-| `tuic` | `tuic-protocol/tuic` latest release | release | cores | `infiproxy-tuic.service` |
-| `mihomo` | `MetaCubeX/mihomo` latest release | release | cores | `infiproxy-mihomo.service` |
+| `xray` | `XTLS/Xray-core` `v26.3.27` | pinned-release | cores | `infiproxy-xray.service` |
+| `sing-box` | `SagerNet/sing-box` `v1.13.20` | pinned-release | cores | `infiproxy-sing-box.service` |
+| `hysteria` | `apernet/hysteria` `app/v2.12.2` | pinned-release | cores | `infiproxy-hysteria.service` |
+| `tuic` | `tuic-protocol/tuic` `tuic-server-1.0.0` | pinned-release | cores | `infiproxy-tuic.service` |
+| `mihomo` | `MetaCubeX/mihomo` `v1.19.30` | pinned-release | cores | `infiproxy-mihomo.service` |
 
 Все активные bundled modules используют GitHub release tags и проверяемые
 release assets. Source-build drivers в активном продукте отсутствуют.
@@ -135,17 +135,17 @@ sudo infiproxy-module-update --check <id>
 
 Это remove runtime, не secure erase secrets.
 
-### Install latest из Available catalog
+### Install validated release из Available catalog
 
 Создает `.register`. Worker повторно валидирует root manifest, активирует его,
-создает config parent и сразу пытается установить latest. При fail request и
+создает config parent и сразу пытается установить manifest target. При fail request и
 manifest получают `.failed` marker.
 
 ## Проверка release asset
 
 Для release module updater:
 
-1. вызывает GitHub latest release API;
+1. для `pinned-release` вызывает API точного release tag и отдельно наблюдает latest;
 2. строит точное asset name для `amd64`/`arm64`;
 3. принимает SHA-256 digest asset metadata либо официальный checksum sidecar;
 4. отвергает URL вне `github.com/<manifest-repo>/releases/download/`;
@@ -232,7 +232,7 @@ sudo INFIPROXY_FORCE_IPV4=true \
 
 | Пункт | Фактическое действие |
 |---|---|
-| **Show installed/latest status** | Запускает `infiproxy-module-update --check-all`; для каждого active manifest обращается к GitHub и сравнивает version marker с latest release/commit. |
+| **Show installed/latest status** | Запускает `infiproxy-module-update --check-all`; сравнивает version marker с validated target и отдельно сообщает о более новом upstream release. |
 | **Check one module** | Предлагает динамический список и выполняет только `--check <id>`; binary/config не меняются. |
 | **Install or update one module** | Сначала выполняет check, затем спрашивает подтверждение и запускает `--update <id>` от root. |
 | **Restart module updater** | Выполняет `systemctl daemon-reload` и включает timer/path watcher; модули при этом не обновляются немедленно. |

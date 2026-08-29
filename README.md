@@ -8,6 +8,12 @@ SQLite + one SSH TUI**. The panel does not implement proxy protocols itself.
 Network traffic is handled by external cores such as Xray, sing-box, Hysteria,
 TUIC and Mihomo.
 
+The production compatibility contract is intentionally pinned and tested:
+Mihomo `v1.19.30`, Xray `v26.3.27`, sing-box `v1.13.20`, Hysteria
+`app/v2.12.2`, and TUIC server `1.0.0`. See
+[`docs/runtime-compatibility.md`](./docs/runtime-compatibility.md) before
+changing a runtime pin. Runtime automatic updates are explicit opt-in.
+
 Full Russian operator and networking documentation is available in the
 [`wiki/`](./wiki/Home.md): installation, every web/TUI control, protocols,
 routing, modules, backups, security and troubleshooting.

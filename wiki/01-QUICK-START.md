@@ -156,11 +156,12 @@ TUI предлагает один цикл, но каждый необязате
 
 Рекомендуемый порядок:
 
-1. Xray для VLESS + REALITY + XHTTP/TCP;
+1. Mihomo `v1.19.30` для новых VLESS + REALITY + XHTTP/TCP профилей;
 2. Hysteria2 как отдельный UDP/QUIC fallback;
 3. TUIC как второй QUIC fallback;
-4. sing-box только после подготовки полного inbound для SS2022/ShadowTLS/AnyTLS.
-5. Mihomo для Trojan TLS, Snell v5 и Mieru TCP.
+4. sing-box `v1.13.20` для SS2022 + ShadowTLS и проверенных fallback-профилей;
+5. Xray `v26.3.27` как фиксированный VLESS REALITY compatibility fallback;
+6. Mihomo для AnyTLS, Trojan, Snell v5 и Mieru TCP.
 
 Не включайте systemd unit, пока placeholder-конфиг не заменен и не прошел
 валидатор конкретного ядра.

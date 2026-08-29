@@ -33,6 +33,7 @@ SSH-TUI, сетевую модель, Mihomo-подписки, внешние pr
 14. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
 15. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
 16. [Адаптеры и атомарное применение](16-ADAPTERS-AND-RECONCILIATION).
+17. [Точный runtime compatibility contract](17-RUNTIME-COMPATIBILITY).
 
 ## Уровни готовности операций
 

@@ -357,12 +357,23 @@ optional `flow` и maturity. GUI показывает только целые з
 |---|---|---|
 | `vless-reality-xhttp` | VLESS + XHTTP + REALITY | Stable |
 | `vless-reality-tcp` | VLESS + TCP + REALITY | Stable |
+| `anytls-tls` | AnyTLS + TCP + TLS | Stable |
+| `anytls-shadowtls-v3` | AnyTLS + TCP + ShadowTLS v3 | Stable |
+| `anytls-restls` | AnyTLS + TCP + ResTLS | Experimental |
+| `anytls-jls` | AnyTLS + TCP + JLS | Experimental |
 | `shadowsocks2022-shadow-tls` | SS2022 + TCP + ShadowTLS v3 | Stable |
 | `hysteria2` | Hysteria2 + QUIC + TLS/optional Salamander | Stable |
 | `any-tls` | AnyTLS + TCP + TLS | Experimental |
 | `tuic` | TUIC v5 + QUIC + TLS | Stable |
 | `trojan-tls` | Trojan + TCP + TLS/uTLS | Stable |
+| `trojan-shadowtls-v3` | Trojan + TCP + ShadowTLS v3 | Stable |
+| `trojan-restls` | Trojan + TCP + ResTLS | Experimental |
+| `trojan-jls` | Trojan + TCP + JLS | Experimental |
+| `trojan-reality` | Trojan + TCP + REALITY | Stable |
 | `snell-v5` | Snell v5 + TCP + PSK | Stable |
+| `snell-v5-shadowtls-v3` | Snell v5 + ShadowTLS v3 | Stable |
+| `snell-v5-restls` | Snell v5 + ResTLS | Experimental |
+| `snell-v5-jls` | Snell v5 + JLS | Experimental |
 | `mieru` | Mieru + TCP + protocol auth | Stable |
 
 Таблица ниже фиксирует ecosystem support, а не обещает готовый Infiproxy
@@ -372,13 +383,13 @@ adapter. Baseline исследования — stable Mihomo `v1.19.30`. Есл�
 
 | Кандидат | Client / server | Auth и ресурсы | Maturity | В Infiproxy |
 |---|---|---|---|---|
-| AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Unsupported: отдельные JLS fields/renderers/golden canary не реализованы |
-| AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Unsupported: отдельные ResTLS fields/renderers/golden canary не реализованы |
+| AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Реализован `anytls-jls`; exact parser/server canary пройден |
+| AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Реализован `anytls-restls`; exact parser/server canary пройден |
 | VLESS + JLS | Mihomo outbound + inbound | UUID users, JLS user/password/destination | Experimental | Unsupported: JLS auth lifecycle и renderer не реализованы |
 | VLESS + ResTLS | Mihomo outbound + inbound | UUID users, ResTLS password/destination | Experimental | Unsupported: ResTLS secret lifecycle и renderer не реализованы |
-| Trojan TLS/uTLS | Mihomo outbound + inbound | UUID password, domain, certificate/private key | Stable | Реализован `trojan-tls` |
+| Trojan TLS/ShadowTLS/ResTLS/JLS/REALITY | Mihomo outbound + inbound | UUID password и credential выбранной единственной wrapper | Stable/Experimental | Все пять явных capabilities реализованы и проверены `v1.19.30` |
 | ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | username/password, QUIC/TLS/JLS, optional domain | Experimental | Unsupported: QUIC/JLS listener ownership и canary не реализованы |
-| Snell v5 | Mihomo outbound + inbound | shared PSK | Stable | Реализован `snell-v5` |
+| Snell v5 plain/ShadowTLS/ResTLS/JLS | Mihomo outbound + inbound | shared PSK и optional wrapper credential | Stable/Experimental | Все четыре capabilities реализованы и проверены `v1.19.30` |
 | Mieru TCP | Mihomo outbound + inbound | username/password | Stable | Реализован `mieru` |
 | MASQUE | Mihomo outbound; matching public inbound не подтверждён | ECDSA key pair, tunnel CIDR, optional SNI | Unsupported | Не предлагается |
 | TrustTunnel | Mihomo outbound + inbound | username/password, domain, certificate/key, HTTP/2 и optional HTTP/3 | Experimental | Unsupported: runtime canary не реализован |

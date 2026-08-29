@@ -157,14 +157,15 @@ update dry-run не должен показывать доступных обн�
 | Rust toolchain и заявленный MSRV | `1.96.0` |
 | Прямые Rust dependencies | `cargo outdated --root-deps-only`: обновлений нет |
 | Xray-core | `v26.3.27` |
-| sing-box | `v1.13.19` |
+| sing-box | `v1.13.20` |
 | Hysteria | `app/v2.12.2` |
 | TUIC server | `tuic-server-1.0.0` |
 | Mihomo | `v1.19.30` |
 
-Module manifests не фиксируют эти номера: updater каждый раз разрешает latest
-release из указанного root-owned manifest, проверяет asset/digest и лишь
-затем переключает `current`. Транзитивные дубликаты crates остаются только там,
+Production module manifests фиксируют эти номера через
+`upstream=pinned-release`: updater разрешает только точный stable tag,
+проверяет asset/digest и лишь затем переключает `current`. Новый upstream tag
+показывается отдельно, но автоматически не выбирается. Транзитивные дубликаты crates остаются только там,
 где независимые upstream libraries требуют разные совместимые API-линии; проект
 не подменяет их вручную и проверяет обе линии через RustSec и `cargo-deny`.
 

@@ -26,3 +26,4 @@
 - [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE)
 - [0.1 beta audit](15-RELEASE-0.1-BETA)
 - [Адаптеры и reconciliation](16-ADAPTERS-AND-RECONCILIATION)
+- [Runtime compatibility](17-RUNTIME-COMPATIBILITY)
