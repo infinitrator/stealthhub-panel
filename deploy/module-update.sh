@@ -113,7 +113,7 @@ load_module() {
   local id="$1" record
   valid_id "$id" || return 1
   record="$("$MANIFEST_HELPER" read "$(manifest_file "$id")" --root-owned)" || return 1
-  IFS='|' read -r M_ID _ _ _ M_REPO M_UPSTREAM _ M_DRIVER \
+  IFS='|' read -r M_ID _ _ _ M_REPO M_UPSTREAM M_REF M_DRIVER \
     M_ROOT M_BINARY M_SERVICE M_CONFIG M_ASSET_AMD64 M_ASSET_ARM64 <<<"$record"
   [[ "$M_ID" == "$id" ]]
 }
@@ -217,10 +217,31 @@ asset_pattern() {
 }
 
 release_metadata() {
-  local arch="$1" pattern api_json
+  local arch="$1" pattern api_url api_json metadata tag
   pattern="$(asset_pattern "$arch")"
+  if [[ "$M_UPSTREAM" == "pinned-release" ]]; then
+    api_url="${GITHUB_API}/${M_REPO}/releases/tags/${M_REF}"
+  else
+    api_url="${GITHUB_API}/${M_REPO}/releases/latest"
+  fi
+  api_json="$(github_json "$api_url")"
+  metadata="$("$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json")"
+  if [[ "$M_UPSTREAM" == "pinned-release" ]]; then
+    tag="${metadata%%|*}"
+    [[ "$tag" == "$M_REF" ]] || die "pinned release tag mismatch for ${M_ID}"
+  fi
+  printf '%s\n' "$metadata"
+}
+
+upstream_latest_version() {
+  local pattern api_json
+  pattern="$(asset_pattern "$(host_arch)")"
   api_json="$(github_json "${GITHUB_API}/${M_REPO}/releases/latest")"
-  "$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json"
+  "$MANIFEST_HELPER" release-metadata "$pattern" <<<"$api_json" | cut -d'|' -f1
+}
+
+compare_versions() {
+  "$MANIFEST_HELPER" compare-versions "$1" "$2"
 }
 
 resolve_checksum() {
@@ -335,7 +356,8 @@ rollback_symlink() {
 }
 
 install_release_module() {
-  local metadata tag asset url digest checksum_url checksum tmp normalized
+  local allow_downgrade="${1:-false}"
+  local metadata tag asset url digest checksum_url checksum tmp normalized current ordering
   local was_enabled=0 was_active=0 current_link previous_target
   metadata="$(release_metadata "$(host_arch)")"
   IFS='|' read -r tag asset url digest checksum_url <<<"$metadata"
@@ -343,12 +365,19 @@ install_release_module() {
     || die "refusing unexpected release URL for ${M_ID}"
   checksum="$(resolve_checksum "$asset" "$digest" "$checksum_url")"
   normalized="$(normalize_version "$tag")"
+  current="$(installed_version "$M_ID")"
 
   if [[ -x "$(module_binary)" ]] \
-    && { [[ "$(installed_version "$M_ID")" == "$tag" ]] \
-      || [[ "$(installed_version "$M_ID")" == "$normalized" ]]; }; then
+    && { [[ "$current" == "$tag" ]] || [[ "$current" == "$normalized" ]]; }; then
     log "${M_ID} is already current (${tag})"
     return
+  fi
+  if [[ "$M_UPSTREAM" == "pinned-release" && "$current" != "unknown" ]]; then
+    ordering="$(compare_versions "$current" "$tag")"
+    if [[ "$ordering" -gt 0 && "$allow_downgrade" != "true" ]]; then
+      log "${M_ID} ${current} is newer than validated pin ${tag}; automatic downgrade refused"
+      return
+    fi
   fi
 
   tmp="$(mktemp -d)"
@@ -378,28 +407,52 @@ install_release_module() {
 }
 
 latest_version() {
-  [[ "$M_UPSTREAM" == "release" ]] || die "retired source modules support removal only"
+  [[ "$M_UPSTREAM" == "release" || "$M_UPSTREAM" == "pinned-release" ]] \
+    || die "retired source modules support removal only"
   release_metadata "$(host_arch)" | cut -d'|' -f1
 }
 
 check_module() {
-  local module="$1" current latest state
+  local module="$1" current latest state ordering upstream_latest
   load_module "$module" || die "unknown or invalid module: $module"
   current="$(installed_version "$module")"
   latest="$(latest_version)"
-  state="update available"
-  [[ "$(normalize_version "$current")" == "$(normalize_version "$latest")" ]] && state="current"
-  [[ ! -x "$(module_binary)" ]] && state="not installed"
+  if [[ ! -x "$(module_binary)" ]]; then
+    if [[ "$M_UPSTREAM" == "pinned-release" ]]; then
+      state="pinned version not installed"
+    else
+      state="not installed"
+    fi
+  elif [[ "$M_UPSTREAM" == "pinned-release" ]]; then
+    ordering="$(compare_versions "$current" "$latest")"
+    if [[ "$ordering" -gt 0 ]]; then
+      state="installed version outside validated contract"
+    elif [[ "$ordering" -lt 0 ]]; then
+      state="pinned version not installed"
+    else
+      upstream_latest="$(upstream_latest_version)"
+      if [[ "$(compare_versions "$upstream_latest" "$latest")" -gt 0 ]]; then
+        state="current; newer upstream intentionally not selected"
+      else
+        state="current"
+      fi
+    fi
+  else
+    state="update available"
+    [[ "$(normalize_version "$current")" == "$(normalize_version "$latest")" ]] \
+      && state="current"
+  fi
   printf '%-20s installed=%-18s latest=%-18s %s\n' \
     "$module" "${current:0:18}" "${latest:0:18}" "$state"
 }
 
 update_module() {
-  local module="$1"
+  local module="$1" allow_downgrade="${2:-false}"
   load_module "$module" || die "unknown or invalid module: $module"
   log "checking ${module}"
-  [[ "$M_UPSTREAM" == "release" ]] || die "retired source modules support removal only"
-  install_release_module
+  [[ "$M_UPSTREAM" == "release" || "$M_UPSTREAM" == "pinned-release" ]] \
+    || die "retired source modules support removal only"
+  install_release_module "$allow_downgrade"
 }
 
 register_requested() {
@@ -424,7 +477,7 @@ register_requested() {
       rm -f "${DISABLED_DIR}/${id}" "${request}.failed"
       load_module "$id" || die "installed manifest could not be reloaded: ${id}"
       install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$(dirname "$M_CONFIG")"
-      if (update_module "$id"); then
+      if (update_module "$id" true); then
         rm -f "$request"
       else
         mv -f "$target" "${target}.failed"
@@ -504,7 +557,7 @@ run_requested() {
       failed=1
       continue
     fi
-    if (update_module "$module"); then
+    if (update_module "$module" true); then
       rm -f "$request" "${request}.failed"
     else
       mv -f "$request" "${request}.failed"
@@ -576,7 +629,7 @@ run_automatic() {
     enabled="$(state_value "$state_file" AUTO_ENABLED || true)"
     installed="$(state_value "$state_file" INSTALLED || true)"
     [[ "$enabled" == "true" && "$installed" == "true" ]] || continue
-    if ! (update_module "$module"); then
+    if ! (update_module "$module" false); then
       log "automatic update failed for ${module}; the scheduler will retry"
       failed=1
     fi
@@ -644,7 +697,7 @@ main() {
       ;;
     --update)
       require_active_product_module "${2:-}"
-      with_lock update_module "$2"
+      with_lock update_module "$2" true
       ;;
     --run-due) with_lock run_due ;;
     -h|--help) usage ;;

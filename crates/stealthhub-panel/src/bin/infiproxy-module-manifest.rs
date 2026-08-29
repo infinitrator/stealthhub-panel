@@ -2,13 +2,19 @@
 
 use serde::Deserialize;
 use std::{env, io::Read, path::PathBuf, process::ExitCode};
-use stealthhub_core::module_manifest::{load_registry, pipe_record, read_manifest, ReadOptions};
+use stealthhub_core::module_manifest::{
+    compare_release_versions, load_registry, pipe_record, read_manifest, ReadOptions,
+};
 
 const MAX_GITHUB_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 struct Release {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<ReleaseAsset>,
 }
@@ -65,6 +71,20 @@ fn run() -> anyhow::Result<()> {
         ensure_no_extra_args(args)?;
         let release: Release = read_json_stdin()?;
         println!("{}", safe_single_line(&release.tag_name)?);
+        return Ok(());
+    }
+    if command == "compare-versions" {
+        let left = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
+        let right = args.next().ok_or_else(|| anyhow::anyhow!(usage()))?;
+        ensure_no_extra_args(args)?;
+        println!(
+            "{}",
+            match compare_release_versions(&left, &right)? {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            }
+        );
         return Ok(());
     }
     if command == "cloudflare-first-id" {
@@ -129,6 +149,8 @@ fn print_metadata(metadata: &ReleaseMetadata) {
 }
 
 fn select_release_metadata(pattern: &str, release: &Release) -> anyhow::Result<ReleaseMetadata> {
+    anyhow::ensure!(!release.draft, "GitHub release is a draft");
+    anyhow::ensure!(!release.prerelease, "GitHub release is a prerelease");
     if pattern.is_empty()
         || pattern.len() > 180
         || !pattern
@@ -237,7 +259,7 @@ fn usage() -> String {
     concat!(
         "usage: infiproxy-module-manifest <read|validate|list> <path> ",
         "[--root-owned] [--registration]\n       ",
-        "infiproxy-module-manifest <release-metadata PATTERN|release-tag|cloudflare-first-id|cloudflare-success> ",
+        "infiproxy-module-manifest <release-metadata PATTERN|release-tag|compare-versions LEFT RIGHT|cloudflare-first-id|cloudflare-success> ",
         "< GitHub-response.json"
     )
     .to_string()
@@ -328,6 +350,17 @@ mod tests {
         let mut external = release_with(Some(serde_json::json!(SHA256)), false);
         external.assets[0].browser_download_url = "https://example.com/tuic-server".to_string();
         assert!(select_release_metadata(PATTERN, &external).is_err());
+    }
+
+    #[test]
+    fn draft_and_prerelease_assets_are_rejected() {
+        let mut draft = release_with(Some(serde_json::json!(SHA256)), false);
+        draft.draft = true;
+        assert!(select_release_metadata(PATTERN, &draft).is_err());
+
+        let mut prerelease = release_with(Some(serde_json::json!(SHA256)), false);
+        prerelease.prerelease = true;
+        assert!(select_release_metadata(PATTERN, &prerelease).is_err());
     }
 
     #[test]

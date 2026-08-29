@@ -5,6 +5,7 @@
 
 use anyhow::Context;
 use std::{
+    cmp::Ordering,
     collections::{HashMap, HashSet},
     fs,
     path::Path,
@@ -36,6 +37,8 @@ pub const FIELDS: [&str; 14] = [
 pub enum UpstreamKind {
     /// Follow the latest stable GitHub release.
     Release,
+    /// Install only one validated stable GitHub release tag.
+    PinnedRelease { tag: String },
     /// Follow the latest commit on a validated Git reference.
     Commit { git_ref: String },
 }
@@ -114,6 +117,7 @@ pub fn read_manifest(path: &Path, options: ReadOptions) -> anyhow::Result<Module
 pub fn pipe_record(spec: &ModuleSpec) -> String {
     let (upstream, git_ref) = match &spec.upstream {
         UpstreamKind::Release => ("release", ""),
+        UpstreamKind::PinnedRelease { tag } => ("pinned-release", tag.as_str()),
         UpstreamKind::Commit { git_ref } => ("commit", git_ref.as_str()),
     };
     [
@@ -171,6 +175,7 @@ pub fn parse_manifest(
     };
     let upstream = match value("upstream")?.as_str() {
         "release" => UpstreamKind::Release,
+        "pinned-release" => UpstreamKind::PinnedRelease { tag: value("ref")? },
         "commit" => UpstreamKind::Commit {
             git_ref: value("ref")?,
         },
@@ -223,6 +228,11 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
             anyhow::bail!("invalid Git reference");
         }
     }
+    if let UpstreamKind::PinnedRelease { tag } = &spec.upstream {
+        if !valid_ref(tag) || normalized_release_version(tag).is_none() {
+            anyhow::bail!("invalid pinned release tag");
+        }
+    }
     if !matches!(spec.root.as_str(), "cores" | "modules") {
         anyhow::bail!("invalid runtime root");
     }
@@ -238,8 +248,10 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
     {
         anyhow::bail!("invalid config path");
     }
-    if matches!(spec.upstream, UpstreamKind::Release)
-        && (!safe_asset(&spec.asset_amd64) || !safe_asset(&spec.asset_arm64))
+    if matches!(
+        spec.upstream,
+        UpstreamKind::Release | UpstreamKind::PinnedRelease { .. }
+    ) && (!safe_asset(&spec.asset_amd64) || !safe_asset(&spec.asset_arm64))
     {
         anyhow::bail!("invalid release asset template");
     }
@@ -279,8 +291,10 @@ fn validate_spec(mut spec: ModuleSpec, registration: bool) -> anyhow::Result<Mod
         _ => anyhow::bail!("unsupported module driver"),
     }
     if registration
-        && (!matches!(spec.upstream, UpstreamKind::Release)
-            || spec.driver != "release"
+        && (!matches!(
+            spec.upstream,
+            UpstreamKind::Release | UpstreamKind::PinnedRelease { .. }
+        ) || spec.driver != "release"
             || spec.root != "cores")
     {
         anyhow::bail!("registration only supports generic release modules under cores");
@@ -317,6 +331,28 @@ pub fn valid_id(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+}
+
+/// Extracts a strict three-component release version from supported tag styles.
+#[must_use]
+pub fn normalized_release_version(value: &str) -> Option<[u64; 3]> {
+    let start = value.find(|character: char| character.is_ascii_digit())?;
+    let components = value[start..]
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|component| !component.is_empty())
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (components.len() == 3).then(|| [components[0], components[1], components[2]])
+}
+
+/// Compares two supported release tags without lexicographic version mistakes.
+pub fn compare_release_versions(left: &str, right: &str) -> anyhow::Result<Ordering> {
+    let left = normalized_release_version(left)
+        .ok_or_else(|| anyhow::anyhow!("unsupported release version: {left}"))?;
+    let right = normalized_release_version(right)
+        .ok_or_else(|| anyhow::anyhow!("unsupported release version: {right}"))?;
+    Ok(left.cmp(&right))
 }
 
 fn valid_repo(value: &str) -> bool {
@@ -404,5 +440,32 @@ mod tests {
     fn pipe_protocol_has_stable_field_count() {
         let spec = parse_manifest(VALID, Path::new("demo.module"), true).unwrap();
         assert_eq!(pipe_record(&spec).split('|').count(), FIELDS.len());
+    }
+
+    #[test]
+    fn pinned_releases_round_trip_and_versions_compare_semantically() {
+        let pinned = VALID
+            .replace("upstream=release", "upstream=pinned-release")
+            .replace("ref=", "ref=app/v2.12.2");
+        let spec = parse_manifest(&pinned, Path::new("demo.module"), true).unwrap();
+        assert_eq!(
+            spec.upstream,
+            UpstreamKind::PinnedRelease {
+                tag: "app/v2.12.2".to_string()
+            }
+        );
+        assert_eq!(pipe_record(&spec).split('|').count(), FIELDS.len());
+        assert_eq!(normalized_release_version("v1.19.30"), Some([1, 19, 30]));
+        assert_eq!(normalized_release_version("1.13.20"), Some([1, 13, 20]));
+        assert_eq!(normalized_release_version("v26.3.27"), Some([26, 3, 27]));
+        assert_eq!(normalized_release_version("app/v2.12.2"), Some([2, 12, 2]));
+        assert_eq!(
+            normalized_release_version("tuic-server-1.0.0"),
+            Some([1, 0, 0])
+        );
+        assert_eq!(
+            compare_release_versions("v1.13.20", "v1.13.9").unwrap(),
+            Ordering::Greater
+        );
     }
 }

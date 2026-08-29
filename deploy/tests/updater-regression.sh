@@ -161,6 +161,8 @@ chmod +x "${FAKE_BIN}/curl"
     export INFIPROXY_STATE_DIR="${TMP_DIR}/module-state"
     export INFIPROXY_ROOT_STATE_DIR="${TMP_DIR}/module-root-state"
     export INFIPROXY_MODULE_UPDATE_LOG="${TMP_DIR}/module-update.log"
+    export INFIPROXY_MODULE_MANIFEST_HELPER="${ROOT_DIR}/target/debug/infiproxy-module-manifest"
+    export INFIPROXY_CORE_ROOT="${TMP_DIR}/module-cores"
     export CURL_ARGS_FILE="${TMP_DIR}/curl.args"
     # shellcheck source=deploy/module-update.sh
     source "${ROOT_DIR}/deploy/module-update.sh"
@@ -183,6 +185,33 @@ chmod +x "${FAKE_BIN}/curl"
     if (resolve_checksum release.bin "" "" >/dev/null 2>&1); then
         fail "missing digest and checksum did not fail closed"
     fi
+
+    github_json() {
+        local tag="v1.1.0"
+        [[ "$1" == */releases/tags/v1.0.0 ]] && tag="v1.0.0"
+        printf '{"tag_name":"%s","draft":false,"prerelease":false,"assets":[{"name":"demo-%s-amd64","browser_download_url":"https://github.com/owner/repo/releases/download/%s/demo-%s-amd64","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"name":"demo-%s-arm64","browser_download_url":"https://github.com/owner/repo/releases/download/%s/demo-%s-arm64","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}' \
+            "$tag" "${tag#v}" "$tag" "${tag#v}" "${tag#v}" "$tag" "${tag#v}"
+    }
+    M_ID="demo"
+    M_REPO="owner/repo"
+    M_UPSTREAM="pinned-release"
+    M_REF="v1.0.0"
+    M_ROOT="cores"
+    M_BINARY="demo"
+    M_ASSET_AMD64='demo-{version}-amd64'
+    M_ASSET_ARM64='demo-{version}-arm64'
+    [[ "$(release_metadata amd64 | cut -d'|' -f1)" == "v1.0.0" ]] \
+        || fail "pinned release did not resolve the exact tag"
+    [[ "$(upstream_latest_version)" == "v1.1.0" ]] \
+        || fail "pinned release check did not observe newer upstream metadata"
+
+    mkdir -p "${MODULE_VERSION_DIR}" "${INFIPROXY_CORE_ROOT}/demo/current"
+    printf 'v1.1.0\n' >"${MODULE_VERSION_DIR}/demo.version"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"${INFIPROXY_CORE_ROOT}/demo/current/demo"
+    chmod +x "${INFIPROXY_CORE_ROOT}/demo/current/demo"
+    install_release_module false
+    [[ "$(cat "${MODULE_VERSION_DIR}/demo.version")" == "v1.1.0" ]] \
+        || fail "automatic pinned update downgraded a newer installed runtime"
 
     M_ID="sing-box"
     M_ROOT="cores"

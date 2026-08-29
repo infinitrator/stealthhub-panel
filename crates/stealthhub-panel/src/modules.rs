@@ -20,7 +20,7 @@ use stealthhub_core::{
         RuntimeHealthState, RuntimeLifecycle, RuntimeLifecycleAction, RuntimeLifecycleStatus,
         RuntimeServiceState, RuntimeUpstreamMetadata,
     },
-    module_manifest::{load_registry, valid_id, ReadOptions},
+    module_manifest::{compare_release_versions, load_registry, valid_id, ReadOptions},
     storage::{get_setting, upsert_setting, upsert_settings},
 };
 
@@ -56,6 +56,7 @@ impl ManifestRuntimeLifecycle {
     fn new(spec: ModuleSpec, active_manifest: bool) -> Self {
         let release_channel = match &spec.upstream {
             UpstreamKind::Release => "stable-release".to_string(),
+            UpstreamKind::PinnedRelease { tag } => format!("pinned-release:{tag}"),
             UpstreamKind::Commit { git_ref } => format!("commit:{git_ref}"),
         };
         Self {
@@ -117,6 +118,10 @@ impl RuntimeLifecycle for ManifestRuntimeLifecycle {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -344,38 +349,43 @@ async fn refresh_with_client(
     spec: ModuleSpec,
     client: &reqwest::Client,
 ) -> anyhow::Result<ModuleStatus> {
-    let latest_version = match &spec.upstream {
+    let (latest_version, upstream_latest) = match &spec.upstream {
         UpstreamKind::Release => {
-            let url = format!("https://api.github.com/repos/{}/releases/latest", spec.repo);
-            client
-                .get(url)
-                .send()
-                .await?
-                .error_for_status()?
-                .json::<GithubRelease>()
-                .await?
-                .tag_name
+            let release = fetch_release(client, &spec.repo, None).await?;
+            (release.tag_name.clone(), release.tag_name)
+        }
+        UpstreamKind::PinnedRelease { tag } => {
+            let release = fetch_release(client, &spec.repo, Some(tag)).await?;
+            anyhow::ensure!(release.tag_name == *tag, "pinned release tag mismatch");
+            let upstream = fetch_release(client, &spec.repo, None).await?.tag_name;
+            (release.tag_name, upstream)
         }
         UpstreamKind::Commit { git_ref } => {
             let url = format!(
                 "https://api.github.com/repos/{}/commits/{git_ref}",
                 spec.repo
             );
-            client
+            let sha = client
                 .get(url)
                 .send()
                 .await?
                 .error_for_status()?
                 .json::<GithubCommit>()
                 .await?
-                .sha
+                .sha;
+            (sha.clone(), sha)
         }
     };
     let installed_version = installed_version(&spec);
     let installed = Path::new(&spec.binary_path).is_file();
-    let update_available = installed
-        && installed_version != "unknown"
-        && versions_differ(&spec.upstream, &installed_version, &latest_version);
+    let (update_available, status) = module_version_status(
+        &spec.upstream,
+        installed,
+        &installed_version,
+        &latest_version,
+        Some(&upstream_latest),
+        "unchecked",
+    )?;
     let auto_update = load_auto_update(pool, &spec.id).await?;
     let status = ModuleStatus {
         spec,
@@ -385,14 +395,7 @@ async fn refresh_with_client(
         update_available,
         auto_update,
         checked_at: Utc::now().to_rfc3339(),
-        status: if !installed {
-            "not installed"
-        } else if update_available {
-            "update available"
-        } else {
-            "current"
-        }
-        .to_string(),
+        status,
     };
     persist_status(pool, &status).await?;
     write_state_file(&status)?;
@@ -403,10 +406,6 @@ async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleS
     let installed = Path::new(&spec.binary_path).is_file();
     let installed_version = installed_version(&spec);
     let latest_version = setting_or_default(pool, &spec.id, "latest_version", "unknown").await?;
-    let update_available = installed
-        && latest_version != "unknown"
-        && installed_version != "unknown"
-        && versions_differ(&spec.upstream, &installed_version, &latest_version);
     let persisted_status = setting_or_default(
         pool,
         &spec.id,
@@ -418,15 +417,14 @@ async fn load_one(pool: &SqlitePool, spec: ModuleSpec) -> anyhow::Result<ModuleS
         },
     )
     .await?;
-    let status = if !installed {
-        "not installed".to_string()
-    } else if update_available {
-        "update available".to_string()
-    } else if latest_version != "unknown" && installed_version != "unknown" {
-        "current".to_string()
-    } else {
-        persisted_status
-    };
+    let (update_available, status) = module_version_status(
+        &spec.upstream,
+        installed,
+        &installed_version,
+        &latest_version,
+        None,
+        &persisted_status,
+    )?;
     Ok(ModuleStatus {
         spec: spec.clone(),
         installed,
@@ -505,6 +503,77 @@ fn github_client() -> anyhow::Result<reqwest::Client> {
         .timeout(Duration::from_secs(15))
         .user_agent(format!("{APP_NAME}/{}", env!("CARGO_PKG_VERSION")))
         .build()?)
+}
+
+async fn fetch_release(
+    client: &reqwest::Client,
+    repository: &str,
+    exact_tag: Option<&str>,
+) -> anyhow::Result<GithubRelease> {
+    let url = exact_tag.map_or_else(
+        || format!("https://api.github.com/repos/{repository}/releases/latest"),
+        |tag| format!("https://api.github.com/repos/{repository}/releases/tags/{tag}"),
+    );
+    let release = client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<GithubRelease>()
+        .await?;
+    anyhow::ensure!(!release.draft, "GitHub release is a draft");
+    anyhow::ensure!(!release.prerelease, "GitHub release is a prerelease");
+    Ok(release)
+}
+
+fn module_version_status(
+    upstream: &UpstreamKind,
+    installed: bool,
+    installed_version: &str,
+    selected_version: &str,
+    upstream_latest: Option<&str>,
+    unchecked_status: &str,
+) -> anyhow::Result<(bool, String)> {
+    if !installed {
+        return Ok((false, "not installed".to_string()));
+    }
+    if installed_version == "unknown" || selected_version == "unknown" {
+        return Ok((false, unchecked_status.to_string()));
+    }
+    if let UpstreamKind::PinnedRelease { .. } = upstream {
+        return match compare_release_versions(installed_version, selected_version)? {
+            std::cmp::Ordering::Less => Ok((true, "pinned version not installed".to_string())),
+            std::cmp::Ordering::Greater => Ok((
+                false,
+                "installed version outside validated contract".to_string(),
+            )),
+            std::cmp::Ordering::Equal => {
+                let newer_exists = upstream_latest
+                    .map(|latest| compare_release_versions(latest, selected_version))
+                    .transpose()?
+                    .is_some_and(|ordering| ordering.is_gt());
+                Ok((
+                    false,
+                    if newer_exists {
+                        "current; newer upstream intentionally not selected"
+                    } else {
+                        "current"
+                    }
+                    .to_string(),
+                ))
+            }
+        };
+    }
+    let differs = versions_differ(upstream, installed_version, selected_version);
+    Ok((
+        differs,
+        if differs {
+            "update available"
+        } else {
+            "current"
+        }
+        .to_string(),
+    ))
 }
 
 fn write_state_file(status: &ModuleStatus) -> anyhow::Result<()> {
@@ -597,7 +666,9 @@ fn setting_key(module_id: &str, suffix: &str) -> String {
 
 fn versions_differ(upstream: &UpstreamKind, installed: &str, latest: &str) -> bool {
     match upstream {
-        UpstreamKind::Release => release_version(installed) != release_version(latest),
+        UpstreamKind::Release | UpstreamKind::PinnedRelease { .. } => {
+            release_version(installed) != release_version(latest)
+        }
         UpstreamKind::Commit { .. } => installed != latest,
     }
 }
@@ -696,6 +767,55 @@ mod tests {
         assert_eq!(release_version("v1.2.3"), "1.2.3");
         assert_eq!(release_version("release/v2.10.0"), "2.10.0");
         assert_eq!(release_version("server-release-1.0.0"), "1.0.0");
+    }
+
+    #[test]
+    fn pinned_release_status_never_schedules_an_automatic_downgrade() {
+        let pinned = UpstreamKind::PinnedRelease {
+            tag: "v1.19.30".to_string(),
+        };
+        assert_eq!(
+            module_version_status(
+                &pinned,
+                true,
+                "v1.19.29",
+                "v1.19.30",
+                Some("v1.19.31"),
+                "unchecked"
+            )
+            .unwrap(),
+            (true, "pinned version not installed".to_string())
+        );
+        assert_eq!(
+            module_version_status(
+                &pinned,
+                true,
+                "v1.19.30",
+                "v1.19.30",
+                Some("v1.19.31"),
+                "unchecked"
+            )
+            .unwrap(),
+            (
+                false,
+                "current; newer upstream intentionally not selected".to_string()
+            )
+        );
+        assert_eq!(
+            module_version_status(
+                &pinned,
+                true,
+                "v1.19.31",
+                "v1.19.30",
+                Some("v1.19.31"),
+                "unchecked"
+            )
+            .unwrap(),
+            (
+                false,
+                "installed version outside validated contract".to_string()
+            )
+        );
     }
 
     #[test]
