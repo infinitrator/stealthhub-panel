@@ -332,7 +332,7 @@ chmod +x "${FAKE_BIN}/systemctl"
     mkdir -p "$(dirname "$APPLIED_SHA_FILE")"
     printf '%s\n' "$FIRST_COMMIT" >"$APPLIED_SHA_FILE"
     # Invoked indirectly by publish_verified_update_commit.
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     wait_panel_ready() { return 1; }
     if publish_verified_update_commit "$SECOND_COMMIT"; then
         fail "failed updater readiness unexpectedly published the target commit"
