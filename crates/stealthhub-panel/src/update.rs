@@ -243,6 +243,13 @@ pub(crate) fn validate_ref(git_ref: &str) -> Result<(), &'static str> {
 }
 
 async fn load_config(pool: &SqlitePool) -> anyhow::Result<Config> {
+    load_config_with_source(pool, load_pinned_source()?).await
+}
+
+async fn load_config_with_source(
+    pool: &SqlitePool,
+    pinned_source: Option<(String, String)>,
+) -> anyhow::Result<Config> {
     let enabled =
         parse_bool_setting(&setting_or_default(pool, "panel_update_enabled", "true").await?);
     let legacy_hour =
@@ -254,7 +261,7 @@ async fn load_config(pool: &SqlitePool) -> anyhow::Result<Config> {
     } else {
         "05:00".to_string()
     };
-    let (repo, git_ref) = if let Some(source) = load_pinned_source()? {
+    let (repo, git_ref) = if let Some(source) = pinned_source {
         source
     } else {
         (
@@ -273,6 +280,10 @@ async fn load_config(pool: &SqlitePool) -> anyhow::Result<Config> {
 
 fn load_pinned_source() -> anyhow::Result<Option<(String, String)>> {
     let path = configured_path("INFIPROXY_UPDATE_CONFIG_FILE", DEFAULT_CONFIG_PATH);
+    load_pinned_source_from(&path)
+}
+
+fn load_pinned_source_from(path: &std::path::Path) -> anyhow::Result<Option<(String, String)>> {
     let content = match fs::read_to_string(path) {
         Ok(value) => value,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -517,7 +528,8 @@ fn shell_env_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::authoritative_commit;
+    use super::{authoritative_commit, load_config_with_source, load_pinned_source_from};
+    use stealthhub_core::storage::{init_db, upsert_setting};
 
     #[test]
     fn applied_marker_wins_over_stale_environment_commit() {
@@ -532,5 +544,38 @@ mod tests {
             ),
             applied
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_source_wins_over_sqlite_update_settings() {
+        let config_path = std::env::temp_dir().join(format!(
+            "infiproxy-update-source-{}.conf",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            "REPO=infinitrator/stealthhub-panel\nREF=main\n",
+        )
+        .unwrap();
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_db(&pool).await.unwrap();
+        upsert_setting(&pool, "panel_update_repo", "untrusted/example")
+            .await
+            .unwrap();
+        upsert_setting(&pool, "panel_update_ref", "feature/unreviewed")
+            .await
+            .unwrap();
+
+        let pinned_source = load_pinned_source_from(&config_path).unwrap();
+        let config = load_config_with_source(&pool, pinned_source).await.unwrap();
+
+        assert_eq!(config.repo, "infinitrator/stealthhub-panel");
+        assert_eq!(config.git_ref, "main");
+        pool.close().await;
+        std::fs::remove_file(config_path).unwrap();
     }
 }

@@ -71,8 +71,7 @@ UPDATE_REPO="$(normalize_github_repo "$source_origin")" || {
     echo "Update source must be a GitHub owner/repo or repository URL: $source_origin" >&2
     exit 2
 }
-UPDATE_REF="${INFIPROXY_UPDATE_REF:-$(git -C "$ROOT_DIR" branch --show-current 2>/dev/null || true)}"
-UPDATE_REF="${UPDATE_REF:-main}"
+UPDATE_REF="${INFIPROXY_UPDATE_REF:-main}"
 if [[ ! "$UPDATE_REF" =~ ^[A-Za-z0-9_./-]+$ || "$UPDATE_REF" == /* \
     || "$UPDATE_REF" == -* || "$UPDATE_REF" == *..* ]]; then
     echo "Invalid update reference: $UPDATE_REF" >&2

@@ -349,6 +349,34 @@ chmod +x "${FAKE_BIN}/systemctl"
     export INFIPROXY_RECONCILE_HELPER_BINARY="${TMP_DIR}/installed/infiproxy-reconcile"
     # shellcheck source=deploy/panel-update.sh
     source "${ROOT_DIR}/deploy/panel-update.sh"
+    mkdir -p "$(dirname "$CONFIG_FILE")" "$(dirname "$STATE_FILE")"
+    printf 'REPO=infinitrator/stealthhub-panel\nREF=main\n' >"$CONFIG_FILE"
+    printf "AUTO_ENABLED=true\nSCHEDULE_TIME='00:00'\nREPO=untrusted/example\nREF=feature/unreviewed\n" \
+        >"$STATE_FILE"
+
+    assert_pinned_update_source() {
+        [[ "$(read_config REPO)" == "infinitrator/stealthhub-panel" \
+            && "$(read_config REF)" == "main" ]] \
+            || fail "panel updater did not use the root-pinned source"
+    }
+
+    : >"$REQUEST_FILE"
+    should_update_now "2222222222222222222222222222222222222222" \
+        "1111111111111111111111111111111111111111" \
+        || fail "manual update request was not recognized"
+    assert_pinned_update_source
+    rm -f "$REQUEST_FILE"
+    should_update_now "2222222222222222222222222222222222222222" \
+        "1111111111111111111111111111111111111111" \
+        || fail "scheduled update policy was not recognized"
+    assert_pinned_update_source
+    valid_ref "some-reviewed-ref" || fail "safe reviewed ref was rejected"
+    for unsafe_ref in "../escape" "/absolute" "-option" "bad ref"; do
+        if valid_ref "$unsafe_ref"; then
+            fail "unsafe panel update ref was accepted: ${unsafe_ref}"
+        fi
+    done
+
     mkdir -p "$SOURCE_DIR"
     git -C "$SOURCE_DIR" init -q
     git -C "$SOURCE_DIR" config user.name "Infiproxy audit"

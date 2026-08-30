@@ -270,6 +270,9 @@ decision root-оператора.
 
 - root timer каждые 15 минут fetch-ит pinned Git ref;
 - repo/ref читаются из root-owned `/etc/infiproxy-update.conf`;
+- production default всегда `infinitrator/stealthhub-panel@main`, независимо от
+  branch текущего checkout; non-`main` ref требует явного operator override;
+- manual request и scheduled apply используют один и тот же pinned source;
 - applied SHA берется из root-written `panel-last-applied.sha`;
 - root пишет bounded `panel-update-status.env`, а web только зеркалирует его в
   SQLite и публикует policy в `panel-update-state.env`.

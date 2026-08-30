@@ -141,8 +141,11 @@ Panel self-updates are split into two layers:
 Change automatic-update enablement and maintenance time in `/admin/settings`.
 The repository and ref are pinned in root-owned `/etc/infiproxy-update.conf`
 during bootstrap; this prevents a stolen web-admin session from replacing the
-root update source. Change channels by rerunning bootstrap with `--repo` and
-`--ref`.
+root update source. Fresh installs pin `infinitrator/stealthhub-panel@main`
+regardless of the installer checkout branch. A non-`main` ref requires an
+explicit operator override through bootstrap `--ref` or
+`INFIPROXY_UPDATE_REF`. Manual and scheduled updates always use this same
+pinned source.
 
 ## Runtime Modules
 
