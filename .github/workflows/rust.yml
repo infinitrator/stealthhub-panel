@@ -57,6 +57,7 @@ jobs:
           for file in deploy/*.sh deploy/cores/*.sh deploy/tests/*.sh; do bash -n "$file"; done
           cargo build --locked -p stealthhub-panel --bins
           target/debug/infiproxy-module-manifest list deploy/modules.d
+          bash deploy/tests/install-state-regression.sh
           bash deploy/tests/updater-regression.sh
           bash deploy/tests/http-smoke.sh
           bash deploy/install.sh --check
