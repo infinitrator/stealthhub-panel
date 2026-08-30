@@ -1,7 +1,7 @@
 id=mihomo
 name=Mihomo
 kind=proxy core
-role=Trojan TLS, Snell v5 and Mieru server runtime
+role=VLESS, AnyTLS, Trojan, Snell, Mieru, TrustTunnel, ShadowQUIC and Sudoku runtime
 repo=MetaCubeX/mihomo
 upstream=pinned-release
 ref=v1.19.30

@@ -12,9 +12,11 @@ paths = [
 
 [[allowlists]]
 description = "Known non-secret protocol parser fixtures retained in Git history"
-regexTarget = "secret"
+regexTarget = "line"
+paths = [
+  '''^crates/stealthhub-core/src/adapters/cores\.rs$''',
+]
 regexes = [
-  '''^0123456789abcdef$''',
-  '''^0123456789abcdef0123456789abcdef$''',
-  '''^MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=$''',
+  '''^\s*"secret\.short-id": "0123456789abcdef",\s*$''',
+  '''^\s*"secret\.password": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",\s*$''',
 ]

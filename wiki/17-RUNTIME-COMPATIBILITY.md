@@ -24,13 +24,14 @@ automatic runtime update означает `false`. Updater не переходи
 
 | Семейство | Stable | Experimental |
 |---|---|---|
-| VLESS | REALITY TCP + Vision + XUDP; REALITY XHTTP без Vision | — |
+| VLESS | REALITY TCP + Vision + XUDP; REALITY XHTTP без Vision | ShadowTLS v3; ResTLS; JLS без Vision |
 | AnyTLS | TLS; ShadowTLS v3 | ResTLS; JLS |
 | Trojan | TLS; ShadowTLS v3; REALITY | ResTLS; JLS |
 | Snell v5 | plain; ShadowTLS v3 | ResTLS; JLS |
 | Shadowsocks | 2022 + ShadowTLS v3 | — |
-| Speed | Hysteria 2 + optional Salamander; TUIC v5 | — |
+| Speed | Hysteria 2 + optional Salamander; TUIC v5 | ShadowQUIC с intrinsic JLS и выключенным 0-RTT |
 | Mieru | TCP, `HANDSHAKE_STANDARD`, `MULTIPLEXING_LOW` | — |
+| HTTP-like | — | TrustTunnel H2; Sudoku legacy HTTPMask с ChaCha20-Poly1305 |
 
 Новые профили создаются **выключенными**. Старый ID `any-tls` сохраняется для
 миграционной совместимости; новые настройки используют `anytls-tls`.
@@ -43,7 +44,15 @@ automatic runtime update означает `false`. Updater не переходи
 - одновременно формируется не более одной из REALITY, ShadowTLS, ResTLS и JLS.
 - server-only REALITY/TLS private key не хранится и не показывается в SQLite,
   подписке или веб-интерфейсе.
-- Xray с version marker, отличным от `v26.3.27`, не выбирается reconciler.
+- Xray с marker/probe version, отличным от `v26.3.27`, не выбирается reconciler.
+- TrustTunnel H3 не выставляется: один profile пока не может атомарно заявить
+  TCP и UDP socket ownership. H2 использует только TCP.
+- ShadowQUIC не получает отдельный `jls-opts`, потому что JLS встроен в протокол.
+- Sudoku никогда не генерирует `aead-method: none`.
+
+Отсутствующий version marker больше не означает compatibility. Adapter запускает
+только фиксированную version-команду своего binary и принимает исключительно
+точный pin; ошибка, неразбираемый вывод и более новая версия дают `outside contract`.
 
 ## Что показывает GUI
 

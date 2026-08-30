@@ -357,6 +357,9 @@ optional `flow` и maturity. GUI показывает только целые з
 |---|---|---|
 | `vless-reality-xhttp` | VLESS + XHTTP + REALITY | Stable |
 | `vless-reality-tcp` | VLESS + TCP + REALITY | Stable |
+| `vless-shadowtls-v3` | VLESS + TCP + ShadowTLS v3, без Vision | Experimental |
+| `vless-restls` | VLESS + TCP + ResTLS, без Vision | Experimental |
+| `vless-jls` | VLESS + TCP + JLS, без Vision | Experimental |
 | `anytls-tls` | AnyTLS + TCP + TLS | Stable |
 | `anytls-shadowtls-v3` | AnyTLS + TCP + ShadowTLS v3 | Stable |
 | `anytls-restls` | AnyTLS + TCP + ResTLS | Experimental |
@@ -375,6 +378,9 @@ optional `flow` и maturity. GUI показывает только целые з
 | `snell-v5-restls` | Snell v5 + ResTLS | Experimental |
 | `snell-v5-jls` | Snell v5 + JLS | Experimental |
 | `mieru` | Mieru + TCP + protocol auth | Stable |
+| `trusttunnel-h2` | TrustTunnel + TCP/H2 + TLS | Experimental |
+| `shadowquic` | ShadowQUIC + UDP/QUIC + intrinsic JLS | Experimental |
+| `sudoku-httpmask` | Sudoku + legacy HTTPMask + ChaCha20-Poly1305 | Experimental |
 
 Таблица ниже фиксирует ecosystem support, а не обещает готовый Infiproxy
 adapter. Baseline исследования — stable Mihomo `v1.19.30`. Если upstream не
@@ -385,14 +391,14 @@ adapter. Baseline исследования — stable Mihomo `v1.19.30`. Есл�
 |---|---|---|---|---|
 | AnyTLS + JLS | Mihomo outbound + inbound | AnyTLS password, JLS user/password, fallback destination | Experimental | Реализован `anytls-jls`; exact parser/server canary пройден |
 | AnyTLS + ResTLS | Mihomo outbound + inbound | AnyTLS password, ResTLS password/destination | Experimental | Реализован `anytls-restls`; exact parser/server canary пройден |
-| VLESS + JLS | Mihomo outbound + inbound | UUID users, JLS user/password/destination | Experimental | Unsupported: JLS auth lifecycle и renderer не реализованы |
-| VLESS + ResTLS | Mihomo outbound + inbound | UUID users, ResTLS password/destination | Experimental | Unsupported: ResTLS secret lifecycle и renderer не реализованы |
+| VLESS + ShadowTLS/JLS/ResTLS | Mihomo outbound + inbound | UUID users и credential ровно одной wrapper | Experimental | Три capabilities реализованы без Vision; exact parser/server canary пройден |
 | Trojan TLS/ShadowTLS/ResTLS/JLS/REALITY | Mihomo outbound + inbound | UUID password и credential выбранной единственной wrapper | Stable/Experimental | Все пять явных capabilities реализованы и проверены `v1.19.30` |
-| ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | username/password, QUIC/TLS/JLS, optional domain | Experimental | Unsupported: QUIC/JLS listener ownership и canary не реализованы |
+| ShadowQUIC | Mihomo outbound + inbound; JLS всегда включён | UUID auth, QUIC/JLS, camouflage upstream | Experimental | Реализован `shadowquic`; `zero-rtt=false`, exact parser/server canary пройден |
 | Snell v5 plain/ShadowTLS/ResTLS/JLS | Mihomo outbound + inbound | shared PSK и optional wrapper credential | Stable/Experimental | Все четыре capabilities реализованы и проверены `v1.19.30` |
 | Mieru TCP | Mihomo outbound + inbound | username/password | Stable | Реализован `mieru` |
 | MASQUE | Mihomo outbound; matching public inbound не подтверждён | ECDSA key pair, tunnel CIDR, optional SNI | Unsupported | Не предлагается |
-| TrustTunnel | Mihomo outbound + inbound | username/password, domain, certificate/key, HTTP/2 и optional HTTP/3 | Experimental | Unsupported: runtime canary не реализован |
+| TrustTunnel | Mihomo outbound + inbound | UUID auth, domain, certificate/key, HTTP/2 | Experimental | Реализован `trusttunnel-h2`; H3 не exposed до dual TCP/UDP listener claims |
+| Sudoku HTTPMask | Mihomo outbound + inbound | shared key, matching path, ChaCha20-Poly1305 | Experimental | Реализован `sudoku-httpmask`; legacy mode не заявляет CDN compatibility |
 
 Первичные источники: [AnyTLS outbound](https://wiki.metacubex.one/en/config/proxies/anytls/),
 [AnyTLS inbound](https://wiki.metacubex.one/en/config/inbound/listeners/anytls/),

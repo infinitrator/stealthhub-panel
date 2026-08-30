@@ -62,6 +62,7 @@ Protocol profiles + secret_values + routing sets + subscription user UUID
 |---|---|---|---|---|---|
 | `VLESS-XHTTP-SAFE` | VLESS + REALITY + XHTTP | AUTO-SAFE | disabled | `node.infiproxy.local:8443` | `xray.reality.public_key`, `xray.reality.short_id` |
 | `VLESS-REALITY-TCP-FALLBACK` | VLESS + REALITY + TCP/RAW | COMPAT | disabled | `node.infiproxy.local:7443` | `xray.reality.public_key`, `xray.reality.short_id` |
+| `VLESS-*-EXPERIMENTAL` | VLESS + ShadowTLS v3 / ResTLS / JLS | COMPAT | disabled | TCP `7543`-`7743` | Credential выбранной единственной wrapper |
 | `SS2022-SHADOWTLS-FALLBACK` | SS2022 + ShadowTLS v3 | COMPAT | disabled | `node.infiproxy.local:9443` | `shadowsocks.2022.password`, `shadowtls.password` |
 | `ANYTLS-EXPERIMENTAL` | AnyTLS | COMPAT | disabled | `node.infiproxy.local:10443` | `anytls.password` |
 | `ANYTLS-TLS` / `ANYTLS-SHADOWTLS-V3` | AnyTLS explicit stable variants | COMPAT | disabled | TCP `10543` / `10643` | AnyTLS password; wrapper password for ShadowTLS |
@@ -71,6 +72,9 @@ Protocol profiles + secret_values + routing sets + subscription user UUID
 | `TROJAN-*` | TLS, ShadowTLS v3, ResTLS, JLS, REALITY | COMPAT | disabled | TCP `12443`-`12843` | Per-user UUID plus selected wrapper references |
 | `SNELL-V5-*` | plain, ShadowTLS v3, ResTLS, JLS | COMPAT | disabled | TCP `13443`-`13743` | `snell.psk` plus selected wrapper references |
 | `MIERU-TCP-COMPATIBILITY` | Mieru TCP | COMPAT | disabled | TCP `14443` | `mieru.password` |
+| `TRUSTTUNNEL-H2-EXPERIMENTAL` | TrustTunnel TLS/H2 | COMPAT | disabled | TCP `15443` | Per-user UUID; fixed TLS files |
+| `SHADOWQUIC-EXPERIMENTAL` | ShadowQUIC + intrinsic JLS | SPEED | disabled | UDP `16443` | Per-user UUID |
+| `SUDOKU-HTTPMASK-EXPERIMENTAL` | Sudoku legacy HTTPMask | COMPAT | disabled | TCP `17443` | `sudoku.key` |
 
 При первом запуске все profiles выключены. Bootstrap marker помечает каталог
 завершенным, поэтому повторный запуск или обновление не восстанавливает удаленные

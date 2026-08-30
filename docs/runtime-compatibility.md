@@ -54,6 +54,9 @@ additional field interoperability testing before broad production rollout.
 |---|---|---|---|---|
 | `vless-reality-tcp` | `v1.19.30`; TCP, Vision, XUDP | Mihomo `v1.19.30` | Xray `v26.3.27`; sing-box `v1.13.20` secondary | Stable |
 | `vless-reality-xhttp` | `v1.19.30`; XHTTP without Vision | Mihomo `v1.19.30` | Xray `v26.3.27` | Stable |
+| `vless-shadowtls-v3` | `v1.19.30`; TCP, no Vision | Mihomo `v1.19.30` | none | Experimental |
+| `vless-restls` | `v1.19.30`; TCP, no Vision | Mihomo `v1.19.30` | none | Experimental |
+| `vless-jls` | `v1.19.30`; TCP, no Vision | Mihomo `v1.19.30` | none | Experimental |
 | `anytls-tls` | `v1.19.30` | Mihomo `v1.19.30` | none | Stable |
 | `anytls-shadowtls-v3` | `v1.19.30` | Mihomo `v1.19.30` | none | Stable |
 | `anytls-restls` | `v1.19.30` | Mihomo `v1.19.30` | none | Experimental |
@@ -71,6 +74,9 @@ additional field interoperability testing before broad production rollout.
 | `hysteria2` | `v1.19.30`; TLS, UDP, optional Salamander | Hysteria `app/v2.12.2` | sing-box `v1.13.20` | Stable |
 | `tuic` | `v1.19.30`; TUIC v5 | TUIC server `1.0.0` | sing-box `v1.13.20` | Stable |
 | `mieru` | `v1.19.30`; TCP, standard handshake, low multiplexing | Mihomo `v1.19.30` | none | Stable |
+| `trusttunnel-h2` | `v1.19.30`; HTTP/2, TLS, per-user auth | Mihomo `v1.19.30` | none | Experimental |
+| `shadowquic` | `v1.19.30`; QUIC, intrinsic JLS, 0-RTT off | Mihomo `v1.19.30` | none | Experimental |
+| `sudoku-httpmask` | `v1.19.30`; legacy HTTPMask, ChaCha20-Poly1305 | Mihomo `v1.19.30` | none | Experimental |
 
 `any-tls` remains as a disabled legacy compatibility ID backed by sing-box
 `v1.13.20`. New profiles use the explicit `anytls-tls` capability.
@@ -78,7 +84,10 @@ additional field interoperability testing before broad production rollout.
 Server syntax evidence: [VLESS listener](https://wiki.metacubex.one/en/config/inbound/listeners/vless/),
 [AnyTLS listener](https://wiki.metacubex.one/en/config/inbound/listeners/anytls/),
 [Trojan listener](https://wiki.metacubex.one/en/config/inbound/listeners/trojan/), and
-[Snell listener](https://wiki.metacubex.one/en/config/inbound/listeners/snell/).
+[Snell listener](https://wiki.metacubex.one/en/config/inbound/listeners/snell/),
+[TrustTunnel listener](https://wiki.metacubex.one/en/config/inbound/listeners/trusttunnel/),
+[ShadowQUIC listener](https://wiki.metacubex.one/en/config/inbound/listeners/shadowquic/), and
+[Sudoku listener](https://wiki.metacubex.one/en/config/inbound/listeners/sudoku/).
 
 ## Rejected combinations
 
@@ -92,10 +101,11 @@ Server syntax evidence: [VLESS listener](https://wiki.metacubex.one/en/config/in
   nonmatching version marker; operators must not update this pin blindly.
 - **Multiple ShadowTLS/ResTLS/JLS/REALITY wrappers** cannot be represented by a
   protocol adapter. Structural tests require at most one wrapper.
-- **VLESS TCP + ShadowTLS/ResTLS/JLS** is not exposed in this release. Although
-  current Mihomo common TLS fields and listener docs describe the primitives,
-  no dedicated Infiproxy composition was required for the minimal catalog and
-  it has not passed this repository's end-to-end interoperability gate.
+- **TrustTunnel HTTP/3** is not exposed. The current listener-claim model cannot
+  safely reserve both TCP and UDP for one profile without an architecture
+  change; `trusttunnel-h2` therefore emits TCP/H2 only.
+- **MASQUE** is not exposed because no matching verified Mihomo server inbound
+  is part of this runtime contract.
 - **Hysteria Gecko or server-only camouflage** is not exposed because the
   Mihomo client contract documents Salamander for this profile.
 

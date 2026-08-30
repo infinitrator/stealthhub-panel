@@ -1145,6 +1145,25 @@ pub async fn ensure_default_protocol_profiles(pool: &SqlitePool) -> Result<()> {
         }
         mark_bootstrap_complete(pool, "modern-security-compositions-v1").await?;
     }
+    if !bootstrap_complete(pool, "mihomo-verified-transports-v1").await? {
+        for profile in crate::adapters::default_profiles()
+            .into_iter()
+            .filter(|profile| {
+                matches!(
+                    profile.protocol_id.as_str(),
+                    "vless-shadowtls-v3"
+                        | "vless-restls"
+                        | "vless-jls"
+                        | "trusttunnel-h2"
+                        | "shadowquic"
+                        | "sudoku-httpmask"
+                )
+            })
+        {
+            ensure_protocol_profile(pool, &NewProtocolProfile::from(profile)).await?;
+        }
+        mark_bootstrap_complete(pool, "mihomo-verified-transports-v1").await?;
+    }
     Ok(())
 }
 
@@ -3977,6 +3996,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verified_transport_upgrade_adds_disabled_profiles_without_touching_owned_rows(
+    ) -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        update_protocol_profile(
+            &pool,
+            UpdateProtocolProfile {
+                name: "VLESS-XHTTP-SAFE".to_string(),
+                enabled: true,
+                server: "preserved.example.test".to_string(),
+                port: 19443,
+                preferred_core_id: Some("xray".to_string()),
+                managed_resource_id: None,
+                config: serde_json::json!({"server_name":"www.example.com","path":"/preserved","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id","private_key_secret":"xray.reality.private_key"}),
+            },
+        )
+        .await?;
+        let new_ids = [
+            "vless-shadowtls-v3",
+            "vless-restls",
+            "vless-jls",
+            "trusttunnel-h2",
+            "shadowquic",
+            "sudoku-httpmask",
+        ];
+        sqlx::query(
+            "DELETE FROM protocol_profiles WHERE kind IN ('vless-shadowtls-v3','vless-restls','vless-jls','trusttunnel-h2','shadowquic','sudoku-httpmask')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM bootstrap_state WHERE key='mihomo-verified-transports-v1'")
+            .execute(&pool)
+            .await?;
+
+        ensure_default_protocol_profiles(&pool).await?;
+        let first = list_protocol_profiles_decoded(&pool).await?;
+        ensure_default_protocol_profiles(&pool).await?;
+        let second = list_protocol_profiles_decoded(&pool).await?;
+        assert_eq!(first, second);
+        for protocol_id in new_ids {
+            let profile = first
+                .iter()
+                .find(|profile| profile.protocol_id == protocol_id)
+                .with_context(|| format!("new profile {protocol_id} is missing"))?;
+            assert!(!profile.enabled, "new profile was enabled by migration");
+        }
+        let preserved = first
+            .iter()
+            .find(|profile| profile.name == "VLESS-XHTTP-SAFE")
+            .context("operator-owned profile is missing")?;
+        assert!(preserved.enabled);
+        assert_eq!(preserved.server, "preserved.example.test");
+        assert_eq!(preserved.port, 19443);
+        assert_eq!(preserved.preferred_core_id.as_deref(), Some("xray"));
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn adapter_migration_is_idempotent_and_preserves_profiles_and_unknown_data() -> Result<()>
     {
         let (pool, path) = test_pool().await?;
@@ -4063,7 +4142,7 @@ mod tests {
 
         ensure_default_routing_rule_sets(&pool).await?;
         let policy = load_client_policy(&pool).await?;
-        assert_eq!(policy.pools.len(), 6);
+        assert_eq!(policy.pools.len(), 9);
         assert_eq!(policy.rules.len(), 5);
         policy.validate(&crate::adapters::default_profiles())?;
         let mut dns = load_dns_policy(&pool).await?;

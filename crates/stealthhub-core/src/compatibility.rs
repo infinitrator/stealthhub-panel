@@ -15,7 +15,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, Row, SqlitePool, TypeInfo, ValueRef};
 use uuid::Uuid;
 
-use crate::storage::{init_db, open_pool};
+use crate::storage::{
+    ensure_default_protocol_profiles, ensure_default_routing_rule_sets, init_db, open_pool,
+};
 
 const PRODUCTION_DATABASE: &str = "/var/lib/infiproxy/infiproxy.sqlite";
 const DURABLE_TABLES: &[&str] = &[
@@ -96,8 +98,12 @@ pub async fn run(source: &Path) -> Result<CompatibilityReport> {
     let before = snapshot(&pool, None).await?;
     init_db(&pool).await?;
     let after_baseline = snapshot(&pool, Some(&before)).await?;
+    ensure_default_protocol_profiles(&pool).await?;
+    ensure_default_routing_rule_sets(&pool).await?;
     let after_first_migration = snapshot(&pool, None).await?;
     init_db(&pool).await?;
+    ensure_default_protocol_profiles(&pool).await?;
+    ensure_default_routing_rule_sets(&pool).await?;
     let after_second_migration = snapshot(&pool, None).await?;
     pool.close().await;
 

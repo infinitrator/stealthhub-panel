@@ -6,10 +6,12 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 use stealthhub_core::{
     adapter::{CoreRegistry, ProtocolRegistry},
-    adapters::desired_resources,
+    adapters::{
+        desired_resources, profile_requires_tls, profile_tls_hostname, tls_material_readiness,
+    },
     inventory::{
         adapter_kind, build_inventory, AdapterInventory, InventoryFacts, PersistedAdapterState,
-        RuntimeInventoryFact,
+        ResourceInventoryState, RuntimeInventoryFact,
     },
     storage::{
         decode_adapter_state, get_reconcile_state, list_adapter_state_records, load_desired_state,
@@ -148,7 +150,7 @@ pub(crate) async fn load(
     } else {
         BTreeSet::new()
     };
-    let inventory = build_inventory(InventoryFacts {
+    let mut inventory = build_inventory(InventoryFacts {
         protocol_manifests: &protocol_manifests,
         core_manifests: &core_manifests,
         runtime_facts: &runtime_facts,
@@ -160,6 +162,30 @@ pub(crate) async fn load(
         reconcile_status: &reconcile.status,
         applied_runtime_ids: &applied_runtime_ids,
     });
+    for profile in desired
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled && profile_requires_tls(&profile.protocol_id))
+    {
+        let hostname = profile_tls_hostname(&profile.protocol_id, &profile.config);
+        let readiness = tls_material_readiness(hostname.as_deref());
+        if readiness.ready {
+            continue;
+        }
+        let resource_id = profile
+            .managed_resource_id
+            .as_deref()
+            .unwrap_or(&profile.name);
+        if let Some(resource) = inventory
+            .resources
+            .iter_mut()
+            .find(|resource| resource.id == resource_id)
+        {
+            resource.state = ResourceInventoryState::ConfiguredPending;
+            resource.applied = false;
+            resource.detail = readiness.detail.clone();
+        }
+    }
 
     Ok(PanelInventory {
         inventory,

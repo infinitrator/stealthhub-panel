@@ -224,6 +224,9 @@ TCP 127.0.0.1:8080      Infiproxy panel
 TCP 12443               Trojan TLS/uTLS starter profile
 TCP 13443               Snell v5 starter profile
 TCP 14443               Mieru TCP starter profile
+TCP 15443               TrustTunnel H2 profile (disabled)
+UDP 16443               ShadowQUIC profile (disabled)
+TCP 17443               Sudoku HTTPMask profile (disabled)
 UDP 443                 Hysteria2 starter config
 UDP 11443               TUIC starter config
 ```

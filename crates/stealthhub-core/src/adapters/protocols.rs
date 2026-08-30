@@ -19,6 +19,7 @@ use crate::{
 enum Implementation {
     VlessXhttp,
     VlessTcp,
+    VlessWrapped(SecurityWrapper),
     ShadowsocksShadowTls,
     Hysteria,
     AnyTlsLegacy,
@@ -27,6 +28,9 @@ enum Implementation {
     Trojan(SecurityWrapper),
     SnellV5(Option<SecurityWrapper>),
     MieruTcp,
+    TrustTunnelH2,
+    ShadowQuic,
+    SudokuHttpMask,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,6 +117,13 @@ fn composition(implementation: Implementation) -> ProtocolComposition {
             Some("xtls-rprx-vision"),
             AdapterMaturity::Stable,
         ),
+        Implementation::VlessWrapped(wrapper) => (
+            "vless",
+            "tcp",
+            wrapper.label(),
+            None,
+            AdapterMaturity::Experimental,
+        ),
         Implementation::ShadowsocksShadowTls => (
             "shadowsocks-2022",
             "tcp",
@@ -150,6 +161,27 @@ fn composition(implementation: Implementation) -> ProtocolComposition {
             "protocol-auth",
             None,
             AdapterMaturity::Stable,
+        ),
+        Implementation::TrustTunnelH2 => (
+            "trusttunnel",
+            "h2",
+            "tls",
+            None,
+            AdapterMaturity::Experimental,
+        ),
+        Implementation::ShadowQuic => (
+            "shadowquic",
+            "quic",
+            "jls",
+            None,
+            AdapterMaturity::Experimental,
+        ),
+        Implementation::SudokuHttpMask => (
+            "sudoku",
+            "httpmask",
+            "chacha20-poly1305",
+            None,
+            AdapterMaturity::Experimental,
         ),
     };
     ProtocolComposition {
@@ -218,9 +250,21 @@ const fn compatibility_note(implementation: Implementation) -> Option<&'static s
     match implementation {
         Implementation::VlessXhttp => Some("XHTTP must not use Vision flow."),
         Implementation::VlessTcp => Some("Vision and XUDP are required by this profile."),
+        Implementation::VlessWrapped(_) => {
+            Some("This TCP profile uses exactly one TLS camouflage wrapper and no Vision flow.")
+        }
         Implementation::AnyTlsLegacy | Implementation::AnyTls(_) => {
             Some("AnyTLS with REALITY is unsupported by Mihomo.")
         }
+        Implementation::TrustTunnelH2 => {
+            Some("HTTP/3 is intentionally not exposed until dual TCP/UDP claims are modeled.")
+        }
+        Implementation::ShadowQuic => {
+            Some("JLS is intrinsic; 0-RTT is disabled to avoid pre-authentication replay risk.")
+        }
+        Implementation::SudokuHttpMask => Some(
+            "Legacy HTTPMask is paired with authenticated AEAD and does not claim CDN support.",
+        ),
         _ => None,
     }
 }
@@ -369,6 +413,23 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                 ]));
                 Value::Object(proxy)
             }
+            Implementation::VlessWrapped(wrapper) => {
+                let mut proxy = self.base(context, "vless");
+                proxy.extend(Map::from_iter([
+                    ("udp".to_string(), json!(true)),
+                    ("uuid".to_string(), json!(context.user.uuid)),
+                    ("encryption".to_string(), json!("")),
+                    ("network".to_string(), json!("tcp")),
+                    ("tls".to_string(), json!(true)),
+                    (
+                        "servername".to_string(),
+                        json!(self.required_text(&context.profile.config, "sni")?),
+                    ),
+                    ("client-fingerprint".to_string(), json!("chrome")),
+                ]));
+                apply_client_wrapper(self, context, &mut proxy, wrapper)?;
+                Value::Object(proxy)
+            }
             Implementation::ShadowsocksShadowTls => {
                 let mut proxy = self.base(context, "ss");
                 proxy.extend(Map::from_iter([
@@ -509,6 +570,65 @@ impl ProtocolAdapter for JsonProtocolAdapter {
                     ),
                     ("multiplexing".to_string(), json!("MULTIPLEXING_LOW")),
                     ("handshake-mode".to_string(), json!("HANDSHAKE_STANDARD")),
+                ]));
+                Value::Object(proxy)
+            }
+            Implementation::TrustTunnelH2 => {
+                let mut proxy = self.base(context, "trusttunnel");
+                proxy.extend(Map::from_iter([
+                    ("username".to_string(), json!(context.user.uuid)),
+                    ("password".to_string(), json!(context.user.uuid)),
+                    ("health-check".to_string(), json!(true)),
+                    ("udp".to_string(), json!(false)),
+                    ("quic".to_string(), json!(false)),
+                    (
+                        "sni".to_string(),
+                        json!(self.required_text(&context.profile.config, "sni")?),
+                    ),
+                    ("alpn".to_string(), json!(["h2"])),
+                    ("client-fingerprint".to_string(), json!("chrome")),
+                ]));
+                Value::Object(proxy)
+            }
+            Implementation::ShadowQuic => {
+                let mut proxy = self.base(context, "shadowquic");
+                proxy.extend(Map::from_iter([
+                    ("username".to_string(), json!(context.user.uuid)),
+                    ("password".to_string(), json!(context.user.uuid)),
+                    (
+                        "sni".to_string(),
+                        json!(self.required_text(&context.profile.config, "sni")?),
+                    ),
+                    ("alpn".to_string(), json!(["h3"])),
+                    ("quic-versions".to_string(), json!(["v1"])),
+                    ("udp-over-stream".to_string(), json!(false)),
+                    ("zero-rtt".to_string(), json!(false)),
+                    ("congestion-controller".to_string(), json!("cubic")),
+                ]));
+                Value::Object(proxy)
+            }
+            Implementation::SudokuHttpMask => {
+                let mut proxy = self.base(context, "sudoku");
+                proxy.extend(Map::from_iter([
+                    (
+                        "key".to_string(),
+                        json!(self.secret(context, "key_secret")?),
+                    ),
+                    ("aead-method".to_string(), json!("chacha20-poly1305")),
+                    ("padding-min".to_string(), json!(2)),
+                    ("padding-max".to_string(), json!(7)),
+                    ("table-type".to_string(), json!("prefer_ascii")),
+                    ("multiplex".to_string(), json!("off")),
+                    (
+                        "httpmask".to_string(),
+                        json!({
+                            "disable": false,
+                            "mode": "legacy",
+                            "path-root": self.required_text(&context.profile.config, "path_root")?,
+                            "multiplex": "off"
+                        }),
+                    ),
+                    ("enable-pure-downlink".to_string(), json!(false)),
                 ]));
                 Value::Object(proxy)
             }
@@ -786,6 +906,39 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
             ListenerNetwork::Tcp,
         ),
         JsonProtocolAdapter::new(
+            "vless-shadowtls-v3",
+            "VLESS + ShadowTLS v3",
+            Implementation::VlessWrapped(SecurityWrapper::ShadowTlsV3),
+            wrapped_fields(
+                vec![text("sni", "SNI", "ShadowTLS destination hostname.")],
+                SecurityWrapper::ShadowTlsV3,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "vless-restls",
+            "VLESS + ResTLS",
+            Implementation::VlessWrapped(SecurityWrapper::ResTls),
+            wrapped_fields(
+                vec![text("sni", "SNI", "ResTLS destination hostname.")],
+                SecurityWrapper::ResTls,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "vless-jls",
+            "VLESS + JLS",
+            Implementation::VlessWrapped(SecurityWrapper::Jls),
+            wrapped_fields(
+                vec![text("sni", "SNI", "JLS destination hostname.")],
+                SecurityWrapper::Jls,
+            ),
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
             "shadowsocks2022-shadow-tls",
             "Shadowsocks 2022 + ShadowTLS",
             Implementation::ShadowsocksShadowTls,
@@ -1024,6 +1177,42 @@ pub(super) fn registry() -> Result<ProtocolRegistry> {
             UserParticipation::PerUserUuid,
             ListenerNetwork::Tcp,
         ),
+        JsonProtocolAdapter::new(
+            "trusttunnel-h2",
+            "TrustTunnel HTTP/2",
+            Implementation::TrustTunnelH2,
+            vec![text("sni", "SNI", "TLS certificate hostname.")],
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Tcp,
+        ),
+        JsonProtocolAdapter::new(
+            "shadowquic",
+            "ShadowQUIC",
+            Implementation::ShadowQuic,
+            vec![text("sni", "SNI", "JLS camouflage upstream hostname.")],
+            UserParticipation::PerUserUuid,
+            ListenerNetwork::Udp,
+        ),
+        JsonProtocolAdapter::new(
+            "sudoku-httpmask",
+            "Sudoku HTTPMask",
+            Implementation::SudokuHttpMask,
+            vec![
+                secret(
+                    "key_secret",
+                    "Shared key",
+                    "Secret reference containing the shared Sudoku UUID or key.",
+                    true,
+                ),
+                text(
+                    "path_root",
+                    "HTTPMask path root",
+                    "Matching first-level path prefix used by both peers.",
+                ),
+            ],
+            UserParticipation::SharedCredential,
+            ListenerNetwork::Tcp,
+        ),
     ];
     for adapter in adapters {
         registry.register(Arc::new(adapter))?;
@@ -1047,6 +1236,27 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
             ProxyRole::Compatibility,
             7443,
             json!({"server_name":"www.microsoft.com","public_key_secret":"xray.reality.public_key","short_id_secret":"xray.reality.short_id","private_key_secret":"xray.reality.private_key"}),
+        ),
+        profile(
+            "VLESS-SHADOWTLS-V3-EXPERIMENTAL",
+            "vless-shadowtls-v3",
+            ProxyRole::Compatibility,
+            7543,
+            json!({"sni":"www.apple.com","shadow_tls_password_secret":"shadowtls.password"}),
+        ),
+        profile(
+            "VLESS-RESTLS-EXPERIMENTAL",
+            "vless-restls",
+            ProxyRole::Compatibility,
+            7643,
+            json!({"sni":"www.apple.com","restls_password_secret":"restls.password"}),
+        ),
+        profile(
+            "VLESS-JLS-EXPERIMENTAL",
+            "vless-jls",
+            ProxyRole::Compatibility,
+            7743,
+            json!({"sni":"www.apple.com","jls_username_secret":"jls.username","jls_password_secret":"jls.password"}),
         ),
         profile(
             "SS2022-SHADOWTLS-FALLBACK",
@@ -1174,6 +1384,27 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
             14443,
             json!({"password_secret":"mieru.password"}),
         ),
+        profile(
+            "TRUSTTUNNEL-H2-EXPERIMENTAL",
+            "trusttunnel-h2",
+            ProxyRole::Compatibility,
+            15443,
+            json!({"sni":"node.infiproxy.local"}),
+        ),
+        profile(
+            "SHADOWQUIC-EXPERIMENTAL",
+            "shadowquic",
+            ProxyRole::Speed,
+            16443,
+            json!({"sni":"www.apple.com"}),
+        ),
+        profile(
+            "SUDOKU-HTTPMASK-EXPERIMENTAL",
+            "sudoku-httpmask",
+            ProxyRole::Compatibility,
+            17443,
+            json!({"key_secret":"sudoku.key","path_root":"infiproxy"}),
+        ),
     ]
 }
 
@@ -1186,6 +1417,9 @@ pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
         "tuic" => Some("tuic"),
         "vless-reality-xhttp"
         | "vless-reality-tcp"
+        | "vless-shadowtls-v3"
+        | "vless-restls"
+        | "vless-jls"
         | "anytls-tls"
         | "anytls-shadowtls-v3"
         | "anytls-restls"
@@ -1199,7 +1433,10 @@ pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
         | "snell-v5-shadowtls-v3"
         | "snell-v5-restls"
         | "snell-v5-jls"
-        | "mieru" => Some("mihomo"),
+        | "mieru"
+        | "trusttunnel-h2"
+        | "shadowquic"
+        | "sudoku-httpmask" => Some("mihomo"),
         _ => None,
     }
 }
@@ -1343,6 +1580,10 @@ mod tests {
             ("tuic.password".into(), "tuic-password".into()),
             ("snell.psk".into(), "snell-password".into()),
             ("mieru.password".into(), "mieru-password".into()),
+            (
+                "sudoku.key".into(),
+                "44444444-4444-4444-8444-444444444444".into(),
+            ),
         ])
     }
 
@@ -1384,9 +1625,34 @@ mod tests {
                 assert_eq!(rendered["network"], "xhttp");
                 assert!(rendered.get("flow").is_none());
             }
+            if profile.protocol_id == "vless-shadowtls-v3" {
+                assert!(rendered.get("shadow-tls-opts").is_some());
+                assert!(rendered.get("flow").is_none());
+            }
+            if profile.protocol_id == "vless-restls" {
+                assert!(rendered.get("restls-opts").is_some());
+                assert!(rendered.get("flow").is_none());
+            }
+            if profile.protocol_id == "vless-jls" {
+                assert!(rendered.get("jls-opts").is_some());
+                assert!(rendered.get("flow").is_none());
+            }
             if profile.protocol_id == "anytls-jls" {
                 assert!(rendered.get("jls-opts").is_some());
                 assert!(rendered.get("reality-opts").is_none());
+            }
+            if profile.protocol_id == "trusttunnel-h2" {
+                assert_eq!(rendered["quic"], false);
+                assert_eq!(rendered["alpn"], json!(["h2"]));
+            }
+            if profile.protocol_id == "shadowquic" {
+                assert_eq!(rendered["zero-rtt"], false);
+                assert!(rendered.get("jls-opts").is_none());
+            }
+            if profile.protocol_id == "sudoku-httpmask" {
+                assert_eq!(rendered["aead-method"], "chacha20-poly1305");
+                assert_ne!(rendered["aead-method"], "none");
+                assert_eq!(rendered["httpmask"]["path-root"], "infiproxy");
             }
         }
     }

@@ -6,6 +6,7 @@
 mod cores;
 mod infrastructure;
 mod protocols;
+mod tls;
 
 use anyhow::Result;
 
@@ -13,6 +14,9 @@ use crate::adapter::{CoreRegistry, ProtocolRegistry};
 
 pub use infrastructure::desired_resources;
 pub use protocols::{default_profiles, legacy_runtime_preference};
+pub use tls::{
+    profile_requires_tls, profile_tls_hostname, tls_material_readiness, TlsMaterialReadiness,
+};
 
 /// Builds the trusted protocol registry shipped with this binary.
 pub fn protocol_registry() -> Result<ProtocolRegistry> {

@@ -20,9 +20,11 @@ use crate::adapter::{
     CoreAdapter, CoreAdapterManifest, CorePlan, CoreRegistry, CoreSnapshot, UserSyncObservation,
     ADAPTER_API_VERSION,
 };
+use crate::module_manifest::normalized_release_version;
 
-const CERTIFICATE_PATH: &str = "/etc/infiproxy-cores/tls/fullchain.pem";
-const PRIVATE_KEY_PATH: &str = "/etc/infiproxy-cores/tls/privkey.pem";
+use super::tls::{
+    capabilities_require_tls, tls_material_readiness, CERTIFICATE_PATH, PRIVATE_KEY_PATH,
+};
 const RUNTIME_GROUP: &str = "infiproxy-runtime";
 const XRAY_CAPABILITIES: &[&str] = &["vless-reality-tcp", "vless-reality-xhttp"];
 const SING_BOX_CAPABILITIES: &[&str] = &[
@@ -37,6 +39,9 @@ const TUIC_CAPABILITIES: &[&str] = &["tuic"];
 const MIHOMO_CAPABILITIES: &[&str] = &[
     "vless-reality-tcp",
     "vless-reality-xhttp",
+    "vless-shadowtls-v3",
+    "vless-restls",
+    "vless-jls",
     "anytls-tls",
     "anytls-shadowtls-v3",
     "anytls-restls",
@@ -51,10 +56,16 @@ const MIHOMO_CAPABILITIES: &[&str] = &[
     "snell-v5-restls",
     "snell-v5-jls",
     "mieru",
+    "trusttunnel-h2",
+    "shadowquic",
+    "sudoku-httpmask",
 ];
 #[cfg(test)]
 const MIHOMO_EXCLUSIVE_CAPABILITIES: &[&str] = &[
     "vless-reality-xhttp",
+    "vless-shadowtls-v3",
+    "vless-restls",
+    "vless-jls",
     "anytls-tls",
     "anytls-shadowtls-v3",
     "anytls-restls",
@@ -69,6 +80,9 @@ const MIHOMO_EXCLUSIVE_CAPABILITIES: &[&str] = &[
     "snell-v5-restls",
     "snell-v5-jls",
     "mieru",
+    "trusttunnel-h2",
+    "shadowquic",
+    "sudoku-httpmask",
 ];
 
 #[derive(Clone, Copy)]
@@ -260,6 +274,23 @@ impl ManagedCoreAdapter {
         Ok(Some(fs::read(&self.config)?))
     }
 
+    fn probed_version(&self) -> Option<[u64; 3]> {
+        let arguments: &[&str] = match self.flavor {
+            Flavor::Xray => &["version"],
+            Flavor::Mihomo => &["-v"],
+            Flavor::SingBox | Flavor::Hysteria => &["version"],
+            Flavor::Tuic => &["--version"],
+        };
+        let output = Command::new(&self.binary).args(arguments).output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .chain(String::from_utf8_lossy(&output.stderr).split_whitespace())
+            .find_map(normalized_release_version)
+    }
+
     fn main_pid(&self) -> Result<u32> {
         let output = Command::new("/usr/bin/systemctl")
             .args([
@@ -326,13 +357,21 @@ impl CoreAdapter for ManagedCoreAdapter {
         Ok(self.binary.is_file())
     }
 
-    fn compatible(&self, _required: &std::collections::BTreeSet<String>) -> Result<bool> {
+    fn compatible(&self, required: &std::collections::BTreeSet<String>) -> Result<bool> {
+        if !self.binary.is_file() {
+            return Ok(false);
+        }
+        if capabilities_require_tls(required.iter()) && !tls_material_readiness(None).ready {
+            return Ok(false);
+        }
+        let expected = normalized_release_version(self.validated_version)
+            .context("validated runtime version is invalid")?;
         let installed = match fs::read_to_string(&self.version_file) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Ok(value) => normalized_release_version(value.trim()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.probed_version(),
             Err(error) => return Err(error.into()),
         };
-        Ok(installed.trim() == self.validated_version)
+        Ok(installed == Some(expected))
     }
 
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
@@ -698,7 +737,16 @@ fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
         let listen_port = port(payload)?;
         let name = &fragment.profile_id;
         let listener = match fragment.capability.as_str() {
-            "vless-reality-tcp" | "vless-reality-xhttp" => {
+            capability
+                if matches!(
+                    capability,
+                    "vless-reality-tcp"
+                        | "vless-reality-xhttp"
+                        | "vless-shadowtls-v3"
+                        | "vless-restls"
+                        | "vless-jls"
+                ) =>
+            {
                 let vision = fragment.capability == "vless-reality-tcp";
                 let user_entries = users(payload)?
                     .iter()
@@ -715,15 +763,24 @@ fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
                     .collect::<Vec<_>>();
                 let mut listener = json!({
                     "name":name,"type":"vless","listen":"::","port":listen_port,
-                    "users":user_entries,
-                    "reality-config":reality_server_options(payload, config)?
+                    "users":user_entries
                 });
-                if !vision {
+                if capability == "vless-reality-tcp" {
+                    listener["reality-config"] = reality_server_options(payload, config)?;
+                } else if capability == "vless-reality-xhttp" {
+                    listener["reality-config"] = reality_server_options(payload, config)?;
                     listener["xhttp-config"] = json!({
                         "path": config_text(config, "path")?,
                         "host": config_text(config, "server_name")?,
                         "mode": "auto"
                     });
+                } else {
+                    apply_mihomo_server_wrapper(
+                        &mut listener,
+                        payload,
+                        config,
+                        wrapper_for_capability(capability)?,
+                    )?;
                 }
                 listener
             }
@@ -785,6 +842,39 @@ fn compose_mihomo(plan: &CorePlan) -> Result<Value> {
                     "transport":"TCP","users":user_entries,"user-hint-is-mandatory":true
                 })
             }
+            "trusttunnel-h2" => {
+                let user_entries = users(payload)?
+                    .iter()
+                    .map(|user| json!({"username":user["uuid"],"password":user["uuid"]}))
+                    .collect::<Vec<_>>();
+                json!({
+                    "name":name,"type":"trusttunnel","listen":"::","port":listen_port,
+                    "users":user_entries,"certificate":CERTIFICATE_PATH,
+                    "private-key":PRIVATE_KEY_PATH,"network":["tcp"]
+                })
+            }
+            "shadowquic" => {
+                let user_entries = users(payload)?
+                    .iter()
+                    .map(|user| json!({"username":user["uuid"],"password":user["uuid"]}))
+                    .collect::<Vec<_>>();
+                let sni = config_text(config, "sni")?;
+                json!({
+                    "name":name,"type":"shadowquic","listen":"::","port":listen_port,
+                    "users":user_entries,
+                    "jls-upstream":{"addr":format!("{sni}:443"),"sni":sni},
+                    "alpn":["h3"],"quic-versions":["v1"],"zero-rtt":false,
+                    "congestion-controller":"cubic"
+                })
+            }
+            "sudoku-httpmask" => json!({
+                "name":name,"type":"sudoku","listen":"::","port":listen_port,
+                "key":resolved_secret(payload,"key_secret")?,
+                "aead-method":"chacha20-poly1305","padding-min":2,"padding-max":7,
+                "table-type":"prefer_ascii","handshake-timeout":5,
+                "enable-pure-downlink":false,
+                "httpmask":{"disable":false,"mode":"legacy","path-root":config_text(config,"path_root")?}
+            }),
             _ => bail!("mihomo adapter received an unsupported capability"),
         };
         listeners.push(listener);
@@ -964,7 +1054,11 @@ fn discover_config_ports(flavor: Flavor, bytes: &[u8]) -> Result<Vec<(u16, bool)
                     .and_then(Value::as_u64)
                     .and_then(|value| u16::try_from(value).ok())
                 {
-                    ports.push((port, false));
+                    let udp = listener
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind == "shadowquic");
+                    ports.push((port, udp));
                 }
             }
         }
@@ -1039,12 +1133,7 @@ fn discover_config_users(
             {
                 match listener.get("users") {
                     Some(Value::Array(entries)) => {
-                        users.extend(entries.iter().filter_map(|entry| {
-                            entry
-                                .get("username")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        }));
+                        users.extend(entries.iter().filter_map(mihomo_array_user_identity));
                     }
                     Some(Value::Object(entries)) => users.extend(entries.keys().cloned()),
                     _ => {}
@@ -1053,6 +1142,14 @@ fn discover_config_users(
         }
     }
     Ok(users)
+}
+
+fn mihomo_array_user_identity(entry: &Value) -> Option<String> {
+    entry
+        .get("uuid")
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("username").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
@@ -1130,7 +1227,10 @@ pub(super) fn registry() -> Result<CoreRegistry> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, process::Command, thread, time::Duration};
+    use std::{
+        collections::BTreeSet, os::unix::fs::PermissionsExt, process::Command, thread,
+        time::Duration,
+    };
 
     use super::*;
 
@@ -1154,7 +1254,9 @@ mod tests {
                         "restls_password_secret": "secret.restls",
                         "jls_username_secret": "secret.jls-username",
                         "jls_password_secret": "secret.jls-password",
-                        "psk_secret": "secret.psk"
+                        "psk_secret": "secret.psk",
+                        "key_secret": "secret.sudoku-key",
+                        "path_root": "infiproxy"
                     },
                     "users": [{"username": "alice", "uuid": "11111111-1111-4111-8111-111111111111"}],
                     "resolved_secrets": {
@@ -1165,13 +1267,54 @@ mod tests {
                         "secret.restls": "restls-password",
                         "secret.jls-username": "jls-user",
                         "secret.jls-password": "jls-password",
-                        "secret.psk": "pre-shared-key"
+                        "secret.psk": "pre-shared-key",
+                        "secret.sudoku-key": "44444444-4444-4444-8444-444444444444"
                     }
                 }),
                 expected_user_ids: None,
                 listeners: Vec::new(),
             }],
         }
+    }
+
+    fn test_adapter(
+        flavor: Flavor,
+        binary: &Path,
+        config: &Path,
+        version_file: &Path,
+        validated_version: &'static str,
+    ) -> Result<ManagedCoreAdapter> {
+        Ok(ManagedCoreAdapter::new(ManagedCoreSpec {
+            id: "test-runtime",
+            display_name: "Test runtime",
+            service: "infiproxy-test.service",
+            flavor,
+            binary: binary
+                .to_str()
+                .context("temporary binary path is not UTF-8")?,
+            config: config
+                .to_str()
+                .context("temporary config path is not UTF-8")?,
+            capabilities: XRAY_CAPABILITIES,
+            selection_priority: 1,
+            validated_version,
+            version_file: Some(
+                version_file
+                    .to_str()
+                    .context("temporary marker path is not UTF-8")?,
+            ),
+        }))
+    }
+
+    fn write_probe(path: &Path, expected_argument: &str, version: &str) -> Result<()> {
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\n[ \"$1\" = \"{expected_argument}\" ] || exit 64\nprintf '%s\\n' '{version}'\n"
+            ),
+        )?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        Ok(())
     }
 
     #[test]
@@ -1201,6 +1344,10 @@ mod tests {
         );
 
         let mihomo = br#"listeners:
+  - type: vless
+    users:
+      - username: alice
+        uuid: 11111111-1111-4111-8111-111111111111
   - type: trojan
     users:
       - username: user-a
@@ -1211,8 +1358,170 @@ mod tests {
 "#;
         assert_eq!(
             discover_config_users(Flavor::Mihomo, mihomo).unwrap(),
-            BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
+            BTreeSet::from([
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                "user-a".to_string(),
+                "user-b".to_string(),
+            ])
         );
+    }
+
+    #[test]
+    fn mihomo_vless_user_lifecycle_observes_uuid_and_reports_count_only_drift() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let directory = std::env::temp_dir().join(format!("infiproxy-users-{suffix}"));
+        fs::create_dir(&directory)?;
+        let binary = directory.join("mihomo");
+        let config = directory.join("config.yaml");
+        let marker = directory.join("mihomo.version");
+        fs::write(&binary, b"installed")?;
+        let adapter = test_adapter(Flavor::Mihomo, &binary, &config, &marker, "v1.19.30")?;
+        let expected_uuid = "11111111-1111-4111-8111-111111111111";
+        let unexpected_uuid = "22222222-2222-4222-8222-222222222222";
+
+        let mut created = minimal_plan("test-runtime", "vless-reality-tcp");
+        created.fragments[0].expected_user_ids = Some(BTreeSet::from([expected_uuid.to_string()]));
+        fs::write(&config, adapter.compose(&created)?)?;
+        assert_eq!(
+            discover_config_users(Flavor::Mihomo, &fs::read(&config)?)?,
+            BTreeSet::from([expected_uuid.to_string()])
+        );
+        assert_eq!(
+            adapter.observe_users(&created)?,
+            UserSyncObservation::InSync { user_count: 1 }
+        );
+
+        let mut drifted = minimal_plan("test-runtime", "vless-reality-tcp");
+        drifted.fragments[0].payload["users"][0]["uuid"] = json!(unexpected_uuid);
+        drifted.fragments[0].expected_user_ids = Some(BTreeSet::from([expected_uuid.to_string()]));
+        fs::write(&config, adapter.compose(&drifted)?)?;
+        let observation = adapter.observe_users(&drifted)?;
+        assert_eq!(
+            observation,
+            UserSyncObservation::Drift {
+                expected_count: 1,
+                observed_count: 1,
+                missing_count: 1,
+                unexpected_count: 1,
+            }
+        );
+        let diagnostic = serde_json::to_string(&observation)?;
+        assert!(!diagnostic.contains(expected_uuid));
+        assert!(!diagnostic.contains(unexpected_uuid));
+        assert!(!diagnostic.contains("alice"));
+
+        let mut disabled = minimal_plan("test-runtime", "vless-reality-tcp");
+        disabled.fragments[0].payload["users"] = json!([]);
+        disabled.fragments[0].expected_user_ids = Some(BTreeSet::new());
+        fs::write(&config, adapter.compose(&disabled)?)?;
+        assert_eq!(
+            adapter.observe_users(&disabled)?,
+            UserSyncObservation::InSync { user_count: 0 }
+        );
+
+        let deleted = CorePlan {
+            generation: 2,
+            core_id: "test-runtime".to_string(),
+            fragments: Vec::new(),
+        };
+        fs::write(&config, adapter.compose(&deleted)?)?;
+        assert_eq!(
+            adapter.observe_users(&deleted)?,
+            UserSyncObservation::InSync { user_count: 0 }
+        );
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_mihomo_listeners_observe_only_adapter_selected_identities() -> Result<()> {
+        let config = br#"listeners:
+  - type: vless
+    users:
+      - username: alice
+        uuid: 11111111-1111-4111-8111-111111111111
+  - type: trojan
+    users:
+      - username: 22222222-2222-4222-8222-222222222222
+        password: never-observe-this-password
+  - type: mieru
+    users:
+      33333333-3333-4333-8333-333333333333: never-observe-this-password
+"#;
+        let observed = discover_config_users(Flavor::Mihomo, config)?;
+        assert_eq!(
+            observed,
+            BTreeSet::from([
+                "11111111-1111-4111-8111-111111111111".to_string(),
+                "22222222-2222-4222-8222-222222222222".to_string(),
+                "33333333-3333-4333-8333-333333333333".to_string(),
+            ])
+        );
+        assert!(!format!("{observed:?}").contains("never-observe"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_version_contract_is_exact_and_missing_markers_probe_fail_closed() -> Result<()> {
+        let cases = [
+            (Flavor::Xray, "version", "Xray 26.3.27", "v26.3.27"),
+            (Flavor::Mihomo, "-v", "Mihomo Meta v1.19.30", "v1.19.30"),
+            (
+                Flavor::SingBox,
+                "version",
+                "sing-box version 1.13.20",
+                "v1.13.20",
+            ),
+            (
+                Flavor::Hysteria,
+                "version",
+                "Version: v2.12.2",
+                "app/v2.12.2",
+            ),
+            (
+                Flavor::Tuic,
+                "--version",
+                "tuic-server 1.0.0",
+                "tuic-server-1.0.0",
+            ),
+        ];
+        for (flavor, argument, output, expected) in cases {
+            let suffix = uuid::Uuid::new_v4();
+            let directory = std::env::temp_dir().join(format!("infiproxy-version-{suffix}"));
+            fs::create_dir(&directory)?;
+            let binary = directory.join("runtime");
+            let config = directory.join("config");
+            let marker = directory.join("runtime.version");
+            write_probe(&binary, argument, output)?;
+            let adapter = test_adapter(flavor, &binary, &config, &marker, expected)?;
+            assert!(adapter.compatible(&BTreeSet::new())?);
+
+            write_probe(&binary, argument, "runtime v9.9.9")?;
+            assert!(!adapter.compatible(&BTreeSet::new())?);
+            fs::write(&marker, format!("{expected}\n"))?;
+            assert!(adapter.compatible(&BTreeSet::new())?);
+            fs::write(&marker, b"v9.9.9\n")?;
+            assert!(!adapter.compatible(&BTreeSet::new())?);
+            fs::remove_file(&binary)?;
+            assert!(!adapter.compatible(&BTreeSet::new())?);
+            fs::remove_dir_all(directory)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn markerless_newer_xray_is_not_compatible_with_the_validated_pin() -> Result<()> {
+        let suffix = uuid::Uuid::new_v4();
+        let directory = std::env::temp_dir().join(format!("infiproxy-xray-{suffix}"));
+        fs::create_dir(&directory)?;
+        let binary = directory.join("xray");
+        let config = directory.join("config.json");
+        let marker = directory.join("xray.version");
+        write_probe(&binary, "version", "Xray 26.7.11")?;
+        let adapter = test_adapter(Flavor::Xray, &binary, &config, &marker, "v26.3.27")?;
+        assert!(!adapter.compatible(&BTreeSet::new())?);
+        fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[test]
@@ -1260,6 +1569,68 @@ mod tests {
         assert_eq!(reparsed["listeners"][0]["type"], "trojan");
         assert_eq!(reparsed["listeners"][1]["version"], 5);
         assert_eq!(reparsed["listeners"][2]["transport"], "TCP");
+    }
+
+    #[test]
+    fn modern_mihomo_listeners_preserve_security_and_transport_invariants() -> Result<()> {
+        let listener = |capability: &str| -> Result<Value> {
+            Ok(compose_mihomo(&minimal_plan("mihomo", capability))?["listeners"][0].clone())
+        };
+        let wrappers = ["reality-config", "shadow-tls", "res-tls", "jls-config"];
+        for capability in MIHOMO_CAPABILITIES {
+            let rendered = listener(capability)?;
+            assert!(
+                wrappers
+                    .iter()
+                    .filter(|field| rendered.get(**field).is_some())
+                    .count()
+                    <= 1,
+                "{capability} contains mutually exclusive wrappers"
+            );
+        }
+
+        let reality = listener("vless-reality-tcp")?;
+        assert_eq!(reality["users"][0]["flow"], "xtls-rprx-vision");
+        let xhttp = listener("vless-reality-xhttp")?;
+        assert!(xhttp["users"][0].get("flow").is_none());
+        for (capability, wrapper) in [
+            ("vless-shadowtls-v3", "shadow-tls"),
+            ("vless-restls", "res-tls"),
+            ("vless-jls", "jls-config"),
+        ] {
+            let rendered = listener(capability)?;
+            assert!(rendered.get(wrapper).is_some());
+            assert!(rendered["users"][0].get("flow").is_none());
+        }
+
+        let trusttunnel = listener("trusttunnel-h2")?;
+        assert_eq!(trusttunnel["network"], json!(["tcp"]));
+        assert_eq!(trusttunnel["certificate"], CERTIFICATE_PATH);
+        assert_eq!(trusttunnel["private-key"], PRIVATE_KEY_PATH);
+        assert_eq!(
+            trusttunnel["users"][0]["username"],
+            trusttunnel["users"][0]["password"]
+        );
+
+        let shadowquic = listener("shadowquic")?;
+        assert_eq!(shadowquic["zero-rtt"], false);
+        assert_eq!(shadowquic["alpn"], json!(["h3"]));
+        assert!(shadowquic.get("jls-config").is_none());
+        assert_eq!(
+            discover_config_ports(
+                Flavor::Mihomo,
+                serde_norway::to_string(&compose_mihomo(&minimal_plan("mihomo", "shadowquic"))?)?
+                    .as_bytes(),
+            )?,
+            vec![(24443, true)]
+        );
+
+        let sudoku = listener("sudoku-httpmask")?;
+        assert_eq!(sudoku["aead-method"], "chacha20-poly1305");
+        assert_ne!(sudoku["aead-method"], "none");
+        assert_eq!(sudoku["httpmask"]["mode"], "legacy");
+        assert_eq!(sudoku["httpmask"]["path-root"], "infiproxy");
+        Ok(())
     }
 
     #[test]
@@ -1452,6 +1823,36 @@ mod tests {
             }
         }
         fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_runtime_version_probes_accept_pinned_binaries() -> Result<()> {
+        let cases = [
+            ("INFIPROXY_TEST_XRAY_BIN", Flavor::Xray, "v26.3.27"),
+            ("INFIPROXY_TEST_MIHOMO_BIN", Flavor::Mihomo, "v1.19.30"),
+            ("INFIPROXY_TEST_SING_BOX_BIN", Flavor::SingBox, "v1.13.20"),
+            (
+                "INFIPROXY_TEST_HYSTERIA_BIN",
+                Flavor::Hysteria,
+                "app/v2.12.2",
+            ),
+            ("INFIPROXY_TEST_TUIC_BIN", Flavor::Tuic, "tuic-server-1.0.0"),
+        ];
+        for (variable, flavor, version) in cases {
+            let Some(binary) = std::env::var_os(variable) else {
+                continue;
+            };
+            let marker = std::env::temp_dir()
+                .join(format!("infiproxy-absent-version-{}", uuid::Uuid::new_v4()));
+            let config = std::env::temp_dir()
+                .join(format!("infiproxy-unused-config-{}", uuid::Uuid::new_v4()));
+            let adapter = test_adapter(flavor, Path::new(&binary), &config, &marker, version)?;
+            assert!(
+                adapter.compatible(&BTreeSet::new())?,
+                "{variable} did not report exact pin {version}"
+            );
+        }
         Ok(())
     }
 

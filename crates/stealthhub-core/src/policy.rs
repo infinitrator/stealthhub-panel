@@ -382,7 +382,7 @@ fn detect_cycle<'a>(
 /// Compatibility bootstrap inserted once by the storage migration.
 #[must_use]
 pub fn default_client_policy() -> ClientPolicy {
-    use PoolMember::{AllProfiles, Direct, Pool, Role};
+    use PoolMember::{AllProfiles, Capability, Direct, Pool, Role};
     let pool = |id: &str,
                 kind: PoolKind,
                 members: Vec<PoolMember>,
@@ -405,8 +405,67 @@ pub fn default_client_policy() -> ClientPolicy {
         priority: 100,
         strategy: strategy.map(str::to_string),
     };
+    let disabled = |mut pool: TransportPool| {
+        pool.enabled = false;
+        pool
+    };
     ClientPolicy {
         pools: vec![
+            disabled(pool(
+                "STEALTH-TCP",
+                PoolKind::Select,
+                [
+                    "vless-reality-tcp",
+                    "vless-shadowtls-v3",
+                    "vless-restls",
+                    "vless-jls",
+                    "anytls-shadowtls-v3",
+                    "anytls-restls",
+                    "anytls-jls",
+                    "trojan-shadowtls-v3",
+                    "trojan-restls",
+                    "trojan-jls",
+                    "trojan-reality",
+                    "snell-v5-shadowtls-v3",
+                    "snell-v5-restls",
+                    "snell-v5-jls",
+                ]
+                .into_iter()
+                .map(|id| Capability(id.to_string()))
+                .collect(),
+                None,
+                None,
+                None,
+            )),
+            disabled(pool(
+                "HTTPS-LIKE",
+                PoolKind::Select,
+                [
+                    "trusttunnel-h2",
+                    "vless-jls",
+                    "anytls-jls",
+                    "trojan-jls",
+                    "snell-v5-jls",
+                    "sudoku-httpmask",
+                ]
+                .into_iter()
+                .map(|id| Capability(id.to_string()))
+                .collect(),
+                None,
+                None,
+                None,
+            )),
+            disabled(pool(
+                "FAST-UDP",
+                PoolKind::Select,
+                ["hysteria2", "tuic", "shadowquic"]
+                    .into_iter()
+                    .map(|id| Capability(id.to_string()))
+                    .collect(),
+                None,
+                None,
+                None,
+            )),
             pool(
                 "AUTO-SAFE",
                 PoolKind::UrlTest,
@@ -586,13 +645,23 @@ mod tests {
     #[test]
     fn missing_references_and_cycles_fail_closed() {
         let mut policy = default_client_policy();
-        policy.pools[0].members = vec![PoolMember::Pool("MISSING".to_string())];
+        policy
+            .pools
+            .iter_mut()
+            .find(|pool| pool.id == "AUTO-SAFE")
+            .unwrap()
+            .members = vec![PoolMember::Pool("MISSING".to_string())];
         assert!(policy
             .validate(&[profile("SAFE", ProxyRole::AutoSafe)])
             .is_err());
 
         let mut policy = default_client_policy();
-        policy.pools[0].members = vec![PoolMember::Pool("FAILOVER".to_string())];
+        policy
+            .pools
+            .iter_mut()
+            .find(|pool| pool.id == "AUTO-SAFE")
+            .unwrap()
+            .members = vec![PoolMember::Pool("FAILOVER".to_string())];
         assert!(policy
             .validate(&[profile("SAFE", ProxyRole::AutoSafe)])
             .is_err());

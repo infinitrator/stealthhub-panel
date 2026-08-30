@@ -396,7 +396,7 @@ enabled Trojan/Snell/Mieru profiles. Не редактируйте managed liste
 
 ## 11. TLS-материалы proxy-runtime
 
-Starter Hysteria и TUIC ожидают:
+Hysteria, TUIC, AnyTLS TLS, Trojan TLS и TrustTunnel H2 ожидают:
 
 ```text
 /etc/infiproxy-cores/tls/fullchain.pem
@@ -416,6 +416,14 @@ Starter Hysteria и TUIC ожидают:
 Предпочтителен отдельный proxy hostname и автоматический deploy hook, который
 сначала проверяет новые файлы, выставляет `root:<runtime-group> 0640`, затем
 рестартует только нужный unit.
+
+Inventory выполняет только чтение: различает regular file и symlink на regular
+file, проверяет root ownership и отсутствие небезопасной записи, срок
+сертификата и SAN для SNI включенного профиля. При missing/expired/mismatch
+сертификатный profile показывается как pending и reconciler не выбирает runtime.
+Проверка не читает содержимое private key, не выпускает сертификат и не копирует
+пути из legacy config. Профили REALITY, ShadowTLS, ResTLS, JLS, ShadowQUIC и
+Sudoku не зависят от этой пары и не блокируются её отсутствием.
 
 ## 13. Секреты в SQLite
 
