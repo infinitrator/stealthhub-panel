@@ -1159,8 +1159,8 @@ mod tests {
                     "users": [{"username": "alice", "uuid": "11111111-1111-4111-8111-111111111111"}],
                     "resolved_secrets": {
                         "secret.private-key": "private-key",
-                        "secret.short-id": "0123456789abcdef",
-                        "secret.password": "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+                        "secret.short-id": "0000000000000000",
+                        "secret.password": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa=",
                         "secret.shadow-tls": "shadow-tls-password",
                         "secret.restls": "restls-password",
                         "secret.jls-username": "jls-user",

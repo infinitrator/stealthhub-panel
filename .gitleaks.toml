@@ -9,3 +9,12 @@ paths = [
   '''^target/''',
   '''^\.runtime/''',
 ]
+
+[[allowlists]]
+description = "Known non-secret protocol parser fixtures retained in Git history"
+regexTarget = "secret"
+regexes = [
+  '''^0123456789abcdef$''',
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=$''',
+]
