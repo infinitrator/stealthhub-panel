@@ -49,6 +49,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_STATE_LIB="${ROOT_DIR}/deploy/lib/install-state.sh"
 # shellcheck disable=SC1090
 . "$INSTALL_STATE_LIB"
+RUNTIME_TLS_LIB="${ROOT_DIR}/deploy/lib/runtime-tls.sh"
+# shellcheck disable=SC1090
+. "$RUNTIME_TLS_LIB"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
 RELEASE_MANIFEST_HELPER="${ROOT_DIR}/target/release/infiproxy-module-manifest"
 RELEASE_RECONCILE_HELPER="${ROOT_DIR}/target/release/infiproxy-reconcile"
@@ -216,6 +219,7 @@ fi
 required_deploy_files=(
     deploy/infiproxy-manager.sh
     deploy/lib/install-state.sh
+    deploy/lib/runtime-tls.sh
     deploy/panel-update.sh
     deploy/module-update.sh
     deploy/cores/install-core.sh
@@ -424,6 +428,8 @@ install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/hysteria"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tuic"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mihomo"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
+normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/fullchain.pem" "$RUNTIME_GROUP"
+normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/privkey.pem" "$RUNTIME_GROUP"
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
     install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
