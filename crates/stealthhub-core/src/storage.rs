@@ -4122,6 +4122,12 @@ mod tests {
             let config: serde_json::Value = serde_json::from_str(&record.config_json)?;
             assert!(config["future_option"]["preserve"].is_number());
             assert!(record.managed_resource_id.is_some());
+            if matches!(
+                record.kind.as_str(),
+                "vless-reality-tcp" | "vless-reality-xhttp"
+            ) {
+                assert_eq!(record.preferred_core_id.as_deref(), Some("xray"));
+            }
         }
         let external = first
             .iter()

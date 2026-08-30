@@ -1408,9 +1408,7 @@ pub fn default_profiles() -> Vec<ProtocolProfile> {
     ]
 }
 
-/// Preserves the pre-adapter runtime placement during the one-way schema lift.
-#[must_use]
-pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
+fn default_runtime_preference(protocol_id: &str) -> Option<&'static str> {
     match protocol_id {
         "shadowsocks2022-shadow-tls" | "any-tls" => Some("sing-box"),
         "hysteria2" => Some("hysteria"),
@@ -1441,6 +1439,15 @@ pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Preserves the pre-adapter runtime placement during the one-way schema lift.
+#[must_use]
+pub fn legacy_runtime_preference(protocol_id: &str) -> Option<&'static str> {
+    match protocol_id {
+        "vless-reality-xhttp" | "vless-reality-tcp" => Some("xray"),
+        _ => default_runtime_preference(protocol_id),
+    }
+}
+
 fn profile(
     name: &str,
     protocol_id: &str,
@@ -1456,7 +1463,7 @@ fn profile(
         server: "node.infiproxy.local".to_string(),
         port,
         enabled: false,
-        preferred_core_id: legacy_runtime_preference(protocol_id).map(str::to_string),
+        preferred_core_id: default_runtime_preference(protocol_id).map(str::to_string),
         managed_resource_id: None,
         config,
     }
@@ -1481,6 +1488,22 @@ mod tests {
                 .unwrap()
                 .validate_config(profile.schema_version, &profile.config)
                 .unwrap();
+        }
+    }
+
+    #[test]
+    fn new_vless_defaults_do_not_change_legacy_runtime_placement() {
+        for profile in default_profiles().into_iter().filter(|profile| {
+            matches!(
+                profile.protocol_id.as_str(),
+                "vless-reality-tcp" | "vless-reality-xhttp"
+            )
+        }) {
+            assert_eq!(profile.preferred_core_id.as_deref(), Some("mihomo"));
+            assert_eq!(
+                legacy_runtime_preference(&profile.protocol_id),
+                Some("xray")
+            );
         }
     }
 

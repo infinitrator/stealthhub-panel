@@ -285,11 +285,21 @@ chmod +x "${FAKE_BIN}/systemctl"
     source "${ROOT_DIR}/deploy/module-update.sh"
     module_is_retired headscale || fail "Headscale is not retired"
     module_is_retired mtproto || fail "MTProto is not retired"
+    if (require_active_product_module headscale >/dev/null 2>&1); then
+        fail "Headscale entered an active updater path"
+    fi
     if (require_active_product_module mtproto >/dev/null 2>&1); then
         fail "MTProto entered an active updater path"
     fi
+    [[ ! -e "${ROOT_DIR}/deploy/modules.d/headscale.module" ]] \
+        || fail "installer still bundles Headscale"
     [[ ! -e "${ROOT_DIR}/deploy/modules.d/mtproto.module" ]] \
         || fail "installer still bundles MTProto"
+    if [[ "$(grep -ci 'headscale' "${ROOT_DIR}/deploy/install.sh")" -ne 1 ]] \
+        || ! grep -Fq 'retire_legacy_module headscale headscale.service' \
+            "${ROOT_DIR}/deploy/install.sh"; then
+        fail "installer has a non-retirement Headscale path"
+    fi
     if [[ "$(grep -ci 'mtproto' "${ROOT_DIR}/deploy/install.sh")" -ne 1 ]] \
         || ! grep -Fq 'retire_legacy_module mtproto infiproxy-mtproto.service' \
             "${ROOT_DIR}/deploy/install.sh"; then

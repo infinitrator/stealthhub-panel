@@ -378,6 +378,7 @@ EOF
 
 # Upgrades retain historical files but cannot resurrect retired products in
 # either the active registry or the installable catalog.
+retire_legacy_module headscale headscale.service
 retire_legacy_module mtproto infiproxy-mtproto.service
 
 for manifest in "${bundled_manifests[@]}"; do

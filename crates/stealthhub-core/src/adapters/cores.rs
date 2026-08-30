@@ -285,10 +285,32 @@ impl ManagedCoreAdapter {
         if !output.status.success() {
             return None;
         }
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .chain(String::from_utf8_lossy(&output.stderr).split_whitespace())
-            .find_map(normalized_release_version)
+        let output = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let prefix = match self.flavor {
+            Flavor::Xray => Some("Xray "),
+            Flavor::Mihomo => Some("Mihomo Meta "),
+            Flavor::SingBox => Some("sing-box version "),
+            Flavor::Hysteria => Some("Version:"),
+            Flavor::Tuic => None,
+        };
+        let versions = output
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                match prefix {
+                    Some(prefix) => line
+                        .strip_prefix(prefix)
+                        .and_then(|suffix| suffix.split_whitespace().next())
+                        .and_then(strict_release_version),
+                    None => strict_release_version(line),
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        (versions.len() == 1).then(|| *versions.first().expect("one probed version"))
     }
 
     fn main_pid(&self) -> Result<u32> {
@@ -366,12 +388,12 @@ impl CoreAdapter for ManagedCoreAdapter {
         }
         let expected = normalized_release_version(self.validated_version)
             .context("validated runtime version is invalid")?;
-        let installed = match fs::read_to_string(&self.version_file) {
-            Ok(value) => normalized_release_version(value.trim()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.probed_version(),
+        let marker_matches = match fs::read_to_string(&self.version_file) {
+            Ok(value) => normalized_release_version(value.trim()) == Some(expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
             Err(error) => return Err(error.into()),
         };
-        Ok(installed == Some(expected))
+        Ok(marker_matches && self.probed_version() == Some(expected))
     }
 
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
@@ -968,6 +990,17 @@ fn apply_mihomo_server_wrapper(
     Ok(())
 }
 
+fn strict_release_version(value: &str) -> Option<[u64; 3]> {
+    let value = value.strip_prefix('v').unwrap_or(value);
+    let mut components = value.split('.');
+    let version = [
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+        components.next()?.parse().ok()?,
+    ];
+    components.next().is_none().then_some(version)
+}
+
 fn listener_line_has_port(line: &str, port: u16) -> bool {
     let marker = format!(":{port}");
     line.split_whitespace()
@@ -1475,15 +1508,10 @@ mod tests {
             (
                 Flavor::Hysteria,
                 "version",
-                "Version: v2.12.2",
+                "Version:\tv2.12.2",
                 "app/v2.12.2",
             ),
-            (
-                Flavor::Tuic,
-                "--version",
-                "tuic-server 1.0.0",
-                "tuic-server-1.0.0",
-            ),
+            (Flavor::Tuic, "--version", "1.0.0", "tuic-server-1.0.0"),
         ];
         for (flavor, argument, output, expected) in cases {
             let suffix = uuid::Uuid::new_v4();
@@ -1496,9 +1524,22 @@ mod tests {
             let adapter = test_adapter(flavor, &binary, &config, &marker, expected)?;
             assert!(adapter.compatible(&BTreeSet::new())?);
 
-            write_probe(&binary, argument, "runtime v9.9.9")?;
+            let wrong_product_version = match flavor {
+                Flavor::Xray => "Xray 9.9.9",
+                Flavor::Mihomo => "Mihomo Meta v9.9.9",
+                Flavor::SingBox => "sing-box version 9.9.9",
+                Flavor::Hysteria => "Version:\tv9.9.9",
+                Flavor::Tuic => "9.9.9",
+            };
+            write_probe(
+                &binary,
+                argument,
+                &format!("{wrong_product_version}\ndocumentation: {output}"),
+            )?;
             assert!(!adapter.compatible(&BTreeSet::new())?);
             fs::write(&marker, format!("{expected}\n"))?;
+            assert!(!adapter.compatible(&BTreeSet::new())?);
+            write_probe(&binary, argument, output)?;
             assert!(adapter.compatible(&BTreeSet::new())?);
             fs::write(&marker, b"v9.9.9\n")?;
             assert!(!adapter.compatible(&BTreeSet::new())?);
