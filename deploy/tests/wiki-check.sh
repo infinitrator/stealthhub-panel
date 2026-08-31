@@ -137,7 +137,7 @@ if git grep -niE 'refactor/atomic-adapter-reconciler|stealthhub\.service' -- REA
   exit 1
 fi
 
-grep -Fq 'UPDATE_REF="${INFIPROXY_UPDATE_REF:-main}"' deploy/install.sh || {
+grep -Fq "UPDATE_REF=\"\${INFIPROXY_UPDATE_REF:-main}\"" deploy/install.sh || {
   echo 'wiki check failed: installer no longer defaults the update ref to main' >&2
   exit 1
 }
