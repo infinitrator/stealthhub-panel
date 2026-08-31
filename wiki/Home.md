@@ -67,8 +67,9 @@ Mihomo.
 - Первый owner, Argon2id password, hashed sessions, CSRF и login throttling.
 - Пользователи, UUID и отдельные subscription tokens.
 - Mihomo YAML, account page и YAML rule providers.
-- Версионированные protocol profiles и capability-based runtime selection.
-- 26 встроенных protocol adapters и 5 встроенных runtime adapters.
+- Версионированные protocol profiles и автоматический capability-based выбор
+  совместимого core; общего core selector в текущем web UI нет.
+- Встроенные protocol adapters и 5 bundled runtime modules.
 - DNS policy, transport pools, routing policy, normalized rule entries и remote
   rule sources.
 - Desired/applied generations, root reconciler, rollback и crash recovery.

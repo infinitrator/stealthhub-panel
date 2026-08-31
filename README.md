@@ -7,7 +7,7 @@ protocol profiles, external proxy runtimes, and their desired state.
 Infiproxy does **not** implement proxy protocols or carry user traffic itself.
 The data plane is provided by independently installed Xray, sing-box, Hysteria,
 TUIC, and Mihomo binaries. The panel generates and reconciles their
-configuration through root-owned adapters.
+configuration through the root reconciler using the built-in adapter registry.
 
 > **Status:** `0.1.0-beta.1`. The architecture and migration contracts are
 > tested, but production operators must keep verified backups and validate real
@@ -51,7 +51,8 @@ User-facing:
 - First-owner setup, login, seven-day sessions, password rotation, and logout.
 - User create, enable/disable, subscription-token rotation, and deletion.
 - Per-user Mihomo YAML and account pages protected by bearer tokens.
-- Runtime-neutral protocol profiles with explicit server/runtime selection.
+- Runtime-neutral protocol profiles with automatic capability-based core
+  selection; the current web UI does not expose a general core selector.
 - DNS policy, transport pools, inline routing policy, rule sets, normalized
   entries, remote sources, and YAML rule providers.
 - Runtime inventory, desired/applied generations, and count-only user-sync

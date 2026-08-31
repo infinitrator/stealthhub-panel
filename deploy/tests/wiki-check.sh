@@ -132,8 +132,26 @@ fi
 
 ((link_failure == 0)) || exit 1
 
-if git grep -niE '(headscale|mtproto)' -- README.md wiki docs; then
-  echo 'wiki check failed: retired modules are still advertised in documentation' >&2
+retired_module_ids=(headscale mtproto)
+for module_id in "${retired_module_ids[@]}"; do
+  [[ ! -e "deploy/modules.d/${module_id}.module" ]] || {
+    printf 'wiki check failed: retired bundled module manifest exists: %s\n' "$module_id" >&2
+    exit 1
+  }
+done
+
+current_support_docs=(
+  README.md
+  deploy/cores/README.md
+  docs/runtime-compatibility.md
+  wiki/Home.md
+  wiki/_Sidebar.md
+  wiki/08-MODULES-AND-UPDATES.md
+  wiki/15-RELEASE-AND-COMPATIBILITY.md
+  wiki/17-RUNTIME-COMPATIBILITY.md
+)
+if grep -HniE '(headscale|mtproto)' "${current_support_docs[@]}"; then
+  echo 'wiki check failed: retired modules are advertised on a current support surface' >&2
   exit 1
 fi
 

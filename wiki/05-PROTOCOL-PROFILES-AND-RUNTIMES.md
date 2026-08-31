@@ -203,9 +203,9 @@ required value завершается fail closed до успешного publis
 8. Создайте временного user, импортируйте YAML и выполните реальный handshake.
 9. Только после canary включайте следующий profile.
 
-Не включайте все 26 profiles одновременно. Простой production baseline обычно
-содержит один стабильный TCP transport и один UDP fallback только при реальной
-необходимости.
+Не включайте все starter profiles одновременно. Простой production baseline
+обычно содержит один стабильный TCP transport и один UDP fallback только при
+реальной необходимости.
 
 ## 9. Диагностика
 

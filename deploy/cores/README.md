@@ -1,8 +1,12 @@
 # Infiproxy Proxy Cores
 
-Infiproxy treats proxy cores as external host services.
+Infiproxy treats proxy cores as external host services running as the dedicated
+`infiproxy-runtime` identity.
 
-The panel should generate and validate configs, then let systemd supervise each core. This keeps production deploys simple and makes rollback explicit: every core binary lives under a versioned directory, while `current` points to the active release.
+The unprivileged panel records desired state. The root reconciler uses the
+built-in adapter registry to generate and validate runtime configs, while
+systemd supervises each core. Every core binary lives under a versioned
+directory and `current` points to the active release, making rollback explicit.
 
 ## Layout
 
@@ -79,3 +83,6 @@ The script refuses to switch `current` if checksum verification fails or the
 staged binary does not answer its runtime-specific version command. Mihomo uses
 `-v`; its single-file `.gz` release is decompressed under the same bounded
 extraction policy as archive-based cores.
+
+Exact supported pins and adapter capabilities are defined in
+[`docs/runtime-compatibility.md`](../../docs/runtime-compatibility.md).
