@@ -1,6 +1,6 @@
 # Proxy-протоколы и серверные ядра
 
-[Назад: профили Mihomo](05-MIHOMO-PROFILES) | [К оглавлению](Home) | [Далее: маршрутизация](07-ROUTING)
+[Назад: профили и runtimes](05-PROTOCOL-PROFILES-AND-RUNTIMES) | [К оглавлению](Home) | [Далее: маршрутизация](07-ROUTING)
 
 ## Перед настройкой
 

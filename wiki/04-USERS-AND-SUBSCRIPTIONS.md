@@ -1,241 +1,243 @@
 # Пользователи и подписки
 
-[Назад: веб-интерфейс](03-WEB-INTERFACE) | [К оглавлению](Home) | [Далее: профили Mihomo](05-MIHOMO-PROFILES)
+[Назад: веб-интерфейс](03-WEB-INTERFACE) | [К оглавлению](Home) |
+[Далее: профили](05-PROTOCOL-PROFILES-AND-RUNTIMES)
 
-## Что означает пользователь Infiproxy
+## 1. Модель пользователя
 
-User — запись, определяющая доступ к общей генерируемой Mihomo-конфигурации.
-Она содержит:
+Одна запись users содержит:
 
-| Поле | Назначение |
+| Поле | Семантика |
 |---|---|
-| `id` | Внутренний SQLite identifier. |
-| `username` | Уникальная operator label. |
-| `uuid` | Уникальный client identifier, используемый там, где generator подставляет user UUID. |
-| `subscription_token` | Секретная bearer-часть публичного URL. |
-| `enabled` | Ручная блокировка/разблокировка. |
-| `traffic_limit_bytes` | Опциональный лимит. |
-| `traffic_used_bytes` | Сохраненный счетчик. |
-| `expires_at` | Опциональный UTC timestamp окончания. |
+| id | Внутренний SQLite ID |
+| username | Уникальная operator label |
+| uuid | Случайный UUID v4 для per-user protocols |
+| subscription_token | Отдельный случайный bearer token для HTTP URL |
+| enabled | Разрешена ли выдача subscription и участие в desired runtime |
+| traffic_limit_bytes | Optional сохраненный limit |
+| traffic_used_bytes | Сохраненное значение usage, default 0 |
+| expires_at | Optional UTC expiry |
+| created_at / updated_at | Audit metadata, не immutable audit log |
 
-Для adapters с индивидуальной identity (сейчас VLESS и TUIC) user входит в
-generated server authorization и меняется атомарно вместе с runtime. Протоколы
-с общим password не получают отдельную server identity на каждого user.
+UUID и subscription token - разные credentials. Reset token не меняет UUID.
+Удаление и повторное создание user дает новые значения.
 
-## Создание
+## 2. Создание
 
-В **Users -> Create user**:
+На странице Users:
 
 ### Username
 
-Используйте техническое имя, не реальное ФИО:
+- trim перед записью;
+- длина 3-64 символа;
+- разрешены ASCII letters/digits, dot, underscore и hyphen;
+- уникален.
 
-```text
-alice-phone
-lab-laptop-01
-test-24h
-```
-
-Одна запись удобнее на одно устройство: тогда reset/revoke не затрагивает все
-устройства человека.
+Не помещайте email, phone или другие персональные данные без необходимости:
+username попадает в operator UI и может участвовать в client labels.
 
 ### Traffic limit, GB
 
-- пусто — unlimited;
-- `0` — unlimited;
-- положительное число — переводится в bytes и сохраняется как limit.
+Пустое значение означает unlimited metadata. Число переводится в bytes.
 
-> [!WARNING]
-> В текущей ревизии нет встроенного collector, который опрашивает runtime и
-> увеличивает `traffic_used_bytes`. Ограничение применяется к значению в БД, но
-> само по себе не обеспечивает реальный accounting. Не продавайте quota как
-> гарантированную до интеграции проверенного accounting source.
+**Ограничение beta:** Infiproxy не собирает live traffic из runtimes, не
+увеличивает traffic_used_bytes и не блокирует data plane по quota. Effective
+subscription check сравнивает stored used/limit, но при неизменяемом used=0 это
+не является реальным enforcement. Используйте внешний collector только после
+отдельного review его доверия и точности.
 
 ### Expires in days
 
-- пусто/`0` — без expiration;
-- `1..3650` — `expires_at = now UTC + days`.
+Пустое значение означает отсутствие expiry. Число 0 также не создает expiry;
+положительное значение до 3650 сохраняет UTC deadline.
 
-Срок рассчитывается в момент создания. GUI не содержит изменения срока
-существующего user.
+Текущий UI не редактирует limit/expiry после create. Для изменения нужна
+контролируемая schema-aware операция, которой web release пока не предоставляет.
+Не правьте production SQLite без backup и согласованного transaction plan.
 
 ### Create
 
-Кнопка создает UUID и random subscription token криптографическим RNG, затем
-возвращает в список. Token не выбирается оператором.
+Create:
 
-## Таблица пользователей
+1. валидирует форму;
+2. генерирует UUID v4 и 32-hex subscription token;
+3. вставляет enabled row с used=0;
+4. увеличивает desired generation;
+5. будит reconciler.
 
-### Enabled
+Если enabled profiles используют PerUserUuid, server config должен получить
+новую identity только после успешного apply.
 
-- `on` — ручная блокировка снята;
-- `off` — subscription заблокирована;
-- даже при `on` expiry или quota может блокировать выдачу.
+## 3. Effective access
 
-### UUID
+Account page и Mihomo YAML блокируются, если:
 
-UUID стабилен при reset subscription token. Удаление user удаляет UUID из панели.
-Нельзя считать UUID секретом уровня пароля, но он является credential для
-VLESS/TUIC-схем, если сервер использует тот же UUID.
+- enabled=false;
+- expires_at уже наступил;
+- stored traffic_used_bytes >= traffic_limit_bytes.
 
-### Subscription
+Проверка выполняется при каждом HTTP запросе. Она не отключает уже открытое
+соединение и не доказывает runtime-side revoke.
 
-Есть два URL:
+HTTP contract:
 
-```text
-/sub/<token>
-/sub/<token>/mihomo.yaml
-```
+| Endpoint | Успех | Ошибка |
+|---|---|---|
+| /sub/{token} | Account HTML | invalid page / blocked status |
+| /sub/{token}/mihomo.yaml | YAML + Subscription-Userinfo | 401 invalid, 403 blocked, 503 incomplete config |
 
-Первый — human-friendly account page, второй — raw client config.
+Responses используют no-store/no-cache и Referrer-Policy no-referrer, но bearer
+token все равно может попасть в browser history, clipboard, reverse-proxy logs
+или screenshot.
 
-### Traffic и Expires
-
-Показывается сохраненное `used / limit` и formatted expiration. Это snapshot
-SQLite, а не live counter ядра.
-
-## Кнопки управления
+## 4. Кнопки Users
 
 ### open
 
-Открывает публичную account page. Это useful preview, но URL в browser history и
-server access log может содержать token. Не демонстрируйте экран публично.
+Открывает account page. Она показывает status, traffic metadata, expiry,
+subscription URL и Mihomo import link.
 
 ### download
 
-Возвращает raw YAML. Ответ помечен `no-store`, содержит `Subscription-Userinfo`
-и должен считаться секретным.
+Запрашивает свежий YAML. Generation включает только enabled profiles, которые:
+
+- имеют установленный protocol adapter;
+- имеют доступную core capability;
+- проходят adapter config/secret validation;
+- могут быть собраны с текущей routing/DNS policy.
+
+Если обязательная конфигурация неполна, endpoint возвращает 503 вместо частично
+опасного YAML.
 
 ### Disable
 
-Сразу ставит `enabled=false`. После этого:
+- enabled становится false;
+- новые subscription requests дают 403;
+- desired generation увеличивается;
+- PerUserUuid adapters удаляют identity при успешном reconcile.
 
-- account page показывает block reason;
-- import/download недоступен;
-- уже загруженная конфигурация на клиенте не стирается;
-- participating adapters удаляют user из нового runtime candidate; shared
-  protocol password остается действительным для ранее скачанного клиента.
-
-Для shared-password протокола полноценный revoke требует rotation общего
-secret, что затронет всех использующих его клиентов.
+Disable не удаляет row/token/UUID и может быть отменен кнопкой Enable.
 
 ### Enable
 
-Ставит `enabled=true`. Если срок истек или `used >= limit`, subscription останется
-заблокированной по соответствующей причине.
+Возвращает user в desired set и запускает reconcile. До Applied server
+authorization может еще не совпадать с intent.
 
 ### Reset token
 
-Первая кнопка открывает confirmation. Вторая генерирует новый bearer token.
+Открывает confirm page, затем атомарно меняет только subscription_token. Старый
+URL перестает находить user немедленно. Generation не увеличивается, потому что
+server identity и UUID не меняются.
 
-Reset нужен при:
+Reset token не отзывает:
 
-- утечке URL;
-- потере устройства;
-- попадании token в screenshot/chat/log;
-- передаче подписки другому устройству по ошибке.
+- уже импортированный YAML;
+- UUID в active runtime;
+- shared passwords;
+- текущие proxy connections.
 
-Reset не меняет UUID и server protocol secrets. Старый URL немедленно перестает
-выдаваться панелью, но локально сохраненный YAML продолжает работать до revoke
-server credentials.
+При утечке client credentials ротируйте соответствующие secrets/UUID через
+поддерживаемый lifecycle, а не ограничивайтесь token reset.
 
 ### Delete
 
-Удаляет SQLite user и token после confirmation. Действие необратимо через GUI.
-Оно создает desired generation; participating adapters удаляют identity только
-после успешного `Applied`. Shared password отдельно не вращается.
+Confirm page показывает UUID, URL и traffic metadata. Delete:
 
-## Публичная account page
+- удаляет users row;
+- инвалидирует subscription token;
+- увеличивает desired generation;
+- удаляет per-user identity после успешного reconcile.
 
-### Status
+SharedCredential protocol не умеет индивидуально удалить знание общего пароля.
 
-Возможные причины блокировки:
+## 5. User participation в protocol adapters
 
-- account disabled;
-- account expired;
-- traffic limit reached.
+| Режим | Примеры | Revoke semantics |
+|---|---|---|
+| PerUserUuid | VLESS, TUIC, Trojan, Mieru | Identity должна исчезнуть из live config |
+| SharedCredential | Hysteria2, SS2022/ShadowTLS, AnyTLS, Snell | Нужна общая ротация для server-side revoke |
+| None | Infrastructure resources | Users не участвуют |
 
-При active доступны:
+Core adapter после apply наблюдает поддерживаемые live user sets. В SQLite
+runtime_user_sync сохраняются только counts, а не identities.
 
-| Кнопка/поле | Назначение |
-|---|---|
-| **Import** | Открывает `clash://install-config?url=...`; результат зависит от client app/OS. |
-| **Download YAML** | Загружает raw Mihomo config. |
-| Subscription URL | Read-only URL для ручного добавления provider. |
-| One-click import URL | Read-only Clash scheme. |
+## 6. Mihomo subscription
 
-Если браузер не знает `clash://`, используйте Download или вставьте HTTPS URL в
-Mihomo-compatible client вручную.
+Server собирает документ на каждый запрос:
 
-## HTTP contract подписки
+1. ищет user по token;
+2. проверяет effective access;
+3. загружает Settings, profiles, secrets, rule sets, client и DNS policy;
+4. собирает capabilities реально установленных runtimes;
+5. protocol adapters создают proxy objects;
+6. policy resolver создает groups/rules;
+7. результат сериализуется в YAML.
 
-### Успех
+Заголовок Subscription-Userinfo содержит upload=0, download=stored usage,
+optional total и expire. Это compatibility metadata, а не подтвержденная
+runtime статистика.
 
-- status `200`;
-- YAML с proxy objects, groups, providers и rules;
-- `Cache-Control: no-store`;
-- `Subscription-Userinfo` с upload/download/total/expire.
+Generated YAML может содержать UUID и shared secrets. Считайте его секретом.
 
-### Ошибки
+## 7. Cache и logging
 
-| Условие | Результат |
-|---|---|
-| Неверный token | `401 Unauthorized`. |
-| Disabled/expired/quota | subscription не выдается, account page показывает причину. |
-| Database/generation error | server error, подробность в panel journal. |
+Приложение выставляет:
 
-## Mihomo import: рекомендуемый порядок
+- Content-Type application/yaml;
+- Cache-Control no-cache, no-store, must-revalidate;
+- Referrer-Policy no-referrer через middleware.
 
-1. Откройте account page на доверенном устройстве.
-2. Скачайте YAML и проверьте его текстом.
-3. Убедитесь, что endpoint, ports, SNI, UUID и secrets совпадают с server config.
-4. Импортируйте через HTTPS URL, чтобы клиент мог обновлять subscription.
-5. Установите разумный update interval в самом client, если он это предлагает.
-6. Проверьте группу `MANUAL`, затем `AUTO-SAFE` и `SPEED`.
-7. Проверьте DNS, TCP и UDP отдельно.
-8. Не пересылайте URL в незащищенном чате.
+Оператор reverse proxy должен дополнительно:
 
-## Идеальная модель выдачи
+- не логировать полный /sub/{token} path либо редактировать token;
+- не кэшировать subscription responses;
+- не отправлять path в внешнюю analytics;
+- использовать valid HTTPS;
+- ограничить доступ к admin host.
 
-- отдельный user/token на устройство;
-- короткий expiry для временных тестов;
-- отдельный server credential на user/device, если runtime поддерживает;
-- disable + server revoke при потере;
-- reset token после любой возможной утечки;
-- accounting source атомарно обновляет `traffic_used_bytes`;
-- audit log связывает выдачу и revoke с operator.
+## 8. Рекомендуемая выдача
 
-## Допустимая модель для личного теста
+1. Создайте временного user.
+2. Дождитесь Applied и InSync для per-user profile.
+3. Откройте account page по HTTPS.
+4. Передайте URL через защищенный канал.
+5. Импортируйте Mihomo YAML.
+6. Проверьте DNS, TCP/UDP handshake и routing.
+7. После подозрения на URL leak нажмите Reset token.
+8. После credential leak ротируйте protocol credential и повторно примените
+   runtime state.
 
-- один user на владельца;
-- unlimited quota;
-- HTTPS subscription;
-- ручной revoke в server config при потере устройства;
-- еженедельный просмотр списка и удаление тестовых записей.
+Не публикуйте token в issue, shell history или screenshots.
 
-## Проверка token без раскрытия в shell history
+## 9. Backup и восстановление
 
-Предпочтительно нажать `download` в браузере. Если нужен curl, передайте URL
-через защищенный prompt:
+Users, token, UUID, profiles и shared secrets находятся в panel SQLite:
 
-```bash
-read -r -s -p 'Subscription URL: ' SUB_URL; echo
-curl --fail --silent --show-error "$SUB_URL" -o /tmp/mihomo.yaml
-unset SUB_URL
-chmod 0600 /tmp/mihomo.yaml
-```
+    /var/lib/infiproxy/infiproxy.sqlite
 
-Не помещайте полный tokenized URL в issue, Git commit, публичный monitoring
-dashboard или shared shell history.
+Для online backup используйте SQLite .backup, а не копирование одного main file
+при активном WAL:
 
-## Backup пользователей
+    backup=/var/backups/infiproxy/manual-$(date -u +%Y%m%dT%H%M%SZ)
+    sudo install -d -o root -g root -m 0700 "$backup"
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '$backup/infiproxy.sqlite'"
+    sudo chmod 0600 "$backup/infiproxy.sqlite"
+    sudo sqlite3 "$backup/infiproxy.sqlite" 'PRAGMA integrity_check;'
 
-Users, UUID, tokens, settings, routing и secret values находятся в SQLite:
+Результат integrity_check должен быть ok. Храните копию off-host в
+зашифрованном виде. Полная процедура:
+[Backup, restore и uninstall](12-BACKUP-RESTORE-UNINSTALL).
 
-```text
-/var/lib/infiproxy/infiproxy.sqlite
-```
+## 10. Текущие ограничения
 
-Копируйте ее согласованно через SQLite `.backup`, а не обычным `cp` работающего
-WAL-файла. Процедура приведена в
-[Бэкапах и восстановлении](12-BACKUP-RESTORE-UNINSTALL).
+- Нет UI edit для username, UUID, limit или expiry.
+- Нет live traffic collector/quota enforcement.
+- Нет массовой ротации subscription tokens.
+- Нет отдельной pause-until даты.
+- Нет API tokens/scopes для автоматизации user lifecycle.
+- Нет per-user revoke у shared-credential protocols.
+- Нет доказательства client usage или последнего успешного proxy handshake.
+- Нет immutable admin audit trail.
+
+Эти ограничения документируются явно и не должны маскироваться значениями,
+которые просто присутствуют в SQLite.

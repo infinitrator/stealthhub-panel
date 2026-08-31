@@ -42,9 +42,9 @@ Do not overwrite active binaries in place.
 
 ## Install Script
 
-The supported operator entrypoint is the shared module updater. It discovers the
-latest official release for the host architecture, verifies it and preserves
-the service state:
+The supported operator entrypoint is the shared module updater. It resolves the
+exact release pinned by the installed root-owned manifest, verifies it, and
+preserves the service state:
 
 ```bash
 sudo infiproxy-module-update --check xray
@@ -69,7 +69,7 @@ You can also import a pre-downloaded archive:
 ```bash
 sudo deploy/cores/install-core.sh \
   --core sing-box \
-  --version 1.13.14 \
+  --version 1.13.20 \
   --archive ./sing-box.tar.gz \
   --sha256 '<sha256>' \
   --binary sing-box

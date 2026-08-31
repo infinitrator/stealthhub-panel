@@ -1,124 +1,118 @@
-# Infiproxy Wiki
+# Infiproxy: руководство оператора
 
-Эта wiki описывает фактическое поведение Infiproxy: установку, веб-интерфейс,
-SSH-TUI, сетевую модель, Mihomo-подписки, внешние proxy-runtime,
-обновления, резервные копии, безопасность и восстановление. Документация
-версионируется вместе с исходным кодом; точная ревизия доступна в истории Git.
+Эта Wiki описывает текущую ветку Infiproxy 0.1.0-beta.1. Источник истины для
+поведения системы - код, root-owned manifests и systemd units в основном
+репозитории. Wiki публикуется из каталога wiki/, поэтому ее версия должна
+совпадать с установленным commit панели.
 
-> [!IMPORTANT]
-> Infiproxy является панелью управления и генератором клиентских подписок.
-> Она не передает пользовательский трафик сама. Xray, sing-box, Hysteria,
-> TUIC и Mihomo работают отдельными процессами. Для
-> поддержанных protocol/core adapters вкладка **Protocols** формирует desired
-> state, а отдельный root reconciler атомарно применяет server config только
-> после validation, health/listener checks и с rollback.
+Infiproxy - control plane для одного Linux VPS. Панель хранит пользователей,
+профили, routing policy и желаемое состояние, но не реализует proxy-протоколы.
+Трафик обрабатывают внешние runtime-модули: Xray, sing-box, Hysteria, TUIC и
+Mihomo.
 
-## Как читать wiki
+## С чего начать
 
-Для первого развертывания пройдите документы в таком порядке:
+1. [Быстрый старт](01-QUICK-START) - подготовка VPS, установка, HTTPS и первый
+   владелец.
+2. [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING) - TCP/UDP,
+   DNS, TLS, reverse proxy и схема control/data plane.
+3. [Веб-интерфейс](03-WEB-INTERFACE) - назначение каждой страницы, кнопки и
+   границы доступа.
+4. [Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS) - UUID, bearer token,
+   отключение, удаление и реальные ограничения учета трафика.
+5. [Профили и выбор runtime](05-PROTOCOL-PROFILES-AND-RUNTIMES) - lifecycle
+   профиля, capability selection, ports и secrets.
+6. [Proxy-протоколы](06-PROXY-PROTOCOLS) - как устроены поддерживаемые
+   композиции и какие runtime их принимают.
+7. [Маршрутизация](07-ROUTING) - DNS policy, transport pools, правила и
+   rule-provider.
+8. [Модули и обновления](08-MODULES-AND-UPDATES) - установка, pinning,
+   verification, rollback и auto-update.
+9. [Desired state и reconciliation](09-RECONCILIATION-AND-DESIRED-STATE) -
+   поколения, атомарное применение и восстановление после сбоя.
+10. [System и SSH manager](10-SYSTEM-AND-TUI) - root TUI, HTTPS, secrets,
+    журналы и опасные операции.
+11. [Конфигурация](11-CONFIGURATION) - пути, переменные окружения и текущие
+    возможности web Configs.
+12. [Backup, restore и uninstall](12-BACKUP-RESTORE-UNINSTALL) - согласованные
+    копии SQLite и проверяемое восстановление.
+13. [Безопасная эксплуатация](13-SECURITY-OPERATIONS) - границы привилегий,
+    hardening, incident response.
+14. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE) - симптомы,
+    команды и карта файлов/services.
+15. [Релиз и совместимость](15-RELEASE-AND-COMPATIBILITY) - beta-gates,
+    ограничения и процедура выпуска.
+16. [Архитектура адаптеров](16-ADAPTER-ARCHITECTURE) - developer-oriented
+    protocol/core/infrastructure contracts.
+17. [Runtime compatibility](17-RUNTIME-COMPATIBILITY) - точные pins и проверенные
+    сочетания.
 
-1. [Быстрый старт и первая настройка](01-QUICK-START).
-2. [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING).
-3. [Веб-интерфейс: все страницы и кнопки](03-WEB-INTERFACE).
-4. [Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS).
-5. [Профили Mihomo](05-MIHOMO-PROFILES).
-6. [Proxy-протоколы и серверные ядра](06-PROXY-PROTOCOLS).
-7. [Маршрутизация Mihomo](07-ROUTING).
-8. [Модули и обновления](08-MODULES-AND-UPDATES).
-9. [Система и SSH-TUI](10-SYSTEM-AND-TUI).
-10. [Конфигурационные файлы](11-CONFIGURATION).
-11. [Бэкапы, восстановление и удаление](12-BACKUP-RESTORE-UNINSTALL).
-12. [Безопасная эксплуатация](13-SECURITY-OPERATIONS).
-13. [Диагностика и справочник](14-TROUBLESHOOTING-AND-REFERENCE).
-14. [Milestone-аудит версии 0.1 beta](15-RELEASE-0.1-BETA).
-15. [Публикация GitHub Wiki](00-WIKI-PUBLISHING).
-16. [Адаптеры и атомарное применение](16-ADAPTERS-AND-RECONCILIATION).
-17. [Точный runtime compatibility contract](17-RUNTIME-COMPATIBILITY).
+## Быстрый выбор раздела
 
-## Уровни готовности операций
-
-В документации используются четыре точных обозначения:
-
-| Обозначение | Что происходит |
+| Задача | Раздел |
 |---|---|
-| **Сразу** | Веб-обработчик меняет SQLite или файл во время текущего запроса. |
-| **В очередь** | Панель создает типизированный request-файл; root-worker выполняет его отдельно. |
-| **Только просмотр** | Кнопка открывает страницу, внешний источник или план команд и ничего не меняет. |
-| **Root-TUI** | Операция выполняется только из `sudo infiproxy-manager` либо отдельной root-командой. |
+| Установить на чистый VPS | [Быстрый старт](01-QUICK-START) |
+| Понять кнопку в панели | [Веб-интерфейс](03-WEB-INTERFACE) |
+| Выдать или отозвать подписку | [Пользователи](04-USERS-AND-SUBSCRIPTIONS) |
+| Выбрать protocol/runtime/port | [Профили](05-PROTOCOL-PROFILES-AND-RUNTIMES) |
+| Настроить правила клиента | [Маршрутизация](07-ROUTING) |
+| Обновить бинарник runtime | [Модули](08-MODULES-AND-UPDATES) |
+| Разобраться с Pending/Failed | [Reconciliation](09-RECONCILIATION-AND-DESIRED-STATE) |
+| Выдать сертификат панели | [System и TUI](10-SYSTEM-AND-TUI) |
+| Сделать backup или удалить систему | [Backup/uninstall](12-BACKUP-RESTORE-UNINSTALL) |
+| Восстановить доступ администратора | [Диагностика](14-TROUBLESHOOTING-AND-REFERENCE) |
 
-Такое разделение принципиально: веб-процесс работает от непривилегированного
-пользователя `infiproxy`, а maintenance-worker запускается systemd от `root`.
+## Что реализовано
 
-## Что уже автоматизировано
+- Первый owner, Argon2id password, hashed sessions, CSRF и login throttling.
+- Пользователи, UUID и отдельные subscription tokens.
+- Mihomo YAML, account page и YAML rule providers.
+- Версионированные protocol profiles и capability-based runtime selection.
+- 26 встроенных protocol adapters и 5 встроенных runtime adapters.
+- DNS policy, transport pools, routing policy, normalized rule entries и remote
+  rule sources.
+- Desired/applied generations, root reconciler, rollback и crash recovery.
+- Root-approved module catalog и независимые binary updates.
+- Pinned panel update source, scheduled и immediate update paths.
+- Guided SSH manager, Cloudflare DNS-01/Certbot flow и root-only secret editor.
 
-- установка панели и systemd-интеграции одной командой;
-- создание первого владельца и администраторских сессий;
-- пользователи, сроки действия и Mihomo subscription URL;
-- клиентские Mihomo-профили и встроенные rule-provider;
-- desired/applied generations и атомарная синхронизация поддержанных runtime;
-- динамический каталог runtime-модулей;
-- проверяемые обновления бинарников с атомарным переключением версии;
-- обновление самой панели с pre-update backup и rollback;
-- Cloudflare DNS-01, Let's Encrypt и Nginx через root-TUI;
-- установка и атомарная настройка Trojan, Snell и Mieru через Mihomo;
-- owner-only хранилище client-side secret values без обратного показа значений;
-- root-only хранилище private server secrets через SSH-TUI;
-- allowlist-редактор конфигов, health/readiness и локальная IP-диагностика;
-- смена пароля администратора с отзывом всех существующих сессий.
+## Что не следует предполагать
 
-## Границы автоматизации
+- Поля traffic limit/used не означают live accounting: collector и quota
+  enforcement отсутствуют.
+- /health проверяет процесс, а /ready - SQLite; это не data-plane probe.
+- Установленный runtime не обязательно активен или выбран профилем.
+- Успешный binary smoke test не доказывает реальный клиентский handshake.
+- Reset subscription token отзывает URL, но не стирает уже импортированные UUID
+  или shared credentials.
+- Shared-credential протокол не дает индивидуального server-side revoke без
+  ротации общего секрета.
+- Web Configs в текущем release - allowlisted read-only inspector. Изменение
+  root configs и применение выполняются через SSH manager.
+- Web uninstall - только preview. Исполнение доступно root в SSH manager.
+- Автоматическое обновление runtime выключено по умолчанию для каждого модуля.
 
-- только зарегистрированные protocol/core adapter combinations участвуют в
-  server reconciliation; внешний module manifest сам по себе не добавляет
-  renderer в панель;
-- private server keys не принимаются из браузера и создаются/вращаются через
-  **Privileged runtime secrets** в root-TUI;
-- изменение считается рабочим только при совпадении desired/applied generation
-  и статусе `Applied`;
-- счетчик `traffic_used_bytes` хранится и проверяется, но встроенного сборщика
-  статистики с proxy-ядер в этой ревизии нет;
-- вкладка **System** показывает состояние и точные root-команды, но не управляет
-  systemd из HTTP; привилегированный путь — SSH-TUI;
-- web-uninstall показывает runbook, но не выполняет удаление;
-- IP Check не отправляет IP во все базы автоматически, а дает явные ссылки.
+## Модель безопасности в одном абзаце
 
-## Два рекомендуемых профиля эксплуатации
+Web-процесс infiproxy записывает только SQLite и bounded request files. Root
+workers повторно проверяют request schema, ownership, manifests, paths и
+версии. Proxy services работают как infiproxy-runtime. Root-only server secrets
+находятся в /etc/infiproxy/secrets.d; общие client/server secrets пока хранятся
+в SQLite без прикладного шифрования. Panel и module updaters остаются
+supply-chain trust boundaries, поэтому нужны защищенная ветка, проверяемые
+backups и staging.
 
-### Рекомендуемый
+## Версия документации
 
-- свежая Ubuntu 24.04 LTS или Debian 12;
-- отдельный VPS только для Infiproxy;
-- панель слушает только `127.0.0.1:8080`;
-- отдельный HTTPS hostname панели за Nginx;
-- Cloudflare token ограничен одной зоной и минимальными DNS-правами;
-- включены только реально настроенные runtime-модули;
-- внешний зашифрованный backup вывозится с VPS;
-- обновления сначала проверяются на резервном узле или в maintenance window.
+Перед опасной операцией сопоставьте документацию и установленный commit:
 
-### Допустимый для теста
+    sudo git -C /opt/infiproxy/source rev-parse HEAD
+    sudo cat /var/lib/infiproxy-maintenance/panel-last-applied.sha
 
-- один VPS и один домен с разными hostname;
-- доступ к панели только через SSH tunnel без публичного Nginx;
-- один полностью настроенный proxy-runtime;
-- ручная проверка `/ready`, systemd и клиентского подключения после изменений;
-- локальные root-only бэкапы до появления внешнего backup-хранилища.
+Если значения различаются, сначала откройте Wiki для фактически установленной
+ревизии. Не переносите команды между release lines без проверки.
 
-Этот профиль годится для полевых испытаний, но не заменяет резервное копирование
-на другой хост и ограничение административного доступа.
-
-## Официальные первичные источники
-
-Сетевые разделы сверены с официальными материалами проектов:
-
-- [Mihomo documentation](https://wiki.metacubex.one/en/)
-- [Project X / Xray documentation](https://xtls.github.io/en/)
-- [sing-box documentation](https://sing-box.sagernet.org/)
-- [Hysteria 2 documentation](https://v2.hysteria.network/docs/)
-- [TUIC protocol repository](https://github.com/tuic-protocol/tuic)
-- [Cloudflare API documentation](https://developers.cloudflare.com/fundamentals/api/)
-
-При расхождении wiki с установленной версией runtime приоритет имеют
-`<binary> --version`, локальный конфиг и документация именно этой версии.
-
-Текущая линия проекта: `0.1.0-beta.1`. Границы готовности и доказательства
-проверок перечислены в [milestone-аудите](15-RELEASE-0.1-BETA).
+Технические контракты для разработчиков находятся в каталоге
+[docs/](https://github.com/infinitrator/stealthhub-panel/tree/main/docs).
+Главная страница репозитория:
+[README](https://github.com/infinitrator/stealthhub-panel).

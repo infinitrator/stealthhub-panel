@@ -1,6 +1,6 @@
 # Runtime compatibility
 
-[Назад: адаптеры](16-ADAPTERS-AND-RECONCILIATION) | [К оглавлению](Home)
+[Назад: адаптеры](16-ADAPTER-ARCHITECTURE) | [К оглавлению](Home)
 
 Контракт проверен **29 августа 2026 года**. Основной клиент — Clash Mi с
 встроенным Mihomo; фиксируется версия parser/core, а не версия приложения.

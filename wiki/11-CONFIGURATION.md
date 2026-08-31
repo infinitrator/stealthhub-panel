@@ -1,504 +1,281 @@
-# Конфигурационные файлы
+# Конфигурация
 
-Infiproxy хранит состояние в трех разных местах, и смешивать их нельзя:
+[Назад: System и TUI](10-SYSTEM-AND-TUI) | [К оглавлению](Home) |
+[Далее: backup и uninstall](12-BACKUP-RESTORE-UNINSTALL)
 
-| Тип данных | Где хранится | Пример |
+## 1. Три источника состояния
+
+| Слой | Источник истины | Примеры |
 |---|---|---|
-| Состояние control plane | SQLite панели | Администраторы, пользователи, Mihomo-профили, routing sets, настройки обновлений. |
-| Конфигурация процессов | Файлы ОС | `infiproxy.env`, runtime JSON/YAML, Nginx и SSH. |
-| Исполняемые версии | Versioned runtime directories | `/opt/infiproxy/cores/xray/<version>/xray` и symlink `current`. |
+| Control plane | SQLite | admins, users, profiles, routing, settings, generations |
+| Root policy | Root-owned files | update source, manifests, server-only secrets, systemd |
+| Applied data plane | Generated configs + journal | runtime JSON/YAML, active services/listeners |
 
-Для поддержанных protocol/core adapters SQLite является desired state, а
-root-reconciler генерирует runtime config. Ручное изменение managed Xray,
-sing-box, Hysteria, TUIC или Mihomo config не обновляет SQLite и будет заменено
-следующим поколением. Nginx и SSH имеют отдельные контракты управления.
+Ручное изменение generated runtime config не изменяет desired state и может
+быть заменено следующим reconcile. Для поддерживаемых adapters изменяйте
+profiles/secrets в соответствующем control surface, затем ждите Applied.
 
-## 1. Вкладка Configs
+## 2. Web Configs
 
-Веб-редактор открывает только файлы из compile-time allowlist и конфиги
-зарегистрированных module manifests. Произвольный путь в форме указать нельзя.
+URL: /admin/configs, owner-only.
 
-### 1.1. Элементы каждой строки
+Страница читает только allowlisted regular UTF-8 files:
 
-| Элемент | Значение |
-|---|---|
-| Название | Человекочитаемая роль файла. |
-| Badge состояния | `ready`, отсутствующий файл, слишком большой файл, symlink или ошибка чтения. |
-| Category | `panel`, `edge`, `host`, `proxy-core` или `mesh-control`. |
-| Syntax | Подсказка `dotenv`, `json`, `yaml`, `nginx`, `sshd_config` или `text`. |
-| **Path** | Read-only реальный путь. |
-| **Limits** | Текущий размер и максимальный размер web-editor. |
-| **Content** | Содержимое UTF-8 файла. Встроенной подсветки и schema validation нет. |
-| **Save with backup** | Проверяет поддерживаемый синтаксис, копирует существующий файл рядом и атомарно заменяет содержимое. Service не перезапускается. |
-
-После сохранения result page показывает:
-
-- исходный путь;
-- `saved` или текст ошибки;
-- путь созданного backup;
-- команду validation;
-- команду apply;
-- кнопки **Back to Configs** и **Open System actions**.
-
-### 1.2. Ограничения редактора
-
-- URL выбирает только известный `slug`, а не путь пользователя.
-- Если сам файл или любой компонент пути является symlink, чтение и запись
-  отклоняются.
-- Редактируются только regular files.
-- Содержимое с NUL byte отклоняется.
-- Файл больше лимита не загружается в браузер.
-- Значение должно быть UTF-8, потому что используется `read_to_string`.
-- Перед записью существующего файла обязателен sibling backup.
-- Запись идет во временный regular file, вызывает `fsync`, наследует mode и
-  завершается атомарным rename в том же каталоге.
-- JSON, YAML, TOML и dotenv проходят parser-level проверку. Это не заменяет
-  semantic configtest конкретного runtime.
-- Nginx и SSH доступны только для просмотра; их native syntax проверяет root-TUI.
-- Save не вызывает reload или restart.
-
-Backup получает имя вида:
-
-```text
-config.json.infiproxy-bak-1786289123456
-```
-
-Число — Unix timestamp. Backup получает mode `0600`; для каждого исходного файла
-редактор сохраняет не более 20 последних sibling backups. Это ограничивает рост,
-но не заменяет off-host backup и контроль свободного места.
-
-> [!CAUTION]
-> Вкладка **Configs** и POST-сохранение доступны только первому owner-admin.
-> Это узкая роль, а не полноценная RBAC-модель; не создавайте лишних
-> администраторов и не передавайте owner session другим операторам.
-
-### 1.3. Фиксированный allowlist
-
-| Slug | Файл | Лимит | Web write |
-|---|---|---:|---:|
-| `panel-env` | `/etc/infiproxy/infiproxy.env` | 16 KiB | Да. |
-| `nginx-site` | `/etc/nginx/sites-available/infiproxy.conf` | 64 KiB | Нет. |
-| `ssh-daemon` | `/etc/ssh/sshd_config` | 64 KiB | Нет. |
-| `xray-core` | `/etc/infiproxy-cores/xray/config.json` | 256 KiB | Да. |
-| `sing-box-core` | `/etc/infiproxy-cores/sing-box/config.json` | 256 KiB | Да. |
-| `hysteria-core` | `/etc/infiproxy-cores/hysteria/config.yaml` | 128 KiB | Да. |
-| `tuic-core` | `/etc/infiproxy-cores/tuic/config.json` | 128 KiB | Да. |
-| `mihomo-core` | `/etc/infiproxy-cores/mihomo/config.yaml` | 256 KiB | Да. |
-
-Для динамического модуля добавляется `module-<id>`, если его `config_path` еще
-не представлен фиксированным allowlist. Максимум динамического файла — 256 KiB;
-syntax определяется по расширению. Web write разрешается только под
-`/etc/infiproxy-cores/`; остальные manifest paths read-only.
-
-## 2. Универсальный безопасный цикл изменения
-
-Применяйте его к каждому конфигу независимо от GUI или editor в SSH:
-
-1. Зафиксируйте исходное состояние unit и активной версии binary.
-2. Сделайте backup базы и изменяемого файла.
-3. Измените минимально необходимый набор параметров.
-4. Выполните parser/config validation родным инструментом.
-5. Сравните diff и убедитесь, что secret не попал в журнал или shell history.
-6. Используйте reload, если runtime его корректно поддерживает; иначе restart.
-7. Проверьте `systemctl status` и последние строки journal.
-8. Проверьте открытый listener через `ss`.
-9. Выполните реальное подключение тестовым клиентом из другой сети.
-10. Только после успеха удаляйте старый backup по retention policy.
-
-Базовый шаблон:
-
-```bash
-sudo cp -a /path/config /path/config.pre-change-$(date +%Y%m%d%H%M%S)
-sudo <program> <config-validation-options>
-sudo systemctl restart <unit>
-sudo systemctl --no-pager --full status <unit>
-sudo journalctl -u <unit> -n 100 --no-pager
-sudo ss -lntup
-```
-
-## 3. Окружение панели
-
-Файл: `/etc/infiproxy/infiproxy.env`.
-
-Штатные права: `root:infiproxy`, mode `0660`. Он читается systemd через
-`EnvironmentFile=`. Текущий template содержит семь переменных.
-
-### `INFIPROXY_BIND`
-
-Адрес и TCP-порт Axum listener.
-
-```dotenv
-INFIPROXY_BIND=127.0.0.1:8080
-```
-
-Рекомендуется оставлять loopback. Nginx принимает публичный HTTPS и передает
-запрос локально. Значение `0.0.0.0:8080` публикует панель напрямую на всех IPv4
-интерфейсах, обходит TLS reverse proxy и не рекомендуется.
-
-### `INFIPROXY_DB`
-
-SQLx SQLite URL:
-
-```dotenv
-INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
-```
-
-`mode=rwc` означает read/write/create. Каталог должен существовать и быть
-доступен пользователю `infiproxy`; иначе запуск завершится ошибкой SQLite code
-14 `unable to open database file`.
-
-Не ставьте SQLite на NFS/SMB. Для одного экземпляра панели локальный диск проще
-и надежнее. Одновременно запускать два процесса панели с одной БД не следует.
-
-### `INFIPROXY_DB_MAX_CONNECTIONS`
-
-Размер SQLx pool:
-
-```dotenv
-INFIPROXY_DB_MAX_CONNECTIONS=2
-```
-
-Допустимы `1..16`; невалидное значение заменяется на `2`. Для слабого VPS
-оставьте `2`. Увеличение не ускоряет небольшой SQLite workload и может усилить
-конкуренцию writers. Busy timeout равен 10 секундам, foreign keys включены.
-
-### `INFIPROXY_COOKIE_SECURE`
-
-```dotenv
-INFIPROXY_COOKIE_SECURE=true
-```
-
-Значения `1`, `true`, `yes`, `on` включают Secure flag; остальные считаются
-false. В production оставляйте `true`: браузер отправляет admin session cookie
-только по HTTPS.
-
-Для временного доступа через `http://127.0.0.1:8080` по SSH tunnel можно
-установить `false`, перезапустить панель, закончить настройку HTTPS и немедленно
-вернуть `true`.
-
-### `INFIPROXY_SETUP_TOKEN`
-
-```dotenv
-INFIPROXY_SETUP_TOKEN=<64-hex-random-value>
-```
-
-Bootstrap генерирует token через CSPRNG и печатает его root-оператору. Пока
-таблица `admins` пуста, startup требует не менее 32 символов, а
-`POST /admin/setup` сравнивает значение constant-time. После атомарного создания
-первого owner setup route больше не принимает регистрацию, поэтому token
-становится неактивным по состоянию БД. Не публикуйте его и смените при подозрении
-на утечку до первого входа.
-
-### `INFIPROXY_CURRENT_COMMIT`
-
-```dotenv
-INFIPROXY_CURRENT_COMMIT=<40-hex-installed-sha>
-```
-
-Idempotent installer записывает exact Git commit установленного binary как
-compatibility/diagnostic fallback. Источник истины для updater — root-owned
-`/var/lib/infiproxy-maintenance/panel-last-applied.sha`; stale env не может
-переопределить его. Marker меняется только после успешной сборки, установки и
-readiness-проверки.
-
-### `RUST_LOG`
-
-```dotenv
-RUST_LOG=stealthhub_panel=info,tower_http=info
-```
-
-Управляет tracing filter. `info` подходит для обычной работы. `debug` повышает
-объем journal и может раскрыть больше operational context; включайте временно.
-Полные session/subscription secrets логировать нельзя.
-
-### Legacy aliases
-
-Код принимает старые `STEALTHHUB_BIND`, `STEALTHHUB_DB`,
-`STEALTHHUB_DB_MAX_CONNECTIONS`, `STEALTHHUB_COOKIE_SECURE` и
-`STEALTHHUB_SETUP_TOKEN`, если соответствующая `INFIPROXY_*` не задана.
-Для новых установок используйте только новое имя, чтобы не создавать два
-конфликтующих источника.
-
-### Проверка после изменения env
-
-```bash
-sudo systemctl restart infiproxy.service
-sudo systemctl --no-pager --full status infiproxy.service
-sudo journalctl -u infiproxy.service -n 100 --no-pager
-curl -fsS http://127.0.0.1:8080/ready
-```
-
-## 4. Nginx панели
-
-Файл: `/etc/nginx/sites-available/infiproxy.conf`.
-
-Guided HTTPS создает два server blocks:
-
-- TCP `443` с TLS certificate/key;
-- TCP `80` с redirect на HTTPS;
-- `proxy_pass http://127.0.0.1:8080`;
-- передача `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`;
-- headers `X-Frame-Options`, `X-Content-Type-Options`, `Referrer-Policy`.
-
-Проверка и применение:
-
-```bash
-sudo nginx -t
-sudo systemctl reload nginx.service
-curl -I https://panel.example.com/health
-```
-
-Не направляйте Nginx обратно на публичный hostname: это создаст loop. Upstream
-должен оставаться `127.0.0.1:8080`.
-
-Сертификаты guided flow ожидает здесь:
-
-```text
-/etc/letsencrypt/live/<domain>/fullchain.pem
-/etc/letsencrypt/live/<domain>/privkey.pem
-```
-
-## 5. SSH daemon
-
-Файл: `/etc/ssh/sshd_config`.
-
-Минимальные production-принципы:
-
-- сначала настройте и проверьте вход по ключу;
-- не отключайте рабочий способ входа до проверки новой сессии;
-- ограничьте root login согласно своей модели управления;
-- отключайте password authentication только после проверки ключей;
-- firewall должен разрешать выбранный SSH-порт до reload;
-- изменения применяйте через reload, не restart.
-
-Проверка effective config:
-
-```bash
-sudo sshd -t
-sudo sshd -T | less
-sudo systemctl reload ssh.service
-```
-
-Infiproxy не создает SSH-ключи, не меняет автоматически порт SSH и не управляет
-authorized_keys. Web-editor предоставляет доступ к файлу, но ответственность за
-доступность recovery console остается у оператора.
-
-## 6. Xray server config
-
-Файл: `/etc/infiproxy-cores/xray/config.json`.
-
-До первого reconcile starter template содержит:
-
-- `log.loglevel: warning`;
-- пустой массив `inbounds`;
-- outbound `freedom` с tag `direct`;
-- outbound `blackhole` с tag `blocked`.
-
-Пустой `inbounds` означает, что одна установка module еще не принимает
-клиентов. Настройте профиль и client/public secrets в web, private REALITY key
-через root-TUI, затем дождитесь `Applied`. Не поддерживайте параллельную ручную
-версию этого managed файла.
-
-Проверка:
-
-```bash
-sudo /opt/infiproxy/cores/xray/current/xray run -test \
-  -config /etc/infiproxy-cores/xray/config.json
-sudo systemctl restart infiproxy-xray.service
-```
-
-Опции Xray менялись между релизами. Перед production сверяйтесь с
-[официальной документацией Xray](https://xtls.github.io/en/config/).
-
-## 7. sing-box server config
-
-Файл: `/etc/infiproxy-cores/sing-box/config.json`.
-
-Starter template содержит log level `warn`, пустые `inbounds`, outbound
-`direct` и `block`. Первый успешный reconcile заменяет его server config,
-собранным из enabled Shadowsocks/ShadowTLS/AnyTLS profiles.
-
-Проверка:
-
-```bash
-sudo /opt/infiproxy/cores/sing-box/current/sing-box check \
-  -c /etc/infiproxy-cores/sing-box/config.json
-sudo systemctl restart infiproxy-sing-box.service
-```
-
-Не копируйте конфиг от другой major/minor версии без `sing-box check`: поля
-могут быть deprecated или удалены. Ссылки на схемы протоколов есть в
-[разделе 6](06-PROXY-PROTOCOLS).
-
-## 8. Hysteria 2 server config
-
-Файл: `/etc/infiproxy-cores/hysteria/config.yaml`.
-
-Starter template:
-
-```yaml
-listen: :443
-tls:
-  cert: /etc/infiproxy-cores/tls/fullchain.pem
-  key: /etc/infiproxy-cores/tls/privkey.pem
-auth:
-  type: password
-  password: REPLACE_WITH_HYSTERIA2_PASSWORD
-```
-
-Что означает каждое поле:
-
-| Поле | Смысл |
-|---|---|
-| `listen` | UDP listener. `:443` занимает UDP/443, но не TCP/443 Nginx. |
-| `tls.cert` | Серверная certificate chain. |
-| `tls.key` | Закрытый TLS key; не должен читаться посторонними. |
-| `auth.type` | Механизм аутентификации Hysteria. |
-| `auth.password` | Общий пароль starter-схемы; placeholder обязательно заменить. |
-
-Проверка команды зависит от версии. Для текущего manifest сначала посмотрите
-`hysteria server --help`, затем используйте поддерживаемый check mode. После
-старта проверьте UDP listener:
-
-```bash
-sudo ss -lunp | grep ':443'
-sudo journalctl -u infiproxy-hysteria.service -n 100 --no-pager
-```
-
-## 9. TUIC server config
-
-Файл: `/etc/infiproxy-cores/tuic/config.json`.
-
-| Starter field | Смысл |
-|---|---|
-| `server: "[::]:11443"` | QUIC/UDP listener на всех IPv6 и, в зависимости от sysctl, IPv4-mapped адресах. |
-| `users: {}` | Пустой map UUID → password; без пользователя вход невозможен. |
-| `certificate` | TLS certificate chain. |
-| `private_key` | TLS private key. |
-| `congestion_control: bbr` | Алгоритм congestion control внутри TUIC/QUIC. |
-| `alpn: ["h3"]` | ALPN, который согласуется в TLS handshake. |
-
-Добавленный UUID/password должен совпасть с данными Mihomo user/profile. Перед
-рестартом изучите `tuic-server --help`: CLI конкретной версии является
-источником истины для validation command.
-
-```bash
-sudo systemctl restart infiproxy-tuic.service
-sudo journalctl -u infiproxy-tuic.service -n 100 --no-pager
-sudo ss -lunp | grep ':11443'
-```
-
-## 10. Mihomo runtime YAML
-
-Файл `/etc/infiproxy-cores/mihomo/config.yaml` генерируется reconciler из
-enabled Trojan/Snell/Mieru profiles. Не редактируйте managed listeners вручную:
-следующее поколение заменит изменения. Проверка: `mihomo -t -f <path>`.
-
-## 11. TLS-материалы proxy-runtime
-
-Hysteria, TUIC, AnyTLS TLS, Trojan TLS и TrustTunnel H2 ожидают:
-
-```text
-/etc/infiproxy-cores/tls/fullchain.pem
-/etc/infiproxy-cores/tls/privkey.pem
-```
-
-Это не те же пути, которые автоматически использует Certbot для Nginx. Нельзя
-бездумно копировать private key в group-writable каталог. Выберите один из
-подходов:
-
-| Подход | Плюсы | Минусы |
-|---|---|---|
-| Deploy hook копирует cert/key с минимальными правами и рестартует runtime | Простая конфигурация runtime. | Нужно надежно поддерживать hook и permissions. |
-| Runtime читает `/etc/letsencrypt/live/...` через ограниченные group/ACL | Нет второй копии ключа. | Сложнее права, возможны проблемы после renewal. |
-| Отдельный сертификат для proxy hostname | Изоляция panel TLS от proxy TLS. | Больше сертификатов и renewal jobs. |
-
-Предпочтителен отдельный proxy hostname и автоматический deploy hook, который
-сначала проверяет новые файлы, выставляет `root:<runtime-group> 0640`, затем
-рестартует только нужный unit.
-
-Inventory выполняет только чтение: различает regular file и symlink на regular
-file, проверяет root ownership и отсутствие небезопасной записи, срок
-сертификата и SAN для SNI включенного профиля. При missing/expired/mismatch
-сертификатный profile показывается как pending и reconciler не выбирает runtime.
-Проверка не читает содержимое private key, не выпускает сертификат и не копирует
-пути из legacy config. Профили REALITY, ShadowTLS, ResTLS, JLS, ShadowQUIC и
-Sudoku не зависят от этой пары и не блокируются её отсутствием.
-
-## 13. Секреты в SQLite
-
-Значения `secret_values` относятся к генерации Mihomo subscription и не
-являются файлом env. Owner-only вкладка **Secrets** создает, ротирует и удаляет
-значения, но после POST показывает только имена и никогда не возвращает value.
-
-Примеры имен:
-
-- `xray.reality.public_key`;
-- `xray.reality.short_id`;
-- `shadowsocks.2022.password`;
-- `shadowtls.password`;
-- `anytls.password`;
-- `hysteria2.password`;
-- `hysteria2.obfs_password`;
-- `tuic.password`.
-
-При отсутствии или пустом значении enabled profile делает generation
-fail-closed с HTTP 503. Процедура внесения и сверки описана в
-[профилях Mihomo](05-MIHOMO-PROFILES#как-безопасно-добавить-secret-value).
-
-## 14. Права на файлы
-
-Установщик создает основные каталоги так:
-
-| Путь | Owner/group | Mode | Назначение |
+| Slug/type | Path | Limit | Web write |
 |---|---|---:|---|
-| `/etc/infiproxy` | `root:infiproxy` | `0770` | Env и control-plane config. |
-| `/var/lib/infiproxy` | `infiproxy:infiproxy` | `0750` | SQLite и web request queues. |
-| `/var/lib/infiproxy-maintenance` | `root:root` | `0751` | Root updater state. |
-| `/etc/infiproxy-modules.d` | `root:root` | `0755` | Active module registry. |
-| `/etc/infiproxy-modules.available.d` | `root:root` | `0755` | Module catalog. |
-| `/opt/infiproxy/cores` | `root:root` | `0755` | Versioned binaries. |
-| `/etc/infiproxy-cores` | `root:infiproxy` | `0770` | Runtime configs. |
-| `/var/log/infiproxy-cores` | `infiproxy:infiproxy` | `0750` | Runtime logs, если unit их использует. |
+| panel-env | /etc/infiproxy/infiproxy.env | 16 KiB | Нет |
+| nginx-site | /etc/nginx/sites-available/infiproxy.conf | 64 KiB | Нет |
+| ssh-daemon | /etc/ssh/sshd_config | 64 KiB | Нет |
+| active module config | manifest-declared path | 256 KiB | Нет |
 
-Файлы runtime config обычно `root:infiproxy 0660`. Это позволяет веб-процессу
-редактировать allowlisted configs, но расширяет последствия компрометации admin
-session. Если web-editing не нужен, можно ужесточить права, приняв, что кнопка
-**Save with backup** перестанет работать.
+В текущем release все ConfigFileSpec имеют editable=false. Content textarea
+read-only, кнопка Save with backup не рендерится. POST route дополнительно
+проверяет owner, CSRF, allowlist и editable flag, поэтому подстановка slug/path
+не превращает его в editor.
 
-После ручного восстановления прав:
+Страница отклоняет:
 
-```bash
-sudo chown root:infiproxy /etc/infiproxy/infiproxy.env
-sudo chmod 0660 /etc/infiproxy/infiproxy.env
-sudo chown infiproxy:infiproxy /var/lib/infiproxy/infiproxy.sqlite*
-sudo chmod 0640 /var/lib/infiproxy/infiproxy.sqlite*
-```
+- symlink в любом компоненте path;
+- directory/device/socket вместо regular file;
+- файл больше лимита;
+- non-UTF-8 content;
+- неизвестный slug.
 
-## 15. Конфигурация «идеально» и «сойдет для теста»
+Изменение root configs выполняйте через sudo infiproxy-manager или
+контролируемый SSH editor с backup, native validation и rollback.
 
-### Production-oriented
+## 3. Panel environment
 
-1. Panel bind остается `127.0.0.1:8080`, cookie Secure включен.
-2. Panel и proxy protocols получают отдельные hostnames/listeners.
-3. Все placeholders заменены уникальными случайными credentials.
-4. Server config и Mihomo profile сверены по полям в таблице до выдачи подписки.
-5. Каждый config validation включен в change runbook.
-6. Private keys доступны только конкретному runtime user/group.
-7. Конфиги и обе SQLite базы регулярно копируются за пределы VPS.
+Путь:
 
-### Приемлемый полевой тест
+    /etc/infiproxy/infiproxy.env
 
-1. Панель доступна только через SSH tunnel.
-2. Включен один runtime с одним тестовым inbound.
-3. Используется отдельный временный пользователь без персональных данных.
-4. Перед каждым изменением создается локальная копия файла и SQLite.
-5. Проверка делается с мобильной сети, а не только с самого VPS.
+| Variable | Default | Значение |
+|---|---|---|
+| INFIPROXY_BIND | 127.0.0.1:8080 | Backend listener; оставляйте loopback за Nginx |
+| INFIPROXY_DB | sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc | SQLite URL |
+| INFIPROXY_DB_MAX_CONNECTIONS | 2 | Небольшой pool для слабого VPS |
+| INFIPROXY_COOKIE_SECURE | true | Secure flag admin cookie |
+| INFIPROXY_SETUP_TOKEN | generated 64 hex | First-admin bootstrap secret |
+| INFIPROXY_CURRENT_COMMIT | installer value | Diagnostic build/source value |
+| RUST_LOG | stealthhub_panel=info,tower_http=info | Logging filter по internal crate name |
 
-## 16. Связанные разделы
+Authoritative deployed SHA - root marker:
 
-- [Архитектура и основы сетей](02-ARCHITECTURE-AND-NETWORKING)
-- [Профили Mihomo](05-MIHOMO-PROFILES)
-- [Proxy-протоколы](06-PROXY-PROTOCOLS)
-- [Система и TUI](10-SYSTEM-AND-TUI)
-- [Backup и восстановление](12-BACKUP-RESTORE-UNINSTALL)
+    /var/lib/infiproxy-maintenance/panel-last-applied.sha
+
+INFIPROXY_CURRENT_COMMIT не должен перекрывать marker при определении current
+update status.
+
+После изменения env:
+
+    sudo systemctl restart infiproxy.service
+    sudo systemctl status infiproxy.service --no-pager
+    curl -fsS http://127.0.0.1:8080/ready
+
+Не ставьте COOKIE_SECURE=false при доступе через публичную сеть. Для локальной
+разработки это допустимо только на loopback.
+
+## 4. SQLite
+
+Путь production:
+
+    /var/lib/infiproxy/infiproxy.sqlite
+
+WAL и foreign_keys включены connection options. Не копируйте только main file
+при работающем процессе. Используйте .backup:
+
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '/var/backups/infiproxy/manual.sqlite'"
+
+Не храните SQL passwords/tokens в shell history. Не редактируйте generations,
+adapter_state или schema_migrations вручную.
+
+## 5. Panel settings в SQLite
+
+UI Settings управляет:
+
+| Key | Назначение |
+|---|---|
+| panel_name | Client metadata/UI name |
+| subscription_domain | Public host для /sub и /rules |
+| node_domain | Profile endpoint/infrastructure readiness |
+| panel_update_enabled | Scheduled panel apply policy |
+| panel_update_time | Local server HH:MM |
+| panel_update_hour | Compatibility mirror derived from time |
+
+Root update source не хранится здесь. REPO/REF берутся из:
+
+    /etc/infiproxy-update.conf
+
+Fresh install:
+
+    REPO=infinitrator/stealthhub-panel
+    REF=main
+
+Non-main ref возможен только через explicit operator override. Manual и
+automatic updater используют один файл.
+
+## 6. Module manifests
+
+    /etc/infiproxy-modules.d
+    /etc/infiproxy-modules.available.d
+
+Manifest - declarative key=value, не shell. Он задает stable ID, display
+metadata, GitHub repo/tag, driver, root, binary, systemd service, config path и
+architecture asset templates.
+
+Installed manifests должны быть:
+
+- root-owned regular files;
+- не symlink;
+- не group/world-writable;
+- bounded;
+- валидны native Rust helper.
+
+Проверка:
+
+    sudo /usr/local/libexec/infiproxy-module-manifest +      list /etc/infiproxy-modules.d --root-owned
+
+Не редактируйте active manifest для обхода exact pin. Импорт нового generic
+manifest - root supply-chain decision через SSH manager.
+
+## 7. Runtime layout
+
+| Runtime | Binary | Config | Unit |
+|---|---|---|---|
+| Xray | /opt/infiproxy/cores/xray/current/xray | /etc/infiproxy-cores/xray/config.json | infiproxy-xray.service |
+| sing-box | /opt/infiproxy/cores/sing-box/current/sing-box | /etc/infiproxy-cores/sing-box/config.json | infiproxy-sing-box.service |
+| Hysteria | /opt/infiproxy/cores/hysteria/current/hysteria | /etc/infiproxy-cores/hysteria/config.yaml | infiproxy-hysteria.service |
+| TUIC | /opt/infiproxy/cores/tuic/current/tuic-server | /etc/infiproxy-cores/tuic/config.json | infiproxy-tuic.service |
+| Mihomo | /opt/infiproxy/cores/mihomo/current/mihomo | /etc/infiproxy-cores/mihomo/config.yaml | infiproxy-mihomo.service |
+
+Module updater меняет versioned binary/current symlink и сохраняет config.
+Reconciler меняет complete config и управляет activation. Не смешивайте эти
+transactions.
+
+Native validation:
+
+    sudo /opt/infiproxy/cores/xray/current/xray run -test +      -config /etc/infiproxy-cores/xray/config.json
+    sudo /opt/infiproxy/cores/sing-box/current/sing-box check +      -c /etc/infiproxy-cores/sing-box/config.json
+    sudo /opt/infiproxy/cores/mihomo/current/mihomo -t +      -f /etc/infiproxy-cores/mihomo/config.yaml
+
+Hysteria/TUIC adapters выполняют structural validation и isolated startup
+smoke tests в compatibility gate; production readiness дополнительно проверяет
+service/listener и реальный canary.
+
+## 8. TLS runtime pair
+
+Fixed paths:
+
+    /etc/infiproxy-cores/tls/fullchain.pem
+    /etc/infiproxy-cores/tls/privkey.pem
+
+Expected identity/modes:
+
+| Object | Owner/group | Mode contract |
+|---|---|---|
+| tls directory | root:infiproxy-runtime | безопасный, group read+traverse, no writes/other |
+| certificate | root:infiproxy-runtime | group read, no unsafe writes |
+| private key | root:infiproxy-runtime | group read, no other access, no unsafe writes |
+
+Readiness independently resolves actual infiproxy-runtime uid/gid. Совпадение
+file/directory с одинаковой, но неверной group не принимается.
+
+Symlink разрешен только к regular target. Installer не chown/chmod target
+symlink, а readiness проверяет metadata resolved target и effective traversal
+всех ancestors. Certificate проверяется openssl: parse, hostname, expiry и
+public key match с private key.
+
+## 9. Secret references
+
+Shared values:
+
+    SQLite table secret_values
+
+Server-only values:
+
+    /etc/infiproxy/secrets.d/<reference>
+
+Root-only file должен быть regular, root-owned, максимум 8192 bytes и mode без
+group/other access. Reconciler не пишет value в logs/journal.
+
+Legacy server-only value можно однократно перенести через SSH manager:
+
+    sudo /usr/local/libexec/infiproxy-reconcile +      --adopt-server-secret xray.reality.private_key
+
+Helper принимает только reference, который protocol adapter классифицирует как
+server-only, сверяет значения, пишет root file и удаляет SQLite copy.
+
+## 10. Nginx
+
+Panel backend остается HTTP на loopback. Nginx завершает TLS и проксирует к:
+
+    http://127.0.0.1:8080
+
+Проверка перед reload:
+
+    sudo nginx -t
+    sudo systemctl reload nginx.service
+
+Admin и subscription hostnames могут иметь разные sites. Не направляйте proxy
+TCP/UDP listeners через admin HTTP vhost, если protocol этого не поддерживает.
+
+SSH manager может:
+
+- создать/обновить Cloudflare A record;
+- сохранить scoped API token mode 0600;
+- выдать certificate Certbot DNS-01;
+- записать panel HTTPS site;
+- проверить nginx -t и восстановить previous file при failure.
+
+## 11. Routing и rule providers
+
+Routing state находится в normalized SQLite tables. Не редактируйте generated
+Mihomo YAML вручную: он собирается на каждый subscription request.
+
+Public provider:
+
+    https://SUBSCRIPTION_HOST/rules/<slug>.yaml
+
+MRS для mixed classical sets не реализован и возвращает 501. Используйте YAML.
+
+Remote rule sources поддерживают bounded HTTPS fetch, allowlisted formats и
+scheduled refresh. URL к private/loopback destination должен fail closed.
+
+## 12. Ownership после install
+
+| Path | Owner/group | Mode |
+|---|---|---:|
+| /etc/infiproxy | root:infiproxy | 0750 |
+| /etc/infiproxy/infiproxy.env | root:infiproxy | 0660 |
+| /etc/infiproxy/secrets.d | root:root | 0700 |
+| /var/lib/infiproxy | infiproxy:infiproxy | 0750 |
+| /var/lib/infiproxy-maintenance | root:root | 0751 |
+| reconcile transaction dirs | root:root | 0700 |
+| /etc/infiproxy-modules.d | root:root | 0755 |
+| /opt/infiproxy/cores | root:root | 0755 |
+| /etc/infiproxy-cores | root:infiproxy-runtime | 0750 |
+| runtime config files | root:infiproxy-runtime | 0640 |
+| /var/log/infiproxy-cores | infiproxy-runtime:infiproxy-runtime | 0750 |
+
+Panel user не добавляется в runtime group. Ручной chown root configs на
+infiproxy ломает privilege boundary.
+
+## 13. Безопасный цикл изменения
+
+1. Зафиксируйте SHA, generation, unit/listener state.
+2. Сделайте SQLite и config backup.
+3. Измените один логический параметр.
+4. Выполните parser/native validation.
+5. Примените через соответствующий control surface.
+6. Дождитесь Applied или доказанного rollback.
+7. Проверьте /ready, service и listener.
+8. Выполните внешний client handshake.
+9. Только после canary включайте следующий change.
+
+Production-oriented настройка: loopback bind, valid HTTPS, exact runtime pins,
+minimum enabled profiles, module auto-update opt-in после staging, encrypted
+off-host backup.
+
+Допустимый тест: SSH tunnel, один temporary user, один stable profile, manual
+updates и отсутствие публичного admin port.

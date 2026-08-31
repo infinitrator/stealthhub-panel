@@ -1,6 +1,6 @@
 # Модули и обновления
 
-[Назад: маршрутизация](07-ROUTING) | [К оглавлению](Home) | [Далее: System и SSH-TUI](10-SYSTEM-AND-TUI)
+[Назад: маршрутизация](07-ROUTING) | [К оглавлению](Home) | [Далее: desired state](09-RECONCILIATION-AND-DESIRED-STATE)
 
 ## Зачем runtime-модули отделены от панели
 
@@ -92,7 +92,8 @@ GitHub API rate limit/error отобразится как check failure; install
 
 ### Auto On/Off и Save
 
-Policy хранится в SQLite, default для module — `true`. Root auto-run берет только
+Policy хранится в SQLite, default для module — `false`: автоматическое
+обновление является явным opt-in. Root auto-run берет только
 module, у которого state одновременно:
 
 ```text

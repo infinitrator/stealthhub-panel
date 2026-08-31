@@ -169,10 +169,11 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 | Возможность | Owner (минимальный admin ID) | Другой admin record |
 |---|---:|---:|
 | Login/dashboard | Да | Да |
-| Users, protocols, routing | Да | Да |
+| Users | Да | Да |
+| Protocols и routing mutations | Да | Нет |
 | Account/password rotation | Да | Да |
 | Secret editor | Да | Нет |
-| Config editor | Да | Нет |
+| Configs read-only inspector | Да | Нет |
 | System read-only telemetry | Да | Да |
 | Uninstall preview | Да | Нет |
 | Общие settings | Да | Да |
@@ -180,8 +181,9 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 | Module check/update/install/remove | Да | Нет |
 
 UI штатно создает только первого admin, но дополнительные records могут
-появиться через миграцию/ручное администрирование. Не считайте их read-only:
-Configs, secrets и root-worker requests имеют высокий impact.
+появиться через миграцию/ручное администрирование. Они могут управлять users,
+общими Settings и собственной account session, но owner-only handlers повторно
+проверяют protocol/routing/module/update/secret/config boundaries на сервере.
 
 Остаточные риски:
 
@@ -267,10 +269,15 @@ Cloudflare token сохраняется root-only mode `0600`, что прави
 - `MemoryDenyWriteExecute=true`;
 - ограниченный `ReadWritePaths`.
 
-Это заметно уменьшает последствия web-компрометации, но разрешенные
-`ReadWritePaths` для `/etc/infiproxy-cores` оставляют owner UI
-возможность изменить runtime config. Такая возможность нужна Configs UI и
-является осознанным tradeoff. Nginx и SSH configs остаются read-only для web.
+Это заметно уменьшает последствия web-компрометации. Единственный
+`ReadWritePaths` panel unit - `/var/lib/infiproxy`; каталоги runtime,
+Nginx, SSH, root manifests и server-only secrets web-процессу недоступны для
+записи. Страница Configs в текущем release является allowlisted read-only
+inspector. Runtime configs меняет root reconciler или оператор через SSH.
+
+Proxy units работают отдельной identity `infiproxy-runtime:infiproxy-runtime`.
+Пользователь panel не входит в runtime group. Это не дает захваченной web
+session читать TLS private key через group permissions.
 
 ### 9.2. Root workers
 
@@ -430,12 +437,12 @@ access logs полезны, но не считаются tamper-proof после
 | Приоритет | Ограничение | Компенсация |
 |---|---|---|
 | Высокий | Root panel updater доверяет mutable Git ref без commit signature/attestation. | Protected branch, reviewed mirror, staging и manual approval. |
-| Высокий | Нет MFA и полноценной RBAC; высокорисковые Configs/Secrets ограничены owner, но обычные admins управляют users/protocols/routing. | Один owner, network allowlist/VPN, сильный уникальный пароль. |
+| Высокий | Нет MFA и полноценной RBAC; высокорисковые protocol/routing/module/update/secret actions ограничены owner, но обычные admins управляют users и общими Settings. | Один owner, network allowlist/VPN, сильный уникальный пароль. |
 | Высокий | Secrets хранятся локально без application-level encryption. | Host hardening, строгие permissions, encrypted off-host backup. |
 | Средний | Нет immutable admin audit trail и session management UI. | Central journal shipping, минимальное число admins. |
 | Средний | Subscription URL — bearer secret в path. | TLS, log redaction, secure delivery, reset on leak. |
 | Средний | Нет scheduled off-host backup. | Настроить restic/borg/другой внешний job. |
-| Средний | Нет автоматической server↔Mihomo credential synchronization. | Change checklist и end-to-end test. |
+| Средний | Reconciler синхронизирует поддерживаемые server identities, но не доказывает реальный внешний handshake и не может индивидуально отозвать shared credentials. | Count-only drift checks, secret rotation и end-to-end canary. |
 | Низкий/функциональный | Traffic quota хранится, но collector runtime usage отсутствует. | Внешний collector или ручной учет; не обещать enforcement. |
 
 ## 16. Hardening checklist перед production

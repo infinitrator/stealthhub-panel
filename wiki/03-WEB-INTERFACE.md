@@ -1,323 +1,294 @@
-# Веб-интерфейс: все страницы и кнопки
+# Веб-интерфейс: страницы и действия
 
-[Назад: архитектура](02-ARCHITECTURE-AND-NETWORKING) | [К оглавлению](Home) | [Далее: пользователи](04-USERS-AND-SUBSCRIPTIONS)
+[Назад: архитектура](02-ARCHITECTURE-AND-NETWORKING) | [К оглавлению](Home) |
+[Далее: пользователи](04-USERS-AND-SUBSCRIPTIONS)
 
-## Общие правила интерфейса
+## 1. Общий контракт
 
-Веб-интерфейс отрисовывается сервером на Rust/Axum/Maud. Отдельного JavaScript
-SPA, Node.js и frontend build pipeline нет. Изменяющие запросы используют POST,
-admin session и CSRF token.
+Интерфейс рендерится сервером на Rust/Maud, использует один CSS asset и не
+зависит от JavaScript. Все authenticated POST actions требуют session cookie и
+CSRF token. Формы ограничены 64 KiB; config route имеет отдельный лимит 1 MiB.
 
-### Верхняя панель
+Верхняя полоса показывает administrator, owner status и update notice.
 
-| Элемент | Доступ | Действие |
+| Элемент | Доступ | Что делает |
 |---|---|---|
-| Username | любой admin | Показывает текущую учетную запись. |
-| `owner` badge | только первый admin | Показывает, что admin имеет минимальный ID в таблице. |
-| Update notification | owner | Появляется, когда checker обнаружил новый commit. |
-| **Update Now** | owner, **в очередь** | Создает `/var/lib/infiproxy/panel-update-now.request`; root path unit запускает updater. |
-| **Logout** | admin, **сразу** | Удаляет текущую server-side session и очищает cookie. |
+| Update Now | owner | Создает bounded request для root panel updater |
+| Logout | любой admin | Удаляет текущую session record и истекает cookie |
 
-`Update Now` не обновляет бинарник внутри HTTP-запроса. После нажатия следите за
-`/var/lib/infiproxy-maintenance/panel-update-run.log` и `/ready`.
+Update Now не принимает repository/ref из браузера. Manual и automatic paths
+используют один root-owned /etc/infiproxy-update.conf.
 
-### Боковая навигация
+## 2. Навигация
 
 | Пункт | URL | Назначение |
 |---|---|---|
-| Home | `/` | Публичная стартовая страница со ссылками на основные admin-разделы. |
-| Dashboard | `/admin` | Сводка архитектуры и переходы. |
-| Account | `/admin/account` | Учетная запись и безопасная смена пароля. |
-| Users | `/admin/users` | Пользователи и subscription tokens. |
-| Settings | `/admin/settings` | Глобальные hostnames и panel updater. |
-| Protocols | `/admin/protocols` | Клиентские proxy-объекты Mihomo. |
-| Secrets | `/admin/secrets` | Owner-only значения, подставляемые в клиентский YAML. |
-| Routing | `/admin/routing` | Pools, policies, rule sets, sources и DNS. |
-| Runtimes | `/admin/cores` | Динамический реестр runtime-модулей. |
-| IP Check | `/admin/ip` | Локальная диагностика и ссылки на reputation DB. |
-| System | `/admin/system` | Host sensors, services и uninstall preview. |
-| Configs | `/admin/configs` | Allowlist-редактор файлов. |
-| Health | `/admin/health` | Подробная диагностика после admin-authentication. |
-| Credits | `/admin/credits` | Версия, лицензия, GitHub и компоненты. |
+| Home | / | Публичные ссылки на основные разделы |
+| Dashboard | /admin | Сводка users, generations, runtimes и shortcuts |
+| Account | /admin/account | Текущий admin и смена password |
+| Users | /admin/users | User lifecycle и subscription URLs |
+| Settings | /admin/settings | Domains, panel name и update schedule |
+| Protocols | /admin/protocols | Protocol profiles и adapter inventory |
+| Secrets | /admin/secrets | Shared secrets, owner-only |
+| Routing | /admin/routing | DNS, pools, policies, rule sets/sources |
+| Modules | /admin/cores | Runtime inventory и typed lifecycle |
+| IP Check | /admin/ip | Local network diagnostics и external reputation links |
+| System | /admin/system | Host/service observations и uninstall preview |
+| Configs | /admin/configs | Owner-only allowlisted read-only config inspector |
+| Health | /admin/health | Detailed authenticated health/inventory |
+| Credits | /admin/credits | Project/component information |
 
-## Home
+## 3. Initial admin setup
 
-Публичная `/` показывает ссылки **Dashboard**, **Users**, **Protocols** и
-**Routing**. Они не обходят авторизацию: admin-route перенаправляет на login.
+URL: /admin/setup.
 
-## Initial admin setup
-
-Страница `/admin/setup` доступна только пока в таблице `admins` нет записей.
-
-| Поле/кнопка | Что делает |
+| Поле/кнопка | Результат |
 |---|---|
-| **Setup token** | Сверяет installer-generated one-time secret длиной не менее 32 символов. |
-| **Username** | Имя длиной 3–64 символа. |
-| **Password** | Пароль минимум 12 символов. |
-| **Confirm password** | Защита от опечатки. |
-| **Create admin** | Хеширует пароль Argon2 в bounded blocking worker, атомарно создает первую admin-запись и session. |
+| Setup token | Сравнивается constant-time с INFIPROXY_SETUP_TOKEN |
+| Username | Создает первый admin/owner |
+| Password + confirmation | Минимум 12 символов, Argon2id hash |
+| Create admin | Атомарно создает только первого admin и открывает session |
 
-Первый admin является owner. После создания страница setup больше не должна
-принимать повторную регистрацию.
+Setup доступен только пока admins table пуста. Сервер не запускается без
+setup-token длиной минимум 32 символа в этом состоянии. Повторный setup после
+создания owner запрещен.
 
-## Admin login
+## 4. Login и Account
 
-| Поле/кнопка | Что делает |
+Login использует username/password. Неудачи имеют фиксированную задержку,
+rate-limit по username+source и bounded Argon2 worker pool. Сообщение не
+раскрывает, существует ли username.
+
+Account:
+
+| Кнопка | Что делает |
 |---|---|
-| **Username** | Ищет admin без раскрытия, существует ли имя. |
-| **Password** | Проверяется Argon2 вне async executor. |
-| **Login** | При успехе создает случайную 32-byte session, хранит только SHA-256 hash и ставит cookie. |
+| Change Password | Проверяет текущий password, валидирует новый, меняет hash |
 
-Ограничитель допускает пять неудач за 15 минут для username и источника. При
-неудаче есть постоянная задержка около 500 мс. Только синтаксически корректный
-`X-Real-IP` доверяется, когда непосредственный peer loopback, то есть ожидается
-локальный Nginx. Клиентский `X-Forwarded-For` не используется.
+Успешная ротация отзывает остальные sessions и создает новую текущую session.
+Username через web UI не меняется. UI управления всеми sessions отсутствует.
 
-## Account
+## 5. Dashboard
 
-Страница показывает имя, роль и время создания текущего администратора.
+Dashboard только наблюдает:
 
-| Поле/кнопка | Что делает |
-|---|---|
-| **Current password** | Повторно подтверждает учетную запись через Argon2. |
-| **New password** | Принимает 12–1024 символа. |
-| **Confirm new password** | Защищает от опечатки. |
-| **Change Password** | Транзакционно меняет hash и отзывает все admin-сессии, включая текущую. |
+- desired/applied generation и reconcile status;
+- число users;
+- runtime/resource inventory;
+- count-only user sync;
+- shortcuts Open Users/Settings/Protocols/Routing/System/Modules.
 
-После успеха браузер возвращается на login. Старый пароль и все ранее выданные
-cookie больше не работают.
+Кнопки Open ... выполняют переход, а не mutation. Applied не является
+end-to-end доказательством client connectivity.
 
-## Dashboard
+## 6. Settings
 
-Status strip показывает архитектурные константы, а не live monitoring:
-
-- **Admin: protected** — раздел требует session;
-- **Storage: SQLite** — тип хранилища;
-- **Client: Mihomo YAML** — формат подписки;
-- **Mode: single-node** — текущая deployment model.
-
-| Кнопка | Тип | Результат |
+| Поле | Кто меняет | Эффект |
 |---|---|---|
-| **Open Users** | просмотр | Переход в Users. |
-| **Open Settings** | просмотр | Переход в Settings. |
-| **Open Protocols** | просмотр | Переход в Protocols. |
-| **Open Routing** | просмотр | Переход в Routing. |
-| **Open System** | просмотр | Переход в System. |
-| **Open Modules** | просмотр | Переход в Modules. |
+| Panel name | любой admin | Metadata/UI name |
+| Subscription host | любой admin | Public subscription/rule-provider host |
+| Node host | любой admin | Starter proxy endpoint host/infrastructure readiness |
+| Panel auto-update | owner | Включает/выключает scheduled panel apply |
+| Maintenance time | owner | Local server HH:MM, default 05:00 |
+| GitHub repository | read-only | Root-pinned REPO |
+| Git reference | read-only | Root-pinned REF |
+| Save Settings | admin; owner для update fields | Валидирует и сохраняет значения |
 
-## Settings
+Изменение domains увеличивает desired generation, потому что они участвуют в
+infrastructure resources. Save не выдает сертификат автоматически.
 
-### Поля
+## 7. Users
 
-| Поле | Ограничение | Влияние |
+| Действие | Кто | Результат |
 |---|---|---|
-| **Panel name** | 2–80 символов | Отображаемое имя и generated metadata. |
-| **Subscription host** | hostname, нормализуется | Формирует HTTPS URL подписок и rules. |
-| **Node host** | hostname/IP | Подставляется как `server` в клиентские профили. |
-| **Panel auto-update** | owner-only Enabled/Disabled | Управляет ночным обновлением панели. |
-| **Maintenance time** | owner-only `HH:MM` | Первый 15-минутный timer slot в/после времени VPS. |
-| **GitHub repository** | read-only | Root-pinned source из `/etc/infiproxy-update.conf`. |
-| **Git reference** | read-only | Root-pinned branch/tag/ref. |
+| Create | любой admin | UUID/token, optional stored limit/expiry, generation |
+| open | любой admin | Account page по bearer URL |
+| download | любой admin | Mihomo YAML по bearer URL |
+| Disable/Enable | любой admin | Меняет effective access и generation |
+| Reset token | любой admin + confirm page | Немедленно заменяет bearer token |
+| Delete user | любой admin + confirm page | Удаляет row и запускает generation |
 
-**Save Settings** записывает обычные значения в SQLite. Для owner изменение
-update settings также обновляет state, который читает root updater. Не-owner
-видит update-поля disabled и не может изменить их через штатную форму.
+Traffic fields не редактируются после create через текущий UI. Runtime collector
+и quota enforcement отсутствуют. Подробности:
+[Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS).
 
-### Generated client endpoints
+## 8. Protocols
 
-Раздел только показывает:
+Страница показывает protocol adapter inventory, runtime/resource status,
+count-only user sync и каждый starter profile.
 
-- шаблон `https://<subscription-host>/sub/{token}/mihomo.yaml`;
-- шаблон `https://<subscription-host>/rules/{name}`;
-- node host;
-- время последней проверки, current/latest SHA и план обновления.
-
-## Users
-
-Полный жизненный цикл описан в
-[Пользователях и подписках](04-USERS-AND-SUBSCRIPTIONS).
-
-| Кнопка/ссылка | Тип | Результат |
+| Элемент | Кто | Что делает |
 |---|---|---|
-| **Create** | сразу | Создает UUID, random token, quota/expiry. |
-| `open` | просмотр | Публичная account/import page. |
-| `download` | просмотр | Отдает Mihomo YAML. |
-| **Disable** | сразу | Запрещает account page import и YAML. |
-| **Enable** | сразу | Снимает ручную блокировку, но не отменяет expiry/quota. |
-| **Reset token** | просмотр | Открывает отдельное подтверждение. |
-| **Reset token** на confirmation | сразу | Генерирует новый token; старый URL сразу недействителен. |
-| **Delete** | просмотр | Открывает отдельное подтверждение. |
-| **Delete user** на confirmation | сразу | Удаляет пользователя и token. |
-| **Cancel** | просмотр | Возвращает без изменений. |
+| Enabled switch | owner | Включает/выключает profile |
+| Server address | owner | Меняет client endpoint |
+| Server port | owner | Меняет listener claim/client port |
+| Adapter fields | owner | Меняет text или secret reference |
+| Save profile | owner | Валидирует adapter schema, сохраняет и queue reconcile |
 
-## Protocols
+UI не создает/удаляет profiles и не меняет adapter/preferred runtime. Полный
+contract: [Профили и runtimes](05-PROTOCOL-PROFILES-AND-RUNTIMES).
 
-Это редактор **клиентской стороны Mihomo**, не server inbound generator.
+## 9. Secrets
 
-Status strip показывает число профилей, enabled, число сохраненных secret names
-и subscription host. Transport matrix является справкой и ничего не меняет.
+Owner-only страница для shared client/server secrets.
 
-### Общие элементы каждого профиля
-
-| Элемент | Что делает |
+| Действие | Результат |
 |---|---|
-| **Enabled** switch | Включает профиль в следующий generated YAML. Не запускает runtime. |
-| **Server address** | Endpoint, который использует клиент Mihomo. |
-| **Server port** | Remote port `1..65535`. |
-| Protocol-specific fields | SNI/path и **имена** записей в `secret_values`. |
-| **Save profile** | Обновляет существующую запись в SQLite; не валидирует/перезапускает серверный core. |
+| Save secret | Создает или заменяет bounded value по валидному reference name |
+| Delete secret | Требует точное подтверждение reference name и удаляет value |
 
-Kind и role встроенного профиля в GUI read-only. Создание новых protocol kinds
-выполняется установкой доверенного adapter package, а не свободным вводом имени
-в браузере. Подробно: [Профили Mihomo](05-MIHOMO-PROFILES).
+Value после записи не отображается обратно. Имена показываются, plaintext нет.
+REALITY private key и другие server-only references через эту страницу не
+принимаются; используйте root SSH manager.
 
-## Secrets
+Удаление required secret может сделать subscription generation или reconcile
+недоступными. Сначала отключите зависимый profile либо подготовьте замену.
 
-Страница доступна только owner. Значения используются исключительно при
-генерации Mihomo YAML и после сохранения никогда не возвращаются браузеру.
+## 10. Routing
 
-| Поле/кнопка | Что делает |
+Все mutations owner-only.
+
+### DNS policy
+
+Save DNS policy сохраняет enabled, IPv6, respect-rules, enhanced mode и списки
+bootstrap/remote/direct resolvers. Resolver проходит scheme/IP/system
+validation.
+
+### Transport pools
+
+| Кнопка | Результат |
 |---|---|
-| **Secret name** | Принимает до 128 ASCII letters/digits и символы `.`, `_`, `-`. |
-| **Secret value** | Принимает непустое значение до 8192 bytes. |
-| **Store secret** | Создает запись либо атомарно заменяет значение существующего имени. |
-| **Delete** | Требует вручную набрать точное имя и удаляет значение. |
+| Create pool | Создает select/url-test/fallback/load-balance pool |
+| Save pool | Обновляет members, health parameters, fallback и strategy |
+| Delete pool | Удаляет pool после проверки зависимостей/replacement |
 
-Таблица показывает только имена, привязка к профилям вычисляется по
-ссылкам из Protocols. Удаление секрета, нужного enabled-профилю, переводит
-subscription generation в fail-closed `503`, а не публикует имя/placeholder.
+Members могут ссылаться на profile, capability, role, другой pool, all,
+DIRECT или REJECT. Cycles и unresolved references отклоняются.
 
-## Routing
+### Inline routing policies
 
-Страница управляет transport pools, inline policies, произвольными rule sets,
-нормализованными entries, remote sources и DNS policy.
+Create/Save policy задает stable ID, display name, priority, Mihomo condition и
+target. Delete policy удаляет правило. Target должен разрешаться в enabled
+pool/profile/capability либо DIRECT/REJECT.
 
-| Элемент | Что делает |
+### Rule sets и entries
+
+| Кнопка | Результат |
 |---|---|
-| **Create/Save/Delete pool** | Управляет stable proxy groups и проверяет graph/references до commit. |
-| **Create/Save/Delete policy** | Управляет ordered inline conditions и target. |
-| **Create/Save/Clone/Delete rule set** | Управляет arbitrary provider sets. |
-| **Add/Edit/Delete normalized entry** | Меняет отдельное типизированное правило. |
-| **Import entries** | Выполняет bulk paste без raw YAML. |
-| **Deduplicate entries** | Удаляет дубликаты внутри set. |
-| **Export / preview YAML** | Открывает фактически скомпилированный provider. |
-| **Add/Save/Refresh/Delete source** | Управляет bounded HTTPS source и его cache. |
-| **Save DNS policy** | Сохраняет resolver policy для следующей subscription. |
+| Save rule set | Создает/обновляет slug, effect, target, enabled и payload |
+| Export / preview YAML | Открывает публичный /rules/{slug}.yaml |
+| Clone | Копирует rule set под новым slug |
+| Delete rule set | Удаляет set и связанные entries/sources |
+| Save entry | Создает/редактирует normalized rule |
+| Delete entry | Удаляет одну запись |
+| Bulk add | Добавляет много values выбранного kind |
+| Deduplicate | Удаляет дубликаты внутри set |
+| Filter/Clear | Только меняет отображаемый список |
 
-Нельзя вложить `RULE-SET`/`SUB-RULE` внутрь classical payload. Source format
-`mrs` не эмулируется для смешанных classical rules. Подробно:
-[Маршрутизация](07-ROUTING).
+Remote source:
 
-## Runtimes
-
-Страница строится из root-owned manifests, поэтому список динамический.
-
-### Runtime registry
-
-| Кнопка | Доступ/тип | Результат |
-|---|---|---|
-| **Check all** | owner, сразу для metadata | Обращается к GitHub API и обновляет known latest state; бинарники не меняет. |
-| Auto **On/Off** + **Save** | owner, сразу | Меняет policy автоматического обновления модуля. |
-| **Check** | owner, сразу для metadata | Проверяет upstream только выбранного модуля. |
-| **Install latest** | owner, в очередь | Request root-worker для неустановленного runtime. |
-| **Update** | owner, в очередь | Request root-worker для установленного runtime с доступной версией. |
-| **Start** | owner, в очередь | Запрашивает запуск manifest-declared systemd unit. |
-| **Stop** | owner, в очередь | Запрашивает остановку manifest-declared systemd unit. |
-| **Restart** | owner, в очередь | Запрашивает перезапуск manifest-declared systemd unit. |
-| **Remove** | owner, в очередь | Требует точный module ID; config сохраняется, а при enabled dependents кнопка блокируется. |
-
-Название update/install зависит от installed state. Все lifecycle operations
-являются типизированными fixed-format requests: HTTP не принимает command, URL
-или unit name. Request не гарантирует успех: результат проверяется по
-state/log/service и user-sync badges.
-
-### Available catalog
-
-**Install latest** активирует только manifest, заранее помещенный root installer
-в `/etc/infiproxy-modules.available.d`. Браузер не передает URL, repo, shell
-command или systemd unit.
-
-Подробно: [Модули и обновления](08-MODULES-AND-UPDATES).
-
-## IP Check
-
-| Элемент | Тип | Результат |
-|---|---|---|
-| IP address | ввод | Принимает только literal IPv4/IPv6, не hostname. |
-| **Analyze IP** | локально | Классифицирует адрес, делает PTR через `host`/`dig` и route lookup через `ip`/`route`. |
-| **Open** у provider | внешний просмотр | Открывает lookup конкретной third-party базы. |
-
-Панель не агрегирует reputation score и не отправляет address в providers в
-фоне. Ссылки ведут в Spamhaus, AbuseIPDB, VirusTotal, Cisco Talos, GreyNoise,
-Shodan, Censys, RIPEstat, BGP.Tools, IPinfo, Scamalytics, Project Honey Pot,
-StopForumSpam и BarracudaCentral.
-
-Speed diagnostics — это текстовые команды `ping`, `curl`, `iperf3`, `mtr`.
-Страница их не запускает, чтобы не создавать скрытую нагрузку/трафик.
-
-## System
-
-### Host overview
-
-Показывает OS/kernel, uptime/load average, память и root disk из локального Linux.
-Это snapshot на момент HTTP-запроса, не time-series monitoring.
-
-### Service control
-
-Таблица является read-only operational map: она показывает live state unit,
-путь конфига, команду проверки и точную root-команду применения. Кнопок
-restart/reload в HTTP нет. Выполняйте эти действия через
-`sudo infiproxy-manager`, чтобы web service не получал systemd/root privileges.
-
-### Uninstall planner
-
-Три кнопки **Preview ... removal/cleanup** только показывают runbook. Они не
-передают его shell и ничего не удаляют. Реальное удаление находится в root-TUI.
-
-## Configs
-
-Раздел owner-only. Для каждого allowlisted файла:
-
-| Элемент | Что делает |
+| Кнопка | Результат |
 |---|---|
-| Path/size/status | Только показывает выбранный путь и лимит. |
-| Textarea | Редактирует полный текст только для явно разрешенных runtime-файлов; Nginx и SSH read-only. |
-| **Save with backup** | Проверяет JSON/YAML/TOML/dotenv, создает sibling backup и атомарно заменяет файл. |
-| **Back to Configs** | Возврат после отчета. |
-| **Open System actions** | Переход к read-only operational map. |
+| Save source | Сохраняет HTTPS URL, format, interval и enabled |
+| Refresh now | Немедленно загружает bounded source и нормализует entries |
+| Delete source | Удаляет source metadata |
 
-Save не запускает native core configtest и не перезапускает сервис. Встроенный
-parser проверяет JSON/YAML/TOML/dotenv; Nginx/SSH остаются read-only и должны
-проверяться родными утилитами из TUI. Symlink path, NUL и превышение размера
-отвергаются. Подробно:
-[Конфигурационные файлы](11-CONFIGURATION).
+Background source checker просыпается каждые 5 минут и обновляет только due
+enabled sources. HTTP URL, private/loopback targets и oversized payload
+отклоняются.
 
-## Health и Ready
+## 11. Modules
 
-- `/health` всегда возвращает минимальный `ok\n`;
-- `/ready` возвращает `ready\n` после успешного SQLite query;
-- `/health` означает только liveness HTTP process;
-- `/ready` выполняет SQLite query и возвращает HTTP 503 при ошибке;
-- обе probe-страницы публичные и не содержат host details;
-- `/admin/health` требует admin session и показывает подробный dashboard.
+Runtime inventory read-only для любого admin; lifecycle controls видит owner.
 
-Health dashboard показывает process/components, app uptime, version, deployment,
-OS/load/memory/disk и service sensors. Он не делает end-to-end proxy request.
-
-## Credits
-
-**Open GitHub** открывает внешний репозиторий. GitHub stars на странице не
-загружаются API-вызовом; это статическая ссылка, поэтому панель не зависит от
-GitHub при обычном рендеринге Credits.
-
-## Коды результата и ожидания
-
-| Результат | Значение |
+| Кнопка | Результат |
 |---|---|
-| Redirect обратно в раздел | Обычно запись принята или request поставлен. |
-| `401` subscription | Token отсутствует/неверен. |
-| `403` subscription | User disabled, expired или quota reached. |
-| `404` rule provider | Slug неизвестен либо set disabled. |
-| `503 /ready` | SQLite query не прошел. |
+| Check all | Обновляет upstream metadata всех active manifests |
+| Check | Проверяет один module |
+| Install latest / Update | Создает typed root request |
+| Auto On/Off + Save | Меняет per-module opt-in |
+| Start/Stop/Restart | Создает typed systemd lifecycle request |
+| Remove | Требует module ID; blocked при enabled dependent resource |
+| Available catalog / Install latest | Активирует уже root-approved manifest |
 
-Для queued action HTTP redirect не является подтверждением update/install.
+Браузер не передает repo, asset URL, shell command, binary path или service
+name. Import нового manifest доступен только root SSH manager.
+
+## 12. IP Check
+
+Analyze IP валидирует IPv4/IPv6 и показывает локальные diagnostics. Open у
+каждой reputation database открывает внешний сайт и передает ему IP. Это не
+единый автоматический score и не гарантия чистоты.
+
+Speed diagnostics показывают команды/внешние инструменты; панель не запускает
+нагрузочный тест автоматически.
+
+## 13. System
+
+System показывает OS, kernel, uptime, load, memory, root disk, cookie mode,
+control-plane units и discovered runtimes. Service table read-only: Action -
+команда для SSH manager, а не web execution.
+
+Owner-only preview:
+
+| Кнопка | Что показывает |
+|---|---|
+| Preview panel-only removal | Control-plane cleanup, runtime modules remain |
+| Preview full footprint removal | Panel + managed runtime footprint |
+| Preview factory footprint cleanup | Максимальный известный footprint без purge OS packages |
+
+Preview экранируется как текст и ничего не выполняет. Запуск удаления только
+через sudo infiproxy-manager.
+
+## 14. Configs
+
+Текущий release показывает allowlisted files:
+
+- panel environment;
+- Nginx site;
+- SSH daemon config;
+- configs active module manifests.
+
+Все текущие specs имеют editable=false. Поэтому Save with backup не
+отображается, web-процесс не меняет root configs. Route сохранения остается
+защищенной owner/CSRF/allowlist validation, но без editable target не является
+доступной функцией.
+
+Изменяйте configs через SSH manager, затем выполняйте указанную validation и
+reload команду. Не считайте Configs встроенным shell/editor.
+
+## 15. Health
+
+Authenticated Health показывает:
+
+- SQLite readiness и cookie mode;
+- host sensors;
+- control-plane service states;
+- adapter/runtime/resource inventory;
+- desired/applied generation;
+- count-only user sync;
+- описание probe boundaries.
+
+Публичные /health и /ready возвращают минимальный plain text. /ready проверяет
+SQLite, но не все proxy listeners.
+
+## 16. Credits и коды ответа
+
+Credits содержит repository link и список компонентов. Open GitHub уводит на
+внешний сайт.
+
+Основные HTTP результаты:
+
+| Код | Значение |
+|---:|---|
+| 200/303 | Успех или redirect после POST |
+| 400 | Поле/config не прошли validation |
+| 401 | Нет/невалидная session или subscription token |
+| 403 | CSRF, owner boundary, disabled/expired/over-limit subscription |
+| 404 | Resource отсутствует |
+| 409 | Setup уже закрыт или конфликт |
+| 429 | Login rate limit / Argon2 workers busy |
+| 503 | SQLite/subscription configuration не ready |
+
+Ошибка UI не означает автоматический rollback всех внешних ручных действий.
+Для runtime mutation всегда проверяйте reconcile status и journal.

@@ -1,908 +1,368 @@
 # Диагностика и справочник
 
-Этот раздел предназначен для ситуации, когда установка, панель, updater или
-runtime уже ведут себя не так, как ожидалось. Диагностика строится снизу вверх:
-процесс → база/файл → listener → reverse proxy → DNS/TLS → внешний клиент.
+[Назад: безопасность](13-SECURITY-OPERATIONS) | [К оглавлению](Home) |
+[Далее: релиз](15-RELEASE-AND-COMPATIBILITY)
 
-> [!IMPORTANT]
-> Не начинайте с переустановки или удаления. Сначала сохраните логи, состояние,
-> commit, manifests и backup. Повторный idempotent installer часто помогает, но
-> не должен скрывать первопричину.
+## 1. Порядок диагностики
 
-## 1. Быстрый triage за пять минут
+Проверяйте слои сверху вниз:
 
-Выполните от `root`:
+1. Host: disk, memory, DNS, clock, network.
+2. Panel process: infiproxy.service.
+3. SQLite: /ready.
+4. Root control workers: updater/reconciler path/timer/service.
+5. Module binary/version/current symlink.
+6. Generated runtime config и native validator.
+7. systemd runtime service.
+8. TCP/UDP listener.
+9. Public DNS/firewall/TLS.
+10. Subscription generation и реальный client handshake.
 
-```bash
-date -Is
-uname -a
-df -h /
-free -h
-systemctl --failed --no-pager --full
-systemctl --no-pager --full status infiproxy.service
-journalctl -u infiproxy.service -n 120 --no-pager
-curl -i -H 'Accept: */*' http://127.0.0.1:8080/health
-curl -i -H 'Accept: */*' http://127.0.0.1:8080/ready
-ss -lntup
-```
+Не начинайте с переустановки: она может затереть evidence и не исправить
+невалидный desired state.
 
-Затем зафиксируйте versions:
+## 2. Минимальная сводка
 
-```bash
-git -C /opt/infiproxy/source rev-parse HEAD
-/usr/local/sbin/infiproxy-module-update --check-all
-systemctl list-timers 'infiproxy-*' --all
-```
+    date
+    uptime
+    df -h /
+    free -h
+    sudo systemctl --failed
+    sudo systemctl status infiproxy.service --no-pager --full
+    curl -i http://127.0.0.1:8080/health
+    curl -i http://127.0.0.1:8080/ready
+    sudo ss -lntup
 
-Интерпретация:
+/health=ok означает, что процесс отвечает. /ready=ok означает, что panel может
+выполнить SQLite query. Ни один endpoint не проверяет все proxy runtimes.
 
-| Наблюдение | Наиболее вероятный слой |
+## 3. Panel не запускается
+
+    sudo systemctl status infiproxy.service --no-pager --full
+    sudo journalctl -u infiproxy.service -n 200 --no-pager
+    sudo systemctl cat infiproxy.service
+    sudo sed -n '1,120p' /etc/infiproxy/infiproxy.env
+
+Не публикуйте setup token или DB URL с credentials. Типичные причины:
+
+| Симптом | Проверка |
 |---|---|
-| Unit failed до появления listener | Env, права, SQLite или binary startup. |
-| `/health` 200, `/ready` 503 | SQLite/storage. |
-| Оба local probes 200, снаружи timeout | Firewall, Nginx, DNS или provider network. |
-| HTTPS 502 | Nginx работает, backend панели недоступен. |
-| Runtime active, но клиент не подключается | Server config, protocol mismatch, TLS/SNI, UDP/firewall. |
-| Module download прошел, symlink не изменился | Checksum, extraction или smoke test. |
-
-## 2. Установка прервалась из-за SSH
-
-Bootstrap и installer рассчитаны на повторный запуск. После reconnect не удаляйте
-каталоги вслепую.
-
-### 2.1. Проверка оставшегося состояния
-
-```bash
-sudo systemctl --no-pager --full status infiproxy.service
-sudo journalctl -u infiproxy.service -n 100 --no-pager
-sudo test -d /opt/infiproxy/source/.git && echo source-ok
-sudo test -x /usr/local/sbin/infiproxy-manager && echo manager-ok
-sudo test -x /usr/local/bin/infiproxy && echo binary-ok
-```
-
-Если source checkout цел и manager установлен:
-
-```bash
-sudo infiproxy-manager --guided
-```
-
-Если manager еще не установлен, повторите bootstrap в `tmux`:
-
-```bash
-tmux new -s infiproxy-install
-curl -fsSL https://raw.githubusercontent.com/infinitrator/stealthhub-panel/main/deploy/bootstrap.sh \
-  | sudo bash -s -- --guided --with-nginx
-```
-
-`tmux` сохраняет процесс при потере клиентского соединения. Отсоединение:
-`Ctrl-b`, затем `d`; возврат:
-
-```bash
-tmux attach -t infiproxy-install
-```
-
-### 2.2. Очистка старых tmux sessions
-
-Посмотреть sessions:
-
-```bash
-tmux list-sessions
-```
-
-Удалить одну после проверки ее имени:
-
-```bash
-tmux kill-session -t OLD_NAME
-```
-
-Удалить все sessions текущего пользователя:
-
-```bash
-tmux kill-server
-```
-
-Последняя команда завершает и процессы внутри tmux; применяйте только когда
-убеждены, что там не выполняется updater/install/build.
-
-## 3. `unable to open database file` / SQLite code 14
-
-Сообщение:
-
-```text
-Failed to validate admin session: error returned from database:
-(code: 14) unable to open database file
-```
-
-означает, что процесс не может открыть сам файл или один из parent directories,
-создать sidecar/journal либо путь из `INFIPROXY_DB` неверен.
-
-### 3.1. Проверка URL и прав
-
-```bash
-sudo systemctl show infiproxy.service -p EnvironmentFiles -p User -p Group
-sudo grep '^INFIPROXY_DB=' /etc/infiproxy/infiproxy.env
-sudo namei -l /var/lib/infiproxy/infiproxy.sqlite
-sudo ls -la /var/lib/infiproxy
-```
-
-Штатный URL:
-
-```dotenv
-INFIPROXY_DB=sqlite:///var/lib/infiproxy/infiproxy.sqlite?mode=rwc
-```
-
-Безопасное исправление штатного layout:
-
-```bash
-sudo install -d -o infiproxy -g infiproxy -m 0750 /var/lib/infiproxy
-sudo find /var/lib/infiproxy -maxdepth 1 -type f -name 'infiproxy.sqlite*' \
-  -exec chown infiproxy:infiproxy {} + \
-  -exec chmod 0640 {} +
-sudo systemctl restart infiproxy.service
-```
-
-Если файла еще нет, не создавайте его командой `sudo sqlite3` от root: panel с
-`mode=rwc` создаст файл с правильным owner. Если БД существует, сначала сделайте
-backup и проверьте integrity.
-
-### 3.2. Дополнительные причины
-
-- filesystem read-only;
-- диск или inode заполнен;
-- путь находится на NFS/SMB;
-- `ProtectSystem` не разрешает измененный custom path;
-- AppArmor/SELinux policy блокирует путь;
-- parent directory не имеет execute bit для service user;
-- env содержит пробел/кавычки в неподдерживаемом формате.
-
-Проверка записи от имени сервиса без изменения БД:
-
-```bash
-sudo -u infiproxy test -r /var/lib/infiproxy/infiproxy.sqlite
-sudo -u infiproxy test -w /var/lib/infiproxy
-```
-
-## 4. Панель не запускается
-
-### 4.1. `Address already in use`
-
-```bash
-sudo ss -ltnp 'sport = :8080'
-sudo systemctl status infiproxy.service
-```
-
-Остановите только установленный конфликтующий процесс либо выберите другой
-loopback port и одновременно исправьте Nginx `proxy_pass`. Не меняйте panel bind
-на public address как обходное решение.
-
-### 4.2. Ошибка env
-
-```bash
-sudo systemd-analyze verify /etc/systemd/system/infiproxy.service
-sudo systemctl cat infiproxy.service
-sudo sed -n '1,120p' /etc/infiproxy/infiproxy.env
-```
-
-Секретов в штатном panel env нет, но перед отправкой вывода третьей стороне все
-равно просмотрите файл. Верните минимальный template из
-[раздела конфигурации](11-CONFIGURATION#3-окружение-панели) и рестартуйте.
-
-### 4.3. Binary не той архитектуры
-
-```bash
-uname -m
-file /usr/local/bin/infiproxy
-/usr/local/bin/infiproxy --version
-```
-
-Bootstrap собирает panel локально и обычно исключает mismatch. Ошибка чаще
-означает ручную установку чужого artifact.
-
-## 5. Login и browser session
-
-### 5.1. После login снова открывается форма
-
-Частая причина — `INFIPROXY_COOKIE_SECURE=true` при доступе по обычному HTTP.
-Secure cookie browser по HTTP не отправляет.
-
-Предпочтительное решение — завершить HTTPS. Для временного SSH tunnel:
-
-```bash
-sudo sed -i 's/^INFIPROXY_COOKIE_SECURE=.*/INFIPROXY_COOKIE_SECURE=false/' \
-  /etc/infiproxy/infiproxy.env
-sudo systemctl restart infiproxy.service
-```
-
-После выпуска certificate обязательно верните `true` и снова войдите.
-
-### 5.2. `/admin/setup` перенаправляет на login
-
-В БД уже есть admin. Проверьте count без вывода password hashes:
-
-```bash
-sudo sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
-  'SELECT id, username, created_at FROM admins ORDER BY id;'
-```
-
-Не удаляйте owner record без backup: foreign keys затрагивают sessions, а роль
-owner привязана к минимальному существующему admin ID.
-
-### 5.3. HTTP 403 `Security token is missing or invalid`
-
-Форма была открыта в старой/истекшей сессии либо cookie изменился. Обновите
-страницу, войдите снова и повторите действие один раз. Не отключайте CSRF.
-
-### 5.4. HTTP 429
-
-После пяти неудачных попыток username/source блокируется до конца 15-минутного
-окна. Проверьте, что Nginx передает корректный `X-Real-IP`, и дождитесь
-`Retry-After`. Restart панели сбрасывает in-memory limiter, но не должен
-использоваться как штатный обход.
-
-## 6. Panel updater failed
-
-Сначала соберите три источника:
-
-```bash
-sudo systemctl --no-pager --full status infiproxy-panel-update.service
-sudo journalctl -xeu infiproxy-panel-update.service --no-pager
-sudo tail -n 200 /var/lib/infiproxy-maintenance/panel-update-run.log
-```
-
-Проверьте source и state:
-
-```bash
-sudo cat /etc/infiproxy-update.conf
-sudo git -C /opt/infiproxy/source status --short
-sudo git -C /opt/infiproxy/source rev-parse HEAD
-sudo sed -n '1,160p' /var/lib/infiproxy/panel-update-state.env
-sudo ls -la /var/lib/infiproxy-maintenance/update-backups
-```
-
-Не публикуйте state без просмотра: в нем нет ожидаемых proxy secrets, но любой
-diagnostic artifact нужно проверять перед отправкой.
-
-### 6.1. Installed и latest одинаковы, но Update now запущен
-
-Текущий TUI создает immediate request даже при `status current`. Root updater
-может повторно собрать тот же commit. Само совпадение SHA не является ошибкой;
-failure ищите дальше в build, installer, Nginx validation или readiness.
-
-Если новая версия не нужна, удалите только необработанный request после
-остановки updater:
-
-```bash
-sudo systemctl stop infiproxy-panel-update.service
-sudo rm -f /var/lib/infiproxy/panel-update-now.request
-```
-
-Не удаляйте `update-backups` и source checkout.
-
-### 6.2. Безопасный повторный update из терминала
-
-Если update действительно доступен:
-
-```bash
-sudo install -m 0640 -o root -g root /dev/null \
-  /var/lib/infiproxy/panel-update-now.request
-sudo systemctl start infiproxy-panel-update.service
-sudo systemctl --no-pager --full status infiproxy-panel-update.service
-```
-
-Updater сам делает pre-update backup. Если service завершается ошибкой, не
-запускайте его циклически: сначала изучите log и последний backup.
-
-### 6.3. Source содержит локальные изменения
-
-Panel updater переключает checkout принудительно и не предназначен для хранения
-production edits. Сначала сохраните patch в отдельный private repository/branch:
-
-```bash
-sudo git -C /opt/infiproxy/source status --short
-sudo git -C /opt/infiproxy/source diff > /root/infiproxy-local.patch
-sudo chmod 0600 /root/infiproxy-local.patch
-```
-
-После этого используйте reviewed commit как update ref. Не полагайтесь на
-uncommitted files внутри managed checkout.
-
-### 6.4. Ручное восстановление из pre-update backup
-
-Если automatic rollback неполон, следуйте
-[процедуре восстановления](12-BACKUP-RESTORE-UNINSTALL#4-восстановление-панели).
-Сначала остановите updater timers/path, чтобы они не начали новый цикл во время
-restore.
-
-## 7. Module helper сообщает `invalid type: null, expected a string`
-
-Это означает несовместимость установленного Rust manifest helper со схемой
-текущего GitHub release JSON, где digest/checksum field может быть `null`.
-Обновлять runtime старым helper не следует.
-
-Сверьте timestamps и hashes:
-
-```bash
-sudo ls -l /usr/local/libexec/infiproxy-module-manifest
-git -C /opt/infiproxy/source rev-parse HEAD
-```
-
-Если source уже обновлен, а helper остался старым, пересоберите и повторно
-запустите idempotent installer:
-
-```bash
-cd /opt/infiproxy/source
-cargo build --release -p stealthhub-panel
-sudo bash deploy/install.sh
-```
-
-Installer сохраняет существующий env и runtime configs без `--force-env`.
-После этого:
-
-```bash
-sudo /usr/local/sbin/infiproxy-module-update --check-all
-```
-
-Не заменяйте `null` выдуманной checksum и не отключайте fail-closed проверку.
-
-## 8. Module download или checksum failed
-
-### 8.1. Сеть/GitHub
-
-```bash
-curl -I https://api.github.com/rate_limit
-getent ahosts github.com
-curl -4I https://github.com/
-curl -6I https://github.com/
-```
-
-Если IPv6 route сломан, только для конкретного update:
-
-```bash
-sudo INFIPROXY_FORCE_IPV4=true \
-  /usr/local/sbin/infiproxy-module-update --update hysteria
-```
-
-`INFIPROXY_FORCE_IPV4` влияет на download, а не исправляет checksum, smoke test
-или server config.
-
-### 8.2. Digest/checksum отсутствует
-
-Updater намеренно прекращает установку, если GitHub asset digest и официальный
-checksum sidecar не дают валидный SHA-256. Это безопасное поведение. Возможные
-действия:
-
-1. Обновить panel/helper до ревизии с актуальным parser.
-2. Проверить официальный upstream release и manifest asset pattern.
-3. Дождаться исправленного upstream release/checksum.
-4. Для ручного import получить SHA-256 из отдельного доверенного канала.
-
-Нельзя подставлять локально вычисленный hash только что скачанного файла как
-доказательство подлинности: он проверяет целостность повторной копии, но не
-происхождение первой.
-
-## 9. `smoke test failed; current symlink was not changed`
-
-Это fail-safe: новая version directory могла быть создана, но active `current`
-остался прежним.
+| unable to open database file | Parent ownership/mode, DB URL, disk |
+| setup token too short | Admins table пуста и token < 32 chars |
+| address already in use | ss -ltnp sport=:8080 |
+| permission denied | systemd sandbox + file ownership |
+| SQLite migration error | Backup, integrity_check, exact binary SHA |
+
+Production permissions:
+
+    sudo namei -l /var/lib/infiproxy/infiproxy.sqlite
+    sudo -u infiproxy test -r /var/lib/infiproxy/infiproxy.sqlite
+    sudo -u infiproxy test -w /var/lib/infiproxy
+
+Ожидается /var/lib/infiproxy owner infiproxy:infiproxy mode 0750, database
+обычно 0640. Не делайте chmod 777.
+
+## 4. Забыты login/password
+
+Штатного password-reset CLI в текущем release нет. Если существует другая
+рабочая admin session, откройте Account и используйте Change Password.
+
+Если доступ потерян полностью, аварийный путь удаляет только admin accounts и
+sessions, после чего first-owner setup открывается заново. Users/profiles/
+subscriptions остаются, но операция требует root и verified backup.
+
+1. Откройте provider console или устойчивую SSH/tmux session.
+2. Сделайте SQLite .backup и integrity_check.
+3. Остановите panel.
+4. Удалите admin rows в одной transaction.
+5. Убедитесь, что INFIPROXY_SETUP_TOKEN содержит минимум 32 символа.
+6. Запустите panel и создайте нового owner через SSH tunnel.
+
+    backup=/var/backups/infiproxy/admin-recovery-$(date -u +%Y%m%dT%H%M%SZ).sqlite
+    sudo install -d -o root -g root -m 0700 /var/backups/infiproxy
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".backup '$backup'"
+    sudo chmod 0600 "$backup"
+    sudo sqlite3 "$backup" 'PRAGMA integrity_check;'
+    sudo systemctl stop infiproxy.service
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite <<'SQL'
+    PRAGMA foreign_keys=ON;
+    BEGIN IMMEDIATE;
+    DELETE FROM admin_sessions;
+    DELETE FROM admins;
+    COMMIT;
+    SQL
+    sudo systemctl start infiproxy.service
+
+Используйте tunnel:
+
+    ssh -L 8080:127.0.0.1:8080 root@SERVER
+
+Откройте http://127.0.0.1:8080/admin/setup. После восстановления проверьте
+Settings, update source, profiles, manifests и active sessions. Считайте старые
+admin credentials скомпрометированными.
+
+## 5. Login отклоняется
+
+- Проверьте точный username; сравнение case-sensitive.
+- Подождите окно rate-limit после серии ошибок.
+- Источник может определяться trusted forwarded header только в настроенной
+  reverse-proxy модели.
+- Argon2 worker pool ограничен двумя jobs; при перегрузке возможен 503/Retry.
+- Cookie Secure не отправляется по HTTP. Для production используйте HTTPS; для
+  loopback development COOKIE_SECURE=false.
+
+Не отключайте throttling и Secure cookie как постоянное исправление.
+
+## 6. Subscription 401/403/503
+
+| Код | Причина |
+|---:|---|
+| 401 | Token не найден, старый после reset или user удален |
+| 403 | User disabled, expired или stored quota condition блокирует |
+| 503 | Profile/secret/policy/runtime capability incomplete |
+
+Проверяйте без вывода token в shared terminal:
+
+    curl --config <(printf 'url = "https://SUB_HOST/sub/%s/mihomo.yaml"\n' "$TOKEN")
+
+503 требует проверки enabled profiles, present secret names, installed runtime
+capabilities и routing policy. Server logs редактируют детали и не должны
+печатать secret values.
+
+## 7. Reconcile Pending/Failed/RolledBack
+
+    sudo systemctl status infiproxy-reconcile.path \
+      infiproxy-reconcile.timer infiproxy-reconcile.service --no-pager
+    sudo journalctl -u infiproxy-reconcile.service -n 200 --no-pager
+    sudo find /var/lib/infiproxy/reconcile-requests -maxdepth 1 -type f -ls
+    sudo find /var/lib/infiproxy-maintenance/reconcile -maxdepth 2 -type f -ls
 
 Проверьте:
 
-```bash
-uname -m
-file /opt/infiproxy/cores/MODULE/VERSION/BINARY
-mount | grep ' /opt '
-readlink -f /opt/infiproxy/cores/MODULE/current
-```
+- request regular/bounded/app-owned и safe mode;
+- desired generation существует в SQLite;
+- protocol/core adapter и capability доступны;
+- exact runtime version совместима;
+- root-only/shared secrets разрешаются;
+- listener network+port уникален;
+- TLS pair ready;
+- native validator принимает candidate.
 
-Запустите ровно тот version command, который ожидает installer:
+RolledBack означает, что previous state восстановлен. RecoveryRequired требует
+ручного restore; не удаляйте journal. Полный contract:
+[Desired state](09-RECONCILIATION-AND-DESIRED-STATE).
 
-| Module | Smoke command |
+## 8. Runtime не установлен или inactive
+
+    sudo infiproxy-module-update --check <id>
+    sudo ls -la /opt/infiproxy/cores/<id>
+    sudo readlink -f /opt/infiproxy/cores/<id>/current
+    sudo systemctl status infiproxy-<id>.service --no-pager
+
+Installed binary и active service - разные состояния. Reconciler активирует
+runtime, только когда desired resources его требуют. Start из Modules создаст
+typed lifecycle request, но пустой/invalid config может снова остановить unit.
+
+## 9. Module update failed
+
+    sudo systemctl status infiproxy-module-update.service --no-pager --full
+    sudo journalctl -u infiproxy-module-update.service -n 200 --no-pager
+    sudo tail -n 200 /var/lib/infiproxy-maintenance/module-update.log
+
+Типичные причины:
+
+- GitHub API/network/IPv6;
+- asset отсутствует для architecture;
+- digest/checksum отсутствует или не совпал;
+- archive safety limit/path validation;
+- binary smoke test;
+- active service не прошел canary;
+- module ID retired/unknown;
+- active desired resource блокирует remove.
+
+Updater не меняет current symlink при failed verification. Если service failed
+после switch, он пытается вернуть previous target и state. Для хоста со
+сломавшимся IPv6 допустим разовый:
+
+    sudo INFIPROXY_FORCE_IPV4=true \
+      /usr/local/sbin/infiproxy-module-update --update <id>
+
+## 10. Panel update failed
+
+    sudo cat /etc/infiproxy-update.conf
+    sudo systemctl status infiproxy-panel-update.service --no-pager --full
+    sudo journalctl -u infiproxy-panel-update.service -n 200 --no-pager
+    sudo tail -n 200 /var/lib/infiproxy-maintenance/panel-update-run.log
+    sudo sed -n '1,160p' /var/lib/infiproxy/panel-update-state.env
+    sudo sed -n '1,160p' /var/lib/infiproxy-maintenance/panel-update-status.env
+
+Ожидаемый production source:
+
+    REPO=infinitrator/stealthhub-panel
+    REF=main
+
+Manual и scheduled paths используют этот файл. SQLite не должен заменять
+REPO/REF. Возможные причины: non-fast-forward, build/test/install failure,
+backup failure, DB compatibility failure, local /ready failure.
+
+Failed update должен восстановить previous source/config/DB/control binaries.
+Сравните:
+
+    sudo git -C /opt/infiproxy/source rev-parse HEAD
+    sudo cat /var/lib/infiproxy-maintenance/panel-last-applied.sha
+
+Не меняйте marker вручную.
+
+## 11. TLS runtime not ready
+
+    sudo namei -l /etc/infiproxy-cores/tls/fullchain.pem
+    sudo namei -l /etc/infiproxy-cores/tls/privkey.pem
+    getent passwd infiproxy-runtime
+    getent group infiproxy-runtime
+    sudo -u infiproxy-runtime test -r /etc/infiproxy-cores/tls/fullchain.pem
+    sudo -u infiproxy-runtime test -r /etc/infiproxy-cores/tls/privkey.pem
+    openssl x509 -in /etc/infiproxy-cores/tls/fullchain.pem -noout \
+      -subject -issuer -dates
+
+Directory и files должны иметь actual runtime GID, а не просто одинаковую
+случайную group. Каждый ancestor symlink target должен быть traversable.
+Installer не изменяет ownership/mode symlink target.
+
+Проверьте key match без вывода private key:
+
+    openssl x509 -in /etc/infiproxy-cores/tls/fullchain.pem -pubkey -noout \
+      | openssl pkey -pubin -outform DER | sha256sum
+    openssl pkey -in /etc/infiproxy-cores/tls/privkey.pem -pubout -outform DER \
+      | sha256sum
+
+Hashes должны совпасть.
+
+## 12. Nginx/HTTPS
+
+    sudo nginx -t
+    sudo systemctl status nginx.service infiproxy.service --no-pager
+    sudo journalctl -u nginx.service -n 100 --no-pager
+    curl -i http://127.0.0.1:8080/ready
+
+Local ready + public 502 обычно означает proxy_pass/SELinux/Nginx problem.
+Certificate mismatch проверяйте по hostname, SNI, chain и expiry.
+
+Cloudflare DNS-01 token должен иметь только Zone:Read и DNS:Edit для нужной
+zone. Не выводите credential file.
+
+## 13. Port/listener problem
+
+    sudo ss -lntup
+    sudo systemctl status infiproxy-xray.service \
+      infiproxy-sing-box.service infiproxy-hysteria.service \
+      infiproxy-tuic.service infiproxy-mihomo.service --no-pager
+
+Сравнивайте network:
+
+- TCP 443 Nginx не конфликтует с UDP 443 Hysteria;
+- одинаковый TCP+port или UDP+port конфликтует;
+- disabled starter profile не обязан иметь listener;
+- listener process должен соответствовать ожидаемому PID/service.
+
+Firewall проверяйте отдельно для IPv4/IPv6 и TCP/UDP. Loopback backend 8080 не
+открывайте публично.
+
+## 14. Routing/rule source
+
+YAML provider:
+
+    curl -i https://SUB_HOST/rules/<slug>.yaml
+
+MRS для mixed classical set не поддержан и возвращает 501. Remote source должен
+использовать HTTPS public URL, допустимый format и bounded response. Проверяйте
+last error/refresh metadata в Routing.
+
+Если generated YAML не проходит Mihomo:
+
+    mihomo -t -f downloaded.yaml
+
+Не передавайте файл третьим лицам: он содержит credentials.
+
+## 15. Configs page
+
+Configs read-only. Отсутствие Save with backup - ожидаемый contract, а не
+ошибка permissions. Если file показывает:
+
+| Status | Причина |
 |---|---|
-| sing-box | `sing-box version` |
-| Hysteria | `hysteria version` |
-| Xray | `xray version`, fallback `xray --version` |
-| TUIC | `tuic-server --version` |
-| Mihomo | `mihomo -v` |
+| file does not exist yet | Optional config не создан |
+| file is larger... | Превышен browser read limit |
+| symlinked config paths... | Path traversal hardening |
+| path is not a regular file | Directory/device/socket |
+| read error | Panel sandbox/permissions |
 
-Пример:
+Изменяйте file через SSH manager, выполняйте native validation и reload.
 
-```bash
-/opt/infiproxy/cores/sing-box/1.13.14/sing-box version
-echo $?
-```
+## 16. Справочник services
 
-Причины:
-
-- asset не той архитектуры;
-- upstream изменил CLI;
-- filesystem смонтирован `noexec`;
-- binary поврежден несмотря на ошибочно выбранный checksum asset;
-- отсутствует dynamic loader/library у не-static binary;
-- old installer использует устаревший smoke command.
-
-Не переключайте `current` вручную до успешного запуска binary. Сначала обновите
-installer или manifest, затем повторите module update.
-
-## 10. Module status `installed=unknown`
-
-Updater читает version marker:
-
-```text
-/var/lib/infiproxy-maintenance/module-versions/<id>.version
-```
-
-Binary может существовать после старого/manual install, но marker отсутствовать.
-`unknown` не означает автоматически, что binary поврежден. Проверьте symlink и
-version, затем запустите штатный `--update <id>`: если upstream trusted metadata
-валидна, updater установит/признает версию и запишет marker.
-
-Не создавайте marker вручную без проверки binary provenance.
-
-## 11. Module request застрял
-
-Проверьте watcher, queue и failed files:
-
-```bash
-sudo systemctl status infiproxy-module-update.path
-sudo systemctl status infiproxy-module-update.service
-sudo find /var/lib/infiproxy/module-requests -maxdepth 1 -type f -ls
-sudo tail -n 200 /var/lib/infiproxy-maintenance/module-update.log
-```
-
-Файл `.failed` сохраняется намеренно для диагностики. После исправления причины
-создайте новый запрос кнопкой/TUI; не переименовывайте неизвестный failed request
-в active без проверки его содержимого.
-
-Перезапуск watcher:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now infiproxy-module-update.timer \
-  infiproxy-module-update.path
-```
-
-## 12. Runtime unit active, но proxy не работает
-
-`active` означает только, что процесс не завершился. Проверяйте data plane:
-
-```bash
-sudo systemctl --no-pager --full status infiproxy-MODULE.service
-sudo journalctl -u infiproxy-MODULE.service -n 150 --no-pager
-sudo ss -lntup
-```
-
-Сверьте server и Mihomo:
-
-| Поле | Должно совпасть |
-|---|---|
-| Protocol | VLESS/SS/Hysteria2/TUIC/AnyTLS и точная версия/вариант. |
-| Address | Публичный DNS/IP, доступный клиенту. |
-| Port | Listener runtime и profile port. |
-| Credential | UUID/password/secret. |
-| TLS name | Certificate SAN и client SNI. |
-| Transport | TCP/XHTTP/QUIC и transport-specific path/host. |
-| REALITY | Public key, short ID, server name и flow. |
-| Network family | IPv4/IPv6 route и firewall. |
-
-Тестируйте из другой сети. Подключение к public IP с самого VPS может проходить
-или ломаться иначе из-за hairpin routing/provider firewall.
-
-## 13. Hysteria/TUIC и UDP
-
-### Симптомы
-
-- TCP-панель работает, QUIC protocol timeout;
-- unit active, но client handshake не начинается;
-- работает в одной сети и не работает в другой.
-
-Проверка:
-
-```bash
-sudo ss -lunp
-sudo nft list ruleset
-sudo ufw status verbose
-```
-
-Убедитесь, что cloud firewall/security group тоже разрешает UDP. `curl` проверяет
-TCP/HTTP и не тестирует QUIC runtime.
-
-Для Hysteria starter ожидается UDP/443. Для TUIC starter — UDP/11443. Эти порты
-можно изменить, но обе стороны и firewall должны быть обновлены одновременно.
-
-Плохой throughput может быть связан с MTU, packet loss, congestion control,
-CPU saturation или provider UDP shaping. Не увеличивайте параметры вслепую;
-сначала сравните packet capture/metrics и официальный performance guide.
-
-## 14. Подписка Mihomo не импортируется
-
-### 14.1. Проверка HTTP
-
-```bash
-curl -fsS -D /tmp/sub.headers \
-  'https://panel.example.com/sub/TOKEN/mihomo.yaml' \
-  -o /tmp/mihomo.yaml
-sed -n '1,40p' /tmp/sub.headers
-```
-
-Не отправляйте `/tmp/mihomo.yaml` третьей стороне без удаления credentials.
-
-### 14.2. Что искать
-
-```bash
-grep -n 'REPLACE_WITH\|xray\.reality\|hysteria2\.\|tuic\.password' \
-  /tmp/mihomo.yaml
-```
-
-Любой placeholder или literal secret name означает незавершенную настройку.
-
-Проверьте YAML parser самого Mihomo, если клиент предоставляет test command.
-Версии Mihomo различаются по поддержке XHTTP/AnyTLS и полям transport, поэтому
-обновите клиент до совместимой версии и сверяйтесь с
-[официальной документацией](https://wiki.metacubex.one/en/).
-
-### 14.3. HTTP 404/410/403
-
-| Ответ | Возможная причина |
-|---|---|
-| 404 | Token не существует или rule set slug неизвестен. |
-| 403 | User отключен. |
-| 410 | User истек либо quota считается исчерпанной. |
-| 500 | DB/generator error; смотреть panel journal. |
-
-Reset token немедленно инвалидирует старый URL.
-
-## 15. Routing provider возвращает 404
-
-Endpoint `/rules/<slug>` публикует только enabled set. Если выключить все sets,
-generator текущей ревизии может использовать default references, но endpoints
-останутся disabled и ответят 404.
-
-Исправление:
-
-1. Включите минимум один корректный rule set.
-2. Убедитесь, что `subscription_domain` указывает на доступный HTTPS hostname.
-3. Откройте каждый generated provider URL вручную.
-4. Проверьте payload validator и первую-match семантику.
-
-Rule providers публичны и не требуют user token; секретов в payload быть не
-должно.
-
-## 17. Cloudflare, certificate и Nginx
-
-### 17.1. Zone not found / API error
-
-Проверьте:
-
-- token относится к правильному Cloudflare account;
-- scope ограничивает, но включает нужную zone;
-- есть `Zone:Read` и `DNS:Edit`;
-- zone input — apex `example.com`, record input — полный hostname;
-- token не содержит случайного пробела/newline.
-
-Не запускайте `set -x` при работе с token.
-
-### 17.2. Certificate issuance failed
-
-```bash
-sudo certbot certificates
-sudo journalctl -u certbot.timer -n 120 --no-pager
-sudo ls -l /root/.secrets/certbot/cloudflare.ini
-```
-
-Credential file должен иметь mode `0600`. DNS-01 зависит от propagation;
-повторный частый выпуск может попасть под Let’s Encrypt rate limit.
-
-### 17.3. Nginx 502
-
-```bash
-sudo nginx -t
-sudo systemctl status nginx.service infiproxy.service
-curl -i http://127.0.0.1:8080/ready
-sudo journalctl -u nginx.service -n 100 --no-pager
-```
-
-Если local readiness работает, проверьте `proxy_pass`, SELinux policy и Nginx
-error log. Если не работает, проблема в panel/storage, а не certificate.
-
-## 18. Configs: Save with backup failed
-
-| Сообщение | Причина |
-|---|---|
-| `unknown config target` | Устаревшая форма/slug или module удален. Обновить страницу. |
-| `content is larger...` | Превышен per-file limit. Редактировать через root editor после backup. |
-| `content contains NUL bytes` | Файл бинарный/поврежден, web-editor его не принимает. |
-| `symlinked config paths are not allowed` | Путь или parent является symlink; защита от path redirection. |
-| `path is not a regular file` | Directory/device/socket вместо файла. |
-| `backup failed` | Permissions, read-only filesystem, no space или inode exhaustion. |
-| `write failed` | Panel user/group не имеет записи либо systemd sandbox запрещает путь. |
-
-После успешного save service не reload автоматически. Выполните validation и
-apply через TUI/root shell.
-
-## 19. Web System button failed
-
-Страница честно показывает stdout/stderr фиксированной команды. Штатный panel
-user обычно не имеет права `systemctl restart`. Это ожидаемая граница
-привилегий, а не повод выдавать полный sudo.
-
-Используйте:
-
-```bash
-sudo infiproxy-manager
-```
-
-Для Xray/sing-box/Hysteria/TUIC валидируйте конфигурацию соответствующим binary.
-
-## 20. IP Check показывает мало данных
-
-Вкладка выполняет только локальные операции: validation literal IP, reverse DNS
-и route lookup. Она не опрашивает автоматически репутационные базы и не запускает
-speed test. Каждая внешняя ссылка передает выбранный IP соответствующему
-провайдеру только после клика.
-
-Результаты reputation-сервисов могут расходиться и устаревать. Проверяйте ASN,
-PTR, BGP origin и конкретный blocklist; не сводите решение к одному score.
-
-## 21. Нехватка памяти или медленная сборка
-
-Runtime panel легкий, но Rust release build требует больше RAM/CPU, чем работа
-готового binary.
-
-Проверьте:
-
-```bash
-free -h
-swapon --show
-journalctl -k -g 'Out of memory\|Killed process' --no-pager
-```
-
-На слабом VPS собирайте release на отдельной совместимой машине/CI либо временно
-добавьте swap согласно политике хоста. Swap не заменяет RAM и может сильно
-замедлить build. После установки уменьшите параллелизм source build при
-необходимости; не ограничивайте память systemd до подтверждения реального peak.
-
-## 22. Полный справочник путей
-
-### 22.1. Control plane
-
-| Путь | Назначение |
-|---|---|
-| `/usr/local/bin/infiproxy` | Panel binary. |
-| `/etc/infiproxy/infiproxy.env` | Runtime environment. |
-| `/var/lib/infiproxy/infiproxy.sqlite` | Panel SQLite. |
-| `/var/lib/infiproxy/panel-update-state.env` | Checker state для root updater/UI. |
-| `/var/lib/infiproxy/panel-update-now.request` | Immediate update trigger. |
-| `/var/lib/infiproxy/module-requests` | Typed module queue. |
-| `/opt/infiproxy/source` | Managed Git checkout. |
-
-### 22.2. Root maintenance
-
-| Путь | Назначение |
-|---|---|
-| `/usr/local/sbin/infiproxy-manager` | SSH-TUI. |
-| `/usr/local/sbin/infiproxy-panel-update` | Panel root updater. |
-| `/usr/local/sbin/infiproxy-module-update` | Module root updater. |
-| `/usr/local/sbin/infiproxy-core-install` | Verified archive installer. |
-| `/usr/local/libexec/infiproxy-module-manifest` | Rust manifest/GitHub JSON helper. |
-| `/etc/infiproxy-update.conf` | Root-owned GitHub repo/ref. |
-| `/etc/infiproxy-modules.d` | Active manifests. |
-| `/etc/infiproxy-modules.available.d` | Available catalog. |
-| `/var/lib/infiproxy-maintenance` | Logs, versions, builds, locks metadata и backups. |
-
-### 22.3. Runtime
-
-| Путь | Назначение |
-|---|---|
-| `/opt/infiproxy/cores/<id>/<version>` | Versioned proxy binaries. |
-| `/opt/infiproxy/cores/<id>/current` | Atomic active symlink. |
-| `/etc/infiproxy-cores/<id>` | Proxy configs. |
-| `/etc/infiproxy-cores/tls` | Starter TLS location для Hysteria/TUIC. |
-| `/var/log/infiproxy-cores` | Runtime log directory, если unit/config его использует. |
-
-## 23. systemd units
-
-| Unit | Тип | Что запускает |
+| Unit | Identity | Назначение |
 |---|---|---|
-| `infiproxy.service` | long-running | Rust web panel. |
-| `infiproxy-panel-update.service` | oneshot root | Panel update when due/requested. |
-| `infiproxy-panel-update.timer` | timer | Проверка due каждые 15 минут. |
-| `infiproxy-panel-update.path` | path | Immediate request watcher. |
-| `infiproxy-module-update.service` | oneshot root | Queue + automatic runtime-module work. |
-| `infiproxy-module-update.timer` | timer | Due work каждые 15 минут. |
-| `infiproxy-module-update.path` | path | Queue watcher. |
-| `infiproxy-xray.service` | long-running | Xray current binary. |
-| `infiproxy-sing-box.service` | long-running | sing-box current binary. |
-| `infiproxy-hysteria.service` | long-running | Hysteria current binary. |
-| `infiproxy-tuic.service` | long-running | TUIC current binary. |
-| `infiproxy-mihomo.service` | long-running | Mihomo current binary. |
+| infiproxy.service | infiproxy | Web control plane |
+| infiproxy-reconcile.service | root oneshot | Desired-state transaction |
+| infiproxy-reconcile.path/timer | systemd | Request/recovery scheduling |
+| infiproxy-panel-update.service | root oneshot | Panel update |
+| infiproxy-panel-update.path/timer | systemd | Immediate/scheduled panel update |
+| infiproxy-module-update.service | root oneshot | Runtime lifecycle |
+| infiproxy-module-update.path/timer | systemd | Requests/daily auto update |
+| infiproxy-{runtime}.service | infiproxy-runtime | Proxy data plane |
 
-Команды:
+## 17. Справочник HTTP routes
 
-```bash
-systemctl cat UNIT
-systemctl is-enabled UNIT
-systemctl is-active UNIT
-systemctl --no-pager --full status UNIT
-journalctl -u UNIT -n 120 --no-pager
-```
-
-## 24. Default port plan
-
-| Protocol/address | Default consumer | Public? |
-|---|---|---:|
-| TCP `22` | SSH, если distro default не изменен | Ограниченно. |
-| TCP `80` | Nginx redirect | Да, optional. |
-| TCP `443` | Nginx panel virtual host | Да. |
-| UDP `443` | Hysteria starter | Только если настроен. |
-| TCP `127.0.0.1:8080` | Infiproxy | Нет. |
-| TCP `8443` | VLESS XHTTP starter profile | Да, после настройки Xray inbound. |
-| TCP `12443` | Trojan TLS starter | Да, если настроен. |
-| TCP `13443` | Snell v5 starter | Да, если настроен. |
-| TCP `14443` | Mieru TCP starter | Да, если настроен. |
-| UDP `11443` | TUIC starter | Да, если настроен. |
-| Configurable | Xray/sing-box inbounds | По конфигу. |
-
-Перед изменением:
-
-```bash
-sudo ss -lntup
-```
-
-## 25. HTTP endpoints
-
-| Method/path | Доступ | Назначение |
+| Route | Access | Contract |
 |---|---|---|
-| `GET /` | Public | Entry page. |
-| `GET/POST /admin/setup` | Public только до первого admin | Owner creation. |
-| `GET/POST /admin/login` | Public | Login. |
-| `POST /admin/logout` | Admin + CSRF | Logout. |
-| `GET /admin` | Admin | Dashboard. |
-| `GET/POST /admin/account` | Admin + CSRF для POST | Password rotation и session revocation. |
-| `/admin/users*` | Admin + CSRF для POST | User lifecycle. |
-| `/admin/settings` | Admin; update controls owner-only | Panel/client/update settings. |
-| `/admin/protocols*` | Admin + CSRF | Mihomo profile editor. |
-| `/admin/secrets*` | Owner-only + CSRF для POST | Write-only secret value lifecycle. |
-| `/admin/routing*` | Admin + CSRF | Rule sets. |
-| `/admin/cores*` | View admin; actions owner-only | Runtime module catalog. |
-| `/admin/ip` | Admin | Local IP diagnosis/external links. |
-| `/admin/system*` | View admin; preview owner-only + CSRF | Sensors, command map, uninstall preview. |
-| `/admin/configs` | Owner-only + CSRF save | Allowlist config editor. |
-| `/admin/health` | Admin | Detailed host/service diagnostics. |
-| `/admin/credits` | Admin | Project/license credits. |
-| `GET /health` | Public | Minimal plain-text liveness. |
-| `GET /ready` | Public | SQLite readiness. |
-| `GET /sub/<token>` | Bearer URL | User subscription page. |
-| `GET /sub/<token>/mihomo.yaml` | Bearer URL | Generated Mihomo config. |
-| `GET /rules/<slug>` | Public if enabled | Rule-provider YAML. |
+| /health | Public | Plain liveness |
+| /ready | Public | Plain SQLite readiness |
+| /admin/setup | Public только до первого admin | Owner creation |
+| /admin/login | Public | Login |
+| /admin/account | Admin | Password rotation |
+| /admin/users* | Admin mutations + CSRF | User lifecycle |
+| /admin/settings | Admin; update fields owner | Settings |
+| /admin/protocols* | View admin; mutations owner | Profiles |
+| /admin/secrets* | Owner | Shared secrets |
+| /admin/routing* | View admin; mutations owner | Routing |
+| /admin/cores | View admin; lifecycle owner | Modules |
+| /admin/system | Admin; uninstall preview owner | Host view |
+| /admin/configs | Owner, read-only targets | Config inspection |
+| /admin/health | Admin | Detailed health |
+| /sub/{token} | Bearer URL | Account |
+| /sub/{token}/mihomo.yaml | Bearer URL | Client config |
+| /rules/{slug} | Public when enabled | YAML provider |
 
-## 26. Локальная разработка
+## 18. Локальная разработка
 
-Используйте отдельную временную БД и insecure cookie только на loopback:
+    export INFIPROXY_SETUP_TOKEN="$(openssl rand -hex 32)"
+    INFIPROXY_BIND=127.0.0.1:8080 \
+    INFIPROXY_DB='sqlite://./infiproxy.local.sqlite?mode=rwc' \
+    INFIPROXY_COOKIE_SECURE=false \
+    cargo run -p stealthhub-panel
 
-```bash
-INFIPROXY_BIND=127.0.0.1:8080 \
-INFIPROXY_DB='sqlite:///tmp/infiproxy-dev.sqlite?mode=rwc' \
-INFIPROXY_DB_MAX_CONNECTIONS=2 \
-INFIPROXY_COOKIE_SECURE=false \
-INFIPROXY_SETUP_TOKEN="$(openssl rand -hex 32)" \
-RUST_LOG='stealthhub_panel=debug,tower_http=info' \
-cargo run -p stealthhub-panel
-```
+Не указывайте production DB/config paths локальному process. Внутренние crate
+names stealthhub-* остаются package identifiers и не являются именем продукта.
 
-Откройте:
+## 19. Безопасный support bundle
 
-```text
-http://127.0.0.1:8080/admin/setup
-```
+Можно передать:
 
-Удаление временного state после остановки процесса:
+- exact commit SHA;
+- sanitized unit state;
+- sanitized journal errors;
+- OS/kernel/version;
+- redacted listener list;
+- test command + exit status.
 
-```bash
-rm -f /tmp/infiproxy-dev.sqlite \
-  /tmp/infiproxy-dev.sqlite-shm \
-  /tmp/infiproxy-dev.sqlite-wal
-```
+Нельзя передавать:
 
-Никогда не направляйте dev process на production SQLite.
-
-## 27. Проверки перед commit/release
-
-Команды соответствуют GitHub Actions:
-
-```bash
-cargo fmt --all -- --check
-cargo check --locked --workspace --all-targets --all-features
-cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
-cargo test --locked --workspace --all-targets --all-features
-```
-
-Deployment contracts:
-
-```bash
-shellcheck -x \
-  deploy/bootstrap.sh \
-  deploy/install.sh \
-  deploy/panel-update.sh \
-  deploy/module-update.sh \
-  deploy/cores/install-core.sh \
-  deploy/infiproxy-manager.sh \
-  deploy/infiproxy-profile.sh \
-  deploy/tests/updater-regression.sh \
-  deploy/tests/http-smoke.sh \
-  deploy/tests/wiki-check.sh
-
-for file in deploy/*.sh deploy/cores/*.sh deploy/tests/*.sh; do
-  bash -n "$file"
-done
-
-cargo build -p stealthhub-panel --bins
-target/debug/infiproxy-module-manifest list deploy/modules.d
-bash deploy/tests/wiki-check.sh
-bash deploy/tests/updater-regression.sh
-bash deploy/tests/http-smoke.sh
-bash deploy/install.sh --check
-bash deploy/bootstrap.sh --check --src-dir "$PWD"
-```
-
-Dependency audit, если `cargo-audit` установлен:
-
-```bash
-cargo audit
-cargo deny check
-```
-
-Release smoke test дополнительно должен включать clean Ubuntu/Debian VPS,
-first-owner setup, HTTPS, один TCP runtime, один UDP runtime, subscription import,
-module update/rollback, reboot/autostart и restore test.
-
-## 28. Безопасный support bundle
-
-Не архивируйте всю `/etc` или `/var/lib/infiproxy`. Сначала соберите только
-нечувствительные метаданные во временный root-only каталог:
-
-```bash
-sudo install -d -m 0700 /root/infiproxy-support
-sudo systemctl --no-pager --full status infiproxy.service \
-  > /root/infiproxy-support/panel-status.txt 2>&1
-sudo journalctl -u infiproxy.service -n 200 --no-pager \
-  > /root/infiproxy-support/panel-journal.txt
-sudo systemctl --failed --no-pager --full \
-  > /root/infiproxy-support/failed-units.txt
-sudo ss -lntup > /root/infiproxy-support/listeners.txt
-sudo /usr/local/sbin/infiproxy-module-update --check-all \
-  > /root/infiproxy-support/modules.txt 2>&1
-```
-
-Перед передачей вручную удалите:
-
-- subscription tokens в URL;
-- usernames/IP, если они чувствительны;
-- cookies и authorization headers;
-- UUID/password/REALITY data;
-- Cloudflare и proxy secrets;
-- private keys;
-- полный config и SQLite dumps.
-
-## 29. Когда нужна provider console
-
-Используйте web/VNC/serial console VPS-провайдера, если:
-
-- firewall закрыл SSH;
-- `sshd_config` не проходит parsing и daemon не стартует;
-- network config потерян;
-- root filesystem read-only или не монтируется;
-- boot завис на failed mount/unit;
-- SSH host keys/permissions повреждены.
-
-Панель и tmux не могут восстановить соединение, если сам SSH/network stack
-недоступен. Проверяйте provider console до рискованных изменений.
-
-## 30. Связанные разделы
-
-- [Быстрый старт](01-QUICK-START)
-- [Веб-интерфейс](03-WEB-INTERFACE)
-- [Модули и обновления](08-MODULES-AND-UPDATES)
-- [System и TUI](10-SYSTEM-AND-TUI)
-- [Конфигурация](11-CONFIGURATION)
-- [Backup и restore](12-BACKUP-RESTORE-UNINSTALL)
-- [Безопасная эксплуатация](13-SECURITY-OPERATIONS)
+- subscription URLs/tokens;
+- session cookies/setup token;
+- UUID/usernames без необходимости;
+- shared/server-only secrets;
+- TLS private key;
+- Cloudflare token;
+- generated Mihomo YAML;
+- полный env/SQLite/config archive.
