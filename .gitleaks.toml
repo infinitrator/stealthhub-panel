@@ -3,18 +3,12 @@ title = "Infiproxy secret scanning"
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "Generated build artifacts and locally downloaded module runtimes"
+[allowlist]
+description = "Generated artifacts and exact non-secret protocol parser fixtures"
+regexTarget = "line"
 paths = [
   '''^target/''',
   '''^\.runtime/''',
-]
-
-[[allowlists]]
-description = "Known non-secret protocol parser fixtures retained in Git history"
-regexTarget = "line"
-paths = [
-  '''^crates/stealthhub-core/src/adapters/cores\.rs$''',
 ]
 regexes = [
   '''^\s*"secret\.short-id": "0123456789abcdef",\s*$''',
