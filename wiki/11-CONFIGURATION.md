@@ -85,7 +85,8 @@ update status.
 WAL и foreign_keys включены connection options. Не копируйте только main file
 при работающем процессе. Используйте .backup:
 
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '/var/backups/infiproxy/manual.sqlite'"
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".backup '/var/backups/infiproxy/manual.sqlite'"
 
 Не храните SQL passwords/tokens в shell history. Не редактируйте generations,
 adapter_state или schema_migrations вручную.
@@ -134,7 +135,8 @@ Installed manifests должны быть:
 
 Проверка:
 
-    sudo /usr/local/libexec/infiproxy-module-manifest +      list /etc/infiproxy-modules.d --root-owned
+    sudo /usr/local/libexec/infiproxy-module-manifest \
+      list /etc/infiproxy-modules.d --root-owned
 
 Не редактируйте active manifest для обхода exact pin. Импорт нового generic
 manifest - root supply-chain decision через SSH manager.
@@ -155,9 +157,12 @@ transactions.
 
 Native validation:
 
-    sudo /opt/infiproxy/cores/xray/current/xray run -test +      -config /etc/infiproxy-cores/xray/config.json
-    sudo /opt/infiproxy/cores/sing-box/current/sing-box check +      -c /etc/infiproxy-cores/sing-box/config.json
-    sudo /opt/infiproxy/cores/mihomo/current/mihomo -t +      -f /etc/infiproxy-cores/mihomo/config.yaml
+    sudo /opt/infiproxy/cores/xray/current/xray run -test \
+      -config /etc/infiproxy-cores/xray/config.json
+    sudo /opt/infiproxy/cores/sing-box/current/sing-box check \
+      -c /etc/infiproxy-cores/sing-box/config.json
+    sudo /opt/infiproxy/cores/mihomo/current/mihomo -t \
+      -f /etc/infiproxy-cores/mihomo/config.yaml
 
 Hysteria/TUIC adapters выполняют structural validation и isolated startup
 smoke tests в compatibility gate; production readiness дополнительно проверяет
@@ -201,7 +206,8 @@ group/other access. Reconciler не пишет value в logs/journal.
 
 Legacy server-only value можно однократно перенести через SSH manager:
 
-    sudo /usr/local/libexec/infiproxy-reconcile +      --adopt-server-secret xray.reality.private_key
+    sudo /usr/local/libexec/infiproxy-reconcile \
+      --adopt-server-secret xray.reality.private_key
 
 Helper принимает только reference, который protocol adapter классифицирует как
 server-only, сверяет значения, пишет root file и удаляет SQLite copy.

@@ -67,6 +67,11 @@ while IFS= read -r page; do
   fi
 done < <(find wiki -maxdepth 1 -type f -name '*.md' -print | sort)
 
+if grep -Hn -E ' \+ {3,}' wiki/*.md; then
+  echo 'wiki check failed: malformed command continuation found in Wiki source' >&2
+  exit 1
+fi
+
 link_failure=0
 while IFS=: read -r source line match; do
   target="${match#*](}"

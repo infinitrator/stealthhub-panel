@@ -220,7 +220,8 @@ Users, token, UUID, profiles и shared secrets находятся в panel SQLit
 
     backup=/var/backups/infiproxy/manual-$(date -u +%Y%m%dT%H%M%SZ)
     sudo install -d -o root -g root -m 0700 "$backup"
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '$backup/infiproxy.sqlite'"
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".backup '$backup/infiproxy.sqlite'"
     sudo chmod 0600 "$backup/infiproxy.sqlite"
     sudo sqlite3 "$backup/infiproxy.sqlite" 'PRAGMA integrity_check;'
 

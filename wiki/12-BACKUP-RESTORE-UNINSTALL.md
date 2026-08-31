@@ -37,7 +37,8 @@ infiproxy.sqlite-wal, поэтому копия только main file може�
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     backup=/var/backups/infiproxy/$stamp
     sudo install -d -o root -g root -m 0700 "$backup"
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '$backup/infiproxy.sqlite'"
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".backup '$backup/infiproxy.sqlite'"
     sudo chmod 0600 "$backup/infiproxy.sqlite"
     sudo sqlite3 "$backup/infiproxy.sqlite" 'PRAGMA integrity_check;'
 
@@ -53,18 +54,38 @@ infiproxy.sqlite-wal, поэтому копия только main file може�
 
 Сохраните SQLite:
 
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".backup '$backup/infiproxy.sqlite'"
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".backup '$backup/infiproxy.sqlite'"
     sudo chmod 0600 "$backup/infiproxy.sqlite"
     sudo sqlite3 "$backup/infiproxy.sqlite" 'PRAGMA integrity_check;'
 
 Сохраните root-owned configs:
 
-    sudo tar -C / -czf "$backup/system-configs.tar.gz" +      etc/infiproxy +      etc/infiproxy-cores +      etc/infiproxy-modules.d +      etc/infiproxy-modules.available.d +      etc/infiproxy-update.conf +      etc/systemd/system/infiproxy.service +      etc/systemd/system/infiproxy-panel-update.service +      etc/systemd/system/infiproxy-panel-update.timer +      etc/systemd/system/infiproxy-panel-update.path +      etc/systemd/system/infiproxy-module-update.service +      etc/systemd/system/infiproxy-module-update.timer +      etc/systemd/system/infiproxy-module-update.path +      etc/systemd/system/infiproxy-reconcile.service +      etc/systemd/system/infiproxy-reconcile.timer +      etc/systemd/system/infiproxy-reconcile.path
+    sudo tar -C / -czf "$backup/system-configs.tar.gz" \
+      etc/infiproxy \
+      etc/infiproxy-cores \
+      etc/infiproxy-modules.d \
+      etc/infiproxy-modules.available.d \
+      etc/infiproxy-update.conf \
+      etc/systemd/system/infiproxy.service \
+      etc/systemd/system/infiproxy-panel-update.service \
+      etc/systemd/system/infiproxy-panel-update.timer \
+      etc/systemd/system/infiproxy-panel-update.path \
+      etc/systemd/system/infiproxy-module-update.service \
+      etc/systemd/system/infiproxy-module-update.timer \
+      etc/systemd/system/infiproxy-module-update.path \
+      etc/systemd/system/infiproxy-reconcile.service \
+      etc/systemd/system/infiproxy-reconcile.timer \
+      etc/systemd/system/infiproxy-reconcile.path
     sudo chmod 0600 "$backup/system-configs.tar.gz"
 
 Если Nginx используется:
 
-    sudo tar -C / -czf "$backup/nginx-sites.tar.gz" +      etc/nginx/sites-available/infiproxy.conf +      etc/nginx/sites-available/infiproxy-subscription.conf +      etc/nginx/sites-enabled/infiproxy.conf +      etc/nginx/sites-enabled/infiproxy-subscription.conf
+    sudo tar -C / -czf "$backup/nginx-sites.tar.gz" \
+      etc/nginx/sites-available/infiproxy.conf \
+      etc/nginx/sites-available/infiproxy-subscription.conf \
+      etc/nginx/sites-enabled/infiproxy.conf \
+      etc/nginx/sites-enabled/infiproxy-subscription.conf
     sudo chmod 0600 "$backup/nginx-sites.tar.gz"
 
 Некоторые optional paths могут отсутствовать. Для универсального automation
@@ -74,7 +95,8 @@ paths; иначе молчаливый неполный backup опасен.
 Снимите диагностику без secrets:
 
     sudo git -C /opt/infiproxy/source rev-parse HEAD >"$backup/source.sha"
-    sudo cat /var/lib/infiproxy-maintenance/panel-last-applied.sha +      >"$backup/applied.sha"
+    sudo cat /var/lib/infiproxy-maintenance/panel-last-applied.sha \
+      >"$backup/applied.sha"
     sudo systemctl list-unit-files 'infiproxy*' >"$backup/units.txt"
     sudo systemctl list-timers 'infiproxy*' >"$backup/timers.txt"
     sudo ss -lntup >"$backup/listeners.txt"
@@ -132,11 +154,14 @@ Default retention - 30 дней. Эти копии предназначены д
 
 Восстановите через SQLite:
 
-    sudo rm -f /var/lib/infiproxy/infiproxy.sqlite-wal +      /var/lib/infiproxy/infiproxy.sqlite-shm
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      ".restore 'BACKUP_DIR/infiproxy.sqlite'"
+    sudo rm -f /var/lib/infiproxy/infiproxy.sqlite-wal \
+      /var/lib/infiproxy/infiproxy.sqlite-shm
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      ".restore 'BACKUP_DIR/infiproxy.sqlite'"
     sudo chown infiproxy:infiproxy /var/lib/infiproxy/infiproxy.sqlite
     sudo chmod 0640 /var/lib/infiproxy/infiproxy.sqlite
-    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite +      'PRAGMA integrity_check;'
+    sudo -u infiproxy sqlite3 /var/lib/infiproxy/infiproxy.sqlite \
+      'PRAGMA integrity_check;'
 
 Не запускайте старую SQLite schema с новым binary без compatibility check.
 
@@ -159,9 +184,12 @@ Default retention - 30 дней. Эти копии предназначены д
 Проверьте configs до старта:
 
     sudo nginx -t
-    sudo /opt/infiproxy/cores/xray/current/xray run -test +      -config /etc/infiproxy-cores/xray/config.json
-    sudo /opt/infiproxy/cores/sing-box/current/sing-box check +      -c /etc/infiproxy-cores/sing-box/config.json
-    sudo /opt/infiproxy/cores/mihomo/current/mihomo -t +      -f /etc/infiproxy-cores/mihomo/config.yaml
+    sudo /opt/infiproxy/cores/xray/current/xray run -test \
+      -config /etc/infiproxy-cores/xray/config.json
+    sudo /opt/infiproxy/cores/sing-box/current/sing-box check \
+      -c /etc/infiproxy-cores/sing-box/config.json
+    sudo /opt/infiproxy/cores/mihomo/current/mihomo -t \
+      -f /etc/infiproxy-cores/mihomo/config.yaml
 
 Запускайте сначала panel, затем reconciler и только ожидаемые runtimes:
 
