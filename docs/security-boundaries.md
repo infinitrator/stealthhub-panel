@@ -47,6 +47,15 @@ Manual and scheduled panel updates use the same root-owned
 `/etc/infiproxy-update.conf`. The default ref is `main`; non-main operation
 requires an explicit operator override during installation.
 
+## Administrative Audit
+
+The owner-only `/admin/audit` view reads bounded pages from the append-only
+SQLite `audit_events` table. Its typed metadata cannot accept arbitrary request
+content or credentials. Ordinary audited domain changes and their event share
+a transaction where the storage API supports it. Privileged requests use the
+`requested` outcome: completion and rollback evidence remains in the separate
+root-owned reconciler/maintenance journal and is not copied blindly to SQLite.
+
 ## Residual Operator Responsibilities
 
 - Restrict SSH, protect root and Cloudflare credentials, and apply OS updates.

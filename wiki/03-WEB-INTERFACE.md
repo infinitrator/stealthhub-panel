@@ -36,7 +36,12 @@ Update Now не принимает repository/ref из браузера. Manual 
 | System | /admin/system | Host/service observations и uninstall preview |
 | Configs | /admin/configs | Owner-only allowlisted read-only config inspector |
 | Health | /admin/health | Detailed authenticated health/inventory |
+| Audit | /admin/audit | Owner-only, bounded administrative change history |
 | Credits | /admin/credits | Project/component information |
+
+`/admin/audit` показывает последние события страницами по 50 записей. Поле
+`succeeded` означает завершенную SQLite-мутацию; `requested` означает только
+прием ограниченного запроса root-helper, а не успешное завершение операции.
 
 ## 3. Initial admin setup
 

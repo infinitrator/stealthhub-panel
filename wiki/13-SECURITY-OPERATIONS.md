@@ -190,7 +190,8 @@ UI штатно создает только первого admin, но допо�
 - owner привязан к минимальному числовому ID, а не неизменяемой role;
 - нет granular permissions;
 - нет UI инвентаризации/выборочного отзыва sessions;
-- нет immutable security audit log действий.
+- административные изменения сохраняются append-only в `audit_events`;
+  root-reconciler journal остается отдельным привилегированным источником.
 
 ## 7. Публичные HTTP endpoints
 
@@ -396,7 +397,7 @@ Placeholder или имя secret, попавшее в YAML, является о�
 | SSH/login | Необычные source IP и серия failures. |
 | Git/module version | Неожиданное изменение вне maintenance window. |
 
-Встроенного append-only audit log административных кнопок нет. Journal и Nginx
+Встроенный append-only audit доступен owner на `/admin/audit`. Journal и Nginx
 access logs полезны, но не считаются tamper-proof после root compromise.
 
 При сборе logs удаляйте:
@@ -439,7 +440,7 @@ access logs полезны, но не считаются tamper-proof после
 | Высокий | Root panel updater доверяет mutable Git ref без commit signature/attestation. | Protected branch, reviewed mirror, staging и manual approval. |
 | Высокий | Нет MFA и полноценной RBAC; высокорисковые protocol/routing/module/update/secret actions ограничены owner, но обычные admins управляют users и общими Settings. | Один owner, network allowlist/VPN, сильный уникальный пароль. |
 | Высокий | Secrets хранятся локально без application-level encryption. | Host hardening, строгие permissions, encrypted off-host backup. |
-| Средний | Нет immutable admin audit trail и session management UI. | Central journal shipping, минимальное число admins. |
+| Средний | Нет session management UI и внешнего неизменяемого audit sink. | Central log shipping, минимальное число admins. |
 | Средний | Subscription URL — bearer secret в path. | TLS, log redaction, secure delivery, reset on leak. |
 | Средний | Нет scheduled off-host backup. | Настроить restic/borg/другой внешний job. |
 | Средний | Reconciler синхронизирует поддерживаемые server identities, но не доказывает реальный внешний handshake и не может индивидуально отозвать shared credentials. | Count-only drift checks, secret rotation и end-to-end canary. |

@@ -17,7 +17,7 @@
 | traffic_limit_bytes | Optional сохраненный limit |
 | traffic_used_bytes | Сохраненное значение usage, default 0 |
 | expires_at | Optional UTC expiry |
-| created_at / updated_at | Audit metadata, не immutable audit log |
+| created_at / updated_at | Временные метки user row; отдельная история находится в `audit_events` |
 
 UUID и subscription token - разные credentials. Reset token не меняет UUID.
 Удаление и повторное создание user дает новые значения.
@@ -238,7 +238,8 @@ Users, token, UUID, profiles и shared secrets находятся в panel SQLit
 - Нет API tokens/scopes для автоматизации user lifecycle.
 - Нет per-user revoke у shared-credential protocols.
 - Нет доказательства client usage или последнего успешного proxy handshake.
-- Нет immutable admin audit trail.
+- Owner видит append-only admin audit trail на `/admin/audit`; токены, UUID и
+  другие credentials в события не записываются.
 
 Эти ограничения документируются явно и не должны маскироваться значениями,
 которые просто присутствуют в SQLite.

@@ -168,6 +168,14 @@ grep -Fq 'REF=main' README.md || {
   echo 'wiki check failed: README does not document the production update ref' >&2
   exit 1
 }
+grep -Fq '/admin/audit' wiki/03-WEB-INTERFACE.md || {
+  echo 'wiki check failed: owner audit route is undocumented' >&2
+  exit 1
+}
+grep -Fq 'audit_events' docs/storage-schema.md || {
+  echo 'wiki check failed: audit_events storage contract is undocumented' >&2
+  exit 1
+}
 
 module_ids="$(awk -F= '$1 == "id" {print $2}' deploy/modules.d/*.module | sort)"
 expected_modules="$(printf '%s\n' hysteria mihomo sing-box tuic xray)"

@@ -16,6 +16,7 @@ backup/restore procedures rather than editing the live database.
 | Desired state | `reconcile_state`, `adapter_state` | Generations, convergence status, active runtimes and opaque adapter observations |
 | User sync | `runtime_user_sync` | Per-runtime authorization observations for a generation |
 | Routing | `client_dns_policy`, `client_transport_pools`, `client_transport_pool_members`, `client_routing_rules`, `routing_rule_sets`, `routing_rule_entries`, `routing_rule_sources` | Mihomo DNS, groups, ordered rules and providers |
+| Administrative audit | `audit_events` | Append-only actor/action/object/outcome snapshots with bounded secret-free metadata |
 
 The exact schema is authoritative in `crates/stealthhub-core/src/storage.rs`.
 Unknown columns must be preserved by migrations and restore tooling.
@@ -45,6 +46,10 @@ writers before a file-level copy. A valid recovery set also includes root-owned
 secrets/configuration and runtime state; the database alone is insufficient.
 Never copy WAL/SHM files independently and never replace the live database while
 services are writing.
+
+Because `audit_events` is part of the same SQLite database, online backups
+naturally preserve audit history. No normal application API updates, deletes,
+or silently expires these rows.
 
 The operator procedure is maintained in
 [`wiki/12-BACKUP-RESTORE-UNINSTALL.md`](../wiki/12-BACKUP-RESTORE-UNINSTALL.md).
