@@ -6,6 +6,7 @@
 
 pub mod adapter;
 pub mod adapters;
+pub mod audit;
 pub mod compatibility;
 pub mod desired;
 pub mod inventory;

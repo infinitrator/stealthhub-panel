@@ -43,6 +43,7 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                             a href="/admin/system" { "System" }
                             a href="/admin/configs" { "Configs" }
                             a href="/admin/health" { "Health" }
+                            a href="/admin/audit" { "Audit" }
                             a href="/admin/credits" { "Credits" }
                         }
                         main class="content" {

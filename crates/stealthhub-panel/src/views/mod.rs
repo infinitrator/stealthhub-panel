@@ -1,6 +1,7 @@
 //! Server-rendered page templates separated from request handlers.
 
 pub(crate) mod account;
+pub(crate) mod audit;
 pub(crate) mod components;
 pub(crate) mod configs;
 pub(crate) mod credits;

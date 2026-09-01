@@ -18,7 +18,7 @@ use stealthhub_core::{
         AdapterInventory, AdapterInventoryEntry, AdapterInventoryState, RuntimeInventoryEntry,
         RuntimeInventoryState,
     },
-    storage::{AdminRecord, UserRecord},
+    storage::{AdminRecord, AuditEventRecord, UserRecord},
 };
 
 fn fixture_user() -> UserRecord {
@@ -80,6 +80,59 @@ fn owner_admin_is_first_created_admin() {
 
     assert!(is_owner_admin(&owner));
     assert!(!is_owner_admin(&regular));
+}
+
+#[test]
+fn audit_history_is_owner_only() {
+    let owner = AuthenticatedAdmin {
+        admin: test_admin(1),
+        is_owner: true,
+        csrf_token: "csrf".to_string(),
+        update_notice: None,
+    };
+    let regular = AuthenticatedAdmin {
+        admin: test_admin(2),
+        is_owner: false,
+        csrf_token: "csrf".to_string(),
+        update_notice: None,
+    };
+    assert!(can_view_audit(&owner));
+    assert!(!can_view_audit(&regular));
+}
+
+#[tokio::test]
+async fn audit_view_escapes_metadata_and_never_receives_secret_fields() {
+    let owner = AuthenticatedAdmin {
+        admin: test_admin(1),
+        is_owner: true,
+        csrf_token: "csrf".to_string(),
+        update_notice: None,
+    };
+    let event = AuditEventRecord {
+        id: 1,
+        created_at: Utc::now(),
+        actor_admin_id: Some(1),
+        actor_username: "owner".to_string(),
+        actor_role: "owner".to_string(),
+        action: "user.created".to_string(),
+        object_type: "user".to_string(),
+        object_id: "<user>".to_string(),
+        outcome: "succeeded".to_string(),
+        metadata_json: r#"{"enabled":true}"#.to_string(),
+    };
+    let response = views::audit::render(&owner, &[event], 0, false);
+    let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+        .await
+        .expect("audit response body");
+    let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 audit page");
+    assert!(rendered.contains("&lt;user&gt;"));
+    for sentinel in [
+        "password-sentinel",
+        "subscription-token-sentinel",
+        "private-key-sentinel",
+    ] {
+        assert!(!rendered.contains(sentinel));
+    }
 }
 
 #[test]

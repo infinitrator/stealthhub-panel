@@ -21,6 +21,7 @@ use crate::{
         valid_adapter_id, CoreRegistry, ProfileUserSyncObservation, ProtocolRegistry,
         UserSyncStatus,
     },
+    audit::NewAuditEvent,
     desired::DesiredState,
     inventory::{adapter_kind, PersistedAdapterState},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
@@ -36,6 +37,38 @@ use crate::{
 };
 
 pub type DbPool = SqlitePool;
+
+/// One immutable administrative audit row returned to the owner UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuditEventRecord {
+    pub id: i64,
+    pub created_at: DateTime<Utc>,
+    pub actor_admin_id: Option<i64>,
+    pub actor_username: String,
+    pub actor_role: String,
+    pub action: String,
+    pub object_type: String,
+    pub object_id: String,
+    pub outcome: String,
+    pub metadata_json: String,
+}
+
+impl<'r> sqlx::FromRow<'r, SqliteRow> for AuditEventRecord {
+    fn from_row(row: &'r SqliteRow) -> std::result::Result<Self, sqlx::Error> {
+        Ok(Self {
+            id: row.try_get("id")?,
+            created_at: row.try_get("created_at")?,
+            actor_admin_id: row.try_get("actor_admin_id")?,
+            actor_username: row.try_get("actor_username")?,
+            actor_role: row.try_get("actor_role")?,
+            action: row.try_get("action")?,
+            object_type: row.try_get("object_type")?,
+            object_id: row.try_get("object_id")?,
+            outcome: row.try_get("outcome")?,
+            metadata_json: row.try_get("metadata_json")?,
+        })
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct UserRecord {
@@ -588,6 +621,7 @@ const EDITABLE_CLIENT_POLICY_MIGRATION: i64 = 5;
 const NORMALIZED_RULES_MIGRATION: i64 = 6;
 const USER_SYNC_STATUS_MIGRATION: i64 = 7;
 const ONE_TIME_BOOTSTRAP_MIGRATION: i64 = 8;
+const ADMIN_AUDIT_MIGRATION: i64 = 9;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -882,8 +916,94 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(ADMIN_AUDIT_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            r"CREATE TABLE audit_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor_admin_id INTEGER NULL,
+                actor_username TEXT NOT NULL CHECK(length(actor_username) BETWEEN 1 AND 64),
+                actor_role TEXT NOT NULL CHECK(actor_role IN ('owner','admin','system')),
+                action TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                object_id TEXT NOT NULL CHECK(length(object_id) BETWEEN 1 AND 192),
+                outcome TEXT NOT NULL CHECK(outcome IN ('succeeded','requested')),
+                metadata_json TEXT NOT NULL CHECK(length(metadata_json) <= 512)
+            )",
+            "CREATE INDEX idx_audit_events_created ON audit_events(id DESC)",
+            "CREATE INDEX idx_audit_events_action ON audit_events(action,id DESC)",
+            "CREATE INDEX idx_audit_events_object ON audit_events(object_type,object_id,id DESC)",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(ADMIN_AUDIT_MIGRATION)
+            .bind("add immutable administrative audit trail")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(())
+}
+
+async fn append_audit_event_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    event.validate()?;
+    let metadata_json = serde_json::to_string(&event.metadata)?;
+    sqlx::query(
+        "INSERT INTO audit_events (created_at,actor_admin_id,actor_username,actor_role,action,object_type,object_id,outcome,metadata_json) VALUES (?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(Utc::now())
+    .bind(event.actor.admin_id)
+    .bind(&event.actor.username)
+    .bind(event.actor.role)
+    .bind(event.action.as_str())
+    .bind(event.object_type.as_str())
+    .bind(&event.object_id)
+    .bind(event.outcome.as_str())
+    .bind(metadata_json)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+/// Appends one validated event. No update or delete audit API is exposed.
+pub async fn append_audit_event(pool: &SqlitePool, event: &NewAuditEvent) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    append_audit_event_in_transaction(&mut transaction, event).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Returns a bounded newest-first page of immutable audit history.
+pub async fn list_audit_events(
+    pool: &SqlitePool,
+    limit: u32,
+    offset: u64,
+) -> Result<Vec<AuditEventRecord>> {
+    let limit = limit.clamp(1, 100);
+    let offset = offset.min(100_000);
+    Ok(sqlx::query_as::<_, AuditEventRecord>(
+        "SELECT id,created_at,actor_admin_id,actor_username,actor_role,action,object_type,object_id,outcome,metadata_json FROM audit_events ORDER BY id DESC LIMIT ? OFFSET ?",
+    )
+    .bind(i64::from(limit))
+    .bind(i64::try_from(offset)?)
+    .fetch_all(pool)
+    .await?)
+}
+
+pub async fn audit_event_count(pool: &SqlitePool) -> Result<i64> {
+    Ok(sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
+        .fetch_one(pool)
+        .await?)
 }
 
 async fn bump_desired_generation(transaction: &mut Transaction<'_, Sqlite>) -> Result<u64> {
@@ -1285,8 +1405,27 @@ pub async fn create_first_admin(
     username: &str,
     password_hash: &str,
 ) -> Result<AdminRecord> {
+    create_first_admin_inner(pool, username, password_hash, None).await
+}
+
+pub async fn create_first_admin_audited(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+    event: &NewAuditEvent,
+) -> Result<AdminRecord> {
+    create_first_admin_inner(pool, username, password_hash, Some(event)).await
+}
+
+async fn create_first_admin_inner(
+    pool: &SqlitePool,
+    username: &str,
+    password_hash: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<AdminRecord> {
     let now = Utc::now();
     let username = username.trim();
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r"
         INSERT INTO admins (username, password_hash, created_at, updated_at)
@@ -1298,16 +1437,25 @@ pub async fn create_first_admin(
     .bind(password_hash)
     .bind(now)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     if result.rows_affected() != 1 {
         bail!("initial administrator already exists");
     }
-
-    get_admin_by_username(pool, username)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("initial administrator was not created"))
+    let admin = sqlx::query_as::<_, AdminRecord>(
+        "SELECT id,username,password_hash,created_at,updated_at FROM admins WHERE username = ?",
+    )
+    .bind(username)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if let Some(event) = event {
+        let mut event = event.clone();
+        event.actor.admin_id = Some(admin.id);
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
+    }
+    transaction.commit().await?;
+    Ok(admin)
 }
 
 pub async fn is_owner_admin_id(pool: &SqlitePool, admin_id: i64) -> Result<bool> {
@@ -1458,6 +1606,24 @@ pub async fn update_admin_password_and_revoke_sessions(
     admin_id: i64,
     password_hash: &str,
 ) -> Result<()> {
+    update_admin_password_inner(pool, admin_id, password_hash, None).await
+}
+
+pub async fn update_admin_password_and_revoke_sessions_audited(
+    pool: &SqlitePool,
+    admin_id: i64,
+    password_hash: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    update_admin_password_inner(pool, admin_id, password_hash, Some(event)).await
+}
+
+async fn update_admin_password_inner(
+    pool: &SqlitePool,
+    admin_id: i64,
+    password_hash: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
@@ -1481,6 +1647,9 @@ pub async fn update_admin_password_and_revoke_sessions(
         .bind(admin_id)
         .execute(&mut *transaction)
         .await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -1581,6 +1750,24 @@ pub async fn upsert_settings_with_runtime_keys(
     values: &[(String, String)],
     runtime_keys: &[&str],
 ) -> Result<Option<u64>> {
+    upsert_settings_with_runtime_keys_inner(pool, values, runtime_keys, None).await
+}
+
+pub async fn upsert_settings_with_runtime_keys_audited(
+    pool: &SqlitePool,
+    values: &[(String, String)],
+    runtime_keys: &[&str],
+    event: &NewAuditEvent,
+) -> Result<Option<u64>> {
+    upsert_settings_with_runtime_keys_inner(pool, values, runtime_keys, Some(event)).await
+}
+
+async fn upsert_settings_with_runtime_keys_inner(
+    pool: &SqlitePool,
+    values: &[(String, String)],
+    runtime_keys: &[&str],
+    event: Option<&NewAuditEvent>,
+) -> Result<Option<u64>> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
     let mut runtime_changed = false;
@@ -1612,6 +1799,9 @@ pub async fn upsert_settings_with_runtime_keys(
     } else {
         None
     };
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(generation)
 }
@@ -1808,6 +1998,24 @@ pub async fn migrate_available_adapter_states(
 }
 
 pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result<()> {
+    upsert_secret_inner(pool, name, value, None).await
+}
+
+pub async fn upsert_secret_audited(
+    pool: &SqlitePool,
+    name: &str,
+    value: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    upsert_secret_inner(pool, name, value, Some(event)).await
+}
+
+async fn upsert_secret_inner(
+    pool: &SqlitePool,
+    name: &str,
+    value: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
 
@@ -1827,6 +2035,9 @@ pub async fn upsert_secret(pool: &SqlitePool, name: &str, value: &str) -> Result
     .execute(&mut *transaction)
     .await?;
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -1861,6 +2072,22 @@ pub async fn list_secret_names(pool: &SqlitePool) -> Result<Vec<String>> {
 }
 
 pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<()> {
+    delete_secret_inner(pool, name, None).await
+}
+
+pub async fn delete_secret_audited(
+    pool: &SqlitePool,
+    name: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_secret_inner(pool, name, Some(event)).await
+}
+
+async fn delete_secret_inner(
+    pool: &SqlitePool,
+    name: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM secret_values WHERE name = ?")
         .bind(name.trim())
@@ -1871,6 +2098,9 @@ pub async fn delete_secret(pool: &SqlitePool, name: &str) -> Result<()> {
         bail!("secret not found");
     }
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -2129,6 +2359,22 @@ pub async fn update_protocol_profile(
     pool: &SqlitePool,
     input: UpdateProtocolProfile,
 ) -> Result<ProtocolProfileRecord> {
+    update_protocol_profile_inner(pool, input, None).await
+}
+
+pub async fn update_protocol_profile_audited(
+    pool: &SqlitePool,
+    input: UpdateProtocolProfile,
+    event: &NewAuditEvent,
+) -> Result<ProtocolProfileRecord> {
+    update_protocol_profile_inner(pool, input, Some(event)).await
+}
+
+async fn update_protocol_profile_inner(
+    pool: &SqlitePool,
+    input: UpdateProtocolProfile,
+    event: Option<&NewAuditEvent>,
+) -> Result<ProtocolProfileRecord> {
     let existing = get_protocol_profile_by_name(pool, &input.name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("protocol profile not found"))?;
@@ -2155,6 +2401,9 @@ pub async fn update_protocol_profile(
     .execute(&mut *transaction)
     .await?;
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
 
     get_protocol_profile_by_name(pool, &existing.name)
@@ -3036,6 +3285,22 @@ where
 }
 
 pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord> {
+    create_user_inner(pool, input, None).await
+}
+
+pub async fn create_user_audited(
+    pool: &SqlitePool,
+    input: NewUser,
+    event: &NewAuditEvent,
+) -> Result<UserRecord> {
+    create_user_inner(pool, input, Some(event)).await
+}
+
+async fn create_user_inner(
+    pool: &SqlitePool,
+    input: NewUser,
+    event: Option<&NewAuditEvent>,
+) -> Result<UserRecord> {
     let now = Utc::now();
     let uuid = Uuid::new_v4().to_string();
     let subscription_token = Uuid::new_v4().simple().to_string();
@@ -3067,6 +3332,9 @@ pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord
     .execute(&mut *transaction)
     .await?;
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
 
     get_user_by_token(pool, &subscription_token).await
@@ -3146,6 +3414,24 @@ pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
 }
 
 pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Result<()> {
+    set_user_enabled_inner(pool, id, enabled, None).await
+}
+
+pub async fn set_user_enabled_audited(
+    pool: &SqlitePool,
+    id: i64,
+    enabled: bool,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    set_user_enabled_inner(pool, id, enabled, Some(event)).await
+}
+
+async fn set_user_enabled_inner(
+    pool: &SqlitePool,
+    id: i64,
+    enabled: bool,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
 
@@ -3166,14 +3452,34 @@ pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Resu
         bail!("user not found");
     }
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
 
 pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result<String> {
+    reset_user_subscription_token_inner(pool, id, None).await
+}
+
+pub async fn reset_user_subscription_token_audited(
+    pool: &SqlitePool,
+    id: i64,
+    event: &NewAuditEvent,
+) -> Result<String> {
+    reset_user_subscription_token_inner(pool, id, Some(event)).await
+}
+
+async fn reset_user_subscription_token_inner(
+    pool: &SqlitePool,
+    id: i64,
+    event: Option<&NewAuditEvent>,
+) -> Result<String> {
     let now = Utc::now();
     let new_token = Uuid::new_v4().simple().to_string();
 
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r"
         UPDATE users
@@ -3184,17 +3490,33 @@ pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result
     .bind(&new_token)
     .bind(now)
     .bind(id)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
 
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
 
     Ok(new_token)
 }
 
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
+    delete_user_inner(pool, id, None).await
+}
+
+pub async fn delete_user_audited(pool: &SqlitePool, id: i64, event: &NewAuditEvent) -> Result<()> {
+    delete_user_inner(pool, id, Some(event)).await
+}
+
+async fn delete_user_inner(
+    pool: &SqlitePool,
+    id: i64,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         r"
@@ -3210,6 +3532,9 @@ pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
         bail!("user not found");
     }
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -3220,6 +3545,9 @@ mod tests {
     use crate::adapter::{
         ClientRenderContext, ConfigField, ProtocolAdapter, ProtocolAdapterManifest, ServerFragment,
         ServerRenderContext, ADAPTER_API_VERSION,
+    };
+    use crate::audit::{
+        AuditAction, AuditActor, AuditMetadata, AuditObjectType, AuditOutcome, NewAuditEvent,
     };
     use anyhow::Context;
     use std::{
@@ -3336,7 +3664,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 8);
+        assert_eq!(migrations, 9);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -4419,6 +4747,228 @@ mod tests {
         assert!(load_rule_entries(&pool, &rule_set.slug).await?.is_empty());
         assert!(load_rule_sources(&pool, &rule_set.slug).await?.is_empty());
 
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    fn user_event(action: AuditAction, username: &str, metadata: AuditMetadata) -> NewAuditEvent {
+        NewAuditEvent {
+            actor: AuditActor::owner(1, "owner"),
+            action,
+            object_type: AuditObjectType::User,
+            object_id: username.to_string(),
+            outcome: AuditOutcome::Succeeded,
+            metadata,
+        }
+    }
+
+    #[tokio::test]
+    async fn audited_user_lifecycle_is_atomic_and_preserves_history() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let user = create_user_audited(
+            &pool,
+            NewUser {
+                username: "alice".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+            &user_event(AuditAction::UserCreated, "alice", AuditMetadata::none()),
+        )
+        .await?;
+        set_user_enabled_audited(
+            &pool,
+            user.id,
+            false,
+            &user_event(
+                AuditAction::UserDisabled,
+                "alice",
+                AuditMetadata::enabled(false),
+            ),
+        )
+        .await?;
+        let old_token = user.subscription_token;
+        let new_token = reset_user_subscription_token_audited(
+            &pool,
+            user.id,
+            &user_event(
+                AuditAction::UserSubscriptionTokenReset,
+                "alice",
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        delete_user_audited(
+            &pool,
+            user.id,
+            &user_event(AuditAction::UserDeleted, "alice", AuditMetadata::none()),
+        )
+        .await?;
+
+        let events = list_audit_events(&pool, 100, 0).await?;
+        assert_eq!(events.len(), 4);
+        assert!(events.iter().all(|event| event.object_id == "alice"));
+        let serialized = serde_json::to_string(&events)?;
+        assert!(!serialized.contains(&old_token));
+        assert!(!serialized.contains(&new_token));
+        assert_eq!(audit_event_count(&pool).await?, 4);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_audit_event_rolls_back_domain_mutation() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let mut event = user_event(AuditAction::UserCreated, "bob", AuditMetadata::none());
+        event.object_id = "x".repeat(193);
+        assert!(create_user_audited(
+            &pool,
+            NewUser {
+                username: "bob".into(),
+                traffic_limit_bytes: None,
+                expires_at: None
+            },
+            &event,
+        )
+        .await
+        .is_err());
+        assert!(list_users(&pool).await?.is_empty());
+        assert_eq!(audit_event_count(&pool).await?, 0);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_page_is_strictly_bounded_and_metadata_is_closed() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        for index in 0..120 {
+            append_audit_event(
+                &pool,
+                &user_event(
+                    AuditAction::UserEnabled,
+                    &format!("user-{index}"),
+                    AuditMetadata::enabled(true),
+                ),
+            )
+            .await?;
+        }
+        assert_eq!(list_audit_events(&pool, 1_000, 0).await?.len(), 100);
+        assert!(serde_json::to_vec(&AuditMetadata::count(usize::MAX))?.len() <= 512);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sensitive_mutations_emit_secret_free_atomic_events() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let actor = AuditActor::owner(1, "owner");
+        let make = |action, object_type, object_id: &str| NewAuditEvent {
+            actor: actor.clone(),
+            action,
+            object_type,
+            object_id: object_id.to_string(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::none(),
+        };
+        create_admin(&pool, "owner", "old-password-hash-sentinel").await?;
+        update_admin_password_and_revoke_sessions_audited(
+            &pool,
+            1,
+            "new-password-hash-sentinel",
+            &make(
+                AuditAction::PasswordChanged,
+                AuditObjectType::AdminAccount,
+                "owner",
+            ),
+        )
+        .await?;
+        upsert_settings_with_runtime_keys_audited(
+            &pool,
+            &[("panel_name".into(), "Audit test".into())],
+            &[],
+            &make(
+                AuditAction::SettingsSaved,
+                AuditObjectType::Settings,
+                "panel",
+            ),
+        )
+        .await?;
+        upsert_secret_audited(
+            &pool,
+            "proxy.password",
+            "shared-secret-sentinel",
+            &make(
+                AuditAction::SecretCreated,
+                AuditObjectType::SecretReference,
+                "proxy.password",
+            ),
+        )
+        .await?;
+        upsert_secret_audited(
+            &pool,
+            "proxy.password",
+            "replacement-secret-sentinel",
+            &make(
+                AuditAction::SecretReplaced,
+                AuditObjectType::SecretReference,
+                "proxy.password",
+            ),
+        )
+        .await?;
+        delete_secret_audited(
+            &pool,
+            "proxy.password",
+            &make(
+                AuditAction::SecretDeleted,
+                AuditObjectType::SecretReference,
+                "proxy.password",
+            ),
+        )
+        .await?;
+        create_protocol_profile(
+            &pool,
+            NewProtocolProfile {
+                name: "profile-one".into(),
+                protocol_id: "test".into(),
+                schema_version: 1,
+                role: ProxyRole::AutoSafe,
+                enabled: true,
+                server: "example.test".into(),
+                port: 443,
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({}),
+            },
+        )
+        .await?;
+        update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "profile-one".into(),
+                enabled: false,
+                server: "example.test".into(),
+                port: 443,
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({}),
+            },
+            &make(
+                AuditAction::ProtocolProfileDisabled,
+                AuditObjectType::ProtocolProfile,
+                "profile-one",
+            ),
+        )
+        .await?;
+
+        let serialized = serde_json::to_string(&list_audit_events(&pool, 100, 0).await?)?;
+        for sentinel in [
+            "old-password-hash-sentinel",
+            "new-password-hash-sentinel",
+            "shared-secret-sentinel",
+            "replacement-secret-sentinel",
+        ] {
+            assert!(!serialized.contains(sentinel));
+        }
+        assert_eq!(audit_event_count(&pool).await?, 6);
         close_and_remove(pool, &path).await;
         Ok(())
     }
