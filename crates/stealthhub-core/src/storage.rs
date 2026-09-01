@@ -38,7 +38,7 @@ use crate::{
 
 pub type DbPool = SqlitePool;
 
-/// One immutable administrative audit row returned to the owner UI.
+/// One append-only administrative audit row returned to the owner UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuditEventRecord {
     pub id: i64,
@@ -622,6 +622,7 @@ const NORMALIZED_RULES_MIGRATION: i64 = 6;
 const USER_SYNC_STATUS_MIGRATION: i64 = 7;
 const ONE_TIME_BOOTSTRAP_MIGRATION: i64 = 8;
 const ADMIN_AUDIT_MIGRATION: i64 = 9;
+const AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION: i64 = 10;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -943,7 +944,31 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         }
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(ADMIN_AUDIT_MIGRATION)
-            .bind("add immutable administrative audit trail")
+            .bind("add administrative audit trail")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            r"CREATE TRIGGER audit_events_reject_update
+               BEFORE UPDATE ON audit_events
+               BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END",
+            r"CREATE TRIGGER audit_events_reject_delete
+               BEFORE DELETE ON audit_events
+               BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END",
+            "CREATE INDEX idx_audit_events_created_id ON audit_events(created_at DESC,id DESC)",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION)
+            .bind("enforce append-only administrative audit rows")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -983,7 +1008,7 @@ pub async fn append_audit_event(pool: &SqlitePool, event: &NewAuditEvent) -> Res
     Ok(())
 }
 
-/// Returns a bounded newest-first page of immutable audit history.
+/// Returns a bounded newest-first page of append-only audit history.
 pub async fn list_audit_events(
     pool: &SqlitePool,
     limit: u32,
@@ -992,7 +1017,7 @@ pub async fn list_audit_events(
     let limit = limit.clamp(1, 100);
     let offset = offset.min(100_000);
     Ok(sqlx::query_as::<_, AuditEventRecord>(
-        "SELECT id,created_at,actor_admin_id,actor_username,actor_role,action,object_type,object_id,outcome,metadata_json FROM audit_events ORDER BY id DESC LIMIT ? OFFSET ?",
+        "SELECT id,created_at,actor_admin_id,actor_username,actor_role,action,object_type,object_id,outcome,metadata_json FROM audit_events ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",
     )
     .bind(i64::from(limit))
     .bind(i64::try_from(offset)?)
@@ -2432,6 +2457,22 @@ pub async fn load_routing_rule_sets(pool: &SqlitePool) -> Result<Vec<RoutingRule
 }
 
 pub async fn update_routing_rule_set(pool: &SqlitePool, input: UpdateRoutingRuleSet) -> Result<()> {
+    update_routing_rule_set_inner(pool, input, None).await
+}
+
+pub async fn update_routing_rule_set_audited(
+    pool: &SqlitePool,
+    input: UpdateRoutingRuleSet,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    update_routing_rule_set_inner(pool, input, Some(event)).await
+}
+
+async fn update_routing_rule_set_inner(
+    pool: &SqlitePool,
+    input: UpdateRoutingRuleSet,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let slug = input.slug.trim();
     let target = input.target.trim();
     let policy = load_client_policy(pool).await?;
@@ -2447,6 +2488,7 @@ pub async fn update_routing_rule_set(pool: &SqlitePool, input: UpdateRoutingRule
     let rules = validate_classical_rule_payload(&input.payload)?;
     let payload = rules.join("\n");
 
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query(
         "UPDATE routing_rule_sets SET enabled=?,target=?,payload=?,updated_at=? WHERE slug=?",
     )
@@ -2455,16 +2497,36 @@ pub async fn update_routing_rule_set(pool: &SqlitePool, input: UpdateRoutingRule
     .bind(payload)
     .bind(Utc::now())
     .bind(slug)
-    .execute(pool)
+    .execute(&mut *transaction)
     .await?;
     if result.rows_affected() == 0 {
         bail!("unknown rule set");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 /// Creates an arbitrary rule set without changing bootstrap rows.
 pub async fn create_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) -> Result<()> {
+    create_routing_rule_set_inner(pool, value, None).await
+}
+
+pub async fn create_routing_rule_set_audited(
+    pool: &SqlitePool,
+    value: &RoutingRuleSet,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    create_routing_rule_set_inner(pool, value, Some(event)).await
+}
+
+async fn create_routing_rule_set_inner(
+    pool: &SqlitePool,
+    value: &RoutingRuleSet,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     validate_rule_set_metadata(pool, value).await?;
     if value.enabled && value.payload.trim().is_empty() {
         bail!("an enabled new rule set requires an initial local payload");
@@ -2474,15 +2536,36 @@ pub async fn create_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) 
     } else {
         validate_classical_rule_payload(&value.payload)?.join("\n")
     };
+    let mut transaction = pool.begin().await?;
     sqlx::query("INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?)")
         .bind(value.slug.trim()).bind(value.title.trim()).bind(value.effect.trim())
         .bind(value.target.trim()).bind(value.enabled).bind(payload).bind(Utc::now())
-        .execute(pool).await?;
+        .execute(&mut *transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 /// Updates editable rule-set metadata and its optional raw local layer.
 pub async fn save_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) -> Result<()> {
+    save_routing_rule_set_inner(pool, value, None).await
+}
+
+pub async fn save_routing_rule_set_audited(
+    pool: &SqlitePool,
+    value: &RoutingRuleSet,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    save_routing_rule_set_inner(pool, value, Some(event)).await
+}
+
+async fn save_routing_rule_set_inner(
+    pool: &SqlitePool,
+    value: &RoutingRuleSet,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     validate_rule_set_metadata(pool, value).await?;
     let payload = if value.payload.trim().is_empty() {
         String::new()
@@ -2496,28 +2579,72 @@ pub async fn save_routing_rule_set(pool: &SqlitePool, value: &RoutingRuleSet) ->
             &load_rule_sources(pool, &value.slug).await?,
         )?;
     }
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("UPDATE routing_rule_sets SET title=?,effect=?,target=?,enabled=?,payload=?,updated_at=? WHERE slug=?")
         .bind(value.title.trim()).bind(value.effect.trim()).bind(value.target.trim())
         .bind(value.enabled).bind(payload).bind(Utc::now()).bind(value.slug.trim())
-        .execute(pool).await?;
+        .execute(&mut *transaction).await?;
     if result.rows_affected() != 1 {
         bail!("unknown rule set");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 pub async fn delete_routing_rule_set(pool: &SqlitePool, slug: &str) -> Result<()> {
+    delete_routing_rule_set_inner(pool, slug, None).await
+}
+
+pub async fn delete_routing_rule_set_audited(
+    pool: &SqlitePool,
+    slug: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_routing_rule_set_inner(pool, slug, Some(event)).await
+}
+
+async fn delete_routing_rule_set_inner(
+    pool: &SqlitePool,
+    slug: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM routing_rule_sets WHERE slug=?")
         .bind(slug.trim())
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     if result.rows_affected() != 1 {
         bail!("unknown rule set");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 pub async fn clone_routing_rule_set(pool: &SqlitePool, source: &str, new_slug: &str) -> Result<()> {
+    clone_routing_rule_set_inner(pool, source, new_slug, None).await
+}
+
+pub async fn clone_routing_rule_set_audited(
+    pool: &SqlitePool,
+    source: &str,
+    new_slug: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    clone_routing_rule_set_inner(pool, source, new_slug, Some(event)).await
+}
+
+async fn clone_routing_rule_set_inner(
+    pool: &SqlitePool,
+    source: &str,
+    new_slug: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let source_set = load_routing_rule_sets(pool)
         .await?
         .into_iter()
@@ -2526,19 +2653,34 @@ pub async fn clone_routing_rule_set(pool: &SqlitePool, source: &str, new_slug: &
     let mut clone = source_set;
     clone.slug = new_slug.trim().to_string();
     clone.title = format!("{} copy", clone.title);
-    create_routing_rule_set(pool, &clone).await?;
+    validate_rule_set_metadata(pool, &clone).await?;
     let entries = load_rule_entries(pool, source).await?;
-    for mut entry in entries {
-        entry.id = Uuid::new_v4().simple().to_string();
-        entry.rule_set_id = clone.slug.clone();
-        upsert_rule_entry(pool, &entry).await?;
-    }
     let sources = load_rule_sources(pool, source).await?;
-    for mut source in sources {
-        source.id = Uuid::new_v4().simple().to_string();
-        source.rule_set_id = clone.slug.clone();
-        upsert_rule_source(pool, &source).await?;
+    let mut transaction = pool.begin().await?;
+    sqlx::query("INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?)")
+        .bind(&clone.slug).bind(&clone.title).bind(&clone.effect).bind(&clone.target)
+        .bind(clone.enabled).bind(&clone.payload).bind(Utc::now())
+        .execute(&mut *transaction).await?;
+    for entry in entries {
+        sqlx::query("INSERT INTO routing_rule_entries (id,rule_set_id,enabled,kind,value,comment,source_tag,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().simple().to_string()).bind(&clone.slug).bind(entry.enabled)
+            .bind(entry.kind.mihomo_name()).bind(entry.value).bind(entry.comment).bind(entry.source_tag)
+            .bind(entry.priority).bind(Utc::now()).bind(Utc::now())
+            .execute(&mut *transaction).await?;
     }
+    for source in sources {
+        sqlx::query("INSERT INTO routing_rule_sources (id,rule_set_id,url,format,enabled,refresh_interval_seconds,etag,last_modified,last_successful_fetch,checksum,entry_count,last_error,cached_payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().simple().to_string()).bind(&clone.slug).bind(source.url)
+            .bind(rule_source_format_name(source.format)).bind(source.enabled)
+            .bind(i64::from(source.refresh_interval_seconds)).bind(source.etag).bind(source.last_modified)
+            .bind(source.last_successful_fetch).bind(source.checksum).bind(i64::from(source.entry_count))
+            .bind(source.last_error).bind(source.cached_payload).bind(Utc::now()).bind(Utc::now())
+            .execute(&mut *transaction).await?;
+    }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -2577,6 +2719,22 @@ pub async fn load_rule_entries(pool: &SqlitePool, rule_set_id: &str) -> Result<V
 }
 
 pub async fn upsert_rule_entry(pool: &SqlitePool, entry: &RuleEntry) -> Result<()> {
+    upsert_rule_entry_inner(pool, entry, None).await
+}
+
+pub async fn upsert_rule_entry_audited(
+    pool: &SqlitePool,
+    entry: &RuleEntry,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    upsert_rule_entry_inner(pool, entry, Some(event)).await
+}
+
+async fn upsert_rule_entry_inner(
+    pool: &SqlitePool,
+    entry: &RuleEntry,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     entry.validate()?;
     let exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routing_rule_sets WHERE slug=?")
         .bind(&entry.rule_set_id)
@@ -2603,14 +2761,35 @@ pub async fn upsert_rule_entry(pool: &SqlitePool, entry: &RuleEntry) -> Result<(
             &load_rule_sources(pool, &entry.rule_set_id).await?,
         )?;
     }
+    let mut transaction = pool.begin().await?;
     sqlx::query("INSERT INTO routing_rule_entries (id,rule_set_id,enabled,kind,value,comment,source_tag,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET rule_set_id=excluded.rule_set_id,enabled=excluded.enabled,kind=excluded.kind,value=excluded.value,comment=excluded.comment,source_tag=excluded.source_tag,priority=excluded.priority,updated_at=excluded.updated_at")
         .bind(&entry.id).bind(&entry.rule_set_id).bind(entry.enabled).bind(entry.kind.mihomo_name())
         .bind(entry.value.trim()).bind(&entry.comment).bind(&entry.source_tag).bind(entry.priority)
-        .bind(Utc::now()).bind(Utc::now()).execute(pool).await?;
+        .bind(Utc::now()).bind(Utc::now()).execute(&mut *transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 pub async fn delete_rule_entry(pool: &SqlitePool, id: &str) -> Result<()> {
+    delete_rule_entry_inner(pool, id, None).await
+}
+
+pub async fn delete_rule_entry_audited(
+    pool: &SqlitePool,
+    id: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_rule_entry_inner(pool, id, Some(event)).await
+}
+
+async fn delete_rule_entry_inner(
+    pool: &SqlitePool,
+    id: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let row = sqlx::query("SELECT rule_set_id FROM routing_rule_entries WHERE id=?")
         .bind(id)
         .fetch_optional(pool)
@@ -2636,13 +2815,18 @@ pub async fn delete_rule_entry(pool: &SqlitePool, id: &str) -> Result<()> {
             &load_rule_sources(pool, &rule_set.slug).await?,
         )?;
     }
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM routing_rule_entries WHERE id=?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     if result.rows_affected() != 1 {
         bail!("unknown rule entry");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -2652,6 +2836,28 @@ pub async fn bulk_add_rule_entries(
     kind: RuleKind,
     input: &str,
     source_tag: Option<&str>,
+) -> Result<usize> {
+    bulk_add_rule_entries_inner(pool, rule_set_id, kind, input, source_tag, None).await
+}
+
+pub async fn bulk_add_rule_entries_audited(
+    pool: &SqlitePool,
+    rule_set_id: &str,
+    kind: RuleKind,
+    input: &str,
+    source_tag: Option<&str>,
+    event: &NewAuditEvent,
+) -> Result<usize> {
+    bulk_add_rule_entries_inner(pool, rule_set_id, kind, input, source_tag, Some(event)).await
+}
+
+async fn bulk_add_rule_entries_inner(
+    pool: &SqlitePool,
+    rule_set_id: &str,
+    kind: RuleKind,
+    input: &str,
+    source_tag: Option<&str>,
+    event: Option<&NewAuditEvent>,
 ) -> Result<usize> {
     let mut values = input
         .lines()
@@ -2665,7 +2871,7 @@ pub async fn bulk_add_rule_entries(
     if kind == RuleKind::Classical {
         values = validate_classical_rule_payload(input)?;
     }
-    let existing = load_rule_entries(pool, rule_set_id).await?;
+    let mut existing = load_rule_entries(pool, rule_set_id).await?;
     let mut seen = existing
         .iter()
         .map(|entry| {
@@ -2677,33 +2883,72 @@ pub async fn bulk_add_rule_entries(
         .map(|entry| entry.priority)
         .max()
         .unwrap_or(0);
-    let mut inserted = 0;
+    let mut additions = Vec::new();
     for value in values {
         let key = format!("{}:{value}", kind.mihomo_name()).to_ascii_lowercase();
         if !seen.insert(key) {
             continue;
         }
         priority = priority.saturating_add(10);
-        upsert_rule_entry(
-            pool,
-            &RuleEntry {
-                id: Uuid::new_v4().simple().to_string(),
-                rule_set_id: rule_set_id.to_string(),
-                enabled: true,
-                kind,
-                value,
-                comment: None,
-                source_tag: source_tag.map(str::to_string),
-                priority,
-            },
-        )
-        .await?;
-        inserted += 1;
+        let entry = RuleEntry {
+            id: Uuid::new_v4().simple().to_string(),
+            rule_set_id: rule_set_id.to_string(),
+            enabled: true,
+            kind,
+            value,
+            comment: None,
+            source_tag: source_tag.map(str::to_string),
+            priority,
+        };
+        entry.validate()?;
+        existing.push(entry.clone());
+        additions.push(entry);
     }
-    Ok(inserted)
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        compile_rule_set_payload(
+            &existing,
+            &rule_set.payload,
+            &load_rule_sources(pool, rule_set_id).await?,
+        )?;
+    }
+    let mut transaction = pool.begin().await?;
+    for entry in &additions {
+        sqlx::query("INSERT INTO routing_rule_entries (id,rule_set_id,enabled,kind,value,comment,source_tag,priority,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+            .bind(&entry.id).bind(&entry.rule_set_id).bind(entry.enabled).bind(entry.kind.mihomo_name())
+            .bind(entry.value.trim()).bind(&entry.comment).bind(&entry.source_tag).bind(entry.priority)
+            .bind(Utc::now()).bind(Utc::now()).execute(&mut *transaction).await?;
+    }
+    if let Some(event) = event {
+        let mut event = event.clone();
+        event.metadata = crate::audit::AuditMetadata::count(additions.len());
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
+    }
+    transaction.commit().await?;
+    Ok(additions.len())
 }
 
 pub async fn deduplicate_rule_entries(pool: &SqlitePool, rule_set_id: &str) -> Result<usize> {
+    deduplicate_rule_entries_inner(pool, rule_set_id, None).await
+}
+
+pub async fn deduplicate_rule_entries_audited(
+    pool: &SqlitePool,
+    rule_set_id: &str,
+    event: &NewAuditEvent,
+) -> Result<usize> {
+    deduplicate_rule_entries_inner(pool, rule_set_id, Some(event)).await
+}
+
+async fn deduplicate_rule_entries_inner(
+    pool: &SqlitePool,
+    rule_set_id: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<usize> {
     let entries = load_rule_entries(pool, rule_set_id).await?;
     let mut seen = std::collections::BTreeSet::new();
     let duplicates = entries
@@ -2715,9 +2960,36 @@ pub async fn deduplicate_rule_entries(pool: &SqlitePool, rule_set_id: &str) -> R
         })
         .map(|entry| entry.id)
         .collect::<Vec<_>>();
-    for id in &duplicates {
-        delete_rule_entry(pool, id).await?;
+    let rule_set = load_routing_rule_sets(pool)
+        .await?
+        .into_iter()
+        .find(|value| value.slug == rule_set_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown rule set"))?;
+    if rule_set.enabled {
+        let remaining = load_rule_entries(pool, rule_set_id)
+            .await?
+            .into_iter()
+            .filter(|entry| !duplicates.contains(&entry.id))
+            .collect::<Vec<_>>();
+        compile_rule_set_payload(
+            &remaining,
+            &rule_set.payload,
+            &load_rule_sources(pool, rule_set_id).await?,
+        )?;
     }
+    let mut transaction = pool.begin().await?;
+    for id in &duplicates {
+        sqlx::query("DELETE FROM routing_rule_entries WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    if let Some(event) = event {
+        let mut event = event.clone();
+        event.metadata = crate::audit::AuditMetadata::count(duplicates.len());
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
+    }
+    transaction.commit().await?;
     Ok(duplicates.len())
 }
 
@@ -2759,6 +3031,22 @@ pub async fn get_rule_source(pool: &SqlitePool, id: &str) -> Result<Option<RuleS
 }
 
 pub async fn upsert_rule_source(pool: &SqlitePool, source: &RuleSetSource) -> Result<()> {
+    upsert_rule_source_inner(pool, source, None).await
+}
+
+pub async fn upsert_rule_source_audited(
+    pool: &SqlitePool,
+    source: &RuleSetSource,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    upsert_rule_source_inner(pool, source, Some(event)).await
+}
+
+async fn upsert_rule_source_inner(
+    pool: &SqlitePool,
+    source: &RuleSetSource,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     if !valid_rule_object_id(&source.id)
         || !valid_rule_object_id(&source.rule_set_id)
         || !source.url.starts_with("https://")
@@ -2795,20 +3083,49 @@ pub async fn upsert_rule_source(pool: &SqlitePool, source: &RuleSetSource) -> Re
             &sources,
         )?;
     }
+    let mut transaction = pool.begin().await?;
     sqlx::query("INSERT INTO routing_rule_sources (id,rule_set_id,url,format,enabled,refresh_interval_seconds,etag,last_modified,last_successful_fetch,checksum,entry_count,last_error,cached_payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET rule_set_id=excluded.rule_set_id,url=excluded.url,format=excluded.format,enabled=excluded.enabled,refresh_interval_seconds=excluded.refresh_interval_seconds,updated_at=excluded.updated_at")
         .bind(&source.id).bind(&source.rule_set_id).bind(&source.url).bind(rule_source_format_name(source.format))
         .bind(source.enabled).bind(i64::from(source.refresh_interval_seconds)).bind(&source.etag)
         .bind(&source.last_modified).bind(&source.last_successful_fetch).bind(&source.checksum)
         .bind(i64::from(source.entry_count)).bind(&source.last_error).bind(&source.cached_payload)
-        .bind(Utc::now()).bind(Utc::now()).execute(pool).await?;
+        .bind(Utc::now()).bind(Utc::now()).execute(&mut *transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
 pub async fn update_rule_source_success(pool: &SqlitePool, source: &RuleSetSource) -> Result<()> {
-    sqlx::query("UPDATE routing_rule_sources SET etag=?,last_modified=?,last_successful_fetch=?,checksum=?,entry_count=?,last_error=NULL,cached_payload=?,updated_at=? WHERE id=?")
+    update_rule_source_success_inner(pool, source, None).await
+}
+
+pub async fn update_rule_source_success_audited(
+    pool: &SqlitePool,
+    source: &RuleSetSource,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    update_rule_source_success_inner(pool, source, Some(event)).await
+}
+
+async fn update_rule_source_success_inner(
+    pool: &SqlitePool,
+    source: &RuleSetSource,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
+    let mut transaction = pool.begin().await?;
+    let result = sqlx::query("UPDATE routing_rule_sources SET etag=?,last_modified=?,last_successful_fetch=?,checksum=?,entry_count=?,last_error=NULL,cached_payload=?,updated_at=? WHERE id=?")
         .bind(&source.etag).bind(&source.last_modified).bind(&source.last_successful_fetch)
         .bind(&source.checksum).bind(i64::from(source.entry_count)).bind(&source.cached_payload)
-        .bind(Utc::now()).bind(&source.id).execute(pool).await?;
+        .bind(Utc::now()).bind(&source.id).execute(&mut *transaction).await?;
+    if result.rows_affected() != 1 {
+        bail!("unknown rule source");
+    }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -2824,6 +3141,22 @@ pub async fn update_rule_source_error(pool: &SqlitePool, id: &str, error: &str) 
 }
 
 pub async fn delete_rule_source(pool: &SqlitePool, id: &str) -> Result<()> {
+    delete_rule_source_inner(pool, id, None).await
+}
+
+pub async fn delete_rule_source_audited(
+    pool: &SqlitePool,
+    id: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_rule_source_inner(pool, id, Some(event)).await
+}
+
+async fn delete_rule_source_inner(
+    pool: &SqlitePool,
+    id: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let source = get_rule_source(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("unknown rule source"))?;
@@ -2844,13 +3177,18 @@ pub async fn delete_rule_source(pool: &SqlitePool, id: &str) -> Result<()> {
             &sources,
         )?;
     }
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM routing_rule_sources WHERE id=?")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     if result.rows_affected() != 1 {
         bail!("unknown rule source");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -2959,6 +3297,26 @@ pub async fn upsert_transport_pool(
     value: TransportPool,
     profiles: &[ProtocolProfile],
 ) -> Result<()> {
+    upsert_transport_pool_inner(database, original_id, value, profiles, None).await
+}
+
+pub async fn upsert_transport_pool_audited(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: TransportPool,
+    profiles: &[ProtocolProfile],
+    event: &NewAuditEvent,
+) -> Result<()> {
+    upsert_transport_pool_inner(database, original_id, value, profiles, Some(event)).await
+}
+
+async fn upsert_transport_pool_inner(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: TransportPool,
+    profiles: &[ProtocolProfile],
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let mut policy = load_client_policy(database).await?;
     let mut renamed_pool = None;
     if let Some(original_id) = original_id.filter(|id| !id.is_empty()) {
@@ -2982,7 +3340,7 @@ pub async fn upsert_transport_pool(
         policy.pools.push(value);
     }
     policy.validate(profiles)?;
-    save_client_policy(database, &policy, renamed_pool.as_ref()).await
+    save_client_policy(database, &policy, renamed_pool.as_ref(), event).await
 }
 
 /// Deletes one transport pool, optionally migrating all references first.
@@ -2991,6 +3349,26 @@ pub async fn delete_transport_pool(
     id: &str,
     replacement: Option<&str>,
     profiles: &[ProtocolProfile],
+) -> Result<()> {
+    delete_transport_pool_inner(database, id, replacement, profiles, None).await
+}
+
+pub async fn delete_transport_pool_audited(
+    database: &SqlitePool,
+    id: &str,
+    replacement: Option<&str>,
+    profiles: &[ProtocolProfile],
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_transport_pool_inner(database, id, replacement, profiles, Some(event)).await
+}
+
+async fn delete_transport_pool_inner(
+    database: &SqlitePool,
+    id: &str,
+    replacement: Option<&str>,
+    profiles: &[ProtocolProfile],
+    event: Option<&NewAuditEvent>,
 ) -> Result<()> {
     let mut policy = load_client_policy(database).await?;
     if !policy.pools.iter().any(|pool| pool.id == id) {
@@ -3022,7 +3400,7 @@ pub async fn delete_transport_pool(
     }
     policy.pools.retain(|pool| pool.id != id);
     policy.validate(profiles)?;
-    save_client_policy(database, &policy, renamed_pool.as_ref()).await
+    save_client_policy(database, &policy, renamed_pool.as_ref(), event).await
 }
 
 /// Creates or updates one ordered routing policy.
@@ -3031,6 +3409,26 @@ pub async fn upsert_routing_policy(
     original_id: Option<&str>,
     value: RoutingPolicyRule,
     profiles: &[ProtocolProfile],
+) -> Result<()> {
+    upsert_routing_policy_inner(database, original_id, value, profiles, None).await
+}
+
+pub async fn upsert_routing_policy_audited(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: RoutingPolicyRule,
+    profiles: &[ProtocolProfile],
+    event: &NewAuditEvent,
+) -> Result<()> {
+    upsert_routing_policy_inner(database, original_id, value, profiles, Some(event)).await
+}
+
+async fn upsert_routing_policy_inner(
+    database: &SqlitePool,
+    original_id: Option<&str>,
+    value: RoutingPolicyRule,
+    profiles: &[ProtocolProfile],
+    event: Option<&NewAuditEvent>,
 ) -> Result<()> {
     let mut policy = load_client_policy(database).await?;
     if let Some(original_id) = original_id.filter(|id| !id.is_empty()) {
@@ -3050,18 +3448,34 @@ pub async fn upsert_routing_policy(
         policy.rules.push(value);
     }
     policy.validate(profiles)?;
-    save_client_policy(database, &policy, None).await
+    save_client_policy(database, &policy, None, event).await
 }
 
 /// Deletes one routing policy by stable ID.
 pub async fn delete_routing_policy(database: &SqlitePool, id: &str) -> Result<()> {
+    delete_routing_policy_inner(database, id, None).await
+}
+
+pub async fn delete_routing_policy_audited(
+    database: &SqlitePool,
+    id: &str,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    delete_routing_policy_inner(database, id, Some(event)).await
+}
+
+async fn delete_routing_policy_inner(
+    database: &SqlitePool,
+    id: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     let mut policy = load_client_policy(database).await?;
     let previous_len = policy.rules.len();
     policy.rules.retain(|rule| rule.id != id);
     if policy.rules.len() == previous_len {
         bail!("unknown routing policy");
     }
-    save_client_policy(database, &policy, None).await
+    save_client_policy(database, &policy, None, event).await
 }
 
 fn replace_pool_references(policy: &mut ClientPolicy, old: &str, replacement: &str) {
@@ -3086,6 +3500,7 @@ async fn save_client_policy(
     database: &SqlitePool,
     policy: &ClientPolicy,
     renamed_pool: Option<&(String, String)>,
+    event: Option<&NewAuditEvent>,
 ) -> Result<()> {
     let mut transaction = database.begin().await?;
     sqlx::query("DELETE FROM client_transport_pool_members")
@@ -3127,6 +3542,9 @@ async fn save_client_policy(
             .await?;
     }
     bump_desired_generation(&mut transaction).await?;
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
     Ok(())
 }
@@ -3165,7 +3583,24 @@ pub async fn load_dns_policy(pool: &SqlitePool) -> Result<DnsPolicy> {
 }
 
 pub async fn update_dns_policy(pool: &SqlitePool, policy: &DnsPolicy) -> Result<()> {
+    update_dns_policy_inner(pool, policy, None).await
+}
+
+pub async fn update_dns_policy_audited(
+    pool: &SqlitePool,
+    policy: &DnsPolicy,
+    event: &NewAuditEvent,
+) -> Result<()> {
+    update_dns_policy_inner(pool, policy, Some(event)).await
+}
+
+async fn update_dns_policy_inner(
+    pool: &SqlitePool,
+    policy: &DnsPolicy,
+    event: Option<&NewAuditEvent>,
+) -> Result<()> {
     policy.validate()?;
+    let mut transaction = pool.begin().await?;
     let result = sqlx::query("UPDATE client_dns_policy SET enabled=?,ipv6=?,enhanced_mode=?,respect_rules=?,bootstrap_resolvers_json=?,remote_resolvers_json=?,direct_resolvers_json=?,updated_at=? WHERE singleton=1")
         .bind(policy.enabled)
         .bind(policy.ipv6)
@@ -3175,11 +3610,15 @@ pub async fn update_dns_policy(pool: &SqlitePool, policy: &DnsPolicy) -> Result<
         .bind(serde_json::to_string(&policy.remote_resolvers)?)
         .bind(serde_json::to_string(&policy.direct_resolvers)?)
         .bind(Utc::now())
-        .execute(pool)
+        .execute(&mut *transaction)
         .await?;
     if result.rows_affected() != 1 {
         bail!("DNS policy is not initialized");
     }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -3664,7 +4103,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 9);
+        assert_eq!(migrations, 10);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -4960,6 +5399,11 @@ mod tests {
         .await?;
 
         let serialized = serde_json::to_string(&list_audit_events(&pool, 100, 0).await?)?;
+        let persisted: String = sqlx::query_scalar(
+            "SELECT COALESCE(group_concat(actor_username || action || object_type || object_id || outcome || metadata_json, ''), '') FROM audit_events",
+        )
+        .fetch_one(&pool)
+        .await?;
         for sentinel in [
             "old-password-hash-sentinel",
             "new-password-hash-sentinel",
@@ -4967,8 +5411,167 @@ mod tests {
             "replacement-secret-sentinel",
         ] {
             assert!(!serialized.contains(sentinel));
+            assert!(!persisted.contains(sentinel));
         }
         assert_eq!(audit_event_count(&pool).await?, 6);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_triggers_reject_update_and_delete() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        append_audit_event(
+            &pool,
+            &user_event(
+                AuditAction::UserCreated,
+                "trigger-test",
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(
+            sqlx::query("UPDATE audit_events SET outcome='requested' WHERE id=1")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query("DELETE FROM audit_events WHERE id=1")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert_eq!(audit_event_count(&pool).await?, 1);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_trigger_migration_upgrades_an_existing_audit_schema() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        for statement in [
+            "DROP TRIGGER audit_events_reject_update",
+            "DROP TRIGGER audit_events_reject_delete",
+            "DROP INDEX idx_audit_events_created_id",
+            "DELETE FROM schema_migrations WHERE version=10",
+        ] {
+            sqlx::query(statement).execute(&pool).await?;
+        }
+
+        init_db(&pool).await?;
+        let trigger_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE type='trigger' AND name IN ('audit_events_reject_update','audit_events_reject_delete')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(trigger_count, 2);
+        append_audit_event(
+            &pool,
+            &user_event(
+                AuditAction::UserCreated,
+                "migration-trigger-test",
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(sqlx::query("UPDATE audit_events SET outcome='requested'")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert!(sqlx::query("DELETE FROM audit_events")
+            .execute(&pool)
+            .await
+            .is_err());
+        assert_eq!(audit_event_count(&pool).await?, 1);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn routing_audit_failure_rolls_back_the_domain_mutation() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_dns_policy(&pool).await?;
+        let original = load_dns_policy(&pool).await?;
+        let mut changed = original.clone();
+        changed.enabled = !original.enabled;
+        let mut invalid = NewAuditEvent {
+            actor: AuditActor::owner(1, "owner"),
+            action: AuditAction::DnsPolicySaved,
+            object_type: AuditObjectType::DnsPolicy,
+            object_id: "client".to_string(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::enabled(changed.enabled),
+        };
+        invalid.object_id = "x".repeat(193);
+        assert!(update_dns_policy_audited(&pool, &changed, &invalid)
+            .await
+            .is_err());
+        assert_eq!(load_dns_policy(&pool).await?, original);
+        assert_eq!(audit_event_count(&pool).await?, 0);
+
+        invalid.object_id = "client".to_string();
+        update_dns_policy_audited(&pool, &changed, &invalid).await?;
+        assert_eq!(load_dns_policy(&pool).await?, changed);
+        assert_eq!(audit_event_count(&pool).await?, 1);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_rule_source_cannot_emit_a_success_audit() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let source = RuleSetSource {
+            id: "deleted-source".to_string(),
+            rule_set_id: "direct-local".to_string(),
+            url: "https://example.test/rules.yaml".to_string(),
+            format: RuleSourceFormat::Yaml,
+            enabled: true,
+            refresh_interval_seconds: 3_600,
+            etag: None,
+            last_modified: None,
+            last_successful_fetch: Some(Utc::now().to_rfc3339()),
+            checksum: None,
+            entry_count: 0,
+            last_error: None,
+            cached_payload: String::new(),
+        };
+        let event = NewAuditEvent {
+            actor: AuditActor::owner(1, "owner"),
+            action: AuditAction::RuleSourceRefreshed,
+            object_type: AuditObjectType::RuleSource,
+            object_id: source.id.clone(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::none(),
+        };
+
+        assert!(update_rule_source_success_audited(&pool, &source, &event)
+            .await
+            .is_err());
+        assert_eq!(audit_event_count(&pool).await?, 0);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn actor_snapshot_survives_admin_deletion() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let initial_event = NewAuditEvent {
+            actor: AuditActor::initial_owner("historical-owner"),
+            action: AuditAction::OwnerCreated,
+            object_type: AuditObjectType::Owner,
+            object_id: "historical-owner".to_string(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::none(),
+        };
+        let admin =
+            create_first_admin_audited(&pool, "historical-owner", "hash", &initial_event).await?;
+        sqlx::query("DELETE FROM admins WHERE id=?")
+            .bind(admin.id)
+            .execute(&pool)
+            .await?;
+        let events = list_audit_events(&pool, 50, 0).await?;
+        assert_eq!(events[0].actor_admin_id, Some(admin.id));
+        assert_eq!(events[0].actor_username, "historical-owner");
+        assert_eq!(events[0].action, "owner.created");
         close_and_remove(pool, &path).await;
         Ok(())
     }

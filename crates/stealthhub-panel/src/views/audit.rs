@@ -3,7 +3,13 @@
 use crate::{admin_bar, ui::layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
-use stealthhub_core::storage::AuditEventRecord;
+use stealthhub_core::{audit::AuditMetadata, storage::AuditEventRecord};
+
+fn safe_metadata(value: &str) -> String {
+    serde_json::from_str::<AuditMetadata>(value)
+        .and_then(|metadata| serde_json::to_string(&metadata))
+        .unwrap_or_else(|_| "[invalid metadata]".to_string())
+}
 
 pub(crate) fn render(
     auth: &AuthenticatedAdmin,
@@ -15,7 +21,7 @@ pub(crate) fn render(
     Html(layout("Audit", html! {
         (admin_bar(auth))
         h1 { "Administrative audit" }
-        p class="muted" { "Immutable SQLite history. A requested privileged action is not a completion result." }
+        p class="muted" { "Append-only application history. A requested privileged action is not a completion result." }
         div class="table-wrap" { table {
             thead { tr { th { "UTC" } th { "Actor" } th { "Action" } th { "Object" } th { "Outcome" } th { "Metadata" } } }
             tbody {
@@ -27,7 +33,7 @@ pub(crate) fn render(
                         td { code { (event.action) } }
                         td { (event.object_type) ":" (event.object_id) }
                         td { (event.outcome) }
-                        td { code { (event.metadata_json) } }
+                        td { code { (safe_metadata(&event.metadata_json)) } }
                     }
                 }
             }

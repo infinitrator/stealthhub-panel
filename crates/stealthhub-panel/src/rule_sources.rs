@@ -15,9 +15,11 @@ use std::{
     time::Duration,
 };
 use stealthhub_core::{
+    audit::NewAuditEvent,
     rules::{validate_classical_rule_payload, RuleSetSource, RuleSourceFormat},
     storage::{
         get_rule_source, list_rule_sources, update_rule_source_error, update_rule_source_success,
+        update_rule_source_success_audited,
     },
 };
 
@@ -70,6 +72,22 @@ struct YamlPayload {
 
 /// Refreshes one source while retaining its previous cache on every failure.
 pub(crate) async fn refresh(pool: &SqlitePool, id: &str) -> Result<RuleSetSource> {
+    refresh_inner(pool, id, None).await
+}
+
+pub(crate) async fn refresh_audited(
+    pool: &SqlitePool,
+    id: &str,
+    event: &NewAuditEvent,
+) -> Result<RuleSetSource> {
+    refresh_inner(pool, id, Some(event)).await
+}
+
+async fn refresh_inner(
+    pool: &SqlitePool,
+    id: &str,
+    event: Option<&NewAuditEvent>,
+) -> Result<RuleSetSource> {
     let source = get_rule_source(pool, id)
         .await?
         .ok_or_else(|| anyhow::anyhow!("unknown rule source"))?;
@@ -77,12 +95,20 @@ pub(crate) async fn refresh(pool: &SqlitePool, id: &str) -> Result<RuleSetSource
     match result {
         Ok(Some(mut updated)) => {
             updated.last_successful_fetch = Some(Utc::now().to_rfc3339());
-            update_rule_source_success(pool, &updated).await?;
+            if let Some(event) = event {
+                update_rule_source_success_audited(pool, &updated, event).await?;
+            } else {
+                update_rule_source_success(pool, &updated).await?;
+            }
         }
         Ok(None) => {
             let mut current = source.clone();
             current.last_successful_fetch = Some(Utc::now().to_rfc3339());
-            update_rule_source_success(pool, &current).await?;
+            if let Some(event) = event {
+                update_rule_source_success_audited(pool, &current, event).await?;
+            } else {
+                update_rule_source_success(pool, &current).await?;
+            }
         }
         Err(error) => {
             update_rule_source_error(pool, id, &error.to_string()).await?;

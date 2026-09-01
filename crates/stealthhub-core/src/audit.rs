@@ -38,7 +38,7 @@ pub enum AuditAction {
     RuleEntriesDeduplicated,
     RuleSourceSaved,
     RuleSourceDeleted,
-    RuleSourceRefreshRequested,
+    RuleSourceRefreshed,
     ModuleCheckRequested,
     ModuleInstallRequested,
     ModuleUpdateRequested,
@@ -82,7 +82,7 @@ impl AuditAction {
             Self::RuleEntriesDeduplicated => "routing.rule-entries-deduplicated",
             Self::RuleSourceSaved => "routing.rule-source-saved",
             Self::RuleSourceDeleted => "routing.rule-source-deleted",
-            Self::RuleSourceRefreshRequested => "routing.rule-source-refresh-requested",
+            Self::RuleSourceRefreshed => "routing.rule-source-refreshed",
             Self::ModuleCheckRequested => "module.check-requested",
             Self::ModuleInstallRequested => "module.install-requested",
             Self::ModuleUpdateRequested => "module.update-requested",
@@ -182,6 +182,7 @@ impl AuditActor {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
@@ -238,5 +239,24 @@ impl NewAuditEvent {
             bail!("audit metadata exceeds the fixed bound");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requested_outcome_never_claims_completion() {
+        assert_eq!(AuditOutcome::Requested.as_str(), "requested");
+        for action in [
+            AuditAction::PanelUpdateRequested,
+            AuditAction::ModuleUpdateRequested,
+            AuditAction::ModuleRestartRequested,
+        ] {
+            assert!(action.as_str().ends_with("requested"));
+            assert!(!action.as_str().contains("completed"));
+            assert!(!action.as_str().contains("succeeded"));
+        }
     }
 }

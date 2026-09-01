@@ -190,7 +190,9 @@ UI штатно создает только первого admin, но допо�
 - owner привязан к минимальному числовому ID, а не неизменяемой role;
 - нет granular permissions;
 - нет UI инвентаризации/выборочного отзыва sessions;
-- административные изменения сохраняются append-only в `audit_events`;
+- административные изменения сохраняются append-only через штатные интерфейсы
+  в `audit_events`; SQLite triggers блокируют UPDATE/DELETE, но root может их
+  удалить или заменить БД;
   root-reconciler journal остается отдельным привилегированным источником.
 
 ## 7. Публичные HTTP endpoints
@@ -397,7 +399,7 @@ Placeholder или имя secret, попавшее в YAML, является о�
 | SSH/login | Необычные source IP и серия failures. |
 | Git/module version | Неожиданное изменение вне maintenance window. |
 
-Встроенный append-only audit доступен owner на `/admin/audit`. Journal и Nginx
+Встроенный application-level append-only audit доступен owner на `/admin/audit`. Journal и Nginx
 access logs полезны, но не считаются tamper-proof после root compromise.
 
 При сборе logs удаляйте:

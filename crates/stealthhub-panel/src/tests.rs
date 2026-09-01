@@ -100,6 +100,16 @@ fn audit_history_is_owner_only() {
     assert!(!can_view_audit(&regular));
 }
 
+#[test]
+fn audit_pagination_has_a_hard_upper_bound() {
+    assert_eq!(AUDIT_PAGE_SIZE, 50);
+    assert_eq!(bounded_audit_page(None), 0);
+    assert_eq!(bounded_audit_page(Some(7)), 7);
+    assert_eq!(bounded_audit_page(Some(u32::MAX)), AUDIT_MAX_PAGE);
+    assert!(audit_has_next(AUDIT_MAX_PAGE - 1, u64::MAX));
+    assert!(!audit_has_next(AUDIT_MAX_PAGE, u64::MAX));
+}
+
 #[tokio::test]
 async fn audit_view_escapes_metadata_and_never_receives_secret_fields() {
     let owner = AuthenticatedAdmin {
@@ -118,7 +128,7 @@ async fn audit_view_escapes_metadata_and_never_receives_secret_fields() {
         object_type: "user".to_string(),
         object_id: "<user>".to_string(),
         outcome: "succeeded".to_string(),
-        metadata_json: r#"{"enabled":true}"#.to_string(),
+        metadata_json: r#"{"enabled":true,"password":"password-sentinel"}"#.to_string(),
     };
     let response = views::audit::render(&owner, &[event], 0, false);
     let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
@@ -126,6 +136,8 @@ async fn audit_view_escapes_metadata_and_never_receives_secret_fields() {
         .expect("audit response body");
     let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 audit page");
     assert!(rendered.contains("&lt;user&gt;"));
+    assert!(rendered.contains("[invalid metadata]"));
+    assert!(!rendered.contains("password-sentinel"));
     for sentinel in [
         "password-sentinel",
         "subscription-token-sentinel",

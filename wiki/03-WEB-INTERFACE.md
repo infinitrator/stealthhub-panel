@@ -39,7 +39,10 @@ Update Now не принимает repository/ref из браузера. Manual 
 | Audit | /admin/audit | Owner-only, bounded administrative change history |
 | Credits | /admin/credits | Project/component information |
 
-`/admin/audit` показывает последние события страницами по 50 записей. Поле
+`/admin/audit` показывает append-only через штатные интерфейсы события
+страницами по 50 записей. SQLite triggers запрещают UPDATE/DELETE, но root может
+удалить triggers или заменить БД, поэтому журнал не является криптографически
+immutable или tamper-proof. Поле
 `succeeded` означает завершенную SQLite-мутацию; `requested` означает только
 прием ограниченного запроса root-helper, а не успешное завершение операции.
 

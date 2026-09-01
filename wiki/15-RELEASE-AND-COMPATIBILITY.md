@@ -155,7 +155,7 @@ Wiki workflow синхронизирует versioned wiki/*.md в GitHub Wiki п
 | Maturity | Beta, не stable |
 | Traffic | Stored fields без collector/enforcement |
 | Auth | Нет MFA, granular RBAC, session inventory |
-| Audit | Нет append-only admin audit log |
+| Audit | Owner-only append-only admin audit в SQLite; не является tamper-proof при root compromise |
 | Secrets | Shared values и bearer tokens без application encryption в SQLite |
 | Subscription | Bearer token в URL |
 | Configs | Web inspector read-only; нет generic editor/shell |

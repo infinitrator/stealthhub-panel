@@ -49,12 +49,28 @@ requires an explicit operator override during installation.
 
 ## Administrative Audit
 
-The owner-only `/admin/audit` view reads bounded pages from the append-only
-SQLite `audit_events` table. Its typed metadata cannot accept arbitrary request
-content or credentials. Ordinary audited domain changes and their event share
-a transaction where the storage API supports it. Privileged requests use the
-`requested` outcome: completion and rollback evidence remains in the separate
-root-owned reconciler/maintenance journal and is not copied blindly to SQLite.
+The owner-only `/admin/audit` view reads bounded pages from SQLite
+`audit_events`. Normal application interfaces expose append and bounded reads,
+but no row mutation API; SQLite triggers additionally reject UPDATE and DELETE.
+This is not tamper-proof against root, direct database replacement, or an
+operator who deliberately removes those triggers. Typed metadata cannot accept
+arbitrary request content or credentials. User, settings, secret, profile and
+routing audited storage paths write their domain change and event in one
+transaction. Privileged requests use the `requested`
+outcome: completion and rollback evidence remains in the separate root-owned
+reconciler/maintenance journal and is not copied blindly to SQLite.
+
+Filesystem request publication and the following SQLite audit INSERT cannot be
+one ACID transaction. If publication succeeds and audit insertion fails, the UI
+returns an explicit error saying the request may already be queued; operators
+must inspect state before retrying. No completion event is inferred from
+request-file creation. Module auto-update policy also crosses SQLite and its
+filesystem state mirror, so an audit failure is reported clearly but cannot
+atomically undo both domains.
+
+The administrative audit records successful state changes and accepted
+privileged requests. It is not a debug/request log, and rejected forms or
+validation failures are intentionally not recorded as successful events.
 
 ## Residual Operator Responsibilities
 

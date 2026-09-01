@@ -64,25 +64,27 @@ use stealthhub_core::{
         RuleSourceFormat,
     },
     storage::{
-        admin_count, append_audit_event, audit_event_count, bulk_add_rule_entries,
-        clone_routing_rule_set, compiled_rule_set_payload, create_admin_session,
-        create_first_admin_audited, create_routing_rule_set, create_user_audited,
-        deduplicate_rule_entries, delete_admin_session, delete_expired_admin_sessions,
-        delete_routing_policy, delete_routing_rule_set, delete_rule_entry, delete_rule_source,
-        delete_secret_audited, delete_transport_pool, delete_user_audited,
-        ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
+        admin_count, append_audit_event, audit_event_count, bulk_add_rule_entries_audited,
+        clone_routing_rule_set_audited, compiled_rule_set_payload, create_admin_session,
+        create_first_admin_audited, create_routing_rule_set_audited, create_user_audited,
+        deduplicate_rule_entries_audited, delete_admin_session, delete_expired_admin_sessions,
+        delete_routing_policy_audited, delete_routing_rule_set_audited, delete_rule_entry_audited,
+        delete_rule_source_audited, delete_secret_audited, delete_transport_pool_audited,
+        delete_user_audited, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
         ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
         get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
         is_owner_admin_id, list_audit_events, list_protocol_profiles_decoded,
         list_runtime_user_sync, list_secret_names, list_users, load_client_policy, load_dns_policy,
         load_panel_settings, load_routing_rule_sets, load_rule_entries, load_rule_sources,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
-        reset_user_subscription_token_audited, save_routing_rule_set, set_user_enabled_audited,
-        touch_admin_session, update_admin_password_and_revoke_sessions_audited, update_dns_policy,
-        update_protocol_profile_audited, update_routing_rule_set, upsert_routing_policy,
-        upsert_rule_entry, upsert_rule_source, upsert_secret_audited, upsert_setting,
-        upsert_settings_with_runtime_keys_audited, upsert_transport_pool, AdminRecord, NewUser,
-        UpdateProtocolProfile, UpdateRoutingRuleSet, UserRecord,
+        reset_user_subscription_token_audited, save_routing_rule_set_audited,
+        set_user_enabled_audited, touch_admin_session,
+        update_admin_password_and_revoke_sessions_audited, update_dns_policy_audited,
+        update_protocol_profile_audited, update_routing_rule_set_audited,
+        upsert_routing_policy_audited, upsert_rule_entry_audited, upsert_rule_source_audited,
+        upsert_secret_audited, upsert_setting, upsert_settings_with_runtime_keys_audited,
+        upsert_transport_pool_audited, AdminRecord, NewUser, UpdateProtocolProfile,
+        UpdateRoutingRuleSet, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -1354,7 +1356,7 @@ async fn panel_update_now_action(
             "Back to Settings",
         );
     }
-    record_audit(
+    if let Err(error) = record_audit(
         &state,
         audit_event(
             &auth,
@@ -1365,7 +1367,14 @@ async fn panel_update_now_action(
             AuditMetadata::none(),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure(
+            "Panel update request may already be queued",
+            error,
+            "/admin/settings",
+        );
+    }
 
     Redirect::to("/admin/settings").into_response()
 }
@@ -1520,7 +1529,7 @@ async fn update_module_action(
             "Back to Modules",
         );
     }
-    record_audit(
+    if let Err(error) = record_audit(
         &state,
         audit_event(
             &auth,
@@ -1531,7 +1540,14 @@ async fn update_module_action(
             AuditMetadata::none(),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure(
+            "Module update request may already be queued",
+            error,
+            "/admin/cores",
+        );
+    }
     let status_key = format!("module_{}_status", spec.id);
     let _ = upsert_setting(&state.pool, &status_key, "update requested").await;
     Redirect::to("/admin/cores").into_response()
@@ -1565,7 +1581,7 @@ async fn module_auto_update_action(
             "Back to Modules",
         );
     }
-    record_audit(
+    if let Err(error) = record_audit(
         &state,
         audit_event(
             &auth,
@@ -1576,7 +1592,10 @@ async fn module_auto_update_action(
             AuditMetadata::enabled(enabled),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure("Module policy may already be saved", error, "/admin/cores");
+    }
     Redirect::to("/admin/cores").into_response()
 }
 
@@ -1608,7 +1627,7 @@ async fn register_module_action(
             "Back to Modules",
         );
     }
-    record_audit(
+    if let Err(error) = record_audit(
         &state,
         audit_event(
             &auth,
@@ -1619,7 +1638,14 @@ async fn register_module_action(
             AuditMetadata::none(),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure(
+            "Module install request may already be queued",
+            error,
+            "/admin/cores",
+        );
+    }
     Redirect::to("/admin/cores").into_response()
 }
 
@@ -1697,7 +1723,7 @@ async fn remove_module_action(
             "Back to Modules",
         );
     }
-    record_audit(
+    if let Err(error) = record_audit(
         &state,
         audit_event(
             &auth,
@@ -1708,7 +1734,14 @@ async fn remove_module_action(
             AuditMetadata::none(),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure(
+            "Module removal request may already be queued",
+            error,
+            "/admin/cores",
+        );
+    }
     Redirect::to("/admin/cores").into_response()
 }
 
@@ -1796,7 +1829,7 @@ async fn runtime_service_action(
         RuntimeLifecycleAction::Stop => AuditAction::ModuleStopRequested,
         RuntimeLifecycleAction::Restart => AuditAction::ModuleRestartRequested,
     };
-    record_audit(
+    if let Err(error) = record_audit(
         state,
         audit_event(
             &auth,
@@ -1807,7 +1840,14 @@ async fn runtime_service_action(
             AuditMetadata::none(),
         ),
     )
-    .await;
+    .await
+    {
+        return audit_record_failure(
+            "Runtime request may already be queued",
+            error,
+            "/admin/cores",
+        );
+    }
     Redirect::to("/admin/cores").into_response()
 }
 
@@ -1940,8 +1980,15 @@ async fn update_routing_rule_action(
         target: form.target,
         payload: form.payload,
     };
-
-    match update_routing_rule_set(&state.pool, input).await {
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSetSaved,
+        AuditObjectType::RuleSet,
+        input.slug.clone(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(input.enabled),
+    );
+    match update_routing_rule_set_audited(&state.pool, input, &event).await {
         Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => html_error_response_with_back(
             StatusCode::BAD_REQUEST,
@@ -1985,22 +2032,16 @@ async fn update_dns_policy_action(
         remote_resolvers: resolvers(&form.remote_resolvers),
         direct_resolvers: resolvers(&form.direct_resolvers),
     };
-    match update_dns_policy(&state.pool, &policy).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::DnsPolicySaved,
-                    AuditObjectType::DnsPolicy,
-                    "client",
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::enabled(policy.enabled),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::DnsPolicySaved,
+        AuditObjectType::DnsPolicy,
+        "client",
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(policy.enabled),
+    );
+    match update_dns_policy_audited(&state.pool, &policy, &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => html_error_response_with_back(
             StatusCode::BAD_REQUEST,
             "DNS policy update failed",
@@ -2036,22 +2077,16 @@ async fn save_transport_pool_action(
     };
     let original_id = (!form.original_id.trim().is_empty()).then_some(form.original_id.trim());
     let object_id = value.id.clone();
-    match upsert_transport_pool(&state.pool, original_id, value, &profiles).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::TransportPoolSaved,
-                    AuditObjectType::TransportPool,
-                    object_id,
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::TransportPoolSaved,
+        AuditObjectType::TransportPool,
+        object_id,
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match upsert_transport_pool_audited(&state.pool, original_id, value, &profiles, &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Transport pool rejected", error),
     }
 }
@@ -2076,22 +2111,18 @@ async fn delete_transport_pool_action(
         Err(error) => return internal_error("load profiles for pool deletion", error),
     };
     let replacement = (!form.replacement.trim().is_empty()).then_some(form.replacement.trim());
-    match delete_transport_pool(&state.pool, form.id.trim(), replacement, &profiles).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::TransportPoolDeleted,
-                    AuditObjectType::TransportPool,
-                    form.id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::TransportPoolDeleted,
+        AuditObjectType::TransportPool,
+        form.id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_transport_pool_audited(&state.pool, form.id.trim(), replacement, &profiles, &event)
+        .await
+    {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Transport pool deletion rejected", error),
     }
 }
@@ -2125,22 +2156,16 @@ async fn save_routing_policy_action(
     };
     let original_id = (!form.original_id.trim().is_empty()).then_some(form.original_id.trim());
     let object_id = value.id.clone();
-    match upsert_routing_policy(&state.pool, original_id, value, &profiles).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RoutingPolicySaved,
-                    AuditObjectType::RoutingPolicy,
-                    object_id,
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RoutingPolicySaved,
+        AuditObjectType::RoutingPolicy,
+        object_id,
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match upsert_routing_policy_audited(&state.pool, original_id, value, &profiles, &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Routing policy rejected", error),
     }
 }
@@ -2160,22 +2185,16 @@ async fn delete_routing_policy_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match delete_routing_policy(&state.pool, form.id.trim()).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RoutingPolicyDeleted,
-                    AuditObjectType::RoutingPolicy,
-                    form.id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RoutingPolicyDeleted,
+        AuditObjectType::RoutingPolicy,
+        form.id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_routing_policy_audited(&state.pool, form.id.trim(), &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Routing policy deletion rejected", error),
     }
 }
@@ -2283,27 +2302,21 @@ async fn save_rule_set_action(
         enabled: checkbox_enabled(&form.enabled),
         payload: form.payload,
     };
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSetSaved,
+        AuditObjectType::RuleSet,
+        value.slug.clone(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(value.enabled),
+    );
     let result = if checkbox_enabled(&form.create) {
-        create_routing_rule_set(&state.pool, &value).await
+        create_routing_rule_set_audited(&state.pool, &value, &event).await
     } else {
-        save_routing_rule_set(&state.pool, &value).await
+        save_routing_rule_set_audited(&state.pool, &value, &event).await
     };
     match result {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSetSaved,
-                    AuditObjectType::RuleSet,
-                    value.slug,
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::enabled(value.enabled),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule set rejected", error),
     }
 }
@@ -2323,22 +2336,16 @@ async fn delete_rule_set_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match delete_routing_rule_set(&state.pool, form.slug.trim()).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSetDeleted,
-                    AuditObjectType::RuleSet,
-                    form.slug.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSetDeleted,
+        AuditObjectType::RuleSet,
+        form.slug.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_routing_rule_set_audited(&state.pool, form.slug.trim(), &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule set deletion rejected", error),
     }
 }
@@ -2358,22 +2365,23 @@ async fn clone_rule_set_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match clone_routing_rule_set(&state.pool, form.slug.trim(), form.new_slug.trim()).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSetCloned,
-                    AuditObjectType::RuleSet,
-                    form.new_slug.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSetCloned,
+        AuditObjectType::RuleSet,
+        form.new_slug.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match clone_routing_rule_set_audited(
+        &state.pool,
+        form.slug.trim(),
+        form.new_slug.trim(),
+        &event,
+    )
+    .await
+    {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule set clone rejected", error),
     }
 }
@@ -2411,22 +2419,16 @@ async fn save_rule_entry_action(
         source_tag: nonempty(&form.source_tag),
         priority: form.priority,
     };
-    match upsert_rule_entry(&state.pool, &entry).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleEntrySaved,
-                    AuditObjectType::RuleEntry,
-                    &entry.id,
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::enabled(entry.enabled),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleEntrySaved,
+        AuditObjectType::RuleEntry,
+        &entry.id,
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(entry.enabled),
+    );
+    match upsert_rule_entry_audited(&state.pool, &entry, &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule entry rejected", error),
     }
 }
@@ -2447,22 +2449,16 @@ async fn delete_rule_entry_action(
         return owner_only_response();
     }
     let _ = &form.rule_set_id;
-    match delete_rule_entry(&state.pool, form.id.trim()).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleEntryDeleted,
-                    AuditObjectType::RuleEntry,
-                    form.id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleEntryDeleted,
+        AuditObjectType::RuleEntry,
+        form.id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_rule_entry_audited(&state.pool, form.id.trim(), &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule entry deletion rejected", error),
     }
 }
@@ -2486,30 +2482,25 @@ async fn bulk_rule_entries_action(
         Ok(value) => value,
         Err(error) => return routing_input_error("Bulk rules rejected", error),
     };
-    match bulk_add_rule_entries(
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleEntriesBulkAdded,
+        AuditObjectType::RuleSet,
+        form.rule_set_id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match bulk_add_rule_entries_audited(
         &state.pool,
         form.rule_set_id.trim(),
         kind,
         &form.input,
         nonempty(&form.source_tag).as_deref(),
+        &event,
     )
     .await
     {
-        Ok(count) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleEntriesBulkAdded,
-                    AuditObjectType::RuleSet,
-                    form.rule_set_id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::count(count),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Bulk rules rejected", error),
     }
 }
@@ -2529,22 +2520,16 @@ async fn deduplicate_rule_entries_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match deduplicate_rule_entries(&state.pool, form.rule_set_id.trim()).await {
-        Ok(count) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleEntriesDeduplicated,
-                    AuditObjectType::RuleSet,
-                    form.rule_set_id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::count(count),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleEntriesDeduplicated,
+        AuditObjectType::RuleSet,
+        form.rule_set_id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match deduplicate_rule_entries_audited(&state.pool, form.rule_set_id.trim(), &event).await {
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule deduplication rejected", error),
     }
 }
@@ -2587,22 +2572,16 @@ async fn save_rule_source_action(
         last_error: None,
         cached_payload: String::new(),
     };
-    match upsert_rule_source(&state.pool, &source).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSourceSaved,
-                    AuditObjectType::RuleSource,
-                    &source.id,
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::enabled(source.enabled),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSourceSaved,
+        AuditObjectType::RuleSource,
+        &source.id,
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(source.enabled),
+    );
+    match upsert_rule_source_audited(&state.pool, &source, &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule source rejected", error),
     }
 }
@@ -2622,22 +2601,16 @@ async fn delete_rule_source_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match delete_rule_source(&state.pool, form.id.trim()).await {
-        Ok(()) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSourceDeleted,
-                    AuditObjectType::RuleSource,
-                    form.id.trim(),
-                    AuditOutcome::Succeeded,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSourceDeleted,
+        AuditObjectType::RuleSource,
+        form.id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_rule_source_audited(&state.pool, form.id.trim(), &event).await {
+        Ok(()) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule source deletion rejected", error),
     }
 }
@@ -2657,22 +2630,16 @@ async fn refresh_rule_source_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    match rule_sources::refresh(&state.pool, form.id.trim()).await {
-        Ok(_) => {
-            record_audit(
-                &state,
-                audit_event(
-                    &auth,
-                    AuditAction::RuleSourceRefreshRequested,
-                    AuditObjectType::RuleSource,
-                    form.id.trim(),
-                    AuditOutcome::Requested,
-                    AuditMetadata::none(),
-                ),
-            )
-            .await;
-            Redirect::to("/admin/routing").into_response()
-        }
+    let event = audit_event(
+        &auth,
+        AuditAction::RuleSourceRefreshed,
+        AuditObjectType::RuleSource,
+        form.id.trim(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match rule_sources::refresh_audited(&state.pool, form.id.trim(), &event).await {
+        Ok(_) => Redirect::to("/admin/routing").into_response(),
         Err(error) => routing_input_error("Rule source refresh failed", error),
     }
 }
@@ -3357,7 +3324,6 @@ async fn audit_page(
     headers: HeaderMap,
     Query(query): Query<AuditPageQuery>,
 ) -> Response {
-    const PAGE_SIZE: u32 = 50;
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
         Err(response) => return response,
@@ -3365,9 +3331,9 @@ async fn audit_page(
     if !can_view_audit(&auth) {
         return owner_only_response();
     }
-    let page = query.page.unwrap_or(0).min(2_000);
-    let offset = u64::from(page) * u64::from(PAGE_SIZE);
-    let events = match list_audit_events(&state.pool, PAGE_SIZE, offset).await {
+    let page = bounded_audit_page(query.page);
+    let offset = u64::from(page) * u64::from(AUDIT_PAGE_SIZE);
+    let events = match list_audit_events(&state.pool, AUDIT_PAGE_SIZE, offset).await {
         Ok(value) => value,
         Err(error) => return internal_error("load administrative audit history", error),
     };
@@ -3375,7 +3341,23 @@ async fn audit_page(
         Ok(value) => value.max(0) as u64,
         Err(error) => return internal_error("count administrative audit history", error),
     };
-    views::audit::render(&auth, &events, page, offset + u64::from(PAGE_SIZE) < total)
+    views::audit::render(&auth, &events, page, audit_has_next(page, total))
+}
+
+const AUDIT_PAGE_SIZE: u32 = 50;
+const AUDIT_MAX_PAGE: u32 = 2_000;
+
+const fn bounded_audit_page(page: Option<u32>) -> u32 {
+    match page {
+        Some(value) if value < AUDIT_MAX_PAGE => value,
+        Some(_) => AUDIT_MAX_PAGE,
+        None => 0,
+    }
+}
+
+fn audit_has_next(page: u32, total: u64) -> bool {
+    let offset = u64::from(page) * u64::from(AUDIT_PAGE_SIZE);
+    page < AUDIT_MAX_PAGE && offset + u64::from(AUDIT_PAGE_SIZE) < total
 }
 
 async fn create_user_action(
@@ -4134,13 +4116,19 @@ fn audit_event(
     }
 }
 
-async fn record_audit(state: &AppState, event: NewAuditEvent) {
-    if let Err(error) = append_audit_event(&state.pool, &event).await {
-        tracing::error!(
-            action = event.action.as_str(),
-            "could not append audit event: {error}"
-        );
-    }
+async fn record_audit(state: &AppState, event: NewAuditEvent) -> anyhow::Result<()> {
+    append_audit_event(&state.pool, &event).await
+}
+
+fn audit_record_failure(title: &'static str, error: anyhow::Error, back: &'static str) -> Response {
+    tracing::error!("a completed or queued administrative action could not be audited: {error}");
+    html_error_response_with_back(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        title,
+        "The action crossed its external boundary, but the audit insert failed. Inspect the request/state before retrying.",
+        back,
+        "Back",
+    )
 }
 
 fn owner_only_response() -> Response {
