@@ -27,7 +27,7 @@ pub(crate) fn render(
             tbody {
                 @if events.is_empty() { tr { td colspan="6" { "No audit events." } } }
                 @for event in events {
-                    tr {
+                    tr class="audit-row" {
                         td { time { (event.created_at.to_rfc3339()) } }
                         td { (event.actor_username) " (" (event.actor_role) ")" }
                         td { code { (event.action) } }
@@ -38,7 +38,7 @@ pub(crate) fn render(
                 }
             }
         } }
-        nav aria-label="Audit pagination" {
+        nav class="pagination actions" aria-label="Audit pagination" {
             @if page > 0 { a class="button" href=(format!("/admin/audit?page={previous}")) { "Newer" } }
             @if has_next { a class="button" href=(format!("/admin/audit?page={}", page + 1)) { "Older" } }
         }

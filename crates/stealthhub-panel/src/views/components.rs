@@ -244,7 +244,7 @@ pub(crate) fn error_response(
                 title,
                 html! {
                     h1 { (title) }
-                    div class="notice error" { (message) }
+                    div class="notice error" role="alert" { (message) }
                     a class="button" href=(back_href) { (back_label) }
                 },
             )

@@ -20,7 +20,7 @@ pub(crate) fn render_home() -> Response {
                     }
                     a class="card" href="/admin/users" {
                         h2 { "Users" }
-                        p { "UUID, subscription token, traffic limit." }
+                        p { "Effective access, expiry and quota." }
                     }
                     a class="card" href="/admin/protocols" {
                         h2 { "Protocols" }

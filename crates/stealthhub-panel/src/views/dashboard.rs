@@ -51,7 +51,7 @@ pub(crate) fn render(
                     div class="grid" {
                         section {
                             h2 { "Users" }
-                            p { "UUID, subscription token, enable flag, traffic limit." }
+                            p { "Effective access, expiry, quota and identity rotation." }
                             a class="button" href="/admin/users" { "Open Users" }
                         }
 
