@@ -3,7 +3,8 @@ resolver = "2"
 members = [
   "crates/stealthhub-core",
   "crates/stealthhub-panel",
-  "crates/stealthhub-cli"
+  "crates/stealthhub-cli",
+  "crates/infiproxy-manager"
 ]
 
 [profile.release]

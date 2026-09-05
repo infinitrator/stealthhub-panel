@@ -13,6 +13,8 @@ RUNTIME_USER="${INFIPROXY_RUNTIME_USER:-infiproxy-runtime}"
 RUNTIME_GROUP="${INFIPROXY_RUNTIME_GROUP:-$RUNTIME_USER}"
 INSTALL_BIN="${INFIPROXY_INSTALL_BIN:-${STEALTHHUB_INSTALL_BIN:-/usr/local/bin/infiproxy}}"
 MANAGER_BIN="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
+TUI_BIN="${INFIPROXY_TUI_BIN:-/usr/local/libexec/infiproxy-tui}"
+MANAGER_OPERATIONS="${INFIPROXY_MANAGER_OPERATIONS:-/usr/local/libexec/infiproxy-manager-operations.sh}"
 UPDATE_BIN="${INFIPROXY_UPDATE_BIN:-/usr/local/sbin/infiproxy-panel-update}"
 MODULE_UPDATE_BIN="${INFIPROXY_MODULE_UPDATE_BIN:-/usr/local/sbin/infiproxy-module-update}"
 MODULE_MANIFEST_HELPER="${INFIPROXY_MODULE_MANIFEST_HELPER:-/usr/local/libexec/infiproxy-module-manifest}"
@@ -55,6 +57,7 @@ RUNTIME_TLS_LIB="${ROOT_DIR}/deploy/lib/runtime-tls.sh"
 RELEASE_BIN="${ROOT_DIR}/target/release/stealthhub-panel"
 RELEASE_MANIFEST_HELPER="${ROOT_DIR}/target/release/infiproxy-module-manifest"
 RELEASE_RECONCILE_HELPER="${ROOT_DIR}/target/release/infiproxy-reconcile"
+RELEASE_TUI="${ROOT_DIR}/target/release/infiproxy-tui"
 
 normalize_github_repo() {
     local value="$1"
@@ -217,6 +220,7 @@ fi
 
 required_deploy_files=(
     deploy/infiproxy-manager.sh
+    deploy/lib/manager-operations.sh
     deploy/lib/install-state.sh
     deploy/lib/runtime-tls.sh
     deploy/panel-update.sh
@@ -246,7 +250,7 @@ if [[ "$BUILD" -eq 1 ]]; then
         echo "cargo is required for --build" >&2
         exit 1
     fi
-    cargo build --locked --release -p stealthhub-panel \
+    cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
         --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
         --manifest-path "${ROOT_DIR}/Cargo.toml"
 fi
@@ -278,6 +282,10 @@ if [[ ! -x "$RELEASE_RECONCILE_HELPER" && "$CHECK_ONLY" -eq 0 ]]; then
     exit 1
 fi
 
+if [[ ! -x "$RELEASE_TUI" && "$CHECK_ONLY" -eq 0 ]]; then
+    echo "Release TUI not found: $RELEASE_TUI (build -p infiproxy-manager)" >&2
+    exit 1
+fi
 if [[ ! -x "$RELEASE_BIN" && "$CHECK_ONLY" -eq 0 ]]; then
     echo "Release binary not found: $RELEASE_BIN" >&2
     echo "Run: cargo build --release -p stealthhub-panel" >&2
@@ -367,6 +375,9 @@ find "$STATE_DIR" -maxdepth 1 -type f -name 'infiproxy.sqlite*' \
 
 install -m 0755 "$RELEASE_BIN" "$INSTALL_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/infiproxy-manager.sh" "$MANAGER_BIN"
+install -d -o root -g root -m 0755 "$(dirname "$TUI_BIN")" "$(dirname "$MANAGER_OPERATIONS")"
+install -m 0755 "$RELEASE_TUI" "$TUI_BIN"
+install -m 0755 "${ROOT_DIR}/deploy/lib/manager-operations.sh" "$MANAGER_OPERATIONS"
 install -m 0755 "${ROOT_DIR}/deploy/panel-update.sh" "$UPDATE_BIN"
 install -m 0755 "${ROOT_DIR}/deploy/module-update.sh" "$MODULE_UPDATE_BIN"
 install -m 0755 "$RELEASE_MANIFEST_HELPER" "$MODULE_MANIFEST_HELPER"

@@ -54,11 +54,12 @@ jobs:
       - name: Deployment contracts
         run: |
           set -euo pipefail
-          for file in deploy/*.sh deploy/cores/*.sh deploy/tests/*.sh; do bash -n "$file"; done
+          find deploy -type f -name '*.sh' -exec bash -n {} +
           cargo build --locked -p stealthhub-panel --bins
           target/debug/infiproxy-module-manifest list deploy/modules.d
           bash deploy/tests/install-state-regression.sh
           bash deploy/tests/updater-regression.sh
+          bash deploy/tests/manager-regression.sh
           bash deploy/tests/http-smoke.sh
           bash deploy/install.sh --check
           bash deploy/bootstrap.sh --check --src-dir "$PWD"

@@ -143,8 +143,9 @@ git -C "$installer_checkout" checkout -qb feature/update-source-regression
 git -C "$installer_checkout" remote set-url origin \
     https://github.com/infinitrator/stealthhub-panel.git
 cp "${ROOT_DIR}/deploy/install.sh" "${installer_checkout}/deploy/install.sh"
+cp "${ROOT_DIR}/deploy/lib/manager-operations.sh" "${installer_checkout}/deploy/lib/manager-operations.sh"
 mkdir -p "${installer_checkout}/target/release"
-for binary in stealthhub-panel infiproxy-module-manifest infiproxy-reconcile; do
+for binary in stealthhub-panel infiproxy-module-manifest infiproxy-reconcile infiproxy-tui; do
     cat >"${installer_checkout}/target/release/${binary}" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -192,6 +193,8 @@ run_installer_case() {
         export INFIPROXY_RUNTIME_USER="$owner" INFIPROXY_RUNTIME_GROUP="$group"
         export INFIPROXY_INSTALL_BIN="${scenario}/bin/infiproxy"
         export INFIPROXY_MANAGER_BIN="${scenario}/sbin/infiproxy-manager"
+        export INFIPROXY_TUI_BIN="${scenario}/libexec/infiproxy-tui"
+        export INFIPROXY_MANAGER_OPERATIONS="${scenario}/libexec/infiproxy-manager-operations.sh"
         export INFIPROXY_UPDATE_BIN="${scenario}/sbin/infiproxy-panel-update"
         export INFIPROXY_MODULE_UPDATE_BIN="${scenario}/sbin/infiproxy-module-update"
         export INFIPROXY_MODULE_MANIFEST_HELPER="${scenario}/libexec/infiproxy-module-manifest"

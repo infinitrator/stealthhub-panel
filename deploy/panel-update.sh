@@ -31,6 +31,9 @@ NGINX_HEADSCALE_AVAILABLE="${INFIPROXY_NGINX_HEADSCALE_AVAILABLE:-/etc/nginx/sit
 PANEL_BINARY="${INFIPROXY_PANEL_BINARY:-/usr/local/bin/infiproxy}"
 MANIFEST_HELPER_BINARY="${INFIPROXY_MANIFEST_HELPER_BINARY:-/usr/local/libexec/infiproxy-module-manifest}"
 RECONCILE_HELPER_BINARY="${INFIPROXY_RECONCILE_HELPER_BINARY:-/usr/local/libexec/infiproxy-reconcile}"
+TUI_BINARY="${INFIPROXY_TUI_BIN:-/usr/local/libexec/infiproxy-tui}"
+MANAGER_BINARY="${INFIPROXY_MANAGER_BIN:-/usr/local/sbin/infiproxy-manager}"
+MANAGER_OPERATIONS="${INFIPROXY_MANAGER_OPERATIONS:-/usr/local/libexec/infiproxy-manager-operations.sh}"
 INSTALL_STATE_LIB="${INFIPROXY_INSTALL_STATE_LIB:-/usr/local/libexec/infiproxy-install-state}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
@@ -168,6 +171,9 @@ backup_control_binaries() {
         "infiproxy:${PANEL_BINARY}"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}"
         "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}"
+        "infiproxy-tui:${TUI_BINARY}"
+        "infiproxy-manager:${MANAGER_BINARY}"
+        "infiproxy-manager-operations:${MANAGER_OPERATIONS}"
     )
     install -d -o root -g root -m 0700 "${backup_dir}/control-binaries"
     for entry in "${binaries[@]}"; do
@@ -193,6 +199,9 @@ restore_control_binaries() {
         "infiproxy:${PANEL_BINARY}:stealthhub-panel"
         "infiproxy-module-manifest:${MANIFEST_HELPER_BINARY}:infiproxy-module-manifest"
         "infiproxy-reconcile:${RECONCILE_HELPER_BINARY}:infiproxy-reconcile"
+        "infiproxy-tui:${TUI_BINARY}:infiproxy-tui"
+        "infiproxy-manager:${MANAGER_BINARY}:infiproxy-manager"
+        "infiproxy-manager-operations:${MANAGER_OPERATIONS}:infiproxy-manager-operations.sh"
     )
     install -d -m 0755 "${SOURCE_DIR}/target/release"
     for entry in "${binaries[@]}"; do
@@ -393,7 +402,7 @@ main() {
     git -C "$SOURCE_DIR" clean -fdx -e target/
 
     export PATH="/root/.cargo/bin:$PATH"
-    if ! cargo build --locked --release -p stealthhub-panel \
+    if ! cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
             --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
             --manifest-path "${SOURCE_DIR}/Cargo.toml" \
         || ! INFIPROXY_UPDATE_REPO="$repo" INFIPROXY_UPDATE_REF="$ref" \

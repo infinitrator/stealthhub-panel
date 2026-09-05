@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Minimal SSH control surface for Infiproxy VPS installs.
+# SSH entry point, finite operation helpers and legacy recovery menus.
 #
 # The manager intentionally stays dependency-light: plain Bash, systemd, curl,
 # certbot and small Rust helpers. Destructive actions require root and explicit
@@ -192,23 +192,28 @@ have_cmd() {
 }
 
 valid_secret_reference() {
-  [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9._-]{1,128}$ && "$1" != "." && "$1" != ".." ]]
 }
 
 store_privileged_secret() {
   local reference value temporary
-  prompt_value reference "Privileged secret" "Reference name" "" 0 || return
+  if [[ $# -eq 1 ]]; then reference="$1"; else
+    prompt_value reference "Privileged secret" "Reference name" "" 0 || return
+  fi
   valid_secret_reference "$reference" || {
     echo "${danger}Invalid reference. Use 1-128 letters, digits, dot, underscore or dash.${reset}" >&2
     pause
     return
   }
-  prompt_value value "Privileged secret" "Secret value (input is hidden)" "" 1 || return
+  if [[ $# -eq 1 ]]; then IFS= read -r value || return 1; else
+    prompt_value value "Privileged secret" "Secret value (input is hidden)" "" 1 || return
+  fi
   if [[ -z "$value" || "${#value}" -gt 8192 ]]; then
     echo "${danger}Secret must contain 1-8192 bytes.${reset}" >&2
     pause
     return
   fi
+  [[ ! -L "$PRIVILEGED_SECRET_DIR" ]] || return 1
   install -d -o root -g root -m 0700 "$PRIVILEGED_SECRET_DIR"
   temporary="$(mktemp "${PRIVILEGED_SECRET_DIR}/.secret.XXXXXX")"
   chmod 0600 "$temporary"
@@ -220,12 +225,14 @@ store_privileged_secret() {
   unset value
   echo "${green}Stored root-only reference ${reference}.${reset}"
   systemctl start infiproxy-reconcile.service || true
-  pause
+  [[ $# -eq 1 ]] || pause
 }
 
 delete_privileged_secret() {
   local reference
-  prompt_value reference "Privileged secret" "Reference name to delete" "" 0 || return
+  if [[ $# -eq 1 ]]; then reference="$1"; else
+    prompt_value reference "Privileged secret" "Reference name to delete" "" 0 || return
+  fi
   valid_secret_reference "$reference" || { invalid_choice; return; }
   [[ -f "${PRIVILEGED_SECRET_DIR}/${reference}" \
       && ! -L "${PRIVILEGED_SECRET_DIR}/${reference}" ]] || {
@@ -233,11 +240,12 @@ delete_privileged_secret() {
     pause
     return
   }
-  confirm_yes "Delete root-only reference ${reference}? The next reconcile may fail closed." "N" \
-    || return
+  if [[ $# -eq 0 ]]; then
+    confirm_yes "Delete root-only reference ${reference}? The next reconcile may fail closed." "N" || return
+  fi
   rm -f -- "${PRIVILEGED_SECRET_DIR:?}/${reference}"
   systemctl start infiproxy-reconcile.service || true
-  pause
+  [[ $# -eq 1 ]] || pause
 }
 
 adopt_legacy_privileged_secret() {
@@ -663,13 +671,13 @@ install_https_deps() {
 }
 
 save_cloudflare_credentials() {
-  local token="$1"
+  local token="$1" staged
   valid_cloudflare_token "$token" \
     || { echo "${danger}Invalid Cloudflare API token format.${reset}" >&2; return 1; }
   install -d -m 0700 -o root -g root "$(dirname "$CLOUDFLARE_CREDENTIALS")"
-  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$CLOUDFLARE_CREDENTIALS"
-  chown root:root "$CLOUDFLARE_CREDENTIALS"
-  chmod 0600 "$CLOUDFLARE_CREDENTIALS"
+  staged="$(mktemp "$(dirname "$CLOUDFLARE_CREDENTIALS")/.cloudflare.XXXXXX")"
+  printf 'dns_cloudflare_api_token = %s\n' "$token" >"$staged"
+  publish_staged_file "$staged" "$CLOUDFLARE_CREDENTIALS" root root 0600
 }
 
 issue_cloudflare_certificate() {
@@ -1199,6 +1207,7 @@ rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
 rm -f /usr/local/bin/infiproxy /usr/local/bin/headscale /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile /usr/local/libexec/infiproxy-install-state
+rm -f /usr/local/libexec/infiproxy-tui /usr/local/libexec/infiproxy-manager-operations.sh
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1234,6 +1243,7 @@ rm -f /etc/systemd/system/headscale.service.d/infiproxy-module.conf
 rmdir /etc/systemd/system/headscale.service.d 2>/dev/null || true
 systemctl daemon-reload
 rm -f /usr/local/bin/infiproxy /usr/local/sbin/infiproxy-manager /usr/local/sbin/infiproxy-panel-update /usr/local/sbin/infiproxy-module-update /usr/local/sbin/infiproxy-core-install /usr/local/libexec/infiproxy-module-manifest /usr/local/libexec/infiproxy-headscale-control /usr/local/libexec/infiproxy-reconcile /usr/local/libexec/infiproxy-install-state
+rm -f /usr/local/libexec/infiproxy-tui /usr/local/libexec/infiproxy-manager-operations.sh
 rm -f /etc/profile.d/infiproxy-manager.sh
 rm -f /etc/infiproxy-update.conf
 rm -rf /etc/infiproxy /etc/infiproxy-modules.d /etc/infiproxy-modules.available.d /var/lib/infiproxy /var/lib/infiproxy-maintenance
@@ -1310,6 +1320,24 @@ main_menu() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  if [[ "${1:-}" == "--operation" ]]; then
+    operations="${INFIPROXY_MANAGER_OPERATIONS:-/usr/local/libexec/infiproxy-manager-operations.sh}"
+    # shellcheck source=deploy/lib/manager-operations.sh
+    source "$operations"
+    shift
+    manager_operation "$@"
+    exit $?
+  fi
+  if [[ "${1:-}" != "--legacy" && "${1:-}" != "--uninstall" ]]; then
+    tui="${INFIPROXY_TUI_BIN:-/usr/local/libexec/infiproxy-tui}"
+    if [[ -x "$tui" ]]; then exec "$tui" "$@"; fi
+    if [[ "${1:-}" != "--guided" && -n "${1:-}" && "${1:-}" != "--help" && "${1:-}" != "-h" ]]; then
+      echo "Compiled manager unavailable; use --legacy for recovery." >&2
+      exit 1
+    fi
+    echo "Compiled manager unavailable; opening legacy recovery." >&2
+  fi
+  if [[ "${1:-}" == "--legacy" ]]; then shift; fi
   case "${1:-}" in
     --guided)
       guided_deployment

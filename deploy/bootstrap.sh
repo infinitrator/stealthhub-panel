@@ -243,7 +243,7 @@ need_cmd systemctl
 
 sync_source
 
-cargo build --locked --release -p stealthhub-panel \
+cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
     --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
     --manifest-path "${SRC_DIR}/Cargo.toml"
 

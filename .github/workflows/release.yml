@@ -25,7 +25,7 @@ jobs:
           toolchain: 1.96.0
 
       - name: Build panel
-        run: cargo build --locked --release -p stealthhub-panel
+        run: cargo build --locked --release -p stealthhub-panel -p infiproxy-manager
 
       - name: Package
         run: |
@@ -33,6 +33,7 @@ jobs:
           mkdir -p dist/infiproxy-linux-x86_64
           cp target/release/stealthhub-panel dist/infiproxy-linux-x86_64/infiproxy
           cp target/release/infiproxy-module-manifest dist/infiproxy-linux-x86_64/
+          cp target/release/infiproxy-tui target/release/infiproxy-reconcile dist/infiproxy-linux-x86_64/
           cp -R deploy wiki README.md LICENSE LICENSE.ru.md dist/infiproxy-linux-x86_64/
           tar -C dist -czf infiproxy-linux-x86_64.tar.gz infiproxy-linux-x86_64
           sha256sum infiproxy-linux-x86_64.tar.gz > infiproxy-linux-x86_64.tar.gz.sha256
