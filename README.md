@@ -62,7 +62,7 @@ User-facing:
 
 Operator-facing:
 
-- Guided SSH manager with a plain-terminal fallback.
+- Full-screen Rust SSH TUI with a legacy recovery fallback.
 - Root-approved runtime module install, check, update, start/stop/restart, and
   removal requests.
 - Panel update scheduling and immediate update request.
@@ -188,6 +188,9 @@ update channel or enabling unattended runtime changes.
 |---|---|
 | `/opt/infiproxy/source` | Installed Git checkout |
 | `/usr/local/bin/infiproxy` | Panel binary |
+| `/usr/local/sbin/infiproxy-manager` | TUI launcher and noninteractive boundary |
+| `/usr/local/libexec/infiproxy-tui` | Full-screen Rust terminal manager |
+| `/usr/local/libexec/infiproxy-manager-operations.sh` | Root-owned finite operation catalog |
 | `/usr/local/libexec/infiproxy-reconcile` | Root reconciler |
 | `/etc/infiproxy/infiproxy.env` | Panel environment |
 | `/var/lib/infiproxy/infiproxy.sqlite` | SQLite state |
