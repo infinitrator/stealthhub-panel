@@ -19,8 +19,14 @@
 | expires_at | Optional UTC expiry |
 | created_at / updated_at | Временные метки user row; отдельная история находится в `audit_events` |
 
-UUID и subscription token - разные credentials. Reset token не меняет UUID.
-Удаление и повторное создание user дает новые значения.
+UUID и subscription token - разные credentials. **Reset subscription URL** не
+меняет UUID. Удаление и повторное создание user дает новые значения.
+
+`users` остается источником истины. Таблица `user_lifecycle_state` хранит только
+производный checkpoint: какие blocking reasons уже наблюдались и какой
+generation еще ожидает публикации bounded reconcile request. Ее строки
+самовосстанавливаются из `users`, удаляются каскадно и входят в обычный SQLite
+backup.
 
 ## 2. Создание
 
@@ -40,20 +46,20 @@ username попадает в operator UI и может участвовать в
 
 Пустое значение означает unlimited metadata. Число переводится в bytes.
 
-**Ограничение beta:** Infiproxy не собирает live traffic из runtimes, не
-увеличивает traffic_used_bytes и не блокирует data plane по quota. Effective
-subscription check сравнивает stored used/limit, но при неизменяемом used=0 это
-не является реальным enforcement. Используйте внешний collector только после
-отдельного review его доверия и точности.
+**Ограничение beta:** Infiproxy не собирает live traffic из runtimes и сам не
+увеличивает traffic_used_bytes. Effective access сравнивает сохраненные
+used/limit и исключает quota-blocked identity из per-user desired state, но без
+доверенного collector это не является измеренным live quota enforcement.
 
 ### Expires in days
 
 Пустое значение означает отсутствие expiry. Число 0 также не создает expiry;
 положительное значение до 3650 сохраняет UTC deadline.
 
-Текущий UI не редактирует limit/expiry после create. Для изменения нужна
-контролируемая schema-aware операция, которой web release пока не предоставляет.
-Не правьте production SQLite без backup и согласованного transaction plan.
+После создания кнопка **Edit** позволяет задать или очистить quota и deadline.
+Редактор expiry принимает только RFC 3339 UTC (`Z` или `+00:00`) и ограничивает
+дату диапазоном 3650 дней от текущего времени. `traffic_used_bytes` показывается
+read-only и не принимается из web-формы.
 
 ### Create
 
@@ -70,14 +76,29 @@ Create:
 
 ## 3. Effective access
 
-Account page и Mihomo YAML блокируются, если:
+Одна core-модель вычисляет три независимых blocking reason. Account page,
+Mihomo YAML и per-user desired authorization блокируются, если:
 
 - enabled=false;
 - expires_at уже наступил;
 - stored traffic_used_bytes >= traffic_limit_bytes.
 
-Проверка выполняется при каждом HTTP запросе. Она не отключает уже открытое
-соединение и не доказывает runtime-side revoke.
+`expires_at <= now` считается истекшим, то есть граница включительна. Несколько
+причин отображаются одновременно, например Disabled + Expired. Проверка
+выполняется при каждом HTTP запросе и поэтому не ждет background task.
+
+При старте panel выполняет один self-heal lifecycle checkpoints. Затем каждые
+30 секунд индексированный deadline scan обнаруживает crossing, атомарно
+увеличивает desired generation один раз и сохраняет pending generation до
+успешной публикации reconcile request. Restart и повторный tick не создают
+generation storm. Задержка data-plane convergence может составить интервал
+проверки плюс время reconcile; уже открытое соединение принудительно не
+разрывается.
+
+Автоматический deadline crossing является системным convergence event, а не
+административной мутацией, поэтому отдельная запись от имени admin в
+`audit_events` не создается. Само изменение generation и его результат видны в
+reconcile state/journal.
 
 HTTP contract:
 
@@ -92,12 +113,26 @@ token все равно может попасть в browser history, clipboard,
 
 ## 4. Кнопки Users
 
-### open
+### Subscription access
 
-Открывает account page. Она показывает status, traffic metadata, expiry,
-subscription URL и Mihomo import link.
+Открывает отдельную authenticated no-store страницу выдачи. Только там
+показываются account URL, Mihomo YAML URL и one-click import. Общий список Users
+не содержит UUID, subscription token или bearer path.
 
-### download
+### Edit
+
+Редактирует username, quota и expiry одной SQLite transaction. Форма содержит
+скрытый `updated_at`; если другой admin уже изменил user, stale submit получает
+conflict вместо перезаписи новых данных. Пустые quota/expiry означают unlimited
+и never. Username проходит тот же контракт 3-64 ASCII символа, что Create.
+
+Изменение active username создает generation, потому что текущие PerUserUuid
+composers используют его как runtime label/name. Если user уже blocked и
+остается blocked, одно изменение label generation не создает. Изменение
+quota/expiry создает generation только при немедленной смене effective access;
+будущий expiry получает отдельную generation при crossing deadline.
+
+### Download через страницу выдачи
 
 Запрашивает свежий YAML. Generation включает только enabled profiles, которые:
 
@@ -113,23 +148,24 @@ subscription URL и Mihomo import link.
 
 - enabled становится false;
 - новые subscription requests дают 403;
-- desired generation увеличивается;
+- desired generation увеличивается, если user до операции был effectively allowed;
 - PerUserUuid adapters удаляют identity при успешном reconcile.
 
 Disable не удаляет row/token/UUID и может быть отменен кнопкой Enable.
 
 ### Enable
 
-Возвращает user в desired set и запускает reconcile. До Applied server
-authorization может еще не совпадать с intent.
+Снимает manual blocking reason. Если expiry/quota продолжают блокировать user,
+generation не нужна; иначе user возвращается в desired set и запускается
+reconcile. До Applied server authorization может еще не совпадать с intent.
 
-### Reset token
+### Reset subscription URL
 
 Открывает confirm page, затем атомарно меняет только subscription_token. Старый
 URL перестает находить user немедленно. Generation не увеличивается, потому что
 server identity и UUID не меняются.
 
-Reset token не отзывает:
+Reset subscription URL не отзывает:
 
 - уже импортированный YAML;
 - UUID в active runtime;
@@ -139,13 +175,25 @@ Reset token не отзывает:
 При утечке client credentials ротируйте соответствующие secrets/UUID через
 поддерживаемый lifecycle, а не ограничивайтесь token reset.
 
+### Rotate runtime identity
+
+Confirmation page отправляет только CSRF и ожидаемый `updated_at`. Новый UUID v4
+генерируется сервером; браузер не может выбрать его. Операция сохраняет username,
+subscription token, quota и expiry, увеличивает generation и пишет
+`user.runtime-identity-rotated` без старого/нового UUID в metadata.
+
+Новые subscription documents сразу используют новый UUID. Для PerUserUuid
+старый runtime identity перестает быть авторизован только когда новое поколение
+получит статус Applied. UUID rotation не влияет на SharedCredential protocols и
+не отзывает ранее выданный общий пароль.
+
 ### Delete
 
-Confirm page показывает UUID, URL и traffic metadata. Delete:
+Confirm page не показывает UUID или bearer URL. Delete:
 
 - удаляет users row;
 - инвалидирует subscription token;
-- увеличивает desired generation;
+- увеличивает desired generation, если user был effectively allowed;
 - удаляет per-user identity после успешного reconcile.
 
 SharedCredential protocol не умеет индивидуально удалить знание общего пароля.
@@ -199,19 +247,22 @@ Generated YAML может содержать UUID и shared secrets. Счита�
 
 1. Создайте временного user.
 2. Дождитесь Applied и InSync для per-user profile.
-3. Откройте account page по HTTPS.
+3. Нажмите **Subscription access** и откройте account page по HTTPS.
 4. Передайте URL через защищенный канал.
 5. Импортируйте Mihomo YAML.
 6. Проверьте DNS, TCP/UDP handshake и routing.
-7. После подозрения на URL leak нажмите Reset token.
-8. После credential leak ротируйте protocol credential и повторно примените
-   runtime state.
+7. После подозрения на URL leak нажмите **Reset subscription URL**.
+8. После утечки per-user UUID нажмите **Rotate runtime identity**, дождитесь
+   Applied и выдайте обновленную subscription.
+9. После утечки shared credential ротируйте protocol secret и повторно примените
+   runtime state для всех затронутых пользователей.
 
 Не публикуйте token в issue, shell history или screenshots.
 
 ## 9. Backup и восстановление
 
-Users, token, UUID, profiles и shared secrets находятся в panel SQLite:
+Users, token, UUID, lifecycle checkpoints, profiles и shared secrets находятся
+в panel SQLite:
 
     /var/lib/infiproxy/infiproxy.sqlite
 
@@ -231,8 +282,7 @@ Users, token, UUID, profiles и shared secrets находятся в panel SQLit
 
 ## 10. Текущие ограничения
 
-- Нет UI edit для username, UUID, limit или expiry.
-- Нет live traffic collector/quota enforcement.
+- Нет live traffic collector; stored quota gate не доказывает фактический usage.
 - Нет массовой ротации subscription tokens.
 - Нет отдельной pause-until даты.
 - Нет API tokens/scopes для автоматизации user lifecycle.

@@ -9,7 +9,7 @@ backup/restore procedures rather than editing the live database.
 | Area | Tables | Purpose |
 |---|---|---|
 | Authentication | `admins`, `admin_sessions` | Password hashes, owner ordering, hashed sessions and expiry |
-| Users | `users` | Subscription identity, enablement, limits, expiry, runtime credential generation and counters |
+| Users | `users`, `user_lifecycle_state` | Authoritative subscription identity plus derived access-transition checkpoint/outbox |
 | Settings | `settings`, `bootstrap_state` | Validated control-plane settings and one-time bootstrap state |
 | Profiles | `protocol_profiles` | Stable adapter ID, schema version, endpoint, role, JSON config, preferred core and managed resource ID |
 | Secrets | `secret_values` | Legacy/control-plane secret storage; runtime-only values use root files and references |
@@ -34,10 +34,20 @@ for each generation. Reconcile candidates, file snapshots, and the sanitized
 operation journal live in the private root-owned maintenance transaction tree,
 not in separate SQLite snapshot/operation tables.
 
-Deleting or toggling a user can change runtime authorization and therefore
-creates a generation. Resetting only the subscription bearer token does not.
-Traffic counters and limits are stored and displayed, but this release does not
-provide a runtime traffic collector or quota-enforcement loop.
+User effective access is derived from `enabled`, UTC expiry, and stored
+usage/quota at one clock boundary. `users` remains authoritative.
+`user_lifecycle_state` is a disposable/self-healing checkpoint used to detect
+deadline crossings exactly once and to retain a pending generation until its
+bounded reconcile request is published. Migration 11 adds this table and a
+partial expiry index without rebuilding `users`; `ON DELETE CASCADE` defines
+checkpoint deletion.
+
+An active username change, an effective-access boundary, UUID rotation, and
+creation of a user can create a generation. A future expiry does not create a
+second generation until its deadline; reset of only the subscription bearer
+token never changes runtime authorization. Traffic counters and limits are
+stored and displayed, but this release does not provide a live runtime traffic
+collector.
 
 ## Backup and Recovery
 
@@ -47,9 +57,10 @@ secrets/configuration and runtime state; the database alone is insufficient.
 Never copy WAL/SHM files independently and never replace the live database while
 services are writing.
 
-Because `audit_events` is part of the same SQLite database, online backups
-naturally preserve audit history. No normal application API updates, deletes,
-or silently expires these rows. Migration 10 installs SQLite triggers that
+Because `audit_events` and `user_lifecycle_state` are part of the same SQLite
+database, online backups naturally preserve audit history and lifecycle
+checkpoints. No normal application API updates, deletes, or silently expires
+audit rows. Migration 10 installs SQLite triggers that
 reject row updates and deletes, and `.backup` preserves those triggers and
 indexes with the schema. This is defense in depth, not cryptographic
 immutability: root or a database owner can drop the triggers or replace the

@@ -176,6 +176,22 @@ grep -Fq 'audit_events' docs/storage-schema.md || {
   echo 'wiki check failed: audit_events storage contract is undocumented' >&2
   exit 1
 }
+grep -Fq 'Rotate runtime identity' wiki/04-USERS-AND-SUBSCRIPTIONS.md || {
+  echo 'wiki check failed: runtime identity rotation is undocumented' >&2
+  exit 1
+}
+grep -Fq 'Reset subscription URL' wiki/04-USERS-AND-SUBSCRIPTIONS.md || {
+  echo 'wiki check failed: subscription token rotation is undocumented' >&2
+  exit 1
+}
+grep -Fq 'live runtime traffic collector' docs/architecture-reconciler.md || {
+  echo 'wiki check failed: lifecycle docs no longer disclaim live traffic accounting' >&2
+  exit 1
+}
+grep -Fq 'lifecycle-checkpoint' docs/architecture-reconciler.md || {
+  echo 'wiki check failed: lifecycle-driven generation is undocumented' >&2
+  exit 1
+}
 
 module_ids="$(awk -F= '$1 == "id" {print $2}' deploy/modules.d/*.module | sort)"
 expected_modules="$(printf '%s\n' hysteria mihomo sing-box tuic xray)"

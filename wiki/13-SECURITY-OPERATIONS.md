@@ -236,7 +236,15 @@ Subscription token является bearer credential. Любой, кто пол
 
 `Referrer-Policy: no-referrer` уменьшает утечку в следующие сайты, но не убирает
 URL из server logs. Не пересылайте subscription URL через открытые каналы.
-После подозрения нажмите **Reset token** и при необходимости отключите user.
+Общий Users list не рендерит token или UUID; bearer URL показывается на отдельной
+authenticated странице **Subscription access** с `Cache-Control: no-store`.
+После подозрения нажмите **Reset subscription URL** и при необходимости
+отключите user.
+
+Reset subscription URL не меняет runtime UUID. При утечке UUID используйте
+**Rotate runtime identity**, дождитесь `Applied` и выдайте обновленную
+subscription. Это отзывает старую identity только у `PerUserUuid` adapters;
+shared password необходимо ротировать отдельно для всех его пользователей.
 
 ## 8. Secrets at rest
 

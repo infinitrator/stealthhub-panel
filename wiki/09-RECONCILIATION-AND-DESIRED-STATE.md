@@ -35,13 +35,17 @@ commands, paths, executable names или secret values.
 
 Runtime-affecting операции:
 
-- create/enable/disable/delete user;
+- create user и rotate runtime identity;
+- active username change;
+- enable/disable/delete или quota/expiry edit, если меняется effective access;
+- автоматический crossing UTC expiry deadline;
 - изменение enabled profile, endpoint или adapter config;
 - изменение panel settings, участвующих в infrastructure resources;
 - изменение routing state, если оно входит в generated client state.
 
-Reset subscription token не меняет server authorization и поэтому не обязан
-создавать runtime generation.
+Будущий expiry сам по себе не создает generation при сохранении: она возникает
+один раз в момент crossing. Reset subscription token меняет только bearer URL и
+не создает runtime generation.
 
 ## 3. Статусы
 
@@ -63,7 +67,7 @@ recovery-required.
 Worker загружает полный DesiredState:
 
 - profiles;
-- enabled users;
+- effectively allowed users;
 - settings;
 - infrastructure resources.
 
@@ -84,6 +88,25 @@ frontend и node DNS readiness.
 
 Unknown profile или future schema сохраняется в inventory как historical/
 unsupported; данные не удаляются автоматически.
+
+### Lifecycle-driven generation
+
+`users` является authoritative state. `user_lifecycle_state` хранит только
+derived access checkpoint и optional pending generation. При старте panel один
+repair scan восстанавливает missing/stale checkpoints и замечает пропущенный
+expiry. После него 30-секундный цикл проверяет deadline crossings через partial
+index `users(expires_at)` вместо полного сканирования таблицы.
+
+Crossing и увеличение generation фиксируются одной SQLite transaction. Pending
+generation очищается только после атомарной публикации bounded request, поэтому
+ошибка filesystem не теряет intent, а restart не увеличивает generation заново.
+HTTP subscription endpoint вычисляет состояние прямо из `users` с текущим UTC и
+блокирует expired user даже до следующего background tick.
+
+Для `PerUserUuid` только allowed users попадают в server fragment. Для
+`SharedCredential` adapter не получает индивидуальный authorization set, а для
+`None` users не участвуют. Generic reconciler не содержит protocol-specific
+ветвей. Уже выданный shared credential остается рабочим до общей ротации.
 
 ## 5. Candidate transaction
 

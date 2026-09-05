@@ -12,7 +12,8 @@ configuration through the root reconciler using the built-in adapter registry.
 > **Status:** `0.1.0-beta.1`. The architecture and migration contracts are
 > tested, but production operators must keep verified backups and validate real
 > client handshakes. Traffic limit and usage fields are stored metadata; this
-> release has no runtime traffic collector or quota enforcement.
+> release has no live runtime traffic collector. Stored values can gate access,
+> but they are not independently measured traffic accounting.
 
 ## Deployment Model
 
@@ -49,7 +50,8 @@ post-mutation failure attempts a complete rollback.
 User-facing:
 
 - First-owner setup, login, seven-day sessions, password rotation, and logout.
-- User create, enable/disable, subscription-token rotation, and deletion.
+- User create/edit, enable/disable, explicit UTC expiry, stored quota gating,
+  subscription-token rotation, runtime-identity rotation, and deletion.
 - Per-user Mihomo YAML and account pages protected by bearer tokens.
 - Runtime-neutral protocol profiles with automatic capability-based core
   selection; the current web UI does not expose a general core selector.

@@ -92,6 +92,22 @@ User mutations affecting runtime authorization create a new generation.
 Subscription-token reset is a client bearer-token operation and does not alter
 runtime credentials unless an adapter explicitly declares that dependency.
 
+Effective user access is one core decision: disabled, expiry at or before the
+caller-supplied UTC instant, and stored usage at or above quota are independent
+blocking reasons. The panel performs one full lifecycle-checkpoint repair at
+startup, then scans indexed expiry deadlines every 30 seconds. A crossing and
+its generation are committed together; the small checkpoint outbox is cleared
+only after the bounded reconcile request is published. HTTP subscription access
+always evaluates the authoritative row directly, so it does not wait for the
+background task. External trusted usage writers can reuse the full transition
+evaluation, but this release includes no live runtime traffic collector.
+
+Only allowed users enter `DesiredState.users`. `PerUserUuid` adapters consume
+that set. `SharedCredential` adapters deliberately render no per-user identity
+set, so disabling, expiry, deletion, or UUID rotation cannot revoke a shared
+credential already learned by a client. `None` adapters ignore users entirely;
+generic reconciliation does not branch on protocol names.
+
 ## Security Invariants
 
 - The panel remains unprivileged and never controls systemd directly.

@@ -26,7 +26,7 @@ Update Now не принимает repository/ref из браузера. Manual 
 | Home | / | Публичные ссылки на основные разделы |
 | Dashboard | /admin | Сводка users, generations, runtimes и shortcuts |
 | Account | /admin/account | Текущий admin и смена password |
-| Users | /admin/users | User lifecycle и subscription URLs |
+| Users | /admin/users | Effective access, user lifecycle и защищенная выдача subscription URLs |
 | Settings | /admin/settings | Domains, panel name и update schedule |
 | Protocols | /admin/protocols | Protocol profiles и adapter inventory |
 | Secrets | /admin/secrets | Shared secrets, owner-only |
@@ -110,14 +110,16 @@ infrastructure resources. Save не выдает сертификат автом
 | Действие | Кто | Результат |
 |---|---|---|
 | Create | любой admin | UUID/token, optional stored limit/expiry, generation |
-| open | любой admin | Account page по bearer URL |
-| download | любой admin | Mihomo YAML по bearer URL |
-| Disable/Enable | любой admin | Меняет effective access и generation |
-| Reset token | любой admin + confirm page | Немедленно заменяет bearer token |
-| Delete user | любой admin + confirm page | Удаляет row и запускает generation |
+| Subscription access | любой admin | Открывает отдельную no-store страницу с bearer URL и Mihomo import |
+| Edit | любой admin | Меняет username, stored quota и точный UTC expiry с optimistic version check |
+| Disable/Enable | любой admin | Меняет manual state; generation создается при смене effective access |
+| Reset subscription URL | любой admin + confirm page | Немедленно заменяет только bearer token |
+| Rotate runtime identity | любой admin + confirm page | Сервер генерирует новый UUID и запускает generation |
+| Delete user | любой admin + confirm page | Удаляет row; active identity удаляется через generation |
 
-Traffic fields не редактируются после create через текущий UI. Runtime collector
-и quota enforcement отсутствуют. Подробности:
+Общая таблица не показывает UUID или subscription token. `traffic_used_bytes`
+read-only; live runtime collector отсутствует. Exact effective state может
+одновременно показывать Disabled, Expired и Quota blocked. Подробности:
 [Пользователи и подписки](04-USERS-AND-SUBSCRIPTIONS).
 
 ## 8. Protocols
