@@ -23,4 +23,3 @@ serde_json.workspace = true
 sqlx.workspace = true
 stealthhub-core = { version = "=0.1.0-beta.1", path = "../stealthhub-core" }
 tokio = { workspace = true, features = ["io-util", "signal", "sync"] }
-
