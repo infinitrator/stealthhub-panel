@@ -17,6 +17,7 @@ use std::{fmt, str::FromStr, time::Duration as StdDuration};
 use uuid::Uuid;
 
 use crate::{
+    access::UserAccessState,
     adapter::{
         valid_adapter_id, CoreRegistry, ProfileUserSyncObservation, ProtocolRegistry,
         UserSyncStatus,
@@ -84,6 +85,20 @@ pub struct UserRecord {
     pub updated_at: DateTime<Utc>,
 }
 
+impl UserRecord {
+    /// Computes all effective-access reasons at one caller-supplied UTC instant.
+    #[must_use]
+    pub fn access_state_at(&self, now: DateTime<Utc>) -> UserAccessState {
+        UserAccessState::evaluate(
+            self.enabled,
+            self.expires_at,
+            self.traffic_limit_bytes,
+            self.traffic_used_bytes,
+            now,
+        )
+    }
+}
+
 impl fmt::Debug for UserRecord {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -107,6 +122,32 @@ pub struct NewUser {
     pub username: String,
     pub traffic_limit_bytes: Option<i64>,
     pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Optimistically updates editable user metadata without accepting credentials.
+#[derive(Debug, Clone)]
+pub struct UpdateUser {
+    pub id: i64,
+    pub username: String,
+    pub traffic_limit_bytes: Option<i64>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub expected_updated_at: DateTime<Utc>,
+}
+
+/// Result of a lifecycle mutation and its reconciliation requirement.
+#[derive(Debug, Clone)]
+pub struct UserMutationResult {
+    pub user: UserRecord,
+    pub generation: Option<u64>,
+    pub access_changed: bool,
+}
+
+/// Durable lifecycle evaluation result consumed by the panel scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UserLifecycleEvaluation {
+    pub evaluated_users: usize,
+    pub access_transitions: usize,
+    pub pending_generation: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -623,6 +664,7 @@ const USER_SYNC_STATUS_MIGRATION: i64 = 7;
 const ONE_TIME_BOOTSTRAP_MIGRATION: i64 = 8;
 const ADMIN_AUDIT_MIGRATION: i64 = 9;
 const AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION: i64 = 10;
+const USER_LIFECYCLE_MIGRATION: i64 = 11;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -969,6 +1011,47 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
         sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
             .bind(AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION)
             .bind("enforce append-only administrative audit rows")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(USER_LIFECYCLE_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            r"CREATE TABLE user_lifecycle_state (
+                user_id INTEGER PRIMARY KEY,
+                allowed INTEGER NOT NULL CHECK(allowed IN (0,1)),
+                disabled INTEGER NOT NULL CHECK(disabled IN (0,1)),
+                expired INTEGER NOT NULL CHECK(expired IN (0,1)),
+                quota_exceeded INTEGER NOT NULL CHECK(quota_exceeded IN (0,1)),
+                source_updated_at TEXT NOT NULL,
+                observed_at TEXT NOT NULL,
+                pending_generation INTEGER NULL CHECK(pending_generation >= 0),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )",
+            "CREATE INDEX idx_user_lifecycle_pending_generation ON user_lifecycle_state(pending_generation) WHERE pending_generation IS NOT NULL",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        let has_expiry_column: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pragma_table_info('users') WHERE name='expires_at'",
+        )
+        .fetch_one(&mut *transaction)
+        .await?;
+        if has_expiry_column == 1 {
+            sqlx::query(
+                "CREATE INDEX idx_users_expires_at ON users(expires_at) WHERE expires_at IS NOT NULL",
+            )
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(USER_LIFECYCLE_MIGRATION)
+            .bind("add durable user lifecycle checkpoints")
             .bind(Utc::now())
             .execute(&mut *transaction)
             .await?;
@@ -2329,6 +2412,11 @@ pub async fn list_protocol_profiles_decoded(pool: &SqlitePool) -> Result<Vec<Pro
 
 /// Loads one coherent desired-state snapshot for the privileged worker.
 pub async fn load_desired_state(pool: &SqlitePool) -> Result<DesiredState> {
+    load_desired_state_at(pool, Utc::now()).await
+}
+
+/// Loads desired state using one deterministic effective-access boundary.
+pub async fn load_desired_state_at(pool: &SqlitePool, now: DateTime<Utc>) -> Result<DesiredState> {
     let mut transaction = pool.begin().await?;
     let (generation,): (i64,) =
         sqlx::query_as("SELECT desired_generation FROM reconcile_state WHERE singleton = 1")
@@ -2345,19 +2433,14 @@ pub async fn load_desired_state(pool: &SqlitePool) -> Result<DesiredState> {
     )
     .fetch_all(&mut *transaction)
     .await?;
-    let now = Utc::now();
     let users = sqlx::query_as::<_, UserRecord>(
         r"
         SELECT id, username, uuid, subscription_token, enabled, traffic_limit_bytes,
                traffic_used_bytes, expires_at, created_at, updated_at
         FROM users
-        WHERE enabled = 1
-          AND (expires_at IS NULL OR expires_at > ?)
-          AND (traffic_limit_bytes IS NULL OR traffic_used_bytes < traffic_limit_bytes)
         ORDER BY id ASC
         ",
     )
-    .bind(now)
     .fetch_all(&mut *transaction)
     .await?;
     let settings =
@@ -2374,7 +2457,11 @@ pub async fn load_desired_state(pool: &SqlitePool) -> Result<DesiredState> {
             .into_iter()
             .map(decode_protocol_profile)
             .collect::<Result<Vec<_>>>()?,
-        users: users.into_iter().map(Into::into).collect(),
+        users: users
+            .into_iter()
+            .filter(|user| user.access_state_at(now).allowed())
+            .map(Into::into)
+            .collect(),
         settings,
         infrastructure: Vec::new(),
     })
@@ -3723,6 +3810,103 @@ where
         .ok_or_else(|| anyhow::anyhow!("expected enum to serialize as string"))
 }
 
+/// Shared username contract used by web and CLI user creation/editing.
+#[must_use]
+pub fn valid_user_name(value: &str) -> bool {
+    (3..=64).contains(&value.len())
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn validate_user_fields(username: &str, traffic_limit_bytes: Option<i64>) -> Result<()> {
+    if !valid_user_name(username) {
+        bail!("invalid user name");
+    }
+    if traffic_limit_bytes.is_some_and(|limit| limit <= 0) {
+        bail!("traffic limit must be positive when present");
+    }
+    Ok(())
+}
+
+fn next_user_updated_at(current: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    if now > current {
+        now
+    } else {
+        current + chrono::Duration::nanoseconds(1)
+    }
+}
+
+async fn get_user_by_id_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: i64,
+) -> Result<UserRecord> {
+    Ok(sqlx::query_as::<_, UserRecord>(
+        r"SELECT id,username,uuid,subscription_token,enabled,traffic_limit_bytes,
+                  traffic_used_bytes,expires_at,created_at,updated_at
+           FROM users WHERE id=?",
+    )
+    .bind(id)
+    .fetch_one(&mut **transaction)
+    .await?)
+}
+
+fn map_user_lookup_error(error: anyhow::Error) -> anyhow::Error {
+    if matches!(
+        error.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::RowNotFound)
+    ) {
+        anyhow::anyhow!("user not found")
+    } else {
+        error
+    }
+}
+
+fn audit_user_id(event: &NewAuditEvent, id: i64) -> Result<NewAuditEvent> {
+    event.validate()?;
+    let mut normalized = event.clone();
+    normalized.object_id = id.to_string();
+    Ok(normalized)
+}
+
+async fn upsert_user_lifecycle_checkpoint(
+    transaction: &mut Transaction<'_, Sqlite>,
+    user: &UserRecord,
+    state: UserAccessState,
+    observed_at: DateTime<Utc>,
+    pending_generation: Option<u64>,
+) -> Result<()> {
+    let pending_generation = pending_generation.map(i64::try_from).transpose()?;
+    sqlx::query(
+        r"INSERT INTO user_lifecycle_state
+             (user_id,allowed,disabled,expired,quota_exceeded,source_updated_at,observed_at,pending_generation)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             allowed=excluded.allowed,
+             disabled=excluded.disabled,
+             expired=excluded.expired,
+             quota_exceeded=excluded.quota_exceeded,
+             source_updated_at=excluded.source_updated_at,
+             observed_at=excluded.observed_at,
+             pending_generation=COALESCE(excluded.pending_generation,user_lifecycle_state.pending_generation)",
+    )
+    .bind(user.id)
+    .bind(state.allowed())
+    .bind(state.disabled)
+    .bind(state.expired)
+    .bind(state.quota_exceeded)
+    .bind(user.updated_at)
+    .bind(observed_at)
+    .bind(pending_generation)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 pub async fn create_user(pool: &SqlitePool, input: NewUser) -> Result<UserRecord> {
     create_user_inner(pool, input, None).await
 }
@@ -3741,6 +3925,8 @@ async fn create_user_inner(
     event: Option<&NewAuditEvent>,
 ) -> Result<UserRecord> {
     let now = Utc::now();
+    let username = input.username.trim();
+    validate_user_fields(username, input.traffic_limit_bytes)?;
     let uuid = Uuid::new_v4().to_string();
     let subscription_token = Uuid::new_v4().simple().to_string();
 
@@ -3761,8 +3947,8 @@ async fn create_user_inner(
         VALUES (?, ?, ?, 1, ?, 0, ?, ?, ?)
         ",
     )
-    .bind(input.username.trim())
-    .bind(uuid)
+    .bind(username)
+    .bind(&uuid)
     .bind(subscription_token.clone())
     .bind(input.traffic_limit_bytes)
     .bind(input.expires_at)
@@ -3770,13 +3956,29 @@ async fn create_user_inner(
     .bind(now)
     .execute(&mut *transaction)
     .await?;
-    bump_desired_generation(&mut transaction).await?;
+    let generation = bump_desired_generation(&mut transaction).await?;
+    let user = sqlx::query_as::<_, UserRecord>(
+        r"SELECT id,username,uuid,subscription_token,enabled,traffic_limit_bytes,
+                  traffic_used_bytes,expires_at,created_at,updated_at
+           FROM users WHERE subscription_token=?",
+    )
+    .bind(&subscription_token)
+    .fetch_one(&mut *transaction)
+    .await?;
+    upsert_user_lifecycle_checkpoint(
+        &mut transaction,
+        &user,
+        user.access_state_at(now),
+        now,
+        Some(generation),
+    )
+    .await?;
     if let Some(event) = event {
-        append_audit_event_in_transaction(&mut transaction, event).await?;
+        let event = audit_user_id(event, user.id)?;
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
     }
     transaction.commit().await?;
-
-    get_user_by_token(pool, &subscription_token).await
+    Ok(user)
 }
 
 pub async fn list_users(pool: &SqlitePool) -> Result<Vec<UserRecord>> {
@@ -3852,8 +4054,134 @@ pub async fn get_user_by_id(pool: &SqlitePool, id: i64) -> Result<UserRecord> {
     Ok(user)
 }
 
+/// Atomically edits user metadata with optimistic concurrency and typed audit.
+pub async fn update_user_audited(
+    pool: &SqlitePool,
+    input: UpdateUser,
+    event: &NewAuditEvent,
+) -> Result<UserMutationResult> {
+    let now = Utc::now();
+    let username = input.username.trim();
+    validate_user_fields(username, input.traffic_limit_bytes)?;
+    let mut transaction = pool.begin().await?;
+    let current = get_user_by_id_in_transaction(&mut transaction, input.id)
+        .await
+        .map_err(map_user_lookup_error)?;
+    if current.updated_at != input.expected_updated_at {
+        bail!("user changed since this form was loaded");
+    }
+
+    let username_changed = current.username != username;
+    let expiry_changed = current.expires_at != input.expires_at;
+    let quota_changed = current.traffic_limit_bytes != input.traffic_limit_bytes;
+    if !username_changed && !expiry_changed && !quota_changed {
+        bail!("user update contains no changes");
+    }
+    let updated_at = next_user_updated_at(current.updated_at, now);
+    let result = sqlx::query(
+        r"UPDATE users
+           SET username=?,traffic_limit_bytes=?,expires_at=?,updated_at=?
+           WHERE id=? AND updated_at=?",
+    )
+    .bind(username)
+    .bind(input.traffic_limit_bytes)
+    .bind(input.expires_at)
+    .bind(updated_at)
+    .bind(input.id)
+    .bind(input.expected_updated_at)
+    .execute(&mut *transaction)
+    .await?;
+    if result.rows_affected() != 1 {
+        bail!("user changed since this form was loaded");
+    }
+
+    let mut updated = current.clone();
+    updated.username = username.to_string();
+    updated.traffic_limit_bytes = input.traffic_limit_bytes;
+    updated.expires_at = input.expires_at;
+    updated.updated_at = updated_at;
+    let previous_access = current.access_state_at(now);
+    let current_access = updated.access_state_at(now);
+    let access_changed = previous_access.allowed() != current_access.allowed();
+    // Current per-user composers emit username as a runtime label/email/name.
+    let runtime_label_changed =
+        username_changed && (previous_access.allowed() || current_access.allowed());
+    let generation = if runtime_label_changed || access_changed {
+        Some(bump_desired_generation(&mut transaction).await?)
+    } else {
+        None
+    };
+    upsert_user_lifecycle_checkpoint(&mut transaction, &updated, current_access, now, generation)
+        .await?;
+    let mut event = audit_user_id(event, updated.id)?;
+    event.metadata = crate::audit::AuditMetadata::user_update(
+        username_changed,
+        expiry_changed,
+        quota_changed,
+        access_changed,
+    );
+    append_audit_event_in_transaction(&mut transaction, &event).await?;
+    transaction.commit().await?;
+    Ok(UserMutationResult {
+        user: updated,
+        generation,
+        access_changed,
+    })
+}
+
+/// Rotates only the server-side per-user UUID; the browser supplies no identity.
+pub async fn rotate_user_runtime_identity_audited(
+    pool: &SqlitePool,
+    id: i64,
+    expected_updated_at: DateTime<Utc>,
+    event: &NewAuditEvent,
+) -> Result<UserMutationResult> {
+    let now = Utc::now();
+    let mut transaction = pool.begin().await?;
+    let current = get_user_by_id_in_transaction(&mut transaction, id)
+        .await
+        .map_err(map_user_lookup_error)?;
+    if current.updated_at != expected_updated_at {
+        bail!("user changed since this confirmation was loaded");
+    }
+    let replacement = Uuid::new_v4().to_string();
+    let updated_at = next_user_updated_at(current.updated_at, now);
+    let result = sqlx::query("UPDATE users SET uuid=?,updated_at=? WHERE id=? AND updated_at=?")
+        .bind(&replacement)
+        .bind(updated_at)
+        .bind(id)
+        .bind(expected_updated_at)
+        .execute(&mut *transaction)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("user changed since this confirmation was loaded");
+    }
+    let generation = bump_desired_generation(&mut transaction).await?;
+    let mut updated = current.clone();
+    updated.uuid = replacement;
+    updated.updated_at = updated_at;
+    upsert_user_lifecycle_checkpoint(
+        &mut transaction,
+        &updated,
+        updated.access_state_at(now),
+        now,
+        Some(generation),
+    )
+    .await?;
+    let event = audit_user_id(event, updated.id)?;
+    append_audit_event_in_transaction(&mut transaction, &event).await?;
+    transaction.commit().await?;
+    Ok(UserMutationResult {
+        user: updated,
+        generation: Some(generation),
+        access_changed: false,
+    })
+}
+
 pub async fn set_user_enabled(pool: &SqlitePool, id: i64, enabled: bool) -> Result<()> {
-    set_user_enabled_inner(pool, id, enabled, None).await
+    set_user_enabled_inner(pool, id, enabled, None)
+        .await
+        .map(|_| ())
 }
 
 pub async fn set_user_enabled_audited(
@@ -3861,7 +4189,7 @@ pub async fn set_user_enabled_audited(
     id: i64,
     enabled: bool,
     event: &NewAuditEvent,
-) -> Result<()> {
+) -> Result<UserMutationResult> {
     set_user_enabled_inner(pool, id, enabled, Some(event)).await
 }
 
@@ -3870,9 +4198,16 @@ async fn set_user_enabled_inner(
     id: i64,
     enabled: bool,
     event: Option<&NewAuditEvent>,
-) -> Result<()> {
+) -> Result<UserMutationResult> {
     let now = Utc::now();
     let mut transaction = pool.begin().await?;
+    let current = get_user_by_id_in_transaction(&mut transaction, id)
+        .await
+        .map_err(map_user_lookup_error)?;
+    if current.enabled == enabled {
+        bail!("user already has the requested enabled state");
+    }
+    let updated_at = next_user_updated_at(current.updated_at, now);
 
     let result = sqlx::query(
         r"
@@ -3882,7 +4217,7 @@ async fn set_user_enabled_inner(
         ",
     )
     .bind(enabled)
-    .bind(now)
+    .bind(updated_at)
     .bind(id)
     .execute(&mut *transaction)
     .await?;
@@ -3890,12 +4225,34 @@ async fn set_user_enabled_inner(
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
-    bump_desired_generation(&mut transaction).await?;
+    let mut updated = current.clone();
+    updated.enabled = enabled;
+    updated.updated_at = updated_at;
+    let access_changed =
+        current.access_state_at(now).allowed() != updated.access_state_at(now).allowed();
+    let generation = if access_changed {
+        Some(bump_desired_generation(&mut transaction).await?)
+    } else {
+        None
+    };
+    upsert_user_lifecycle_checkpoint(
+        &mut transaction,
+        &updated,
+        updated.access_state_at(now),
+        now,
+        generation,
+    )
+    .await?;
     if let Some(event) = event {
-        append_audit_event_in_transaction(&mut transaction, event).await?;
+        let event = audit_user_id(event, updated.id)?;
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
     }
     transaction.commit().await?;
-    Ok(())
+    Ok(UserMutationResult {
+        user: updated,
+        generation,
+        access_changed,
+    })
 }
 
 pub async fn reset_user_subscription_token(pool: &SqlitePool, id: i64) -> Result<String> {
@@ -3919,6 +4276,10 @@ async fn reset_user_subscription_token_inner(
     let new_token = Uuid::new_v4().simple().to_string();
 
     let mut transaction = pool.begin().await?;
+    let current = get_user_by_id_in_transaction(&mut transaction, id)
+        .await
+        .map_err(map_user_lookup_error)?;
+    let updated_at = next_user_updated_at(current.updated_at, now);
     let result = sqlx::query(
         r"
         UPDATE users
@@ -3927,7 +4288,7 @@ async fn reset_user_subscription_token_inner(
         ",
     )
     .bind(&new_token)
-    .bind(now)
+    .bind(updated_at)
     .bind(id)
     .execute(&mut *transaction)
     .await?;
@@ -3935,8 +4296,20 @@ async fn reset_user_subscription_token_inner(
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
+    let mut updated = current;
+    updated.subscription_token = new_token.clone();
+    updated.updated_at = updated_at;
+    upsert_user_lifecycle_checkpoint(
+        &mut transaction,
+        &updated,
+        updated.access_state_at(now),
+        now,
+        None,
+    )
+    .await?;
     if let Some(event) = event {
-        append_audit_event_in_transaction(&mut transaction, event).await?;
+        let event = audit_user_id(event, updated.id)?;
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
     }
     transaction.commit().await?;
 
@@ -3944,10 +4317,14 @@ async fn reset_user_subscription_token_inner(
 }
 
 pub async fn delete_user(pool: &SqlitePool, id: i64) -> Result<()> {
-    delete_user_inner(pool, id, None).await
+    delete_user_inner(pool, id, None).await.map(|_| ())
 }
 
-pub async fn delete_user_audited(pool: &SqlitePool, id: i64, event: &NewAuditEvent) -> Result<()> {
+pub async fn delete_user_audited(
+    pool: &SqlitePool,
+    id: i64,
+    event: &NewAuditEvent,
+) -> Result<UserMutationResult> {
     delete_user_inner(pool, id, Some(event)).await
 }
 
@@ -3955,8 +4332,12 @@ async fn delete_user_inner(
     pool: &SqlitePool,
     id: i64,
     event: Option<&NewAuditEvent>,
-) -> Result<()> {
+) -> Result<UserMutationResult> {
+    let now = Utc::now();
     let mut transaction = pool.begin().await?;
+    let current = get_user_by_id_in_transaction(&mut transaction, id)
+        .await
+        .map_err(map_user_lookup_error)?;
     let result = sqlx::query(
         r"
         DELETE FROM users
@@ -3970,11 +4351,167 @@ async fn delete_user_inner(
     if result.rows_affected() == 0 {
         bail!("user not found");
     }
-    bump_desired_generation(&mut transaction).await?;
+    let access_changed = current.access_state_at(now).allowed();
+    let generation = if access_changed {
+        Some(bump_desired_generation(&mut transaction).await?)
+    } else {
+        None
+    };
     if let Some(event) = event {
-        append_audit_event_in_transaction(&mut transaction, event).await?;
+        let event = audit_user_id(event, current.id)?;
+        append_audit_event_in_transaction(&mut transaction, &event).await?;
     }
     transaction.commit().await?;
+    Ok(UserMutationResult {
+        user: current,
+        generation,
+        access_changed,
+    })
+}
+
+/// Evaluates only missing, stale or deadline-due lifecycle checkpoints.
+///
+/// A transition that changes effective authorization advances generation once.
+/// The returned generation remains durable until request publication is
+/// acknowledged with [`mark_user_lifecycle_reconcile_published`].
+pub async fn evaluate_user_lifecycle_transitions(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<UserLifecycleEvaluation> {
+    evaluate_user_lifecycle(pool, now, LifecycleEvaluationScope::Repair).await
+}
+
+/// Evaluates deadline crossings through the partial expiry index.
+///
+/// Normal mutations maintain their own checkpoints, so the background loop can
+/// use this bounded scan after one startup repair.
+pub async fn evaluate_due_user_lifecycle_transitions(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+) -> Result<UserLifecycleEvaluation> {
+    evaluate_user_lifecycle(pool, now, LifecycleEvaluationScope::Deadlines).await
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LifecycleEvaluationScope {
+    Repair,
+    Deadlines,
+}
+
+async fn evaluate_user_lifecycle(
+    pool: &SqlitePool,
+    now: DateTime<Utc>,
+    scope: LifecycleEvaluationScope,
+) -> Result<UserLifecycleEvaluation> {
+    let mut transaction = pool.begin().await?;
+    let candidate_ids = match scope {
+        LifecycleEvaluationScope::Repair => {
+            sqlx::query_scalar::<_, i64>(
+                r"SELECT users.id
+                   FROM users
+                   LEFT JOIN user_lifecycle_state lifecycle ON lifecycle.user_id=users.id
+                   WHERE lifecycle.user_id IS NULL
+                      OR lifecycle.source_updated_at<>users.updated_at
+                      OR (users.expires_at IS NOT NULL AND users.expires_at<=? AND lifecycle.expired=0)
+                      OR (users.expires_at IS NOT NULL AND users.expires_at>? AND lifecycle.expired=1)
+                   ORDER BY users.expires_at ASC,users.id ASC",
+            )
+            .bind(now)
+            .bind(now)
+            .fetch_all(&mut *transaction)
+            .await?
+        }
+        LifecycleEvaluationScope::Deadlines => {
+            sqlx::query_scalar::<_, i64>(
+                r"SELECT users.id
+                   FROM users
+                   JOIN user_lifecycle_state lifecycle ON lifecycle.user_id=users.id
+                   WHERE users.expires_at<=? AND lifecycle.expired=0
+                   UNION ALL
+                   SELECT users.id
+                   FROM users
+                   JOIN user_lifecycle_state lifecycle ON lifecycle.user_id=users.id
+                   WHERE users.expires_at>? AND lifecycle.expired=1
+                   ORDER BY id ASC",
+            )
+            .bind(now)
+            .bind(now)
+            .fetch_all(&mut *transaction)
+            .await?
+        }
+    };
+    let existing_pending = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(pending_generation) FROM user_lifecycle_state",
+    )
+    .fetch_one(&mut *transaction)
+    .await?
+    .map(u64::try_from)
+    .transpose()?;
+
+    let mut evaluated = Vec::with_capacity(candidate_ids.len());
+    let mut transition_count = 0usize;
+    for id in candidate_ids {
+        let user = get_user_by_id_in_transaction(&mut transaction, id).await?;
+        let previous_allowed = sqlx::query_scalar::<_, bool>(
+            "SELECT allowed FROM user_lifecycle_state WHERE user_id=?",
+        )
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let current = user.access_state_at(now);
+        let access_transition =
+            previous_allowed.map_or(!current.allowed(), |allowed| allowed != current.allowed());
+        if access_transition {
+            transition_count += 1;
+        }
+        evaluated.push((user, current, access_transition));
+    }
+
+    let new_generation = if transition_count > 0 {
+        let generation = bump_desired_generation(&mut transaction).await?;
+        sqlx::query(
+            "UPDATE user_lifecycle_state SET pending_generation=? WHERE pending_generation IS NOT NULL",
+        )
+        .bind(i64::try_from(generation)?)
+        .execute(&mut *transaction)
+        .await?;
+        Some(generation)
+    } else {
+        None
+    };
+    for (user, state, access_transition) in &evaluated {
+        upsert_user_lifecycle_checkpoint(
+            &mut transaction,
+            user,
+            *state,
+            now,
+            if *access_transition {
+                new_generation
+            } else {
+                None
+            },
+        )
+        .await?;
+    }
+    transaction.commit().await?;
+    Ok(UserLifecycleEvaluation {
+        evaluated_users: evaluated.len(),
+        access_transitions: transition_count,
+        pending_generation: new_generation.or(existing_pending),
+    })
+}
+
+/// Clears lifecycle outbox rows only after the bounded reconcile request exists.
+pub async fn mark_user_lifecycle_reconcile_published(
+    pool: &SqlitePool,
+    generation: u64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE user_lifecycle_state SET pending_generation=NULL WHERE pending_generation<=?",
+    )
+    .bind(i64::try_from(generation)?)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -4103,12 +4640,57 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 10);
+        assert_eq!(migrations, 11);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
             .await?;
         assert_eq!(integrity, "ok");
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_lifecycle_migration_upgrades_existing_users_without_loss() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let user = create_user(
+            &pool,
+            NewUser {
+                username: "migration-user".into(),
+                traffic_limit_bytes: Some(2_048),
+                expires_at: Some(Utc::now() + chrono::Duration::days(1)),
+            },
+        )
+        .await?;
+        for statement in [
+            "DROP INDEX idx_user_lifecycle_pending_generation",
+            "DROP TABLE user_lifecycle_state",
+            "DROP INDEX idx_users_expires_at",
+            "DELETE FROM schema_migrations WHERE version=11",
+        ] {
+            sqlx::query(statement).execute(&pool).await?;
+        }
+
+        init_db(&pool).await?;
+        let preserved = get_user_by_id(&pool, user.id).await?;
+        assert_eq!(preserved.username, user.username);
+        assert_eq!(preserved.uuid, user.uuid);
+        assert_eq!(preserved.subscription_token, user.subscription_token);
+        assert_eq!(preserved.traffic_limit_bytes, Some(2_048));
+        let migration_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version=11")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(migration_count, 1);
+        let repair = evaluate_user_lifecycle_transitions(&pool, Utc::now()).await?;
+        assert_eq!(repair.evaluated_users, 1);
+        let checkpoint_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_lifecycle_state WHERE user_id=?")
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(checkpoint_count, 1);
 
         close_and_remove(pool, &path).await;
         Ok(())
@@ -5202,6 +5784,476 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_edits_preserve_fields_and_apply_explicit_generation_rules() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let mut user = create_user(
+            &pool,
+            NewUser {
+                username: "alice".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+        )
+        .await?;
+        let original_uuid = user.uuid.clone();
+        let original_token = user.subscription_token.clone();
+        let initial_generation = get_reconcile_state(&pool).await?.desired_generation;
+        mark_user_lifecycle_reconcile_published(&pool, u64::try_from(initial_generation)?).await?;
+
+        let renamed = update_user_audited(
+            &pool,
+            UpdateUser {
+                id: user.id,
+                username: "alice-phone".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: user.updated_at,
+            },
+            &user_event(
+                AuditAction::UserUpdated,
+                &user.id.to_string(),
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(!renamed.access_changed);
+        assert_eq!(
+            renamed.generation,
+            Some(u64::try_from(initial_generation + 1)?)
+        );
+        user = renamed.user;
+        assert_eq!(user.uuid, original_uuid);
+        assert_eq!(user.subscription_token, original_token);
+
+        for (limit, expiry) in [
+            (Some(1_024), None),
+            (Some(2_048), None),
+            (Some(2_048), Some(Utc::now() + chrono::Duration::days(2))),
+            (Some(2_048), Some(Utc::now() + chrono::Duration::days(3))),
+            (None, None),
+        ] {
+            let result = update_user_audited(
+                &pool,
+                UpdateUser {
+                    id: user.id,
+                    username: user.username.clone(),
+                    traffic_limit_bytes: limit,
+                    expires_at: expiry,
+                    expected_updated_at: user.updated_at,
+                },
+                &user_event(
+                    AuditAction::UserUpdated,
+                    &user.id.to_string(),
+                    AuditMetadata::none(),
+                ),
+            )
+            .await?;
+            assert!(!result.access_changed);
+            assert_eq!(result.generation, None);
+            user = result.user;
+        }
+        assert_eq!(user.traffic_limit_bytes, None);
+        assert_eq!(user.expires_at, None);
+        assert_eq!(user.traffic_used_bytes, 0);
+        assert_eq!(user.uuid, original_uuid);
+        assert_eq!(user.subscription_token, original_token);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            initial_generation + 1
+        );
+
+        let events = list_audit_events(&pool, 100, 0).await?;
+        assert_eq!(events.len(), 6);
+        assert!(events
+            .iter()
+            .all(|event| event.object_id == user.id.to_string()));
+        let rename_metadata: AuditMetadata =
+            serde_json::from_str(&events.last().expect("rename event").metadata_json)?;
+        assert_eq!(
+            rename_metadata,
+            AuditMetadata::user_update(true, false, false, false)
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalid_duplicate_stale_and_noop_edits_leave_no_success_event() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let alice = create_user(
+            &pool,
+            NewUser {
+                username: "alice".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+        )
+        .await?;
+        let bob = create_user(
+            &pool,
+            NewUser {
+                username: "bob-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+        )
+        .await?;
+        let baseline_generation = get_reconcile_state(&pool).await?.desired_generation;
+        let event = user_event(
+            AuditAction::UserUpdated,
+            &bob.id.to_string(),
+            AuditMetadata::none(),
+        );
+
+        for input in [
+            UpdateUser {
+                id: bob.id,
+                username: "x".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: bob.updated_at,
+            },
+            UpdateUser {
+                id: bob.id,
+                username: alice.username.clone(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: bob.updated_at,
+            },
+            UpdateUser {
+                id: bob.id,
+                username: bob.username.clone(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: bob.updated_at,
+            },
+            UpdateUser {
+                id: bob.id,
+                username: "bob-renamed".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: bob.updated_at - chrono::Duration::seconds(1),
+            },
+        ] {
+            assert!(update_user_audited(&pool, input, &event).await.is_err());
+        }
+        let unchanged = get_user_by_id(&pool, bob.id).await?;
+        assert_eq!(unchanged.username, bob.username);
+        assert_eq!(unchanged.uuid, bob.uuid);
+        assert_eq!(unchanged.subscription_token, bob.subscription_token);
+        assert_eq!(audit_event_count(&pool).await?, 0);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            baseline_generation
+        );
+
+        delete_user(&pool, bob.id).await?;
+        let after_delete_generation = get_reconcile_state(&pool).await?.desired_generation;
+        assert!(update_user_audited(
+            &pool,
+            UpdateUser {
+                id: bob.id,
+                username: "deleted-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: bob.updated_at,
+            },
+            &event,
+        )
+        .await
+        .is_err());
+        assert!(rotate_user_runtime_identity_audited(
+            &pool,
+            bob.id,
+            bob.updated_at,
+            &user_event(
+                AuditAction::UserRuntimeIdentityRotated,
+                &bob.id.to_string(),
+                AuditMetadata::none(),
+            ),
+        )
+        .await
+        .is_err());
+        assert_eq!(audit_event_count(&pool).await?, 0);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            after_delete_generation
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn quota_transitions_block_and_restore_desired_authorization() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let user = create_user(
+            &pool,
+            NewUser {
+                username: "quota-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+        )
+        .await?;
+        let used_at = next_user_updated_at(user.updated_at, Utc::now());
+        sqlx::query("UPDATE users SET traffic_used_bytes=2048,updated_at=? WHERE id=?")
+            .bind(used_at)
+            .bind(user.id)
+            .execute(&pool)
+            .await?;
+        let user = get_user_by_id(&pool, user.id).await?;
+        let before = get_reconcile_state(&pool).await?.desired_generation;
+        let blocked = update_user_audited(
+            &pool,
+            UpdateUser {
+                id: user.id,
+                username: user.username.clone(),
+                traffic_limit_bytes: Some(1_024),
+                expires_at: None,
+                expected_updated_at: user.updated_at,
+            },
+            &user_event(
+                AuditAction::UserUpdated,
+                &user.id.to_string(),
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(blocked.access_changed);
+        assert_eq!(blocked.generation, Some(u64::try_from(before + 1)?));
+        assert!(load_desired_state(&pool).await?.users.is_empty());
+
+        let renamed_while_blocked = update_user_audited(
+            &pool,
+            UpdateUser {
+                id: user.id,
+                username: "quota-user-renamed".into(),
+                traffic_limit_bytes: blocked.user.traffic_limit_bytes,
+                expires_at: blocked.user.expires_at,
+                expected_updated_at: blocked.user.updated_at,
+            },
+            &user_event(
+                AuditAction::UserUpdated,
+                &user.id.to_string(),
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(!renamed_while_blocked.access_changed);
+        assert_eq!(renamed_while_blocked.generation, None);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            before + 1
+        );
+
+        let restored = update_user_audited(
+            &pool,
+            UpdateUser {
+                id: user.id,
+                username: renamed_while_blocked.user.username,
+                traffic_limit_bytes: None,
+                expires_at: None,
+                expected_updated_at: renamed_while_blocked.user.updated_at,
+            },
+            &user_event(
+                AuditAction::UserUpdated,
+                &user.id.to_string(),
+                AuditMetadata::none(),
+            ),
+        )
+        .await?;
+        assert!(restored.access_changed);
+        assert_eq!(restored.generation, Some(u64::try_from(before + 2)?));
+        assert_eq!(load_desired_state(&pool).await?.users.len(), 1);
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deadline_crossing_advances_generation_once_and_survives_restart() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        create_user(
+            &pool,
+            NewUser {
+                username: "expiry-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: Some(deadline),
+            },
+        )
+        .await?;
+        let created_generation = get_reconcile_state(&pool).await?.desired_generation;
+        mark_user_lifecycle_reconcile_published(&pool, u64::try_from(created_generation)?).await?;
+
+        let before = evaluate_due_user_lifecycle_transitions(
+            &pool,
+            deadline - chrono::Duration::nanoseconds(1),
+        )
+        .await?;
+        assert_eq!(before.access_transitions, 0);
+        assert_eq!(before.pending_generation, None);
+        let crossing = evaluate_due_user_lifecycle_transitions(&pool, deadline).await?;
+        assert_eq!(crossing.access_transitions, 1);
+        assert_eq!(
+            crossing.pending_generation,
+            Some(u64::try_from(created_generation + 1)?)
+        );
+        assert!(load_desired_state_at(&pool, deadline)
+            .await?
+            .users
+            .is_empty());
+
+        let repeated = evaluate_due_user_lifecycle_transitions(&pool, deadline).await?;
+        assert_eq!(repeated.access_transitions, 0);
+        assert_eq!(repeated.pending_generation, crossing.pending_generation);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            created_generation + 1
+        );
+        mark_user_lifecycle_reconcile_published(
+            &pool,
+            crossing.pending_generation.expect("expiry generation"),
+        )
+        .await?;
+        let after_restart = evaluate_user_lifecycle_transitions(&pool, deadline).await?;
+        assert_eq!(after_restart.access_transitions, 0);
+        assert_eq!(after_restart.pending_generation, None);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            created_generation + 1
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_repair_self_heals_a_missed_expiry_without_generation_storms() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let deadline = Utc::now() + chrono::Duration::hours(1);
+        let user = create_user(
+            &pool,
+            NewUser {
+                username: "repair-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: Some(deadline),
+            },
+        )
+        .await?;
+        let before = get_reconcile_state(&pool).await?.desired_generation;
+        mark_user_lifecycle_reconcile_published(&pool, u64::try_from(before)?).await?;
+        sqlx::query("DELETE FROM user_lifecycle_state WHERE user_id=?")
+            .bind(user.id)
+            .execute(&pool)
+            .await?;
+
+        let repaired = evaluate_user_lifecycle_transitions(&pool, deadline).await?;
+        assert_eq!(repaired.evaluated_users, 1);
+        assert_eq!(repaired.access_transitions, 1);
+        assert_eq!(
+            repaired.pending_generation,
+            Some(u64::try_from(before + 1)?)
+        );
+        let repeated = evaluate_user_lifecycle_transitions(&pool, deadline).await?;
+        assert_eq!(repeated.access_transitions, 0);
+        assert_eq!(
+            get_reconcile_state(&pool).await?.desired_generation,
+            before + 1
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_identity_rotation_is_atomic_versioned_and_secret_free() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let user = create_user(
+            &pool,
+            NewUser {
+                username: "rotation-user".into(),
+                traffic_limit_bytes: Some(4_096),
+                expires_at: Some(Utc::now() + chrono::Duration::days(2)),
+            },
+        )
+        .await?;
+        let old_uuid = user.uuid.clone();
+        let old_token = user.subscription_token.clone();
+        let before = get_reconcile_state(&pool).await?.desired_generation;
+        let event = user_event(
+            AuditAction::UserRuntimeIdentityRotated,
+            &user.id.to_string(),
+            AuditMetadata::none(),
+        );
+        let rotated =
+            rotate_user_runtime_identity_audited(&pool, user.id, user.updated_at, &event).await?;
+        assert_ne!(rotated.user.uuid, old_uuid);
+        assert_eq!(rotated.user.subscription_token, old_token);
+        assert_eq!(rotated.user.username, user.username);
+        assert_eq!(rotated.user.traffic_limit_bytes, user.traffic_limit_bytes);
+        assert_eq!(rotated.user.expires_at, user.expires_at);
+        assert_eq!(rotated.generation, Some(u64::try_from(before + 1)?));
+        let desired = load_desired_state(&pool).await?;
+        assert_eq!(desired.users.len(), 1);
+        assert_eq!(desired.users[0].uuid, rotated.user.uuid);
+
+        let serialized = serde_json::to_string(&list_audit_events(&pool, 100, 0).await?)?;
+        assert!(!serialized.contains(&old_uuid));
+        assert!(!serialized.contains(&rotated.user.uuid));
+        assert!(!serialized.contains(&old_token));
+        assert_eq!(audit_event_count(&pool).await?, 1);
+
+        assert!(
+            rotate_user_runtime_identity_audited(&pool, user.id, user.updated_at, &event,)
+                .await
+                .is_err()
+        );
+        assert_eq!(audit_event_count(&pool).await?, 1);
+        assert_eq!(
+            get_user_by_id(&pool, user.id).await?.uuid,
+            rotated.user.uuid
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_identity_audit_rolls_back_uuid_and_generation() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let user = create_user(
+            &pool,
+            NewUser {
+                username: "rollback-user".into(),
+                traffic_limit_bytes: None,
+                expires_at: None,
+            },
+        )
+        .await?;
+        let before = get_reconcile_state(&pool).await?.desired_generation;
+        let mut invalid = user_event(
+            AuditAction::UserRuntimeIdentityRotated,
+            &user.id.to_string(),
+            AuditMetadata::none(),
+        );
+        invalid.object_id = "x".repeat(193);
+        assert!(
+            rotate_user_runtime_identity_audited(&pool, user.id, user.updated_at, &invalid,)
+                .await
+                .is_err()
+        );
+        assert_eq!(get_user_by_id(&pool, user.id).await?.uuid, user.uuid);
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, before);
+        assert_eq!(audit_event_count(&pool).await?, 0);
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn audited_user_lifecycle_is_atomic_and_preserves_history() -> Result<()> {
         let (pool, path) = test_pool().await?;
         let user = create_user_audited(
@@ -5245,7 +6297,9 @@ mod tests {
 
         let events = list_audit_events(&pool, 100, 0).await?;
         assert_eq!(events.len(), 4);
-        assert!(events.iter().all(|event| event.object_id == "alice"));
+        assert!(events
+            .iter()
+            .all(|event| event.object_id == user.id.to_string()));
         let serialized = serde_json::to_string(&events)?;
         assert!(!serialized.contains(&old_token));
         assert!(!serialized.contains(&new_token));

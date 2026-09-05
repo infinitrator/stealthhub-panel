@@ -83,6 +83,14 @@ subscription_token_from_body() {
     printf '%s' "$value"
 }
 
+user_version_from_body() {
+    local value
+    value="$(grep -oE 'name="expected_updated_at" value="[^"]+"' "$BODY_FILE" \
+        | sed -n '1p' | cut -d'"' -f4)"
+    [[ -n "$value" ]] || fail "user version was not rendered"
+    printf '%s' "$value"
+}
+
 [[ -x "$PANEL_BIN" ]] || fail "panel binary is missing: ${PANEL_BIN}"
 if curl --silent --fail --max-time 1 "${BASE_URL}/health" >/dev/null 2>&1; then
     fail "test port ${PORT} is already in use"
@@ -207,8 +215,49 @@ request 303 /admin/users/create --request POST \
     --data-urlencode expires_in_days=30
 request 200 /admin/users
 body_contains 'field-user'
+body_excludes '/sub/'
+request 200 /admin/users/1/subscription
 SUBSCRIPTION_TOKEN="$(subscription_token_from_body)"
 request 200 "/sub/${SUBSCRIPTION_TOKEN}"
+request 503 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
+body_contains 'subscription is not configured'
+
+request 200 /admin/users/1/edit
+body_contains 'Stored traffic usage'
+body_excludes 'name="traffic_used_bytes"'
+EDIT_VERSION="$(user_version_from_body)"
+request 403 /admin/users/1/edit --request POST \
+    --data-urlencode username=field-user-edited \
+    --data-urlencode expected_updated_at="$EDIT_VERSION"
+request 400 /admin/users/1/edit --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode username=field-user-edited \
+    --data-urlencode traffic_limit_gb=20 \
+    --data-urlencode expires_at_utc=2030-01-01T05:00:00+03:00 \
+    --data-urlencode expected_updated_at="$EDIT_VERSION"
+request 303 /admin/users/1/edit --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode username=field-user-edited \
+    --data-urlencode traffic_limit_gb=20 \
+    --data-urlencode expires_at_utc= \
+    --data-urlencode expected_updated_at="$EDIT_VERSION"
+request 409 /admin/users/1/edit --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode username=stale-edit \
+    --data-urlencode traffic_limit_gb=20 \
+    --data-urlencode expires_at_utc= \
+    --data-urlencode expected_updated_at="$EDIT_VERSION"
+request 200 /admin/users/1/rotate-identity
+body_excludes 'name="uuid"'
+ROTATE_VERSION="$(user_version_from_body)"
+request 403 /admin/users/1/rotate-identity --request POST \
+    --data-urlencode expected_updated_at="$ROTATE_VERSION"
+request 303 /admin/users/1/rotate-identity --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$ROTATE_VERSION"
+request 409 /admin/users/1/rotate-identity --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$ROTATE_VERSION"
 request 503 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
 body_contains 'subscription is not configured'
 
@@ -286,6 +335,8 @@ request 303 "/admin/users/1/reset-token" --request POST \
     --data-urlencode csrf_token="$RESET_CSRF"
 request 401 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
 request 200 /admin/users
+body_excludes '/sub/'
+request 200 /admin/users/1/subscription
 NEW_SUBSCRIPTION_TOKEN="$(subscription_token_from_body)"
 [[ "$NEW_SUBSCRIPTION_TOKEN" != "$SUBSCRIPTION_TOKEN" ]] \
     || fail "subscription token did not rotate"

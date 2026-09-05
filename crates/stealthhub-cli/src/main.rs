@@ -3,6 +3,7 @@
 //! The CLI intentionally stays small: it initializes `SQLite` state and performs
 //! explicit user maintenance without starting the web control plane.
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use stealthhub_core::adapters::{core_registry, protocol_registry};
 use stealthhub_core::storage::{
@@ -46,12 +47,18 @@ async fn main() -> anyhow::Result<()> {
             traffic_limit_gb,
         } => {
             let pool = open_initialized_pool(&db).await?;
+            let traffic_limit_bytes = traffic_limit_gb
+                .map(|gib| {
+                    anyhow::ensure!(gib > 0, "traffic limit must be positive");
+                    gib.checked_mul(1024 * 1024 * 1024)
+                        .ok_or_else(|| anyhow::anyhow!("traffic limit is too large"))
+                })
+                .transpose()?;
             let user = create_user(
                 &pool,
                 NewUser {
                     username,
-                    traffic_limit_bytes: traffic_limit_gb
-                        .map(|gb| gb.saturating_mul(1024 * 1024 * 1024)),
+                    traffic_limit_bytes,
                     expires_at: None,
                 },
             )
@@ -65,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         Command::ListUsers { db } => {
             let pool = open_initialized_pool(&db).await?;
             let users = list_users(&pool).await?;
+            let now = Utc::now();
 
             if users.is_empty() {
                 println!("no users");
@@ -73,7 +81,20 @@ async fn main() -> anyhow::Result<()> {
                     let limit = user
                         .traffic_limit_bytes
                         .map_or_else(|| "unlimited".to_string(), format_bytes);
-                    let status = if user.enabled { "enabled" } else { "disabled" };
+                    let access = user.access_state_at(now);
+                    let status = if access.allowed() {
+                        "active".to_string()
+                    } else {
+                        [
+                            access.disabled.then_some("disabled"),
+                            access.expired.then_some("expired"),
+                            access.quota_exceeded.then_some("quota-blocked"),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                    };
                     println!(
                         "{}\t{}\t{}\t/sub/{}/mihomo.yaml",
                         user.id, user.username, status, user.subscription_token

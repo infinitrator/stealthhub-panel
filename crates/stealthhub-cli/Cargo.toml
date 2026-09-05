@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 stealthhub-core = { version = "=0.1.0-beta.1", path = "../stealthhub-core" }
 tokio.workspace = true

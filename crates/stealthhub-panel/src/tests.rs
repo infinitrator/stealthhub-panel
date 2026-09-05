@@ -317,28 +317,124 @@ fn secret_names_are_bounded_and_path_independent() {
 #[test]
 fn subscription_block_reason_enforces_user_state() {
     let mut user = fixture_user();
-    assert!(subscription_block_reason(&user).is_none());
+    let now = Utc::now();
+    assert!(subscription_block_reason(&user, now).is_none());
 
     user.enabled = false;
     assert_eq!(
-        subscription_block_reason(&user),
-        Some("subscription disabled")
+        subscription_block_reason(&user, now),
+        Some("subscription unavailable")
     );
 
     user.enabled = true;
-    user.expires_at = Some(Utc::now() - Duration::days(1));
+    user.expires_at = Some(now);
     assert_eq!(
-        subscription_block_reason(&user),
-        Some("subscription expired")
+        subscription_block_reason(&user, now),
+        Some("subscription unavailable")
     );
 
     user.expires_at = None;
     user.traffic_limit_bytes = Some(1024);
     user.traffic_used_bytes = 1024;
     assert_eq!(
-        subscription_block_reason(&user),
-        Some("traffic limit reached")
+        subscription_block_reason(&user, now),
+        Some("subscription unavailable")
     );
+}
+
+#[test]
+fn user_form_parsers_are_bounded_and_utc_explicit() {
+    let now = Utc::now();
+    assert_eq!(parse_user_traffic_limit(""), Ok(None));
+    assert_eq!(parse_user_traffic_limit("0"), Ok(None));
+    assert_eq!(parse_user_traffic_limit("2"), Ok(Some(2 * GIB_BYTES)));
+    assert!(parse_user_traffic_limit("-1").is_err());
+    assert!(parse_user_traffic_limit("1.5").is_err());
+    assert!(parse_user_traffic_limit(&i64::MAX.to_string()).is_err());
+
+    assert_eq!(parse_create_user_expiry("", now), Ok(None));
+    assert_eq!(
+        parse_create_user_expiry("1", now),
+        Ok(Some(now + Duration::days(1)))
+    );
+    assert!(parse_create_user_expiry("-1", now).is_err());
+    assert!(parse_create_user_expiry("3651", now).is_err());
+
+    let exact = now.to_rfc3339();
+    assert_eq!(parse_user_expiry_utc(&exact, now), Ok(Some(now)));
+    assert!(parse_user_expiry_utc("2030-01-01T05:00:00+03:00", now).is_err());
+    assert!(parse_user_expiry_utc("not-a-date", now).is_err());
+    assert!(parse_user_expiry_utc(
+        &(now + Duration::days(MAX_USER_EXPIRY_DAYS + 1)).to_rfc3339(),
+        now
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn user_views_show_lifecycle_without_exposing_credentials() {
+    let admin = AuthenticatedAdmin {
+        admin: test_admin(2),
+        is_owner: false,
+        csrf_token: "csrf-sentinel".to_string(),
+        update_notice: None,
+    };
+    let now = Utc::now();
+    let mut user = fixture_user();
+    user.uuid = "uuid-secret-sentinel".to_string();
+    user.subscription_token = "subscription-secret-sentinel".to_string();
+    user.enabled = false;
+    user.expires_at = Some(now);
+    user.traffic_limit_bytes = Some(1);
+    user.traffic_used_bytes = 1;
+
+    let response = views::users::render_index(&admin, &[user.clone()], &[], now);
+    let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
+        .await
+        .expect("users response body");
+    let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 users page");
+    for status in ["Disabled", "Expired", "Quota blocked"] {
+        assert!(rendered.contains(status));
+    }
+    assert!(rendered.contains("No live collector"));
+    assert!(!rendered.contains("uuid-secret-sentinel"));
+    assert!(!rendered.contains("subscription-secret-sentinel"));
+
+    let delivery = views::users::render_subscription_access(
+        &admin,
+        &user,
+        "https://panel.test/sub/subscription-secret-sentinel",
+        "https://panel.test/sub/subscription-secret-sentinel/mihomo.yaml",
+        "clash://install-config?url=subscription-secret-sentinel",
+    );
+    let body = axum::body::to_bytes(delivery.into_body(), 128 * 1024)
+        .await
+        .expect("subscription access response body");
+    let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 subscription access page");
+    assert!(rendered.contains("subscription-secret-sentinel"));
+    assert!(rendered.contains("bearer URLs grant access"));
+
+    let edit = views::users::render_edit(&admin, &user);
+    let body = axum::body::to_bytes(edit.into_body(), 128 * 1024)
+        .await
+        .expect("edit response body");
+    let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 edit page");
+    assert!(rendered.contains("name=\"expected_updated_at\""));
+    assert!(rendered.contains("name=\"csrf_token\""));
+    assert!(!rendered.contains("name=\"traffic_used_bytes\""));
+    assert!(!rendered.contains("uuid-secret-sentinel"));
+    assert!(!rendered.contains("subscription-secret-sentinel"));
+
+    let rotate = views::users::render_rotate_identity(&admin, &user);
+    let body = axum::body::to_bytes(rotate.into_body(), 128 * 1024)
+        .await
+        .expect("rotation response body");
+    let rendered = String::from_utf8(body.to_vec()).expect("UTF-8 rotation page");
+    assert!(rendered.contains("name=\"expected_updated_at\""));
+    assert!(rendered.contains("new desired generation is Applied"));
+    assert!(!rendered.contains("name=\"uuid\""));
+    assert!(!rendered.contains("uuid-secret-sentinel"));
+    assert!(!rendered.contains("subscription-secret-sentinel"));
 }
 
 #[test]

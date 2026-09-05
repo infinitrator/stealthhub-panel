@@ -1475,7 +1475,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        adapter::{ClientRenderContext, MapSecretResolver},
+        adapter::{ClientRenderContext, MapSecretResolver, ServerRenderContext},
         models::SubscriptionUser,
     };
 
@@ -1678,6 +1678,36 @@ mod tests {
                 assert_eq!(rendered["httpmask"]["path-root"], "infiproxy");
             }
         }
+    }
+
+    #[test]
+    fn shared_credential_server_state_does_not_claim_individual_revocation() {
+        let registry = registry().unwrap();
+        let profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.protocol_id == "snell-v5")
+            .expect("Snell profile");
+        let users = vec![SubscriptionUser {
+            username: "alice".to_string(),
+            uuid: "11111111-1111-4111-8111-111111111111".to_string(),
+            subscription_token: "token".to_string(),
+        }];
+        let secrets = test_secrets();
+        let resolver = MapSecretResolver::new(&secrets);
+        let adapter = registry.get(&profile.protocol_id).expect("Snell adapter");
+        assert_eq!(
+            adapter.manifest().user_participation,
+            UserParticipation::SharedCredential
+        );
+        let rendered = adapter
+            .render_server(&ServerRenderContext {
+                profile: &profile,
+                users: &users,
+                secrets: &resolver,
+            })
+            .expect("server fragment");
+        assert_eq!(rendered.payload["users"], json!([]));
+        assert_eq!(rendered.expected_user_ids, None);
     }
 
     #[test]

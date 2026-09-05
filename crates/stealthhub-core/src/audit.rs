@@ -14,7 +14,9 @@ pub enum AuditAction {
     UserCreated,
     UserEnabled,
     UserDisabled,
+    UserUpdated,
     UserSubscriptionTokenReset,
+    UserRuntimeIdentityRotated,
     UserDeleted,
     SettingsSaved,
     PanelAutoUpdatePolicyChanged,
@@ -58,7 +60,9 @@ impl AuditAction {
             Self::UserCreated => "user.created",
             Self::UserEnabled => "user.enabled",
             Self::UserDisabled => "user.disabled",
+            Self::UserUpdated => "user.updated",
             Self::UserSubscriptionTokenReset => "user.subscription-token-reset",
+            Self::UserRuntimeIdentityRotated => "user.runtime-identity-rotated",
             Self::UserDeleted => "user.deleted",
             Self::SettingsSaved => "settings.saved",
             Self::PanelAutoUpdatePolicyChanged => "panel.auto-update-policy-changed",
@@ -188,6 +192,14 @@ pub struct AuditMetadata {
     pub enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expiry_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_changed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_changed: Option<bool>,
 }
 
 impl AuditMetadata {
@@ -195,18 +207,36 @@ impl AuditMetadata {
         Self {
             enabled: None,
             count: None,
+            username_changed: None,
+            expiry_changed: None,
+            quota_changed: None,
+            access_changed: None,
         }
     }
     pub const fn enabled(value: bool) -> Self {
         Self {
             enabled: Some(value),
-            count: None,
+            ..Self::none()
         }
     }
     pub fn count(value: usize) -> Self {
         Self {
-            enabled: None,
             count: Some(value as u64),
+            ..Self::none()
+        }
+    }
+    pub const fn user_update(
+        username_changed: bool,
+        expiry_changed: bool,
+        quota_changed: bool,
+        access_changed: bool,
+    ) -> Self {
+        Self {
+            username_changed: Some(username_changed),
+            expiry_changed: Some(expiry_changed),
+            quota_changed: Some(quota_changed),
+            access_changed: Some(access_changed),
+            ..Self::none()
         }
     }
 }

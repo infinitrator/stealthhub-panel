@@ -15,6 +15,7 @@ mod reconcile_request;
 mod rule_sources;
 mod ui;
 mod update;
+mod user_lifecycle;
 mod views;
 
 pub(crate) use crate::views::components::{admin_bar, csrf_field};
@@ -41,7 +42,7 @@ use axum::{
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use cookie::{time::Duration as CookieDuration, Cookie, SameSite};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -77,14 +78,14 @@ use stealthhub_core::{
         list_runtime_user_sync, list_secret_names, list_users, load_client_policy, load_dns_policy,
         load_panel_settings, load_routing_rule_sets, load_rule_entries, load_rule_sources,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
-        reset_user_subscription_token_audited, save_routing_rule_set_audited,
-        set_user_enabled_audited, touch_admin_session,
+        reset_user_subscription_token_audited, rotate_user_runtime_identity_audited,
+        save_routing_rule_set_audited, set_user_enabled_audited, touch_admin_session,
         update_admin_password_and_revoke_sessions_audited, update_dns_policy_audited,
-        update_protocol_profile_audited, update_routing_rule_set_audited,
+        update_protocol_profile_audited, update_routing_rule_set_audited, update_user_audited,
         upsert_routing_policy_audited, upsert_rule_entry_audited, upsert_rule_source_audited,
         upsert_secret_audited, upsert_setting, upsert_settings_with_runtime_keys_audited,
-        upsert_transport_pool_audited, AdminRecord, NewUser, UpdateProtocolProfile,
-        UpdateRoutingRuleSet, UserRecord,
+        upsert_transport_pool_audited, valid_user_name, AdminRecord, NewUser,
+        UpdateProtocolProfile, UpdateRoutingRuleSet, UpdateUser, UserRecord,
     },
 };
 use subtle::ConstantTimeEq;
@@ -138,6 +139,25 @@ struct CreateUserForm {
     traffic_limit_gb: String,
     #[serde(default)]
     expires_in_days: String,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct EditUserForm {
+    username: String,
+    #[serde(default)]
+    traffic_limit_gb: String,
+    #[serde(default)]
+    expires_at_utc: String,
+    expected_updated_at: String,
+    #[serde(default)]
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct VersionedUserForm {
+    expected_updated_at: String,
     #[serde(default)]
     csrf_token: String,
 }
@@ -465,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
     update::spawn_checker(pool.clone());
     modules::spawn_checker(pool.clone());
     rule_sources::spawn_checker(pool.clone());
+    user_lifecycle::spawn_checker(pool.clone());
 
     let state = AppState {
         pool,
@@ -602,10 +623,22 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/credits", get(credits_page))
         .route("/admin/health", get(admin_health))
         .route("/admin/users/create", post(create_user_action))
+        .route(
+            "/admin/users/{id}/edit",
+            get(edit_user_page).post(edit_user_action),
+        )
+        .route(
+            "/admin/users/{id}/subscription",
+            get(user_subscription_access_page),
+        )
         .route("/admin/users/{id}/toggle", post(toggle_user_action))
         .route(
             "/admin/users/{id}/reset-token",
             get(reset_user_token_page).post(reset_user_token_action),
+        )
+        .route(
+            "/admin/users/{id}/rotate-identity",
+            get(rotate_user_identity_page).post(rotate_user_identity_action),
         )
         .route(
             "/admin/users/{id}/delete",
@@ -655,7 +688,7 @@ async fn mihomo_subscription(State(state): State<AppState>, Path(token): Path<St
         }
     };
 
-    if let Some(reason) = subscription_block_reason(&user) {
+    if let Some(reason) = subscription_block_reason(&user, Utc::now()) {
         return (StatusCode::FORBIDDEN, format!("{reason}\n")).into_response();
     }
 
@@ -748,7 +781,7 @@ async fn subscription_page(State(state): State<AppState>, Path(token): Path<Stri
 
     let yaml_url = mihomo_subscription_url(&settings.subscription_domain, &user.subscription_token);
     let import_url = mihomo_import_url(&settings.panel_name, &user.username, &yaml_url);
-    let block_reason = subscription_block_reason(&user);
+    let block_reason = subscription_block_reason(&user, Utc::now());
 
     views::subscription::render(
         &user,
@@ -3287,6 +3320,74 @@ fn valid_account_name(value: &str, minimum_length: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+const GIB_BYTES: i64 = 1024 * 1024 * 1024;
+const MAX_USER_EXPIRY_DAYS: i64 = 3650;
+
+fn parse_user_traffic_limit(value: &str) -> Result<Option<i64>, &'static str> {
+    match value.trim() {
+        "" | "0" => Ok(None),
+        value => {
+            let gib = value
+                .parse::<i64>()
+                .map_err(|_| "Traffic limit must be a whole number of GiB")?;
+            if gib <= 0 {
+                return Err("Traffic limit must be positive");
+            }
+            gib.checked_mul(GIB_BYTES)
+                .map(Some)
+                .ok_or("Traffic limit is too large")
+        }
+    }
+}
+
+fn parse_create_user_expiry(
+    value: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, &'static str> {
+    match value.trim() {
+        "" | "0" => Ok(None),
+        value => {
+            let days = value
+                .parse::<i64>()
+                .map_err(|_| "Expiry must be a whole number of days")?;
+            if !(1..=MAX_USER_EXPIRY_DAYS).contains(&days) {
+                return Err("Expiry must be between 1 and 3650 days");
+            }
+            now.checked_add_signed(Duration::days(days))
+                .map(Some)
+                .ok_or("Expiry is out of range")
+        }
+    }
+}
+
+fn parse_user_expiry_utc(
+    value: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let parsed = DateTime::parse_from_rfc3339(value)
+        .map_err(|_| "Expiry must be an RFC 3339 timestamp in UTC")?;
+    if parsed.offset().local_minus_utc() != 0 {
+        return Err("Expiry must use UTC with a Z or +00:00 offset");
+    }
+    let parsed = parsed.with_timezone(&Utc);
+    let earliest = now - Duration::days(MAX_USER_EXPIRY_DAYS);
+    let latest = now + Duration::days(MAX_USER_EXPIRY_DAYS);
+    if parsed < earliest || parsed > latest {
+        return Err("Expiry must be within 3650 days of the current UTC time");
+    }
+    Ok(Some(parsed))
+}
+
+fn parse_user_version(value: &str) -> Result<DateTime<Utc>, &'static str> {
+    DateTime::parse_from_rfc3339(value.trim())
+        .map(|value| value.with_timezone(&Utc))
+        .map_err(|_| "The user form version is invalid; reload the page")
+}
+
 fn checkbox_enabled(value: &str) -> bool {
     matches!(value, "1" | "true" | "yes" | "on")
 }
@@ -3316,7 +3417,142 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
         Err(error) => return internal_error("load user synchronization summary", error),
     };
 
-    views::users::render_index(&auth, &users, &user_sync)
+    views::users::render_index(&auth, &users, &user_sync, Utc::now())
+}
+
+async fn edit_user_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match get_user_by_id(&state.pool, id).await {
+        Ok(user) => views::users::render_edit(&auth, &user),
+        Err(error) => logged_error_with_back(
+            StatusCode::NOT_FOUND,
+            "load user for edit",
+            error,
+            "User not found",
+            "The requested user does not exist.",
+            "/admin/users",
+            "Back to Users",
+        ),
+    }
+}
+
+async fn user_subscription_access_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let user = match get_user_by_id(&state.pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return logged_error_with_back(
+                StatusCode::NOT_FOUND,
+                "load user subscription access",
+                error,
+                "User not found",
+                "The requested user does not exist.",
+                "/admin/users",
+                "Back to Users",
+            )
+        }
+    };
+    let settings = match load_panel_settings(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load subscription settings", error),
+    };
+    let yaml_url = mihomo_subscription_url(&settings.subscription_domain, &user.subscription_token);
+    let account_url = format!(
+        "https://{}/sub/{}",
+        settings.subscription_domain.trim().trim_end_matches('/'),
+        user.subscription_token
+    );
+    let import_url = mihomo_import_url(&settings.panel_name, &user.username, &yaml_url);
+    views::users::render_subscription_access(&auth, &user, &account_url, &yaml_url, &import_url)
+}
+
+async fn edit_user_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<EditUserForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+
+    let username = form.username.trim().to_string();
+    if !valid_user_name(&username) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Bad request",
+            "Username must be 3-64 ASCII letters, digits, dots, underscores or hyphens and must start with a letter or digit.",
+        );
+    }
+    let traffic_limit_bytes = match parse_user_traffic_limit(&form.traffic_limit_gb) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
+        }
+    };
+    let now = Utc::now();
+    let expires_at = match parse_user_expiry_utc(&form.expires_at_utc, now) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
+        }
+    };
+    let expected_updated_at = match parse_user_version(&form.expected_updated_at) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
+        }
+    };
+    let event = audit_event(
+        &auth,
+        AuditAction::UserUpdated,
+        AuditObjectType::User,
+        id.to_string(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    let input = UpdateUser {
+        id,
+        username,
+        traffic_limit_bytes,
+        expires_at,
+        expected_updated_at,
+    };
+    match update_user_audited(&state.pool, input, &event).await {
+        Ok(result) => {
+            if result.generation.is_some() {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to("/admin/users").into_response()
+        }
+        Err(error) => logged_error_with_back(
+            StatusCode::CONFLICT,
+            "edit user",
+            error,
+            "Edit user failed",
+            "The user was changed elsewhere, the username is already used, or the submitted values are unchanged. Reload the page and try again.",
+            "/admin/users",
+            "Back to Users",
+        ),
+    }
 }
 
 async fn audit_page(
@@ -3376,69 +3612,24 @@ async fn create_user_action(
 
     let username = form.username.trim().to_string();
 
-    if !valid_account_name(&username, 1) {
+    if !valid_user_name(&username) {
         return html_error_response(
             StatusCode::BAD_REQUEST,
             "Bad request",
-            "Username must be 1-64 ASCII letters, digits, dots, underscores or hyphens and must start with a letter or digit.",
+            "Username must be 3-64 ASCII letters, digits, dots, underscores or hyphens and must start with a letter or digit.",
         );
     }
 
-    let traffic_limit_bytes = match form.traffic_limit_gb.trim() {
-        "" | "0" => None,
-        value => {
-            let gb = match value.parse::<i64>() {
-                Ok(value) if value > 0 => value,
-                Ok(_) => {
-                    return html_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request",
-                        "Traffic limit must be positive",
-                    );
-                }
-                Err(_) => {
-                    return html_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request",
-                        "Traffic limit must be a number",
-                    );
-                }
-            };
-
-            match gb.checked_mul(1024 * 1024 * 1024) {
-                Some(bytes) => Some(bytes),
-                None => {
-                    return html_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request",
-                        "Traffic limit is too large",
-                    );
-                }
-            }
+    let traffic_limit_bytes = match parse_user_traffic_limit(&form.traffic_limit_gb) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
         }
     };
-    let expires_at = match form.expires_in_days.trim() {
-        "" | "0" => None,
-        value => {
-            let days = match value.parse::<i64>() {
-                Ok(value) if (1..=3650).contains(&value) => value,
-                Ok(_) => {
-                    return html_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request",
-                        "Expiry must be between 1 and 3650 days",
-                    );
-                }
-                Err(_) => {
-                    return html_error_response(
-                        StatusCode::BAD_REQUEST,
-                        "Bad request",
-                        "Expiry must be a number",
-                    );
-                }
-            };
-
-            Some(Utc::now() + Duration::days(days))
+    let expires_at = match parse_create_user_expiry(&form.expires_in_days, Utc::now()) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
         }
     };
 
@@ -3511,13 +3702,15 @@ async fn toggle_user_action(
             AuditAction::UserDisabled
         },
         AuditObjectType::User,
-        user.username,
+        id.to_string(),
         AuditOutcome::Succeeded,
         AuditMetadata::enabled(enabled),
     );
     match set_user_enabled_audited(&state.pool, id, enabled, &event).await {
-        Ok(()) => {
-            queue_latest_reconcile(&state).await;
+        Ok(result) => {
+            if result.generation.is_some() {
+                queue_latest_reconcile(&state).await;
+            }
             Redirect::to("/admin/users").into_response()
         }
         Err(error) => logged_error_with_back(
@@ -3575,15 +3768,11 @@ async fn reset_user_token_action(
         return response;
     }
 
-    let user = match get_user_by_id(&state.pool, id).await {
-        Ok(value) => value,
-        Err(error) => return internal_error("load user for token reset", error),
-    };
     let event = audit_event(
         &auth,
         AuditAction::UserSubscriptionTokenReset,
         AuditObjectType::User,
-        user.username,
+        id.to_string(),
         AuditOutcome::Succeeded,
         AuditMetadata::none(),
     );
@@ -3595,6 +3784,75 @@ async fn reset_user_token_action(
             error,
             "Reset token failed",
             "The subscription token could not be reset. Review the server journal.",
+            "/admin/users",
+            "Back to Users",
+        ),
+    }
+}
+
+async fn rotate_user_identity_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    match get_user_by_id(&state.pool, id).await {
+        Ok(user) => views::users::render_rotate_identity(&auth, &user),
+        Err(error) => logged_error_with_back(
+            StatusCode::NOT_FOUND,
+            "load user for runtime identity rotation",
+            error,
+            "User not found",
+            "The requested user does not exist.",
+            "/admin/users",
+            "Back to Users",
+        ),
+    }
+}
+
+async fn rotate_user_identity_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Form(form): Form<VersionedUserForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    let expected_updated_at = match parse_user_version(&form.expected_updated_at) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Bad request", message)
+        }
+    };
+    let event = audit_event(
+        &auth,
+        AuditAction::UserRuntimeIdentityRotated,
+        AuditObjectType::User,
+        id.to_string(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match rotate_user_runtime_identity_audited(&state.pool, id, expected_updated_at, &event).await {
+        Ok(result) => {
+            if result.generation.is_some() {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to("/admin/users").into_response()
+        }
+        Err(error) => logged_error_with_back(
+            StatusCode::CONFLICT,
+            "rotate user runtime identity",
+            error,
+            "Rotate identity failed",
+            "The user was changed elsewhere or no longer exists. Reload the page and try again.",
             "/admin/users",
             "Back to Users",
         ),
@@ -3644,21 +3902,19 @@ async fn delete_user_action(
         return response;
     }
 
-    let user = match get_user_by_id(&state.pool, id).await {
-        Ok(value) => value,
-        Err(error) => return internal_error("load user for deletion", error),
-    };
     let event = audit_event(
         &auth,
         AuditAction::UserDeleted,
         AuditObjectType::User,
-        user.username,
+        id.to_string(),
         AuditOutcome::Succeeded,
         AuditMetadata::none(),
     );
     match delete_user_audited(&state.pool, id, &event).await {
-        Ok(()) => {
-            queue_latest_reconcile(&state).await;
+        Ok(result) => {
+            if result.generation.is_some() {
+                queue_latest_reconcile(&state).await;
+            }
             Redirect::to("/admin/users").into_response()
         }
         Err(error) => logged_error_with_back(
@@ -4075,7 +4331,7 @@ async fn queue_latest_reconcile(state: &AppState) {
         let status = get_reconcile_state(&state.pool).await?;
         let generation = u64::try_from(status.desired_generation)
             .map_err(|_| anyhow::anyhow!("invalid desired generation"))?;
-        reconcile_request::publish(generation)
+        user_lifecycle::publish_and_acknowledge(&state.pool, generation).await
     }
     .await;
     if let Err(error) = result {
@@ -4229,26 +4485,8 @@ fn html_error_response_with_back(
     views::components::error_response(status, title, message, back_href, back_label)
 }
 
-fn subscription_block_reason(user: &UserRecord) -> Option<&'static str> {
-    if !user.enabled {
-        return Some("subscription disabled");
-    }
-
-    if user
-        .expires_at
-        .is_some_and(|expires_at| expires_at <= Utc::now())
-    {
-        return Some("subscription expired");
-    }
-
-    if user
-        .traffic_limit_bytes
-        .is_some_and(|limit| limit > 0 && user.traffic_used_bytes >= limit)
-    {
-        return Some("traffic limit reached");
-    }
-
-    None
+fn subscription_block_reason(user: &UserRecord, now: DateTime<Utc>) -> Option<&'static str> {
+    (!user.access_state_at(now).allowed()).then_some("subscription unavailable")
 }
 
 fn subscription_userinfo_header(user: &UserRecord) -> HeaderValue {

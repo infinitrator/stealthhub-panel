@@ -4,6 +4,7 @@
 //! generation. It has no web/UI responsibilities, which keeps the panel and CLI
 //! thin wrappers around the same tested core.
 
+pub mod access;
 pub mod adapter;
 pub mod adapters;
 pub mod audit;

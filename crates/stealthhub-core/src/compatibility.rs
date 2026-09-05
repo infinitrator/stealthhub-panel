@@ -37,6 +37,7 @@ const DURABLE_TABLES: &[&str] = &[
     "routing_rule_entries",
     "routing_rule_sources",
     "runtime_user_sync",
+    "user_lifecycle_state",
     "bootstrap_state",
     "client_dns_policy",
 ];
