@@ -53,8 +53,9 @@ User-facing:
 - User create/edit, enable/disable, explicit UTC expiry, stored quota gating,
   subscription-token rotation, runtime-identity rotation, and deletion.
 - Per-user Mihomo YAML and account pages protected by bearer tokens.
-- Runtime-neutral protocol profiles with automatic capability-based core
-  selection; the current web UI does not expose a general core selector.
+- Lifecycle-managed protocol profiles with stable IDs, typed create/edit,
+  enable/disable/delete, optimistic concurrency, and automatic capability-based
+  core selection; the web UI does not expose a general core selector.
 - DNS policy, transport pools, inline routing policy, rule sets, normalized
   entries, remote sources, and YAML rule providers.
 - Runtime inventory, desired/applied generations, and count-only user-sync

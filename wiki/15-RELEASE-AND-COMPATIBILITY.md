@@ -159,7 +159,7 @@ Wiki workflow синхронизирует versioned wiki/*.md в GitHub Wiki п
 | Secrets | Shared values и bearer tokens без application encryption в SQLite |
 | Subscription | Bearer token в URL |
 | Configs | Web inspector read-only; нет generic editor/shell |
-| Profiles | UI update-only; нет create/delete/core selector |
+| Profiles | Полный typed lifecycle; нет общего ручного core selector и clone |
 | Users | Нет edit limit/expiry/UUID после create |
 | Revoke | Shared credentials нельзя отозвать индивидуально |
 | Health | Public ready проверяет SQLite, не data plane |

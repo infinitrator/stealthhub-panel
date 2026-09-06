@@ -83,7 +83,7 @@ subscription_token_from_body() {
     printf '%s' "$value"
 }
 
-user_version_from_body() {
+resource_version_from_body() {
     local value
     value="$(grep -oE 'name="expected_updated_at" value="[^"]+"' "$BODY_FILE" \
         | sed -n '1p' | cut -d'"' -f4)"
@@ -229,7 +229,7 @@ body_contains 'subscription is not configured'
 request 200 /admin/users/1/edit
 body_contains 'Stored traffic usage'
 body_excludes 'name="traffic_used_bytes"'
-EDIT_VERSION="$(user_version_from_body)"
+EDIT_VERSION="$(resource_version_from_body)"
 request 403 /admin/users/1/edit --request POST \
     --data-urlencode username=field-user-edited \
     --data-urlencode expected_updated_at="$EDIT_VERSION"
@@ -253,7 +253,7 @@ request 409 /admin/users/1/edit --request POST \
     --data-urlencode expected_updated_at="$EDIT_VERSION"
 request 200 /admin/users/1/rotate-identity
 body_excludes 'name="uuid"'
-ROTATE_VERSION="$(user_version_from_body)"
+ROTATE_VERSION="$(resource_version_from_body)"
 request 403 /admin/users/1/rotate-identity --request POST \
     --data-urlencode expected_updated_at="$ROTATE_VERSION"
 request 303 /admin/users/1/rotate-identity --request POST \
@@ -272,16 +272,95 @@ request 303 /admin/secrets --request POST \
 request 200 /admin/secrets
 body_contains 'tuic.password'
 body_excludes 'smoke-tuic-password'
-request 303 /admin/protocols/TUIC-SPEED/update --request POST \
+request 200 /admin/protocols/TUIC-SPEED
+PROFILE_VERSION="$(resource_version_from_body)"
+body_excludes 'smoke-tuic-password'
+request 400 /admin/protocols/TUIC-SPEED/update --request POST \
     --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION" \
+    --data-urlencode display_name=TUIC-SPEED \
     --data-urlencode enabled=on \
     --data-urlencode server=node.example.test \
     --data-urlencode port=11443 \
     --data-urlencode sni=www.github.com \
     --data-urlencode password_secret=tuic.password
+body_contains 'preferred core adapter is incompatible or not installed'
+body_excludes 'smoke-tuic-password'
 # The smoke host has manifests but deliberately has no installed runtime binary.
 # Enabling a profile must therefore remain fail-closed instead of publishing an
 # unusable configuration or weakening the production runtime check for tests.
+request 400 /admin/protocols/new --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode name=phase-b-invalid \
+    --data-urlencode 'display_name=Invalid profile' \
+    --data-urlencode role=manual \
+    --data-urlencode server=node.example.test \
+    --data-urlencode port=23443 \
+    --data-urlencode protocol_id=tuic \
+    --data-urlencode preferred_core_id=mihomo \
+    --data-urlencode password_secret=tuic.password
+body_contains 'SNI is required'
+body_excludes 'smoke-tuic-password'
+request 303 /admin/protocols/new --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode name=phase-b-profile \
+    --data-urlencode 'display_name=Phase B profile' \
+    --data-urlencode role=manual \
+    --data-urlencode server=node.example.test \
+    --data-urlencode port=23443 \
+    --data-urlencode protocol_id=tuic \
+    --data-urlencode preferred_core_id=mihomo \
+    --data-urlencode password_secret=tuic.password \
+    --data-urlencode sni=www.github.com
+request 200 /admin/protocols/phase-b-profile
+body_contains 'Phase B profile'
+body_contains 'phase-b-profile'
+body_contains '<dt>Preferred runtime</dt><dd><code>tuic</code></dd>'
+body_excludes 'smoke-tuic-password'
+PROFILE_VERSION="$(resource_version_from_body)"
+request 303 /admin/protocols/phase-b-profile/update --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION" \
+    --data-urlencode 'display_name=Renamed Phase B profile' \
+    --data-urlencode server=node.example.test \
+    --data-urlencode port=23443 \
+    --data-urlencode password_secret=tuic.password \
+    --data-urlencode sni=www.github.com
+request 409 /admin/protocols/phase-b-profile/update --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION" \
+    --data-urlencode 'display_name=Stale overwrite' \
+    --data-urlencode server=node.example.test \
+    --data-urlencode port=23443 \
+    --data-urlencode password_secret=tuic.password \
+    --data-urlencode sni=www.github.com
+request 200 /admin/protocols/phase-b-profile
+body_contains 'Renamed Phase B profile'
+body_excludes 'Stale overwrite'
+PROFILE_VERSION="$(resource_version_from_body)"
+request 400 /admin/protocols/phase-b-profile/enabled --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION"
+body_contains 'Profile state must be explicitly enabled or disabled.'
+request 400 /admin/protocols/phase-b-profile/enabled --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION" \
+    --data-urlencode enabled=true
+body_contains 'preferred core adapter is incompatible or not installed'
+request 303 /admin/protocols/phase-b-profile/enabled --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION" \
+    --data-urlencode enabled=false
+request 200 /admin/protocols/phase-b-profile/delete
+PROFILE_VERSION="$(resource_version_from_body)"
+request 303 /admin/protocols/phase-b-profile/delete --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode expected_updated_at="$PROFILE_VERSION"
+request 404 /admin/protocols/phase-b-profile
+request 200 /admin/audit
+body_contains 'protocol-profile.created'
+body_contains 'protocol-profile.deleted'
+body_contains 'phase-b-profile'
 request 503 "/sub/${SUBSCRIPTION_TOKEN}/mihomo.yaml"
 body_contains 'subscription is not configured'
 body_excludes 'smoke-tuic-password'

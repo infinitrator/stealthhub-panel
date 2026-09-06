@@ -8,7 +8,8 @@
 Protocol profile - это версионированная запись желаемого endpoint. Она
 содержит:
 
-- стабильное имя профиля;
+- неизменяемый стабильный ID (`name` в совместимой схеме хранения);
+- отдельное отображаемое имя;
 - protocol adapter ID и schema version;
 - роль в клиентской routing policy;
 - server hostname/IP и port;
@@ -29,22 +30,39 @@ Applied, выбранный runtime не прошел health/listener checks и 
 
 ## 2. Lifecycle в текущем интерфейсе
 
-Страница Protocols показывает встроенные profiles и inventory adapters. В
-текущем beta release web UI:
+Страница Protocols предоставляет полный безопасный lifecycle: Create, Inspect,
+Edit, Enable, Disable и Delete. Stable ID выбирается при создании и далее не
+редактируется; Display name можно менять без разрыва routing references.
+Protocol adapter и schema фиксируются при создании. Для отсутствующего adapter
+историческая запись и opaque JSON сохраняются, schema-dependent edit/enable
+блокируются, а disable и безопасное удаление остаются возможны.
 
-- изменяет Enabled, Server address, Server port и adapter-specific fields;
-- не создает произвольные новые profiles;
-- не удаляет встроенные profiles;
-- не меняет protocol adapter ID;
-- не меняет preferred core ID существующей записи.
+Все mutation доступны только owner, требуют CSRF и передают `updated_at` как
+optimistic-concurrency revision. Старая вкладка не может затереть более новое
+изменение: сервер возвращает conflict без generation и success audit. Перед
+публикацией проверяются hostname/IP, port, adapter schema, известные поля,
+secret references, runtime capability и очевидный конфликт TCP/UDP listener.
+Неизвестные adapter-owned поля сохраняются при редактировании известных полей.
 
-Save profile доступен только owner. Сервер валидирует hostname/IP, port,
-ограничения строк, secret reference names и текущую adapter schema. Успешное
-сохранение увеличивает desired generation и создает bounded reconcile request.
+Delete имеет отдельное подтверждение и блокируется, пока stable ID прямо
+используется transport pool, inline policy или rule set. Маршрутизация не
+переписывается и не удаляется каскадно.
+
+### Точные правила generation
+
+- create enabled profile: одно generation; create disabled: без generation;
+- runtime-effective edit включенного profile: одно generation;
+- изменение только Display name: без generation;
+- изменение конфигурации выключенного profile: без generation;
+- enable/disable при реальном переходе: одно generation;
+- повторное idempotent enable/disable: без generation и лишнего success audit;
+- delete enabled: одно generation; delete disabled: без generation;
+- validation failure, stale write и blocked delete: без generation/audit.
 
 ### Enabled
 
-Enabled включает профиль в subscription и desired server state. Disable:
+Enabled включает профиль в subscription и desired server state. Отдельное
+действие Disable:
 
 - исключает proxy object из новых YAML;
 - запускает новое поколение server configuration;
@@ -94,8 +112,9 @@ priority. Выбор происходит так:
 4. Если совместимого установленного core нет, resource получает состояние
    CoreUnavailable/Unsupported и live state не меняется.
 
-Starter profiles имеют явные preferred runtimes. UI текущей версии показывает
-selection в inventory, но не предлагает переключатель core. Изменять persisted
+Starter profiles имеют явные preferred runtimes. Create автоматически закрепляет
+adapter-declared preferred runtime; общий ручной core selector пока не
+предоставляется. Изменять persisted
 preferred_core_id вручную через SQLite не рекомендуется: это обход schema и
 reconcile validation.
 
@@ -197,7 +216,7 @@ required value завершается fail closed до успешного publis
 2. Создайте необходимые shared и root-only secrets.
 3. Проверьте DNS server address и firewall для TCP/UDP profile.
 4. Проверьте TLS pair, если capability его требует.
-5. Включите один profile и нажмите Save profile.
+5. Создайте или откройте один profile и выполните Enable.
 6. Дождитесь Applied и равенства desired/applied generations.
 7. Проверьте service, PID-owned listener и journal.
 8. Создайте временного user, импортируйте YAML и выполните реальный handshake.

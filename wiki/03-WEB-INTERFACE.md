@@ -126,18 +126,24 @@ read-only; live runtime collector отсутствует. Exact effective state 
 ## 8. Protocols
 
 Страница показывает protocol adapter inventory, runtime/resource status,
-count-only user sync и каждый starter profile.
+count-only user sync, lifecycle state и каждый profile. List ведет в detail;
+Create сначала выбирает adapter, затем сервер рендерит только его typed fields.
 
 | Элемент | Кто | Что делает |
 |---|---|---|
-| Enabled switch | owner | Включает/выключает profile |
+| Create profile | owner | Создает stable ID, display name и typed adapter state |
+| Inspect | admin | Показывает identity, revision, references и desired/applied state |
+| Display name | owner | Меняет только operator label, не stable ID |
 | Server address | owner | Меняет client endpoint |
 | Server port | owner | Меняет listener claim/client port |
 | Adapter fields | owner | Меняет text или secret reference |
-| Save profile | owner | Валидирует adapter schema, сохраняет и queue reconcile |
+| Save profile | owner | Проверяет revision/schema/secrets/runtime и атомарно сохраняет |
+| Enable / Disable | owner | Меняет участие в desired state и создает одно generation |
+| Delete profile | owner | Подтверждает удаление; блокируется при routing references |
 
-UI не создает/удаляет profiles и не меняет adapter/preferred runtime. Полный
-contract: [Профили и runtimes](05-PROTOCOL-PROFILES-AND-RUNTIMES).
+Secret fields содержат только reference names; opaque неизвестные поля не
+выводятся в HTML. Полный contract:
+[Профили и runtimes](05-PROTOCOL-PROFILES-AND-RUNTIMES).
 
 ## 9. Secrets
 

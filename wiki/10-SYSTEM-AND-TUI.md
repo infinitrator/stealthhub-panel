@@ -86,9 +86,12 @@ target, состояние и выбранный runtime, когда он раз
 
 ### Users и Profiles
 
-Это read-only обзор SQLite, максимум 500 строк. Здесь намеренно не показываются
-credential values, subscription tokens, runtime UUID и `config_json`. Изменения
-делаются в авторизованной веб-панели, после чего TUI показывает новое состояние.
+Это read-only обзор SQLite, максимум 500 строк. Profiles показывает display
+name, stable ID, adapter availability, enablement, endpoint, runtime и общий
+desired/applied controller state. `←`/`→` выбирают профиль и открывают bounded
+detail. Здесь намеренно не показываются credential values, subscription tokens,
+runtime UUID и `config_json`. Изменения делаются в авторизованной веб-панели,
+после чего TUI показывает новое состояние.
 
 ### Runtimes
 
