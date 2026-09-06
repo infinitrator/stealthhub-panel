@@ -24,7 +24,7 @@ Update Now не принимает repository/ref из браузера. Manual 
 | Пункт | URL | Назначение |
 |---|---|---|
 | Home | / | Публичные ссылки на основные разделы |
-| Dashboard | /admin | Сводка users, generations, runtimes и shortcuts |
+| Health | /admin и /admin/health | Каноническая сводка node, generations, services, runtimes и ресурсов |
 | Account | /admin/account | Текущий admin и смена password |
 | Users | /admin/users | Effective access, user lifecycle и защищенная выдача subscription URLs |
 | Settings | /admin/settings | Domains, panel name и update schedule |
@@ -35,7 +35,6 @@ Update Now не принимает repository/ref из браузера. Manual 
 | IP Check | /admin/ip | Local network diagnostics и external reputation links |
 | System | /admin/system | Host/service observations и uninstall preview |
 | Configs | /admin/configs | Owner-only allowlisted read-only config inspector |
-| Health | /admin/health | Detailed authenticated health/inventory |
 | Audit | /admin/audit | Owner-only, bounded administrative change history |
 | Credits | /admin/credits | Project/component information |
 
@@ -76,17 +75,19 @@ Account:
 Успешная ротация отзывает остальные sessions и создает новую текущую session.
 Username через web UI не меняется. UI управления всеми sessions отсутствует.
 
-## 5. Dashboard
+## 5. Health
 
-Dashboard только наблюдает:
+`/admin` и `/admin/health` показывают один и тот же authenticated operational
+экран. Health только наблюдает:
 
 - desired/applied generation и reconcile status;
 - число users;
 - runtime/resource inventory;
 - count-only user sync;
-- shortcuts Open Users/Settings/Protocols/Routing/System/Modules.
+- host load, memory, disk и uptime;
+- ссылки Users/Settings/Protocols/Routing/System/Modules.
 
-Кнопки Open ... выполняют переход, а не mutation. Applied не является
+Ссылки выполняют переход, а не mutation. Applied не является
 end-to-end доказательством client connectivity.
 
 ## 6. Settings

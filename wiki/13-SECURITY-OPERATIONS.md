@@ -168,7 +168,7 @@ add_header Strict-Transport-Security "max-age=31536000" always;
 
 | Возможность | Owner (минимальный admin ID) | Другой admin record |
 |---|---:|---:|
-| Login/dashboard | Да | Да |
+| Login/Health | Да | Да |
 | Users | Да | Да |
 | Protocols и routing mutations | Да | Нет |
 | Account/password rotation | Да | Да |

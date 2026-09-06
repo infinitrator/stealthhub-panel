@@ -28,6 +28,22 @@ Schema v8 выполняет bootstrap policy ровно один раз. Обн
 запуск не восстанавливают удаленные оператором profiles, pools, policies или
 rule sets. Перед обновлением все эти таблицы входят в штатный SQLite backup.
 
+### Effective routing order и инспектор
+
+Верхняя часть Routing строится на сервере из той же типизированной Rust-модели,
+что использует SSH-TUI. SVG показывает первые 12 логических путей, а следующая
+таблица содержит полный доступный порядок. Большой provider остается одним
+путем с числом скомпилированных записей, поэтому сотни domains не создают сотни
+узлов.
+
+Поле **Inspect domain** выполняет только локальный разбор сохраненной политики:
+оно не делает DNS-запрос и не отправляет hostname третьей стороне. Точно
+моделируются `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`, `DOMAIN-WILDCARD` и
+`MATCH`. Если раньше возможного domain-match находится IP/process/geo или иной
+runtime-dependent matcher, ответ будет `Runtime-dependent result`, а не
+выдуманный точный маршрут. Поврежденная ссылка, отсутствующий adapter/runtime и
+неявный fallback отображаются как требующие внимания.
+
 ### Transport pools
 
 Pool превращается в Mihomo `proxy-group`. Поддерживаются `select`, `url-test`,

@@ -150,6 +150,10 @@ grep -Fqi 'httponly' "$HEADER_FILE" || fail "session cookie is not HttpOnly"
 grep -Fqi 'samesite=lax' "$HEADER_FILE" || fail "session cookie SameSite policy is missing"
 
 request 200 /admin
+body_contains '>Health<'
+body_excludes '>Dashboard<'
+body_contains 'Desired generation'
+body_contains 'Reconciliation'
 grep -Fqi "content-security-policy: default-src 'none'; style-src 'self';" "$HEADER_FILE" \
     || fail "strict CSP is missing"
 if grep -Fqi "unsafe-inline" "$HEADER_FILE"; then
@@ -302,6 +306,9 @@ RULE_ETAG="$(sed -nE 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*(.*)\r$/\1/p' "$HEADER_FIL
 [[ -n "$RULE_ETAG" ]] || fail "routing provider ETag is missing"
 request 304 /rules/proxy-ai.yaml --header "If-None-Match: ${RULE_ETAG}"
 [[ ! -s "$BODY_FILE" ]] || fail "304 routing provider response contains a body"
+request 200 '/admin/routing?domain=api.openai.com'
+body_contains 'Runtime-dependent result'
+body_contains 'api.openai.com'
 
 mkdir -p "${TMP_DIR}/module-requests"
 printf 'module-victim-preserved\n' >"${TMP_DIR}/module-request-victim"

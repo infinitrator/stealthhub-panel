@@ -45,6 +45,7 @@ sudo infiproxy-manager update check
 | `Esc` | Вернуться либо отменить форму без операции. |
 | `R` | Повторно собрать локальное состояние. |
 | `PgUp`/`PgDn`, `Home`/`End` | Прокрутить вывод. |
+| `←`/`→` в Routing | Выбрать логический routing path и показать его детали. |
 | `?` | Открыть справку. Любая клавиша закрывает её. |
 | `Q`, `Ctrl-C` | Завершить TUI с восстановлением терминала. |
 
@@ -54,13 +55,21 @@ reconcile state и доступные runtime-модули. Наблюдения
 
 ## 3. Разделы TUI
 
-### Dashboard
+### Health
 
 Показывает состояние процесса панели, desired/applied generation, reconcile,
 uptime, локальные `/health` и `/ready`, слушающие сокеты, SQLite и URL панели.
 `active` или успешный listener-check не доказывает успешный proxy handshake.
 Действие **Run reconciliation** публикует только ограниченный запрос
 `reconcile` и требует подтверждения `APPLY`.
+
+### Routing
+
+Read-only дерево показывает фактический порядок rule providers, затем inline
+rules по priority и явный либо неопределенный fallback. Каждый путь содержит
+target, состояние и выбранный runtime, когда он разрешим. `←`/`→` выбирают путь
+для detail view; длинный вывод прокручивается штатными клавишами. Интерпретация
+совпадает с Web Routing и не содержит profile config или secret values.
 
 ### System
 

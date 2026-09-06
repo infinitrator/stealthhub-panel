@@ -308,8 +308,14 @@ Root updater до checkout создает:
 
 Updater разрешает только fast-forward переход от установленного commit; ручное
 исключение `INFIPROXY_ALLOW_NON_FAST_FORWARD=true` предназначено только для
-проверенного recovery. Затем он checkout-ит точный fetched commit, запускает
-bootstrap/install и до 15 раз
+проверенного recovery. Затем он checkout-ит точный fetched commit и запускает
+его repository-owned `deploy/build-control-plane.sh`. Поэтому именно target
+release определяет фиксированный Cargo build и проверяет обязательные
+control-plane binaries; список не поступает из UI или environment. Новые
+устанавливаемые control artifacts объявляются в строго проверяемом
+`deploy/control-plane-artifacts`, чтобы rollback восстановил старый файл либо
+удалил файл, отсутствовавший в старом release. Затем target installer
+устанавливает проверенные артефакты, и updater до 15 раз
 проверяет local `/ready` с интервалом 2 s. Он отказывается проверять non-local
 bind. При failure восстанавливает configs, DB, все control binaries и previous
 source revision. Failed target SHA не публикуется: root marker изменяется одной

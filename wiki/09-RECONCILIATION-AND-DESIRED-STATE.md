@@ -199,7 +199,7 @@ Shared-credential adapters не обещают per-user runtime revoke и не �
 
 ## 10. Inventory
 
-Один AdapterInventory используется Dashboard, Protocols, Modules, Configs и
+Один AdapterInventory используется Health, Protocols, Modules, Configs и
 Health. Он объединяет:
 
 - зарегистрированные manifests;
@@ -254,7 +254,7 @@ adapter может мигрировать собственную opaque schema.
     curl -fsS http://127.0.0.1:8080/ready
     sudo systemctl is-active infiproxy-reconcile.timer
 
-Затем проверьте Dashboard: desired и applied равны, status Applied. Финальный
+Затем проверьте Health: desired и applied равны, status Applied. Финальный
 критерий data plane - внешний handshake для каждого enabled adapter/runtime
 pair, а не только зеленый control-plane status.
 
