@@ -68,9 +68,12 @@ pub enum ProxyRole {
 }
 
 /// One adapter-owned protocol profile.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProtocolProfile {
+    /// Stable machine identity referenced by routing and runtime state.
     pub name: String,
+    /// Operator-facing label; changing it never changes runtime identity.
+    pub display_name: String,
     pub protocol_id: String,
     pub schema_version: u32,
     pub role: ProxyRole,
@@ -80,4 +83,23 @@ pub struct ProtocolProfile {
     pub preferred_core_id: Option<String>,
     pub managed_resource_id: Option<String>,
     pub config: Value,
+}
+
+impl std::fmt::Debug for ProtocolProfile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtocolProfile")
+            .field("name", &self.name)
+            .field("display_name", &self.display_name)
+            .field("protocol_id", &self.protocol_id)
+            .field("schema_version", &self.schema_version)
+            .field("role", &self.role)
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("enabled", &self.enabled)
+            .field("preferred_core_id", &self.preferred_core_id)
+            .field("managed_resource_id", &self.managed_resource_id)
+            .field("config", &"[REDACTED]")
+            .finish()
+    }
 }

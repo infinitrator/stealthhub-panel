@@ -107,6 +107,16 @@ impl App {
                 ));
             }
         }
+        if self.screen_name() == "Profiles" {
+            if let Some(detail) = self.snapshot.profile_details.get(self.selected) {
+                value.push_str(&format!(
+                    "\n\nSELECTED PROFILE {} / {} (Left/Right)\n{}",
+                    self.selected + 1,
+                    self.snapshot.profile_details.len(),
+                    detail
+                ));
+            }
+        }
         format!("{}\n\n{}", value, self.output)
     }
     pub fn key(&mut self, key: KeyEvent) -> Intent {
@@ -210,6 +220,13 @@ impl App {
                 self.selected =
                     (self.selected + 1).min(self.snapshot.routing_paths.len().saturating_sub(1));
             }
+            KeyCode::Left if self.screen_name() == "Profiles" => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::Right if self.screen_name() == "Profiles" => {
+                self.selected =
+                    (self.selected + 1).min(self.snapshot.profile_details.len().saturating_sub(1));
+            }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 0 => {
                     self.screen = self.screen.saturating_sub(1);
@@ -308,6 +325,22 @@ mod tests {
         press(&mut app, KeyCode::Right);
         assert_eq!(app.selected, 1);
         assert!(app.content().contains("second"));
+        assert!(app.actions().is_empty());
+    }
+
+    #[test]
+    fn profile_selection_is_read_only_bounded_and_secret_free() {
+        let mut app = App::new(false);
+        app.screen = SCREENS.iter().position(|name| *name == "Profiles").unwrap();
+        app.snapshot.profile_details = vec![
+            "Alpha [alpha] / enabled / applied".into(),
+            format!("{} [beta] / disabled / adapter missing", "B".repeat(180)),
+        ];
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.selected, 1);
+        assert!(app.content().contains("adapter missing"));
+        assert!(!app.content().contains("password"));
         assert!(app.actions().is_empty());
     }
 }

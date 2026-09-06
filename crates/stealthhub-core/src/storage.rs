@@ -277,10 +277,11 @@ impl fmt::Debug for SecretRecord {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtocolProfileRecord {
     pub id: i64,
     pub name: String,
+    pub display_name: String,
     pub kind: String,
     pub role: String,
     pub enabled: bool,
@@ -294,9 +295,32 @@ pub struct ProtocolProfileRecord {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for ProtocolProfileRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProtocolProfileRecord")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("display_name", &self.display_name)
+            .field("kind", &self.kind)
+            .field("role", &self.role)
+            .field("enabled", &self.enabled)
+            .field("server", &self.server)
+            .field("port", &self.port)
+            .field("config_json", &"[REDACTED]")
+            .field("schema_version", &self.schema_version)
+            .field("preferred_core_id", &self.preferred_core_id)
+            .field("managed_resource_id", &self.managed_resource_id)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct NewProtocolProfile {
     pub name: String,
+    pub display_name: String,
     pub protocol_id: String,
     pub schema_version: u32,
     pub role: ProxyRole,
@@ -308,9 +332,11 @@ pub struct NewProtocolProfile {
     pub config: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct UpdateProtocolProfile {
     pub name: String,
+    pub display_name: String,
+    pub expected_updated_at: Option<DateTime<Utc>>,
     pub enabled: bool,
     pub server: String,
     pub port: u16,
@@ -427,6 +453,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ProtocolProfileRecord {
         Ok(Self {
             id: row.try_get("id")?,
             name: row.try_get("name")?,
+            display_name: row.try_get("display_name")?,
             kind: row.try_get("kind")?,
             role: row.try_get("role")?,
             enabled: row.try_get("enabled")?,
@@ -612,6 +639,7 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         CREATE TABLE IF NOT EXISTS protocol_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL,
             kind TEXT NOT NULL,
             role TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -645,6 +673,12 @@ pub async fn init_db(pool: &SqlitePool) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_protocol_profiles_enabled
         ON protocol_profiles(enabled);
         ",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_protocol_profiles_display_name ON protocol_profiles(display_name)",
     )
     .execute(pool)
     .await?;
@@ -1275,6 +1309,10 @@ async fn ensure_protocol_profile_columns(pool: &SqlitePool) -> Result<()> {
 
     for (name, statement) in [
         (
+            "display_name",
+            "ALTER TABLE protocol_profiles ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
+        ),
+        (
             "schema_version",
             "ALTER TABLE protocol_profiles ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version > 0)",
         ),
@@ -1291,6 +1329,9 @@ async fn ensure_protocol_profile_columns(pool: &SqlitePool) -> Result<()> {
             sqlx::query(statement).execute(pool).await?;
         }
     }
+    sqlx::query("UPDATE protocol_profiles SET display_name=name WHERE display_name='' ")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -1424,14 +1465,15 @@ async fn ensure_protocol_profile(pool: &SqlitePool, input: &NewProtocolProfile) 
     sqlx::query(
         r"
         INSERT INTO protocol_profiles (
-            name, kind, role, enabled, server, port, config_json, schema_version,
+            name, display_name, kind, role, enabled, server, port, config_json, schema_version,
             preferred_core_id, managed_resource_id, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(name) DO NOTHING
         ",
     )
     .bind(input.name.trim())
+    .bind(input.display_name.trim())
     .bind(input.protocol_id.trim())
     .bind(role)
     .bind(input.enabled)
@@ -1452,6 +1494,7 @@ impl From<ProtocolProfile> for NewProtocolProfile {
     fn from(profile: ProtocolProfile) -> Self {
         Self {
             name: profile.name,
+            display_name: profile.display_name,
             protocol_id: profile.protocol_id,
             schema_version: profile.schema_version,
             role: profile.role,
@@ -2217,6 +2260,23 @@ pub async fn create_protocol_profile(
     pool: &SqlitePool,
     input: NewProtocolProfile,
 ) -> Result<ProtocolProfileRecord> {
+    create_protocol_profile_inner(pool, input, None).await
+}
+
+/// Creates a profile, generation, and audit event in one transaction.
+pub async fn create_protocol_profile_audited(
+    pool: &SqlitePool,
+    input: NewProtocolProfile,
+    event: &NewAuditEvent,
+) -> Result<ProtocolProfileRecord> {
+    create_protocol_profile_inner(pool, input, Some(event)).await
+}
+
+async fn create_protocol_profile_inner(
+    pool: &SqlitePool,
+    input: NewProtocolProfile,
+    event: Option<&NewAuditEvent>,
+) -> Result<ProtocolProfileRecord> {
     let now = Utc::now();
     let role = storage_string(&input.role)?;
     let config_json = serde_json::to_string(&input.config)?;
@@ -2226,6 +2286,7 @@ pub async fn create_protocol_profile(
         r"
         INSERT INTO protocol_profiles (
             name,
+            display_name,
             kind,
             role,
             enabled,
@@ -2238,10 +2299,11 @@ pub async fn create_protocol_profile(
             created_at,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ",
     )
     .bind(input.name.trim())
+    .bind(input.display_name.trim())
     .bind(input.protocol_id.trim())
     .bind(role)
     .bind(input.enabled)
@@ -2255,7 +2317,12 @@ pub async fn create_protocol_profile(
     .bind(now)
     .execute(&mut *transaction)
     .await?;
-    bump_desired_generation(&mut transaction).await?;
+    if input.enabled {
+        bump_desired_generation(&mut transaction).await?;
+    }
+    if let Some(event) = event {
+        append_audit_event_in_transaction(&mut transaction, event).await?;
+    }
     transaction.commit().await?;
 
     get_protocol_profile_by_name(pool, &input.name)
@@ -2272,6 +2339,7 @@ pub async fn get_protocol_profile_by_name(
         SELECT
             id,
             name,
+            display_name,
             kind,
             role,
             enabled,
@@ -2300,6 +2368,7 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
         SELECT
             id,
             name,
+            display_name,
             kind,
             role,
             enabled,
@@ -2312,7 +2381,7 @@ pub async fn list_protocol_profiles(pool: &SqlitePool) -> Result<Vec<ProtocolPro
             created_at,
             updated_at
         FROM protocol_profiles
-        ORDER BY role ASC, name ASC
+        ORDER BY role ASC, display_name ASC, name ASC
         ",
     )
     .fetch_all(pool)
@@ -2330,6 +2399,7 @@ pub fn decode_protocol_profile(record: ProtocolProfileRecord) -> Result<Protocol
 
     Ok(ProtocolProfile {
         name: record.name,
+        display_name: record.display_name,
         protocol_id: record.kind,
         schema_version,
         role,
@@ -2350,7 +2420,7 @@ pub async fn migrate_protocol_adapter_configs(
     let mut transaction = pool.begin().await?;
     let records = sqlx::query_as::<_, ProtocolProfileRecord>(
         r"
-        SELECT id, name, kind, role, enabled, server, port, config_json,
+        SELECT id, name, display_name, kind, role, enabled, server, port, config_json,
                schema_version, preferred_core_id, managed_resource_id,
                created_at, updated_at
         FROM protocol_profiles
@@ -2424,7 +2494,7 @@ pub async fn load_desired_state_at(pool: &SqlitePool, now: DateTime<Utc>) -> Res
             .await?;
     let records = sqlx::query_as::<_, ProtocolProfileRecord>(
         r"
-        SELECT id, name, kind, role, enabled, server, port, config_json,
+        SELECT id, name, display_name, kind, role, enabled, server, port, config_json,
                schema_version, preferred_core_id, managed_resource_id,
                created_at, updated_at
         FROM protocol_profiles
@@ -2487,32 +2557,71 @@ async fn update_protocol_profile_inner(
     input: UpdateProtocolProfile,
     event: Option<&NewAuditEvent>,
 ) -> Result<ProtocolProfileRecord> {
-    let existing = get_protocol_profile_by_name(pool, &input.name)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("protocol profile not found"))?;
-    let now = Utc::now();
-    let config_json = serde_json::to_string(&input.config)?;
-
     let mut transaction = pool.begin().await?;
-    sqlx::query(
+    let existing = sqlx::query_as::<_, ProtocolProfileRecord>(
+        r"SELECT id,name,display_name,kind,role,enabled,server,port,config_json,
+                  schema_version,preferred_core_id,managed_resource_id,created_at,updated_at
+           FROM protocol_profiles WHERE name=?",
+    )
+    .bind(input.name.trim())
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("protocol profile not found"))?;
+    if input
+        .expected_updated_at
+        .is_some_and(|expected| expected != existing.updated_at)
+    {
+        bail!("protocol profile changed in another session");
+    }
+
+    let display_name = input.display_name.trim();
+    let server = input.server.trim();
+    let config_json = serde_json::to_string(&input.config)?;
+    let changed = display_name != existing.display_name
+        || input.enabled != existing.enabled
+        || server != existing.server
+        || i64::from(input.port) != existing.port
+        || config_json != existing.config_json
+        || input.preferred_core_id != existing.preferred_core_id
+        || input.managed_resource_id != existing.managed_resource_id;
+    if !changed {
+        transaction.commit().await?;
+        return Ok(existing);
+    }
+    let runtime_changed = input.enabled != existing.enabled
+        || (input.enabled
+            && (server != existing.server
+                || i64::from(input.port) != existing.port
+                || config_json != existing.config_json
+                || input.preferred_core_id != existing.preferred_core_id
+                || input.managed_resource_id != existing.managed_resource_id));
+    let now = Utc::now();
+    let result = sqlx::query(
         r"
         UPDATE protocol_profiles
-        SET enabled = ?, server = ?, port = ?, config_json = ?, preferred_core_id = ?,
+        SET display_name = ?, enabled = ?, server = ?, port = ?, config_json = ?, preferred_core_id = ?,
             managed_resource_id = ?, updated_at = ?
-        WHERE name = ?
+        WHERE name = ? AND updated_at = ?
         ",
     )
+    .bind(display_name)
     .bind(input.enabled)
-    .bind(input.server.trim())
+    .bind(server)
     .bind(i64::from(input.port))
     .bind(config_json)
     .bind(input.preferred_core_id.as_deref())
     .bind(input.managed_resource_id.as_deref())
     .bind(now)
     .bind(existing.name.as_str())
+    .bind(existing.updated_at)
     .execute(&mut *transaction)
     .await?;
-    bump_desired_generation(&mut transaction).await?;
+    if result.rows_affected() != 1 {
+        bail!("protocol profile changed in another session");
+    }
+    if runtime_changed {
+        bump_desired_generation(&mut transaction).await?;
+    }
     if let Some(event) = event {
         append_audit_event_in_transaction(&mut transaction, event).await?;
     }
@@ -2521,6 +2630,74 @@ async fn update_protocol_profile_inner(
     get_protocol_profile_by_name(pool, &existing.name)
         .await?
         .ok_or_else(|| anyhow::anyhow!("protocol profile was not updated"))
+}
+
+/// Returns routing objects that directly reference a stable profile ID.
+pub async fn protocol_profile_reference_count(pool: &SqlitePool, name: &str) -> Result<u64> {
+    let (members, rules, rule_sets): (i64, i64, i64) = sqlx::query_as(
+        r"SELECT
+             (SELECT COUNT(*) FROM client_transport_pool_members
+              WHERE member_kind='profile' AND member_value=?),
+             (SELECT COUNT(*) FROM client_routing_rules WHERE target=?),
+             (SELECT COUNT(*) FROM routing_rule_sets WHERE target=?)",
+    )
+    .bind(name.trim())
+    .bind(name.trim())
+    .bind(name.trim())
+    .fetch_one(pool)
+    .await?;
+    u64::try_from(members + rules + rule_sets).map_err(Into::into)
+}
+
+/// Deletes an unreferenced profile with optimistic concurrency and audit.
+pub async fn delete_protocol_profile_audited(
+    pool: &SqlitePool,
+    name: &str,
+    expected_updated_at: DateTime<Utc>,
+    event: &NewAuditEvent,
+) -> Result<bool> {
+    let mut transaction = pool.begin().await?;
+    let existing = sqlx::query_as::<_, ProtocolProfileRecord>(
+        r"SELECT id,name,display_name,kind,role,enabled,server,port,config_json,
+                  schema_version,preferred_core_id,managed_resource_id,created_at,updated_at
+           FROM protocol_profiles WHERE name=?",
+    )
+    .bind(name.trim())
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("protocol profile not found"))?;
+    if existing.updated_at != expected_updated_at {
+        bail!("protocol profile changed in another session");
+    }
+    let references: i64 = sqlx::query_scalar(
+        r"SELECT
+             (SELECT COUNT(*) FROM client_transport_pool_members
+              WHERE member_kind='profile' AND member_value=?) +
+             (SELECT COUNT(*) FROM client_routing_rules WHERE target=?) +
+             (SELECT COUNT(*) FROM routing_rule_sets WHERE target=?)",
+    )
+    .bind(name.trim())
+    .bind(name.trim())
+    .bind(name.trim())
+    .fetch_one(&mut *transaction)
+    .await?;
+    if references != 0 {
+        bail!("protocol profile is referenced by routing");
+    }
+    let result = sqlx::query("DELETE FROM protocol_profiles WHERE name=? AND updated_at=?")
+        .bind(name.trim())
+        .bind(expected_updated_at)
+        .execute(&mut *transaction)
+        .await?;
+    if result.rows_affected() != 1 {
+        bail!("protocol profile changed in another session");
+    }
+    if existing.enabled {
+        bump_desired_generation(&mut transaction).await?;
+    }
+    append_audit_event_in_transaction(&mut transaction, event).await?;
+    transaction.commit().await?;
+    Ok(existing.enabled)
 }
 
 pub async fn load_routing_rule_sets(pool: &SqlitePool) -> Result<Vec<RoutingRuleSet>> {
@@ -4701,9 +4878,9 @@ mod tests {
         let (pool, path) = test_pool().await?;
         sqlx::query(
             r"INSERT INTO protocol_profiles
-               (name,kind,role,enabled,server,port,config_json,schema_version,
+               (name,display_name,kind,role,enabled,server,port,config_json,schema_version,
                 preferred_core_id,managed_resource_id,created_at,updated_at)
-               VALUES ('profile-a','adapter-a','manual',1,'example.test',443,'{}',1,
+               VALUES ('profile-a','Profile A','adapter-a','manual',1,'example.test',443,'{}',1,
                        NULL,NULL,?,?)",
         )
         .bind(Utc::now())
@@ -5113,6 +5290,7 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
                 protocol_id: "vless-reality-xhttp".to_string(),
                 schema_version: 1,
                 role: ProxyRole::AutoSafe,
@@ -5134,6 +5312,8 @@ mod tests {
         assert_eq!(profile.kind, "vless-reality-xhttp");
         assert_eq!(profile.role, "auto-safe");
         assert_eq!(profile.port, 8443);
+        assert_eq!(profile.display_name, "VLESS XHTTP Safe");
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 1);
 
         let config: serde_json::Value = serde_json::from_str(&profile.config_json)?;
         assert_eq!(config["path"], "/api/v1");
@@ -5154,6 +5334,7 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
                 protocol_id: "vless-reality-xhttp".to_string(),
                 schema_version: 1,
                 role: ProxyRole::AutoSafe,
@@ -5171,6 +5352,8 @@ mod tests {
             &pool,
             UpdateProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
+                expected_updated_at: None,
                 enabled: false,
                 server: "new.example.test".to_string(),
                 port: 9443,
@@ -5208,6 +5391,8 @@ mod tests {
             &pool,
             UpdateProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
+                expected_updated_at: None,
                 enabled: true,
                 server: "custom.example.test".to_string(),
                 port: 9443,
@@ -5290,6 +5475,8 @@ mod tests {
             &pool,
             UpdateProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
+                expected_updated_at: None,
                 enabled: true,
                 server: "preserved.example.test".to_string(),
                 port: 19443,
@@ -5353,6 +5540,8 @@ mod tests {
             &pool,
             UpdateProtocolProfile {
                 name: "VLESS-XHTTP-SAFE".to_string(),
+                display_name: "VLESS XHTTP Safe".to_string(),
+                expected_updated_at: None,
                 enabled: true,
                 server: "preserved.example.test".to_string(),
                 port: 19443,
@@ -5439,6 +5628,7 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "EXTERNAL-PRESERVED".to_string(),
+                display_name: "External preserved".to_string(),
                 protocol_id: "external-future-adapter".to_string(),
                 schema_version: 7,
                 role: ProxyRole::Manual,
@@ -6421,6 +6611,7 @@ mod tests {
             &pool,
             NewProtocolProfile {
                 name: "profile-one".into(),
+                display_name: "Profile one".into(),
                 protocol_id: "test".into(),
                 schema_version: 1,
                 role: ProxyRole::AutoSafe,
@@ -6437,6 +6628,8 @@ mod tests {
             &pool,
             UpdateProtocolProfile {
                 name: "profile-one".into(),
+                display_name: "Profile one".into(),
+                expected_updated_at: None,
                 enabled: false,
                 server: "example.test".into(),
                 port: 443,
@@ -6626,6 +6819,262 @@ mod tests {
         assert_eq!(events[0].actor_admin_id, Some(admin.id));
         assert_eq!(events[0].actor_username, "historical-owner");
         assert_eq!(events[0].action, "owner.created");
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profile_lifecycle_is_atomic_versioned_and_generation_exact() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        let event = |action| NewAuditEvent {
+            actor: AuditActor::owner(1, "owner"),
+            action,
+            object_type: AuditObjectType::ProtocolProfile,
+            object_id: "stable-profile".into(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::none(),
+        };
+        let created = create_protocol_profile_audited(
+            &pool,
+            NewProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: "Initial label".into(),
+                protocol_id: "missing-adapter".into(),
+                schema_version: 9,
+                role: ProxyRole::Manual,
+                enabled: false,
+                server: "node.example.test".into(),
+                port: 443,
+                preferred_core_id: None,
+                managed_resource_id: Some("stable-profile".into()),
+                config: serde_json::json!({"opaque":{"future":true,"value":"PLAINTEXT_PROFILE_CANARY"}}),
+            },
+            &event(AuditAction::ProtocolProfileCreated),
+        )
+        .await?;
+        assert!(!format!("{created:?}").contains("PLAINTEXT_PROFILE_CANARY"));
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 0);
+
+        let renamed = update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: "Renamed label".into(),
+                expected_updated_at: Some(created.updated_at),
+                enabled: false,
+                server: created.server.clone(),
+                port: u16::try_from(created.port)?,
+                preferred_core_id: created.preferred_core_id.clone(),
+                managed_resource_id: created.managed_resource_id.clone(),
+                config: serde_json::from_str(&created.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileSaved),
+        )
+        .await?;
+        assert_eq!(renamed.name, "stable-profile");
+        assert_eq!(renamed.display_name, "Renamed label");
+        assert!(renamed.config_json.contains("future"));
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 0);
+
+        let configured = update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: renamed.display_name.clone(),
+                expected_updated_at: Some(renamed.updated_at),
+                enabled: false,
+                server: "configured.example.test".into(),
+                port: u16::try_from(renamed.port)?,
+                preferred_core_id: renamed.preferred_core_id.clone(),
+                managed_resource_id: renamed.managed_resource_id.clone(),
+                config: serde_json::from_str(&renamed.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileSaved),
+        )
+        .await?;
+        assert_eq!(configured.server, "configured.example.test");
+        assert!(configured.config_json.contains("future"));
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 0);
+
+        let stale = update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: "Stale overwrite".into(),
+                expected_updated_at: Some(renamed.updated_at),
+                enabled: false,
+                server: configured.server.clone(),
+                port: u16::try_from(configured.port)?,
+                preferred_core_id: configured.preferred_core_id.clone(),
+                managed_resource_id: configured.managed_resource_id.clone(),
+                config: serde_json::from_str(&configured.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileSaved),
+        )
+        .await;
+        assert!(stale.is_err());
+        assert_eq!(audit_event_count(&pool).await?, 3);
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 0);
+
+        let enabled = update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: configured.display_name.clone(),
+                expected_updated_at: Some(configured.updated_at),
+                enabled: true,
+                server: configured.server.clone(),
+                port: u16::try_from(configured.port)?,
+                preferred_core_id: configured.preferred_core_id.clone(),
+                managed_resource_id: configured.managed_resource_id.clone(),
+                config: serde_json::from_str(&configured.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileEnabled),
+        )
+        .await?;
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 1);
+
+        let reconfigured = update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: enabled.display_name.clone(),
+                expected_updated_at: Some(enabled.updated_at),
+                enabled: true,
+                server: enabled.server.clone(),
+                port: u16::try_from(enabled.port)? + 1,
+                preferred_core_id: enabled.preferred_core_id.clone(),
+                managed_resource_id: enabled.managed_resource_id.clone(),
+                config: serde_json::from_str(&enabled.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileSaved),
+        )
+        .await?;
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 2);
+
+        update_protocol_profile_audited(
+            &pool,
+            UpdateProtocolProfile {
+                name: "stable-profile".into(),
+                display_name: reconfigured.display_name.clone(),
+                expected_updated_at: Some(reconfigured.updated_at),
+                enabled: true,
+                server: reconfigured.server.clone(),
+                port: u16::try_from(reconfigured.port)?,
+                preferred_core_id: reconfigured.preferred_core_id.clone(),
+                managed_resource_id: reconfigured.managed_resource_id.clone(),
+                config: serde_json::from_str(&reconfigured.config_json)?,
+            },
+            &event(AuditAction::ProtocolProfileEnabled),
+        )
+        .await?;
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 2);
+        assert_eq!(audit_event_count(&pool).await?, 5);
+
+        assert!(delete_protocol_profile_audited(
+            &pool,
+            "stable-profile",
+            enabled.updated_at,
+            &event(AuditAction::ProtocolProfileDeleted),
+        )
+        .await
+        .is_err());
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 2);
+        assert_eq!(audit_event_count(&pool).await?, 5);
+
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,lazy,priority,position) VALUES ('pool','Pool','select',1,1,0,0)")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO client_transport_pool_members (pool_id,position,member_kind,member_value) VALUES ('pool',0,'profile','stable-profile')")
+            .execute(&pool).await?;
+        assert!(delete_protocol_profile_audited(
+            &pool,
+            "stable-profile",
+            reconfigured.updated_at,
+            &event(AuditAction::ProtocolProfileDeleted),
+        )
+        .await
+        .is_err());
+        assert_eq!(audit_event_count(&pool).await?, 5);
+        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id='pool'")
+            .execute(&pool)
+            .await?;
+        assert!(
+            delete_protocol_profile_audited(
+                &pool,
+                "stable-profile",
+                reconfigured.updated_at,
+                &event(AuditAction::ProtocolProfileDeleted),
+            )
+            .await?
+        );
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 3);
+        assert_eq!(audit_event_count(&pool).await?, 6);
+
+        let disabled_event = NewAuditEvent {
+            actor: AuditActor::owner(1, "owner"),
+            action: AuditAction::ProtocolProfileDeleted,
+            object_type: AuditObjectType::ProtocolProfile,
+            object_id: "disabled-profile".into(),
+            outcome: AuditOutcome::Succeeded,
+            metadata: AuditMetadata::none(),
+        };
+        let disabled = create_protocol_profile(
+            &pool,
+            NewProtocolProfile {
+                name: "disabled-profile".into(),
+                display_name: "Disabled".into(),
+                protocol_id: "missing".into(),
+                schema_version: 1,
+                role: ProxyRole::Manual,
+                enabled: false,
+                server: "node.example.test".into(),
+                port: 8443,
+                preferred_core_id: None,
+                managed_resource_id: None,
+                config: serde_json::json!({}),
+            },
+        )
+        .await?;
+        assert!(
+            !delete_protocol_profile_audited(
+                &pool,
+                "disabled-profile",
+                disabled.updated_at,
+                &disabled_event,
+            )
+            .await?
+        );
+        assert_eq!(get_reconcile_state(&pool).await?.desired_generation, 3);
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn profile_display_name_backfill_preserves_existing_identity() -> Result<()> {
+        let path = std::env::temp_dir().join(format!(
+            "infiproxy-profile-migration-{}.sqlite",
+            Uuid::new_v4().simple()
+        ));
+        let pool = open_pool(&format!("sqlite://{}?mode=rwc", path.display())).await?;
+        sqlx::query(
+            r"CREATE TABLE protocol_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,role TEXT NOT NULL,enabled INTEGER NOT NULL,
+                server TEXT NOT NULL,port INTEGER NOT NULL,config_json TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,preferred_core_id TEXT NULL,
+                managed_resource_id TEXT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)",
+        )
+        .execute(&pool)
+        .await?;
+        let now = Utc::now();
+        sqlx::query("INSERT INTO protocol_profiles (name,kind,role,enabled,server,port,config_json,schema_version,preferred_core_id,managed_resource_id,created_at,updated_at) VALUES ('legacy-profile','missing','manual',0,'node.example.test',443,'{}',1,NULL,NULL,?,?)")
+            .bind(now).bind(now).execute(&pool).await?;
+        init_db(&pool).await?;
+        let profile = get_protocol_profile_by_name(&pool, "legacy-profile")
+            .await?
+            .context("profile missing after migration")?;
+        assert_eq!(profile.name, "legacy-profile");
+        assert_eq!(profile.display_name, "legacy-profile");
         close_and_remove(pool, &path).await;
         Ok(())
     }

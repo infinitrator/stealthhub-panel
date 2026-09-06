@@ -32,6 +32,7 @@ pub struct Snapshot {
     pub active_runtimes: usize,
     pub panel_url: String,
     pub routing_paths: Vec<String>,
+    pub profile_details: Vec<String>,
 }
 
 /// Bounds both allocation and input size; files are data and never sourced.
@@ -91,13 +92,15 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
         .connect_with(options)
         .await?;
     let row = sqlx::query("SELECT desired_generation,applied_generation,status,last_error FROM reconcile_state WHERE singleton=1").fetch_one(&db).await?;
+    let desired_generation = row.try_get::<i64, _>("desired_generation")?;
+    let applied_generation = row.try_get::<i64, _>("applied_generation")?;
     snapshot.reconcile = row.try_get("status")?;
     snapshot.sections.insert(
         "Reconcile".into(),
         format!(
             "Desired: {}\nApplied: {}\nState: {}\nDetail: {}",
-            row.try_get::<i64, _>("desired_generation")?,
-            row.try_get::<i64, _>("applied_generation")?,
+            desired_generation,
+            applied_generation,
             snapshot.reconcile,
             command::safe_output(
                 &row.try_get::<Option<String>, _>("last_error")?
@@ -144,14 +147,24 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
     snapshot
         .sections
         .insert("Users".into(), command::safe_output(&lines.join("\n")));
-    let profiles = sqlx::query("SELECT name,kind,enabled,server,port,preferred_core_id FROM protocol_profiles ORDER BY name LIMIT 500").fetch_all(&db).await?;
+    let protocol_adapters = protocol_registry()?;
+    let profiles = sqlx::query("SELECT name,display_name,kind,enabled,server,port,preferred_core_id FROM protocol_profiles ORDER BY display_name,name LIMIT 500").fetch_all(&db).await?;
     let lines = profiles
         .iter()
         .map(|p| {
             Ok(format!(
-                "{} / {} / {} / {}:{} / runtime {}",
+                "{} [{}] / {} / {} / {} / {}:{} / runtime {}",
+                p.try_get::<String, _>("display_name")?,
                 p.try_get::<String, _>("name")?,
                 p.try_get::<String, _>("kind")?,
+                if protocol_adapters
+                    .get(&p.try_get::<String, _>("kind")?)
+                    .is_some()
+                {
+                    "adapter ready"
+                } else {
+                    "ADAPTER MISSING"
+                },
                 if p.try_get::<bool, _>("enabled")? {
                     "Enabled"
                 } else {
@@ -164,6 +177,21 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    snapshot.profile_details = lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| {
+            command::safe_output(&format!(
+                "PROFILE {} / {}\n{}\nDesired generation: {}\nApplied generation: {}\nController: {}",
+                index + 1,
+                lines.len(),
+                line,
+                desired_generation,
+                applied_generation,
+                snapshot.reconcile
+            ))
+        })
+        .collect();
     snapshot
         .sections
         .insert("Profiles".into(), command::safe_output(&lines.join("\n")));
@@ -198,7 +226,7 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
             load_rule_sources(&db, &rule_set.slug).await?,
         );
     }
-    let protocols = protocol_registry()?;
+    let protocols = protocol_adapters;
     let cores = core_registry()?;
     let mut availability = TopologyAvailability {
         protocol_adapters: protocols

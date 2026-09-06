@@ -1339,6 +1339,7 @@ mod tests {
                 % 50_000;
         ProtocolProfile {
             name: format!("profile-{protocol_id}"),
+            display_name: format!("Profile {protocol_id}"),
             protocol_id: protocol_id.to_string(),
             schema_version: 1,
             role: ProxyRole::AutoSafe,

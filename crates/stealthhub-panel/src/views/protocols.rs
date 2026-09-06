@@ -12,24 +12,38 @@ use stealthhub_core::{
     adapter::{AdapterMaturity, ConfigField, ConfigFieldKind, ProtocolRegistry},
     inventory::{adapter_kind, AdapterInventory},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
-    storage::UserSyncStatusRecord,
+    storage::{ProtocolProfileRecord, ReconcileStateRecord, UserSyncStatusRecord},
 };
 
-pub(crate) fn render(
-    auth: &AuthenticatedAdmin,
-    settings: &PanelSettings,
-    profiles: &[ProtocolProfile],
-    secret_names: &[String],
-    registry: &ProtocolRegistry,
-    inventory: &AdapterInventory,
-    user_sync: &[UserSyncStatusRecord],
-) -> Response {
+pub(crate) struct ProtocolPage<'a> {
+    pub settings: &'a PanelSettings,
+    pub profiles: &'a [ProtocolProfile],
+    pub secret_names: &'a [String],
+    pub registry: &'a ProtocolRegistry,
+    pub inventory: &'a AdapterInventory,
+    pub user_sync: &'a [UserSyncStatusRecord],
+    pub reconcile: &'a ReconcileStateRecord,
+}
+
+pub(crate) fn render(auth: &AuthenticatedAdmin, page: ProtocolPage<'_>) -> Response {
+    let ProtocolPage {
+        settings,
+        profiles,
+        secret_names,
+        registry,
+        inventory,
+        user_sync,
+        reconcile,
+    } = page;
     Html(
             layout(
                 "Protocols",
                 html! {
                     (admin_bar(auth))
                     h1 { "Protocols" }
+                    div class="actions" {
+                        a class="button" href="/admin/protocols/new" { "Create profile" }
+                    }
 
                     div class="status-strip" {
                         div class="metric" {
@@ -84,12 +98,18 @@ pub(crate) fn render(
                                             th { "Endpoint" }
                                             th { "Secrets" }
                                             th { "User sync" }
+                                            th { "Desired state" }
+                                            th { "Actions" }
                                         }
                                     }
                                     tbody {
                                         @for profile in profiles {
                                             tr {
-                                                td { code { (&profile.name) } }
+                                                td {
+                                                    strong { (&profile.display_name) }
+                                                    br;
+                                                    code { (&profile.name) }
+                                                }
                                                 td { (protocol_label(profile, registry)) }
                                                 td { (protocol_composition(profile, registry)) }
                                                 td { (runtime_contract(profile, registry, inventory)) }
@@ -125,6 +145,10 @@ pub(crate) fn render(
                                                     }
                                                 }
                                                 td { (user_sync_badges(user_sync, Some(&profile.name), None)) }
+                                                td { (reconcile_badge(reconcile)) }
+                                                td class="module-actions" {
+                                                    a class="button compact" href=(format!("/admin/protocols/{}", profile.name)) { "Inspect" }
+                                                }
                                             }
                                         }
                                     }
@@ -133,19 +157,6 @@ pub(crate) fn render(
                         }
                     }
 
-                    section {
-                        h2 { "Profile parameters" }
-                        datalist id="secret-names" {
-                            @for secret in secret_names {
-                                option value=(secret) {}
-                            }
-                        }
-                        div class="config-list" {
-                            @for profile in profiles {
-                                (protocol_profile_editor(profile, auth, secret_names, registry))
-                            }
-                        }
-                    }
                 },
             )
             .into_string(),
@@ -155,6 +166,7 @@ pub(crate) fn render(
 
 fn protocol_profile_editor(
     profile: &ProtocolProfile,
+    record: &ProtocolProfileRecord,
     auth: &AuthenticatedAdmin,
     secret_names: &[String],
     registry: &ProtocolRegistry,
@@ -162,7 +174,7 @@ fn protocol_profile_editor(
     html! {
         section class="config-row" {
             div class="config-row-head" {
-                h3 { (&profile.name) }
+                h3 { (&profile.display_name) }
                 div class="config-row-meta" {
                     span class=(format!("badge {}", if profile.enabled { "ok" } else { "off" })) {
                         @if profile.enabled { "enabled" } @else { "disabled" }
@@ -173,6 +185,12 @@ fn protocol_profile_editor(
             }
             form method="post" action=(format!("/admin/protocols/{}/update", profile.name)) class="config-form" {
                 (csrf_field(&auth.csrf_token))
+                input type="hidden" name="expected_updated_at" value=(record.updated_at.to_rfc3339());
+                label {
+                    span { "Display name" }
+                    input type="text" name="display_name" maxlength="96" value=(&profile.display_name) required;
+                    small { "Operator label. The stable ID and routing references do not change." }
+                }
                 label class="switch-field" {
                     input type="checkbox" name="enabled" checked[profile.enabled];
                     span class="switch-ui" {}
@@ -196,6 +214,157 @@ fn protocol_profile_editor(
             }
         }
     }
+}
+
+fn reconcile_badge(reconcile: &ReconcileStateRecord) -> Markup {
+    if reconcile.status == "failed" || reconcile.status == "recovery-required" {
+        html! { span class="badge off" { "failed" } }
+    } else if reconcile.desired_generation > reconcile.applied_generation {
+        html! { span class="badge neutral" { "pending" } }
+    } else {
+        html! { span class="badge ok" { "applied" } }
+    }
+}
+
+pub(crate) fn render_detail(
+    auth: &AuthenticatedAdmin,
+    profile: &ProtocolProfile,
+    record: &ProtocolProfileRecord,
+    secret_names: &[String],
+    registry: &ProtocolRegistry,
+    reconcile: &ReconcileStateRecord,
+    references: u64,
+) -> Response {
+    Html(layout("Profile", html! {
+        (admin_bar(auth))
+        h1 { (&profile.display_name) }
+        div class="actions" { a class="button compact" href="/admin/protocols" { "Back to profiles" } }
+        section {
+            h2 { "Lifecycle" }
+            dl class="details" {
+                dt { "Stable ID" } dd { code { (&profile.name) } }
+                dt { "Adapter" } dd { code { (&profile.protocol_id) } }
+                dt { "Endpoint" } dd { code { (format!("{}:{}", profile.server, profile.port)) } }
+                dt { "Preferred runtime" } dd {
+                    @if let Some(runtime) = &profile.preferred_core_id {
+                        code { (runtime) }
+                    } @else {
+                        "adapter-selected"
+                    }
+                }
+                dt { "State" } dd { @if profile.enabled { "enabled" } @else { "disabled" } }
+                dt { "Desired / applied" } dd { (reconcile.desired_generation) " / " (reconcile.applied_generation) " " (reconcile_badge(reconcile)) }
+                dt { "Routing references" } dd { (references) }
+                dt { "Revision" } dd { code { (record.updated_at.to_rfc3339()) } }
+            }
+            @if let Some(error) = &reconcile.last_error { p class="inline-warn" { (error) } }
+        }
+        (protocol_profile_editor(profile, record, auth, secret_names, registry))
+        section class="danger-zone" {
+            h2 { "Lifecycle actions" }
+            div class="actions" {
+                form method="post" action=(format!("/admin/protocols/{}/enabled", profile.name)) class="inline-form" {
+                    (csrf_field(&auth.csrf_token))
+                    input type="hidden" name="expected_updated_at" value=(record.updated_at.to_rfc3339());
+                    input type="hidden" name="enabled" value=(if profile.enabled { "false" } else { "true" });
+                    button type="submit" { @if profile.enabled { "Disable" } @else { "Enable" } }
+                }
+                a class="button compact danger" href=(format!("/admin/protocols/{}/delete", profile.name)) { "Delete" }
+            }
+        }
+    }).into_string()).into_response()
+}
+
+pub(crate) fn render_delete(
+    auth: &AuthenticatedAdmin,
+    profile: &ProtocolProfile,
+    record: &ProtocolProfileRecord,
+    references: u64,
+) -> Response {
+    Html(layout("Delete profile", html! {
+        (admin_bar(auth))
+        h1 { "Delete profile" }
+        section class="confirm-panel danger-zone" {
+            h2 { (&profile.display_name) }
+            p { "This removes the desired-state object. It does not rewrite routing." }
+            p { "Stable ID: " code { (&profile.name) } }
+            p { "Routing references: " strong { (references) } }
+            @if references > 0 { p class="inline-warn" { "Deletion is blocked until these references are removed." } }
+            div class="actions" {
+                form method="post" action=(format!("/admin/protocols/{}/delete", profile.name)) {
+                    (csrf_field(&auth.csrf_token))
+                    input type="hidden" name="expected_updated_at" value=(record.updated_at.to_rfc3339());
+                    button class="danger" type="submit" disabled[references > 0] { "Delete profile" }
+                }
+                a class="button" href=(format!("/admin/protocols/{}", profile.name)) { "Cancel" }
+            }
+        }
+    }).into_string()).into_response()
+}
+
+pub(crate) fn render_new(
+    auth: &AuthenticatedAdmin,
+    registry: &ProtocolRegistry,
+    selected_adapter: Option<&str>,
+    secret_names: &[String],
+) -> Response {
+    let manifests = registry.manifests();
+    let selected = selected_adapter.and_then(|id| registry.get(id));
+    Html(layout("Create profile", html! {
+        (admin_bar(auth))
+        h1 { "Create protocol profile" }
+        div class="actions" { a class="button compact" href="/admin/protocols" { "Back to profiles" } }
+        section class="config-row" {
+            h2 { "Adapter" }
+            form method="get" action="/admin/protocols/new" class="config-form" {
+                label {
+                    span { "Protocol adapter" }
+                    select name="adapter" required {
+                        option value="" { "Select an adapter" }
+                        @for manifest in &manifests {
+                            option value=(&manifest.id) selected[selected_adapter == Some(manifest.id.as_str())] {
+                                (&manifest.display_name) " (" (&manifest.id) ")"
+                            }
+                        }
+                    }
+                }
+                button type="submit" { "Load fields" }
+            }
+        }
+        @if let Some(adapter) = selected {
+            @let manifest = adapter.manifest();
+            @let empty = ProtocolProfile {
+                name: String::new(),
+                display_name: String::new(),
+                protocol_id: manifest.id.clone(),
+                schema_version: manifest.schema_version,
+                role: ProxyRole::Manual,
+                server: String::new(),
+                port: 443,
+                enabled: false,
+                preferred_core_id: manifest.composition.preferred_runtime.as_ref().map(|runtime| runtime.adapter_id.clone()),
+                managed_resource_id: None,
+                config: serde_json::json!({}),
+            };
+            section class="config-row" {
+                h2 { "Profile parameters" }
+                datalist id="secret-names" { @for secret in secret_names { option value=(secret) {} } }
+                form method="post" action="/admin/protocols/new" class="config-form" {
+                    (csrf_field(&auth.csrf_token))
+                    input type="hidden" name="protocol_id" value=(&manifest.id);
+                    input type="hidden" name="schema_version" value=(manifest.schema_version);
+                    label { span { "Stable ID" } input type="text" name="name" maxlength="64" pattern="[a-z][a-z0-9-]*" required; small { "Permanent routing and runtime identity. It cannot be renamed." } }
+                    label { span { "Display name" } input type="text" name="display_name" maxlength="96" required; }
+                    label { span { "Role" } select name="role" { option value="auto-safe" { "AUTO-SAFE" } option value="speed" { "SPEED" } option value="compatibility" { "COMPAT" } option value="ru-access" { "RU-ACCESS" } option value="manual" selected { "MANUAL" } } }
+                    label class="switch-field" { input type="checkbox" name="enabled"; span class="switch-ui" {} span { strong { "Enabled" } small { "Publish immediately after validation. Keep off until its runtime is installed." } } }
+                    label { span { "Server address" } input type="text" name="server" required; }
+                    label { span { "Server port" } input type="number" name="port" min="1" max="65535" value="443" required; }
+                    @for field in adapter.fields() { (adapter_field(&empty, field, secret_names)) }
+                    button type="submit" { "Create profile" }
+                }
+            }
+        }
+    }).into_string()).into_response()
 }
 
 fn protocol_specific_fields(

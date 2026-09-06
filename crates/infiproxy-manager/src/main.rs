@@ -36,7 +36,7 @@ fn restore() {
 }
 
 enum Completion {
-    Snapshot(data::Snapshot),
+    Snapshot(Box<data::Snapshot>),
     Operation(&'static str, Result<String>),
 }
 
@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
     let tx = sender.clone();
     let mut task = tokio::spawn(async move {
-        let _ = tx.send(Completion::Snapshot(data::collect().await)).await;
+        let _ = tx
+            .send(Completion::Snapshot(Box::new(data::collect().await)))
+            .await;
     });
     let result = (|| -> Result<()> {
         loop {
@@ -123,7 +125,7 @@ async fn main() -> Result<()> {
                 app.busy = false;
                 match message {
                     Completion::Snapshot(snapshot) => {
-                        app.snapshot = snapshot;
+                        app.snapshot = *snapshot;
                         app.output="Refreshed local observations. Process/listener status does not prove a proxy handshake.".into();
                     }
                     Completion::Operation(label, result) => match result {
@@ -147,7 +149,9 @@ async fn main() -> Result<()> {
                         Intent::Refresh => {
                             let tx = sender.clone();
                             task = tokio::spawn(async move {
-                                let _ = tx.send(Completion::Snapshot(data::collect().await)).await;
+                                let _ = tx
+                                    .send(Completion::Snapshot(Box::new(data::collect().await)))
+                                    .await;
                             });
                         }
                         Intent::Execute(action, values) => {

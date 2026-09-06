@@ -18,7 +18,9 @@ use stealthhub_core::{
         AdapterInventory, AdapterInventoryEntry, AdapterInventoryState, RuntimeInventoryEntry,
         RuntimeInventoryState,
     },
-    storage::{AdminRecord, AuditEventRecord, UserRecord},
+    storage::{
+        AdminRecord, AuditEventRecord, ProtocolProfileRecord, ReconcileStateRecord, UserRecord,
+    },
 };
 
 fn fixture_user() -> UserRecord {
@@ -283,6 +285,104 @@ fn protocol_secret_references_and_paths_fail_closed() {
     );
     assert!(normalize_profile_server("example.com:443").is_err());
     assert!(normalize_profile_server("example com").is_err());
+    assert!(valid_stored_profile_id("VLESS-XHTTP-SAFE"));
+    assert!(valid_stored_profile_id("future_profile-2"));
+    assert!(!valid_stored_profile_id("../profile"));
+    assert!(!valid_stored_profile_id("profile/name"));
+}
+
+#[test]
+fn protocol_form_preserves_opaque_adapter_state_and_revision_is_required() {
+    let registry = stealthhub_core::adapters::protocol_registry().unwrap();
+    let mut profile = stealthhub_core::adapters::default_profiles()
+        .into_iter()
+        .find(|profile| profile.protocol_id == "vless-reality-xhttp")
+        .unwrap();
+    profile.config["future-owned-field"] = serde_json::json!({"keep": true});
+    let adapter = registry.get(&profile.protocol_id).unwrap();
+    let form = adapter
+        .fields()
+        .iter()
+        .filter_map(|field| {
+            profile
+                .config
+                .get(&field.name)
+                .and_then(serde_json::Value::as_str)
+                .map(|value| (field.name.clone(), value.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let updated = protocol_config_from_form(&profile, &form, &registry).unwrap();
+    assert_eq!(updated["future-owned-field"]["keep"], true);
+
+    let missing_revision = HashMap::new();
+    assert!(parse_profile_revision(&missing_revision).is_err());
+    let mut renamed = profile.clone();
+    renamed.display_name = "Cosmetic rename".into();
+    assert!(!profile_runtime_changed(&profile, &renamed));
+}
+
+#[tokio::test]
+async fn profile_detail_exposes_lifecycle_controls_without_opaque_secret_state() {
+    let admin = AuthenticatedAdmin {
+        admin: test_admin(1),
+        is_owner: true,
+        csrf_token: "csrf".into(),
+        update_notice: None,
+    };
+    let now = Utc::now();
+    let mut profile = stealthhub_core::adapters::default_profiles()
+        .into_iter()
+        .find(|profile| profile.protocol_id == "vless-reality-xhttp")
+        .unwrap();
+    profile.name = "stable-profile".into();
+    profile.display_name = "Readable profile".into();
+    profile.config["opaque-secret"] = serde_json::json!("PLAINTEXT_SECRET_CANARY");
+    let record = ProtocolProfileRecord {
+        id: 1,
+        name: profile.name.clone(),
+        display_name: profile.display_name.clone(),
+        kind: profile.protocol_id.clone(),
+        role: "manual".into(),
+        enabled: false,
+        server: profile.server.clone(),
+        port: i64::from(profile.port),
+        config_json: serde_json::to_string(&profile.config).unwrap(),
+        schema_version: 1,
+        preferred_core_id: profile.preferred_core_id.clone(),
+        managed_resource_id: profile.managed_resource_id.clone(),
+        created_at: now,
+        updated_at: now,
+    };
+    let reconcile = ReconcileStateRecord {
+        desired_generation: 4,
+        applied_generation: 3,
+        status: "pending".into(),
+        last_operation_id: None,
+        last_error: None,
+        affected_resources_json: "[]".into(),
+        active_runtime_ids_json: "[]".into(),
+        started_at: None,
+        completed_at: None,
+        updated_at: now,
+    };
+    let response = views::protocols::render_detail(
+        &admin,
+        &profile,
+        &record,
+        &[],
+        &stealthhub_core::adapters::protocol_registry().unwrap(),
+        &reconcile,
+        0,
+    );
+    let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Readable profile"));
+    assert!(html.contains("stable-profile"));
+    assert!(html.contains("expected_updated_at"));
+    assert!(html.contains(">Delete</a>"));
+    assert!(!html.contains("PLAINTEXT_SECRET_CANARY"));
 }
 
 #[test]

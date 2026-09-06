@@ -349,6 +349,7 @@ mod tests {
     fn fixture_profile() -> ProtocolProfile {
         ProtocolProfile {
             name: "VLESS-XHTTP-SAFE".to_string(),
+            display_name: "VLESS XHTTP Safe".to_string(),
             protocol_id: "vless-reality-xhttp".to_string(),
             schema_version: 1,
             role: ProxyRole::AutoSafe,
@@ -472,6 +473,7 @@ mod tests {
             .unwrap();
         let profile = ProtocolProfile {
             name: "EXTERNAL".to_string(),
+            display_name: "External".to_string(),
             protocol_id: "external-test".to_string(),
             schema_version: 1,
             role: ProxyRole::Manual,

@@ -1457,6 +1457,7 @@ fn profile(
 ) -> ProtocolProfile {
     ProtocolProfile {
         name: name.to_string(),
+        display_name: name.to_string(),
         protocol_id: protocol_id.to_string(),
         schema_version: 1,
         role,

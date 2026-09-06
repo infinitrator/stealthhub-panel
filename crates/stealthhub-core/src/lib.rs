@@ -15,6 +15,7 @@ pub mod mihomo;
 pub mod models;
 pub mod module_manifest;
 pub mod policy;
+pub mod profile_lifecycle;
 pub mod reconcile;
 pub mod routing_topology;
 pub mod rules;

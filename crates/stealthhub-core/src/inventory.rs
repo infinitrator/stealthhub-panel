@@ -577,6 +577,7 @@ mod tests {
     fn profile(adapter: &str, schema_version: u32, enabled: bool) -> ProtocolProfile {
         ProtocolProfile {
             name: "resource-one".to_string(),
+            display_name: "Resource one".to_string(),
             protocol_id: adapter.to_string(),
             schema_version,
             role: ProxyRole::Manual,

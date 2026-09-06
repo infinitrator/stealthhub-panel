@@ -453,13 +453,13 @@ fn resolve_target(
             path.detail = "Pool member selection occurs in the Mihomo client".into();
         }
         _ => {
-            if let Some(profile) = profiles
-                .iter()
-                .find(|profile| profile.enabled && profile.name == input.target)
-            {
+            if let Some(profile) = profiles.iter().find(|profile| profile.name == input.target) {
                 path.target_kind = TargetKind::Profile;
                 path.profile = Some(profile.name.clone());
-                if !availability
+                if !profile.enabled {
+                    path.state = TopologyState::Unresolved;
+                    path.detail = format!("Profile `{}` is disabled", profile.display_name);
+                } else if !availability
                     .protocol_adapters
                     .contains(&profile.protocol_id)
                 {
@@ -475,7 +475,10 @@ fn resolve_target(
                         path.detail = "Compatible runtime is unavailable".into();
                     } else {
                         path.state = TopologyState::Ready;
-                        path.detail = "Profile and runtime are available".into();
+                        path.detail = format!(
+                            "Profile `{}` and runtime are available",
+                            profile.display_name
+                        );
                     }
                 } else {
                     path.state = TopologyState::Dynamic;
@@ -574,6 +577,7 @@ mod tests {
     fn profile(name: &str, adapter: &str) -> ProtocolProfile {
         ProtocolProfile {
             name: name.into(),
+            display_name: name.into(),
             protocol_id: adapter.into(),
             schema_version: 1,
             role: ProxyRole::AutoSafe,
@@ -619,6 +623,45 @@ mod tests {
             topology.inspect_domain("example.com").outcome,
             InspectionOutcome::Default
         );
+    }
+
+    #[test]
+    fn display_rename_preserves_route_identity_and_disabled_state_is_explicit() {
+        let mut target = profile("proxy-main", "vless");
+        target.display_name = "Renamed operator label".into();
+        let policy = ClientPolicy {
+            pools: vec![],
+            rules: vec![RoutingPolicyRule {
+                id: "stable-route".into(),
+                display_name: "Stable route".into(),
+                enabled: true,
+                priority: 1,
+                condition: "DOMAIN,example.test".into(),
+                target: "proxy-main".into(),
+            }],
+        };
+        let ready = RoutingTopology::build(
+            &[],
+            &policy,
+            &[target.clone()],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &availability(),
+        );
+        assert_eq!(ready.paths[0].profile.as_deref(), Some("proxy-main"));
+        assert!(ready.paths[0].detail.contains("Renamed operator label"));
+
+        target.enabled = false;
+        let disabled = RoutingTopology::build(
+            &[],
+            &policy,
+            &[target],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &availability(),
+        );
+        assert_eq!(disabled.paths[0].state, TopologyState::Unresolved);
+        assert!(disabled.paths[0].detail.contains("disabled"));
     }
 
     #[test]

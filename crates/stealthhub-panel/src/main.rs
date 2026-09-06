@@ -53,6 +53,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
 };
+use stealthhub_core::profile_lifecycle::validate_profile_candidate;
 use stealthhub_core::{
     adapter::{ConfigFieldKind, CoreRegistry, ProtocolRegistry, RuntimeLifecycleAction, SecretRef},
     adapters::{core_registry, protocol_registry},
@@ -68,24 +69,28 @@ use stealthhub_core::{
     storage::{
         admin_count, append_audit_event, audit_event_count, bulk_add_rule_entries_audited,
         clone_routing_rule_set_audited, compiled_rule_set_payload, create_admin_session,
-        create_first_admin_audited, create_routing_rule_set_audited, create_user_audited,
+        create_first_admin_audited, create_protocol_profile_audited,
+        create_routing_rule_set_audited, create_user_audited, decode_protocol_profile,
         deduplicate_rule_entries_audited, delete_admin_session, delete_expired_admin_sessions,
-        delete_routing_policy_audited, delete_routing_rule_set_audited, delete_rule_entry_audited,
-        delete_rule_source_audited, delete_secret_audited, delete_transport_pool_audited,
-        delete_user_audited, ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
-        ensure_default_settings, get_admin_by_id, get_admin_by_username, get_reconcile_state,
-        get_secret, get_user_by_id, get_user_by_token, get_valid_admin_session, init_db,
-        is_owner_admin_id, list_audit_events, list_protocol_profiles_decoded,
-        list_runtime_user_sync, list_secret_names, list_users, load_client_policy, load_dns_policy,
-        load_panel_settings, load_routing_rule_sets, load_rule_entries, load_rule_sources,
+        delete_protocol_profile_audited, delete_routing_policy_audited,
+        delete_routing_rule_set_audited, delete_rule_entry_audited, delete_rule_source_audited,
+        delete_secret_audited, delete_transport_pool_audited, delete_user_audited,
+        ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
+        ensure_default_settings, get_admin_by_id, get_admin_by_username,
+        get_protocol_profile_by_name, get_reconcile_state, get_secret, get_user_by_id,
+        get_user_by_token, get_valid_admin_session, init_db, is_owner_admin_id, list_audit_events,
+        list_protocol_profiles, list_protocol_profiles_decoded, list_runtime_user_sync,
+        list_secret_names, list_users, load_client_policy, load_dns_policy, load_panel_settings,
+        load_routing_rule_sets, load_rule_entries, load_rule_sources,
         migrate_available_adapter_states, migrate_protocol_adapter_configs, open_pool,
-        reset_user_subscription_token_audited, rotate_user_runtime_identity_audited,
-        save_routing_rule_set_audited, set_user_enabled_audited, touch_admin_session,
+        protocol_profile_reference_count, reset_user_subscription_token_audited,
+        rotate_user_runtime_identity_audited, save_routing_rule_set_audited,
+        set_user_enabled_audited, touch_admin_session,
         update_admin_password_and_revoke_sessions_audited, update_dns_policy_audited,
         update_protocol_profile_audited, update_routing_rule_set_audited, update_user_audited,
         upsert_routing_policy_audited, upsert_rule_entry_audited, upsert_rule_source_audited,
         upsert_secret_audited, upsert_setting, upsert_settings_with_runtime_keys_audited,
-        upsert_transport_pool_audited, valid_user_name, AdminRecord, NewUser,
+        upsert_transport_pool_audited, valid_user_name, AdminRecord, NewProtocolProfile, NewUser,
         UpdateProtocolProfile, UpdateRoutingRuleSet, UpdateUser, UserRecord,
     },
 };
@@ -120,6 +125,7 @@ pub(crate) struct AppState {
     setup_token: Arc<str>,
     login_limiter: Arc<LoginRateLimiter>,
     password_workers: Arc<Semaphore>,
+    profile_mutations: Arc<Semaphore>,
 }
 
 #[derive(Debug, Default)]
@@ -498,6 +504,7 @@ async fn main() -> anyhow::Result<()> {
         setup_token: Arc::from(setup_token),
         login_limiter: Arc::new(LoginRateLimiter::default()),
         password_workers: Arc::new(Semaphore::new(PASSWORD_WORKER_LIMIT)),
+        profile_mutations: Arc::new(Semaphore::new(1)),
     };
 
     let app = Router::new()
@@ -552,11 +559,24 @@ async fn main() -> anyhow::Result<()> {
             post(restart_module_action),
         )
         .route("/admin/protocols", get(protocols_page))
+        .route(
+            "/admin/protocols/new",
+            get(new_protocol_page).post(create_protocol_action),
+        )
+        .route("/admin/protocols/{name}", get(protocol_detail_page))
         .route("/admin/secrets", get(secrets_page).post(secret_save_action))
         .route("/admin/secrets/delete", post(secret_delete_action))
         .route(
             "/admin/protocols/{name}/update",
             post(update_protocol_action),
+        )
+        .route(
+            "/admin/protocols/{name}/enabled",
+            post(set_protocol_enabled_action),
+        )
+        .route(
+            "/admin/protocols/{name}/delete",
+            get(delete_protocol_page).post(delete_protocol_action),
         )
         .route(
             "/admin/routing",
@@ -1350,7 +1370,6 @@ async fn panel_update_now_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-
     if let Err(error) = upsert_setting(&state.pool, "panel_update_status", "requested").await {
         return logged_error_with_back(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3024,7 +3043,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         }
     };
 
-    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
+    let records = match list_protocol_profiles(&state.pool).await {
         Ok(value) => value,
         Err(error) => {
             return logged_error_with_back(
@@ -3037,6 +3056,15 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "Back to Health",
             );
         }
+    };
+    let profiles = match records
+        .iter()
+        .cloned()
+        .map(decode_protocol_profile)
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(value) => value,
+        Err(error) => return internal_error("decode protocol profiles", error),
     };
 
     let secret_names = match list_secret_names(&state.pool).await {
@@ -3062,15 +3090,22 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
         Ok(value) => value,
         Err(error) => return internal_error("load protocol user synchronization", error),
     };
+    let reconcile = match get_reconcile_state(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load protocol reconcile state", error),
+    };
 
     views::protocols::render(
         &auth,
-        &settings,
-        &profiles,
-        &secret_names,
-        &state.protocol_registry,
-        &inventory,
-        &user_sync,
+        views::protocols::ProtocolPage {
+            settings: &settings,
+            profiles: &profiles,
+            secret_names: &secret_names,
+            registry: &state.protocol_registry,
+            inventory: &inventory,
+            user_sync: &user_sync,
+            reconcile: &reconcile,
+        },
     )
 }
 
@@ -3093,27 +3128,43 @@ async fn update_protocol_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
+    if !valid_stored_profile_id(&name) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Protocol update failed",
+            "Invalid profile ID.",
+        );
+    }
+    let _mutation = state
+        .profile_mutations
+        .acquire()
+        .await
+        .expect("profile mutation semaphore remains open");
 
-    let profiles = match list_protocol_profiles_decoded(&state.pool).await {
-        Ok(value) => value,
-        Err(error) => {
-            return logged_error_with_back(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "load protocol profile for update",
-                error,
+    let record = match get_protocol_profile_by_name(&state.pool, &name).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
                 "Protocol update failed",
-                "Protocol profiles could not be loaded. Review the server journal.",
-                "/admin/protocols",
-                "Back to Protocols",
+                "Profile not found",
             )
         }
+        Err(error) => return internal_error("load protocol profile for update", error),
     };
-    let Some(existing) = profiles.into_iter().find(|profile| profile.name == name) else {
-        return html_error_response(
-            StatusCode::NOT_FOUND,
-            "Protocol update failed",
-            "Profile not found",
-        );
+    let existing = match decode_protocol_profile(record.clone()) {
+        Ok(value) => value,
+        Err(error) => return internal_error("decode protocol profile", error),
+    };
+    let expected_updated_at = match parse_profile_revision(&form) {
+        Ok(value) => value,
+        Err(error) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Protocol update failed",
+                error.to_string(),
+            )
+        }
     };
 
     let server = match normalize_profile_server(form.get("server").map_or("", String::as_str)) {
@@ -3133,34 +3184,78 @@ async fn update_protocol_action(
         }
     };
 
-    let config = match protocol_config_from_form(&existing, &form, &state.protocol_registry) {
+    let display_name = match required_profile_field(
+        form.get("display_name").map_or("", String::as_str),
+        "Display name",
+        96,
+    ) {
         Ok(value) => value,
-        Err(err) => {
+        Err(error) => {
             return html_error_response(
                 StatusCode::BAD_REQUEST,
                 "Protocol update failed",
-                err.to_string(),
+                error.to_string(),
             )
         }
     };
+    let enabled = form
+        .get("enabled")
+        .is_some_and(|value| checkbox_enabled(value));
+    let adapter_available = state.protocol_registry.get(&existing.protocol_id).is_some();
+    let config = if adapter_available {
+        match protocol_config_from_form(&existing, &form, &state.protocol_registry) {
+            Ok(value) => value,
+            Err(error) => {
+                return html_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Protocol update failed",
+                    error.to_string(),
+                )
+            }
+        }
+    } else {
+        existing.config.clone()
+    };
+    let mut candidate = existing.clone();
+    candidate.display_name = display_name.clone();
+    candidate.enabled = enabled;
+    candidate.server = server.clone();
+    candidate.port = port;
+    candidate.config = config.clone();
+    let runtime_changed = profile_runtime_changed(&existing, &candidate);
+    let configuration_changed = profile_configuration_changed(&existing, &candidate);
+    let validation_needed = configuration_changed || (!existing.enabled && candidate.enabled);
+    if !adapter_available && validation_needed {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Protocol update failed",
+            "The missing adapter permits only a display-name change or disabling the profile.",
+        );
+    }
+    if adapter_available && validation_needed {
+        if let Err(error) = validate_profile_for_publish(&state, &candidate).await {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Protocol update failed",
+                error.to_string(),
+            );
+        }
+    }
 
     let previous_enabled = existing.enabled;
     let profile_name = existing.name.clone();
     let input = UpdateProtocolProfile {
-        name: existing.name,
-        enabled: form
-            .get("enabled")
-            .is_some_and(|value| checkbox_enabled(value)),
+        name: existing.name.clone(),
+        display_name,
+        expected_updated_at: Some(expected_updated_at),
+        enabled,
         server,
         port,
-        preferred_core_id: existing.preferred_core_id,
-        managed_resource_id: existing.managed_resource_id,
+        preferred_core_id: existing.preferred_core_id.clone(),
+        managed_resource_id: existing.managed_resource_id.clone(),
         config,
     };
 
-    let enabled = form
-        .get("enabled")
-        .is_some_and(|value| checkbox_enabled(value));
     let action = if enabled != previous_enabled {
         if enabled {
             AuditAction::ProtocolProfileEnabled
@@ -3174,17 +3269,19 @@ async fn update_protocol_action(
         &auth,
         action,
         AuditObjectType::ProtocolProfile,
-        profile_name,
+        profile_name.clone(),
         AuditOutcome::Succeeded,
         AuditMetadata::enabled(enabled),
     );
     match update_protocol_profile_audited(&state.pool, input, &event).await {
         Ok(_) => {
-            queue_latest_reconcile(&state).await;
-            Redirect::to("/admin/protocols").into_response()
+            if runtime_changed {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to(&format!("/admin/protocols/{profile_name}")).into_response()
         }
         Err(error) => logged_error_with_back(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            profile_write_status(&error),
             "update protocol profile",
             error,
             "Protocol update failed",
@@ -3195,6 +3292,537 @@ async fn update_protocol_action(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct NewProtocolQuery {
+    adapter: Option<String>,
+}
+
+async fn new_protocol_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<NewProtocolQuery>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let secret_names = match list_secret_names(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profile secret references", error),
+    };
+    views::protocols::render_new(
+        &auth,
+        &state.protocol_registry,
+        query.adapter.as_deref(),
+        &secret_names,
+    )
+}
+
+async fn create_protocol_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        csrf_error_response(&auth, form.get("csrf_token").map_or("", String::as_str))
+    {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    let _mutation = state
+        .profile_mutations
+        .acquire()
+        .await
+        .expect("profile mutation semaphore remains open");
+    let name = form
+        .get("name")
+        .map_or("", String::as_str)
+        .trim()
+        .to_string();
+    if !stealthhub_core::adapter::valid_adapter_id(&name) {
+        return html_error_response(StatusCode::BAD_REQUEST, "Profile creation failed", "Stable ID must begin with a lowercase letter and contain only lowercase letters, digits, and hyphens.");
+    }
+    match get_protocol_profile_by_name(&state.pool, &name).await {
+        Ok(Some(_)) => {
+            return html_error_response(
+                StatusCode::CONFLICT,
+                "Profile creation failed",
+                "Profile ID already exists.",
+            )
+        }
+        Ok(None) => {}
+        Err(error) => return internal_error("check profile identity", error),
+    }
+    let protocol_id = form.get("protocol_id").map_or("", String::as_str).trim();
+    let Some(adapter) = state.protocol_registry.get(protocol_id) else {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile creation failed",
+            "Protocol adapter is not installed.",
+        );
+    };
+    let schema_version = adapter.manifest().schema_version;
+    let display_name = match required_profile_field(
+        form.get("display_name").map_or("", String::as_str),
+        "Display name",
+        96,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile creation failed",
+                error.to_string(),
+            )
+        }
+    };
+    let server = match normalize_profile_server(form.get("server").map_or("", String::as_str)) {
+        Ok(value) => value,
+        Err(message) => {
+            return html_error_response(StatusCode::BAD_REQUEST, "Profile creation failed", message)
+        }
+    };
+    let port = match form.get("port").and_then(|value| value.parse::<u16>().ok()) {
+        Some(value) if value > 0 => value,
+        _ => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile creation failed",
+                "Server port must be between 1 and 65535.",
+            )
+        }
+    };
+    let role = match parse_role(form.get("role").map_or("", String::as_str)) {
+        Ok(value) => value,
+        Err(error) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile creation failed",
+                error.to_string(),
+            )
+        }
+    };
+    let config =
+        match protocol_config_from_fields(serde_json::json!({}), schema_version, &adapter, &form) {
+            Ok(value) => value,
+            Err(error) => {
+                return html_error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Profile creation failed",
+                    error.to_string(),
+                )
+            }
+        };
+    let preferred_core_id = adapter
+        .manifest()
+        .composition
+        .preferred_runtime
+        .as_ref()
+        .map(|runtime| runtime.adapter_id.clone());
+    let candidate = ProtocolProfile {
+        name: name.clone(),
+        display_name: display_name.clone(),
+        protocol_id: protocol_id.to_string(),
+        schema_version,
+        role,
+        server: server.clone(),
+        port,
+        enabled: form
+            .get("enabled")
+            .is_some_and(|value| checkbox_enabled(value)),
+        preferred_core_id: preferred_core_id.clone(),
+        managed_resource_id: Some(name.clone()),
+        config: config.clone(),
+    };
+    if let Err(error) = validate_profile_for_publish(&state, &candidate).await {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile creation failed",
+            error.to_string(),
+        );
+    }
+    let event = audit_event(
+        &auth,
+        AuditAction::ProtocolProfileCreated,
+        AuditObjectType::ProtocolProfile,
+        name.clone(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(candidate.enabled),
+    );
+    let input = NewProtocolProfile {
+        name: name.clone(),
+        display_name,
+        protocol_id: protocol_id.to_string(),
+        schema_version,
+        role,
+        enabled: candidate.enabled,
+        server,
+        port,
+        preferred_core_id,
+        managed_resource_id: Some(name.clone()),
+        config,
+    };
+    match create_protocol_profile_audited(&state.pool, input, &event).await {
+        Ok(_) => {
+            if candidate.enabled {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to(&format!("/admin/protocols/{name}")).into_response()
+        }
+        Err(error) => logged_error_with_back(
+            profile_write_status(&error),
+            "create protocol profile",
+            error,
+            "Profile creation failed",
+            "The profile could not be created.",
+            "/admin/protocols/new",
+            "Back to creation",
+        ),
+    }
+}
+
+async fn protocol_detail_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !valid_stored_profile_id(&name) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile unavailable",
+            "Invalid profile ID.",
+        );
+    }
+    let record = match get_protocol_profile_by_name(&state.pool, &name).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "Profile unavailable",
+                "Profile not found.",
+            )
+        }
+        Err(error) => return internal_error("load protocol profile", error),
+    };
+    let profile = match decode_protocol_profile(record.clone()) {
+        Ok(value) => value,
+        Err(error) => return internal_error("decode protocol profile", error),
+    };
+    let secret_names = match list_secret_names(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load secret references", error),
+    };
+    let reconcile = match get_reconcile_state(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load reconcile state", error),
+    };
+    let references = match protocol_profile_reference_count(&state.pool, &name).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profile references", error),
+    };
+    views::protocols::render_detail(
+        &auth,
+        &profile,
+        &record,
+        &secret_names,
+        &state.protocol_registry,
+        &reconcile,
+        references,
+    )
+}
+
+async fn set_protocol_enabled_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        csrf_error_response(&auth, form.get("csrf_token").map_or("", String::as_str))
+    {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if !valid_stored_profile_id(&name) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile update failed",
+            "Invalid profile ID.",
+        );
+    }
+    let _mutation = state
+        .profile_mutations
+        .acquire()
+        .await
+        .expect("profile mutation semaphore remains open");
+    let record = match get_protocol_profile_by_name(&state.pool, &name).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "Profile update failed",
+                "Profile not found.",
+            )
+        }
+        Err(error) => return internal_error("load protocol profile", error),
+    };
+    let existing = match decode_protocol_profile(record) {
+        Ok(value) => value,
+        Err(error) => return internal_error("decode protocol profile", error),
+    };
+    let enabled = match form.get("enabled").map(String::as_str) {
+        Some("true") => true,
+        Some("false") => false,
+        _ => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile update failed",
+                "Profile state must be explicitly enabled or disabled.",
+            )
+        }
+    };
+    let expected = match parse_profile_revision(&form) {
+        Ok(value) => value,
+        Err(error) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Protocol update failed",
+                error.to_string(),
+            )
+        }
+    };
+    let mut candidate = existing.clone();
+    candidate.enabled = enabled;
+    if enabled && !existing.enabled {
+        if let Err(error) = validate_profile_for_publish(&state, &candidate).await {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile enable failed",
+                error.to_string(),
+            );
+        }
+    }
+    let action = if enabled {
+        AuditAction::ProtocolProfileEnabled
+    } else {
+        AuditAction::ProtocolProfileDisabled
+    };
+    let event = audit_event(
+        &auth,
+        action,
+        AuditObjectType::ProtocolProfile,
+        name.clone(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::enabled(enabled),
+    );
+    let input = UpdateProtocolProfile {
+        name: name.clone(),
+        display_name: existing.display_name,
+        expected_updated_at: Some(expected),
+        enabled,
+        server: existing.server,
+        port: existing.port,
+        preferred_core_id: existing.preferred_core_id,
+        managed_resource_id: existing.managed_resource_id,
+        config: existing.config,
+    };
+    match update_protocol_profile_audited(&state.pool, input, &event).await {
+        Ok(_) => {
+            if enabled != existing.enabled {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to(&format!("/admin/protocols/{name}")).into_response()
+        }
+        Err(error) => logged_error_with_back(
+            profile_write_status(&error),
+            "set protocol enabled state",
+            error,
+            "Profile update failed",
+            "The profile state was not changed.",
+            "/admin/protocols",
+            "Back to profile",
+        ),
+    }
+}
+
+async fn delete_protocol_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if !valid_stored_profile_id(&name) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile unavailable",
+            "Invalid profile ID.",
+        );
+    }
+    let record = match get_protocol_profile_by_name(&state.pool, &name).await {
+        Ok(Some(value)) => value,
+        Ok(None) => {
+            return html_error_response(
+                StatusCode::NOT_FOUND,
+                "Profile unavailable",
+                "Profile not found.",
+            )
+        }
+        Err(error) => return internal_error("load protocol profile", error),
+    };
+    let profile = match decode_protocol_profile(record.clone()) {
+        Ok(value) => value,
+        Err(error) => return internal_error("decode protocol profile", error),
+    };
+    let references = match protocol_profile_reference_count(&state.pool, &name).await {
+        Ok(value) => value,
+        Err(error) => return internal_error("load profile references", error),
+    };
+    views::protocols::render_delete(&auth, &profile, &record, references)
+}
+
+async fn delete_protocol_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) =
+        csrf_error_response(&auth, form.get("csrf_token").map_or("", String::as_str))
+    {
+        return response;
+    }
+    if !is_owner_admin(&auth) {
+        return owner_only_response();
+    }
+    if !valid_stored_profile_id(&name) {
+        return html_error_response(
+            StatusCode::BAD_REQUEST,
+            "Profile deletion failed",
+            "Invalid profile ID.",
+        );
+    }
+    let _mutation = state
+        .profile_mutations
+        .acquire()
+        .await
+        .expect("profile mutation semaphore remains open");
+    let expected = match parse_profile_revision(&form) {
+        Ok(value) => value,
+        Err(error) => {
+            return html_error_response(
+                StatusCode::BAD_REQUEST,
+                "Profile deletion failed",
+                error.to_string(),
+            )
+        }
+    };
+    let event = audit_event(
+        &auth,
+        AuditAction::ProtocolProfileDeleted,
+        AuditObjectType::ProtocolProfile,
+        name.clone(),
+        AuditOutcome::Succeeded,
+        AuditMetadata::none(),
+    );
+    match delete_protocol_profile_audited(&state.pool, &name, expected, &event).await {
+        Ok(runtime_changed) => {
+            if runtime_changed {
+                queue_latest_reconcile(&state).await;
+            }
+            Redirect::to("/admin/protocols").into_response()
+        }
+        Err(error) => logged_error_with_back(
+            profile_write_status(&error),
+            "delete protocol profile",
+            error,
+            "Profile deletion failed",
+            "Remove routing references or reload the current revision.",
+            "/admin/protocols",
+            "Back to confirmation",
+        ),
+    }
+}
+
+fn parse_profile_revision(form: &HashMap<String, String>) -> anyhow::Result<DateTime<Utc>> {
+    form.get("expected_updated_at")
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .ok_or_else(|| anyhow::anyhow!("profile revision is missing or invalid"))
+}
+
+fn valid_stored_profile_id(value: &str) -> bool {
+    (1..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn profile_write_status(error: &anyhow::Error) -> StatusCode {
+    if error.to_string().contains("another session")
+        || error.to_string().contains("referenced by routing")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+fn profile_runtime_changed(before: &ProtocolProfile, after: &ProtocolProfile) -> bool {
+    before.enabled != after.enabled
+        || (after.enabled
+            && (before.server != after.server
+                || before.port != after.port
+                || before.preferred_core_id != after.preferred_core_id
+                || before.managed_resource_id != after.managed_resource_id
+                || before.config != after.config))
+}
+
+fn profile_configuration_changed(before: &ProtocolProfile, after: &ProtocolProfile) -> bool {
+    before.server != after.server
+        || before.port != after.port
+        || before.preferred_core_id != after.preferred_core_id
+        || before.managed_resource_id != after.managed_resource_id
+        || before.config != after.config
+}
+
+async fn validate_profile_for_publish(
+    state: &AppState,
+    candidate: &ProtocolProfile,
+) -> anyhow::Result<()> {
+    let profiles = list_protocol_profiles_decoded(&state.pool).await?;
+    let secrets = list_secret_names(&state.pool).await?.into_iter().collect();
+    validate_profile_candidate(
+        candidate,
+        &profiles,
+        &state.protocol_registry,
+        &state.core_registry,
+        &secrets,
+    )
+}
+
 fn protocol_config_from_form(
     existing: &ProtocolProfile,
     form: &HashMap<String, String>,
@@ -3203,8 +3831,21 @@ fn protocol_config_from_form(
     let adapter = registry
         .get(&existing.protocol_id)
         .ok_or_else(|| anyhow::anyhow!("protocol adapter is not installed"))?;
-    let mut config = existing
-        .config
+    protocol_config_from_fields(
+        existing.config.clone(),
+        existing.schema_version,
+        &adapter,
+        form,
+    )
+}
+
+fn protocol_config_from_fields(
+    initial: serde_json::Value,
+    schema_version: u32,
+    adapter: &Arc<dyn stealthhub_core::adapter::ProtocolAdapter>,
+    form: &HashMap<String, String>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut config = initial
         .as_object()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("stored adapter configuration is invalid"))?;
@@ -3224,7 +3865,7 @@ fn protocol_config_from_form(
         config.insert(field.name.clone(), serde_json::Value::String(value));
     }
     let config = serde_json::Value::Object(config);
-    adapter.validate_config(existing.schema_version, &config)?;
+    adapter.validate_config(schema_version, &config)?;
     Ok(config)
 }
 
