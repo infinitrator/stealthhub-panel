@@ -143,6 +143,11 @@ git -C "$installer_checkout" checkout -qb feature/update-source-regression
 git -C "$installer_checkout" remote set-url origin \
     https://github.com/infinitrator/stealthhub-panel.git
 cp "${ROOT_DIR}/deploy/install.sh" "${installer_checkout}/deploy/install.sh"
+cp "${ROOT_DIR}/deploy/build-control-plane.sh" \
+    "${installer_checkout}/deploy/build-control-plane.sh"
+cp "${ROOT_DIR}/deploy/control-plane-artifacts" \
+    "${installer_checkout}/deploy/control-plane-artifacts"
+chmod 0755 "${installer_checkout}/deploy/build-control-plane.sh"
 cp "${ROOT_DIR}/deploy/lib/manager-operations.sh" "${installer_checkout}/deploy/lib/manager-operations.sh"
 mkdir -p "${installer_checkout}/target/release"
 for binary in stealthhub-panel infiproxy-module-manifest infiproxy-reconcile infiproxy-tui; do

@@ -399,6 +399,26 @@ chmod +x "${FAKE_BIN}/systemctl"
     INFIPROXY_ALLOW_NON_FAST_FORWARD=true \
         is_safe_update_target "$SECOND_COMMIT" "$FIRST_COMMIT" \
         || fail "reviewed non-fast-forward recovery override was ignored"
+    mkdir -p "${SOURCE_DIR}/deploy"
+    cat >"${SOURCE_DIR}/deploy/build-control-plane.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'target-owned\n' >"${TARGET_BUILD_MARKER:?}"
+EOF
+    chmod 0755 "${SOURCE_DIR}/deploy/build-control-plane.sh"
+    cat >"${SOURCE_DIR}/deploy/control-plane-artifacts" <<'EOF'
+future-helper|infiproxy-future-helper|/usr/local/libexec/infiproxy-future-helper
+EOF
+    git -C "$SOURCE_DIR" add deploy
+    git -C "$SOURCE_DIR" commit -qm 'add target build contract'
+    TARGET_COMMIT="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+    TARGET_BUILD_MARKER="${TMP_DIR}/target-build.marker" build_target_control_plane
+    assert_file_contains "${TMP_DIR}/target-build.marker" "target-owned"
+    printf '#!/usr/bin/env bash\nexit 1\n' >"${SOURCE_DIR}/deploy/build-control-plane.sh"
+    chmod 0755 "${SOURCE_DIR}/deploy/build-control-plane.sh"
+    if build_target_control_plane; then
+        fail "failed target build contract was reported as successful"
+    fi
     mkdir -p "$(dirname "$APPLIED_SHA_FILE")"
     printf '%s\n' "$FIRST_COMMIT" >"$APPLIED_SHA_FILE"
     # Invoked indirectly by publish_verified_update_commit.
@@ -424,6 +444,13 @@ chmod +x "${FAKE_BIN}/systemctl"
     PANEL_BACKUP="${TMP_DIR}/panel-backup"
     mkdir -p "$PANEL_BACKUP"
     backup_control_binaries "$PANEL_BACKUP"
+    export INFIPROXY_CONTROL_ARTIFACT_ROOT="${TMP_DIR}/artifact-root"
+    CONTROL_ARTIFACT_ROOT="$INFIPROXY_CONTROL_ARTIFACT_ROOT"
+    backup_forward_artifacts "$PANEL_BACKUP" "$TARGET_COMMIT"
+    mkdir -p "${CONTROL_ARTIFACT_ROOT}/usr/local/libexec"
+    printf 'new future helper\n' \
+        >"${CONTROL_ARTIFACT_ROOT}/usr/local/libexec/infiproxy-future-helper"
+    chmod 0755 "${CONTROL_ARTIFACT_ROOT}/usr/local/libexec/infiproxy-future-helper"
     printf 'new panel\n' >"$PANEL_BINARY"
     printf 'new manifest helper\n' >"$MANIFEST_HELPER_BINARY"
     printf 'new reconcile helper\n' >"$RECONCILE_HELPER_BINARY"
@@ -431,12 +458,15 @@ chmod +x "${FAKE_BIN}/systemctl"
     printf 'new manager wrapper\n' >"$MANAGER_BINARY"
     printf 'new manager operations\n' >"$MANAGER_OPERATIONS"
     restore_control_binaries "$PANEL_BACKUP"
+    restore_forward_artifacts "$PANEL_BACKUP"
     assert_file_contains "$PANEL_BINARY" "old panel"
     assert_file_contains "$MANIFEST_HELPER_BINARY" "old manifest helper"
     assert_file_contains "$RECONCILE_HELPER_BINARY" "old reconcile helper"
     assert_file_contains "$TUI_BINARY" "old TUI"
     assert_file_contains "$MANAGER_BINARY" "old manager wrapper"
     assert_file_contains "$MANAGER_OPERATIONS" "old manager operations"
+    [[ ! -e "${CONTROL_ARTIFACT_ROOT}/usr/local/libexec/infiproxy-future-helper" ]] \
+        || fail "rollback retained a forward artifact absent from the old release"
     backup_database "$PANEL_BACKUP"
     backup_system_configs "$PANEL_BACKUP"
     if SQLITE_FAIL=true backup_database "${TMP_DIR}/failed-panel-backup"; then

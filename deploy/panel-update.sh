@@ -37,6 +37,7 @@ MANAGER_OPERATIONS="${INFIPROXY_MANAGER_OPERATIONS:-/usr/local/libexec/infiproxy
 INSTALL_STATE_LIB="${INFIPROXY_INSTALL_STATE_LIB:-/usr/local/libexec/infiproxy-install-state}"
 BACKUP_RETENTION_DAYS="${INFIPROXY_BACKUP_RETENTION_DAYS:-30}"
 MAX_LOG_BYTES="${INFIPROXY_UPDATE_LOG_MAX_BYTES:-5242880}"
+CONTROL_ARTIFACT_ROOT="${INFIPROXY_CONTROL_ARTIFACT_ROOT:-}"
 
 if [[ ! -f "$INSTALL_STATE_LIB" ]]; then
     INSTALL_STATE_LIB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/install-state.sh"
@@ -191,6 +192,70 @@ backup_control_binaries() {
         log "installed panel binary is missing or unsafe: ${PANEL_BINARY}"
         return 1
     }
+}
+
+backup_forward_artifacts() {
+    local backup_dir="$1" target_commit="$2" manifest entry id release destination source
+    manifest="${backup_dir}/forward-artifacts.tsv"
+    git -C "$SOURCE_DIR" show "${target_commit}:deploy/control-plane-artifacts" >"${manifest}.tmp" \
+        || { log "target control artifact manifest is missing"; return 1; }
+    [[ "$(wc -c <"${manifest}.tmp")" -le 65536 \
+        && "$(grep -Evc '^(#|$)' "${manifest}.tmp" || true)" -le 64 ]] \
+        || { log "target control artifact manifest exceeds bounds"; return 1; }
+    : >"$manifest"
+    while IFS= read -r entry || [[ -n "$entry" ]]; do
+        [[ -z "$entry" || "$entry" == \#* ]] && continue
+        IFS='|' read -r id release destination extra <<<"$entry"
+        [[ -z "${extra:-}" && "$id" =~ ^[a-z][a-z0-9-]{0,63}$ \
+            && "$release" =~ ^[A-Za-z0-9_-]+$ \
+            && "$destination" =~ ^/usr/local/(bin|sbin|libexec)/infiproxy-[A-Za-z0-9_-]+$ ]] \
+            || { log "invalid target control artifact declaration"; return 1; }
+        grep -Fq "|${destination}" "$manifest" \
+            && { log "duplicate target control artifact destination"; return 1; }
+        grep -Eq "^${id}\\|" "$manifest" \
+            && { log "duplicate target control artifact ID"; return 1; }
+        printf '%s|%s|%s\n' "$id" "$release" "$destination" >>"$manifest"
+        source="${CONTROL_ARTIFACT_ROOT}${destination}"
+        if [[ -x "$source" && ! -L "$source" ]]; then
+            install -m 0700 -o root -g root "$source" \
+                "${backup_dir}/control-binaries/forward-${id}"
+        else
+            install -m 0600 -o root -g root /dev/null \
+                "${backup_dir}/control-binaries/forward-${id}.absent"
+        fi
+    done <"${manifest}.tmp"
+    rm -f "${manifest}.tmp"
+    chmod 0600 "$manifest"
+}
+
+restore_forward_artifacts() {
+    local backup_dir="$1" id release destination extra backup
+    [[ -f "${backup_dir}/forward-artifacts.tsv" ]] || return 0
+    while IFS='|' read -r id release destination extra; do
+        [[ -z "$id" ]] && continue
+        [[ -z "${extra:-}" && "$id" =~ ^[a-z][a-z0-9-]{0,63}$ \
+            && "$release" =~ ^[A-Za-z0-9_-]+$ \
+            && "$destination" =~ ^/usr/local/(bin|sbin|libexec)/infiproxy-[A-Za-z0-9_-]+$ ]] \
+            || { log "invalid saved control artifact declaration"; return 1; }
+        destination="${CONTROL_ARTIFACT_ROOT}${destination}"
+        backup="${backup_dir}/control-binaries/forward-${id}"
+        if [[ -f "$backup" ]]; then
+            install -d -m 0755 "$(dirname "$destination")"
+            install -m 0755 "$backup" "$destination"
+        elif [[ -f "${backup}.absent" ]]; then
+            rm -f -- "$destination" "${SOURCE_DIR}/target/release/${release}"
+        else
+            log "forward control artifact backup is incomplete: ${id}"
+            return 1
+        fi
+    done <"${backup_dir}/forward-artifacts.tsv"
+}
+
+build_target_control_plane() {
+    local build_script="${SOURCE_DIR}/deploy/build-control-plane.sh"
+    [[ -f "$build_script" && -x "$build_script" && ! -L "$build_script" ]] \
+        || { log "target build contract is missing or unsafe"; return 1; }
+    "$build_script"
 }
 
 restore_control_binaries() {
@@ -384,6 +449,8 @@ main() {
     install -d -o root -g root -m 0700 "$backup_dir"
     backup_control_binaries "$backup_dir" \
         || { log "panel update aborted: control binary backup failed"; exit 1; }
+    backup_forward_artifacts "$backup_dir" "$target_commit" \
+        || { log "panel update aborted: forward artifact backup failed"; exit 1; }
     [[ -f "$DATABASE_FILE" ]] && database_was_present=1
     backup_database "$backup_dir" \
         || { log "panel update aborted: database backup failed"; exit 1; }
@@ -402,9 +469,7 @@ main() {
     git -C "$SOURCE_DIR" clean -fdx -e target/
 
     export PATH="/root/.cargo/bin:$PATH"
-    if ! cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
-            --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
-            --manifest-path "${SOURCE_DIR}/Cargo.toml" \
+    if ! build_target_control_plane \
         || ! INFIPROXY_UPDATE_REPO="$repo" INFIPROXY_UPDATE_REF="$ref" \
             INFIPROXY_INSTALL_COMMIT="$target_commit" \
             INFIPROXY_DEFER_APPLIED_SHA=true \
@@ -421,6 +486,8 @@ main() {
                 INFIPROXY_DEFER_APPLIED_SHA=true \
                 bash "${SOURCE_DIR}/deploy/install.sh" --with-nginx \
                 || log "warning: previous installer could not fully repair the control plane"
+            restore_forward_artifacts "$backup_dir" \
+                || log "warning: forward artifacts could not be fully restored"
             systemctl restart infiproxy.service || true
         else
             log "warning: previous control binaries could not be fully restored"

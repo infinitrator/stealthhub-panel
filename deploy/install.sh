@@ -224,6 +224,8 @@ required_deploy_files=(
     deploy/lib/install-state.sh
     deploy/lib/runtime-tls.sh
     deploy/panel-update.sh
+    deploy/build-control-plane.sh
+    deploy/control-plane-artifacts
     deploy/module-update.sh
     deploy/cores/install-core.sh
     deploy/infiproxy-profile.sh
@@ -250,9 +252,7 @@ if [[ "$BUILD" -eq 1 ]]; then
         echo "cargo is required for --build" >&2
         exit 1
     fi
-    cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
-        --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
-        --manifest-path "${ROOT_DIR}/Cargo.toml"
+    "${ROOT_DIR}/deploy/build-control-plane.sh"
 fi
 
 shopt -s nullglob

@@ -1,0 +1,5 @@
+# Additional forward-installed artifacts, one per line:
+# stable-id|target/release-name|/usr/local/{bin,sbin,libexec}/infiproxy-*
+#
+# Existing baseline artifacts are backed up explicitly by panel-update.sh.
+# A future installer adding an artifact must declare it here for safe rollback.

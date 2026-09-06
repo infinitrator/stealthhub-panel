@@ -243,9 +243,7 @@ need_cmd systemctl
 
 sync_source
 
-cargo build --locked --release -p stealthhub-panel -p infiproxy-manager \
-    --jobs "${INFIPROXY_BUILD_JOBS:-2}" \
-    --manifest-path "${SRC_DIR}/Cargo.toml"
+"${SRC_DIR}/deploy/build-control-plane.sh"
 
 install_args=()
 if [[ "$FORCE_ENV" -eq 1 ]]; then
