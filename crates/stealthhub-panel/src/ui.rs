@@ -9,8 +9,7 @@ pub(crate) const APP_NAME: &str = "Infiproxy";
 pub(crate) const PANEL_CSS: &str = include_str!("assets/panel.css");
 
 const NAVIGATION: &[(&str, &str, &str)] = &[
-    ("Node", "/admin", "Dashboard"),
-    ("Node", "/admin/health", "Health"),
+    ("Node", "/admin", "Health"),
     ("Access", "/admin/users", "Users"),
     ("Access", "/admin/secrets", "Secrets"),
     ("Network", "/admin/protocols", "Protocols"),
@@ -89,7 +88,7 @@ mod tests {
 
     #[test]
     fn shell_keeps_semantic_navigation_and_no_script_dependency() {
-        let rendered = layout("Dashboard", html! { p { "test" } }).into_string();
+        let rendered = layout("Health", html! { p { "test" } }).into_string();
         assert!(rendered.contains("class=\"app-chrome\""));
         assert!(rendered.contains("aria-label=\"Main navigation\""));
         assert!(rendered.contains("aria-current=\"page\""));
@@ -97,5 +96,7 @@ mod tests {
         assert!(!rendered.contains("<script"));
         assert!(PANEL_CSS.contains("--accent:"));
         assert!(PANEL_CSS.contains("prefers-reduced-motion"));
+        assert!(!rendered.contains(">Dashboard<"));
+        assert!(rendered.contains("href=\"/admin\" aria-current=\"page\">"));
     }
 }

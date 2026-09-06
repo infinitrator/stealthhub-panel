@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use stealthhub_core::{
     models::ProtocolProfile,
     policy::{role_name, ClientPolicy, DnsPolicy, PoolMember, RoutingPolicyRule, TransportPool},
+    routing_topology::{InspectionOutcome, RouteInspection, RoutingTopology, TopologyPath},
     rules::{RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource, RuleSourceFormat},
 };
 
@@ -19,6 +20,9 @@ pub(crate) struct RoutingPageData<'a> {
     pub(crate) sources: &'a BTreeMap<String, Vec<RuleSetSource>>,
     pub(crate) search: &'a str,
     pub(crate) kind_filter: &'a str,
+    pub(crate) inspect_domain: &'a str,
+    pub(crate) topology: &'a RoutingTopology,
+    pub(crate) inspection: Option<&'a RouteInspection>,
 }
 
 pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Response {
@@ -31,6 +35,9 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
         sources,
         search,
         kind_filter,
+        inspect_domain,
+        topology,
+        inspection,
     } = data;
     let targets = ["DIRECT".to_string(), "REJECT".to_string()]
         .into_iter()
@@ -69,6 +76,52 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                         div class="metric" {
                             span { "Transport pools" }
                             strong { (policy.pools.iter().filter(|pool| pool.enabled).count()) }
+                        }
+                    }
+
+                    section aria-labelledby="routing-topology-heading" {
+                        h2 id="routing-topology-heading" { "Effective routing order" }
+                        p { "Mihomo evaluates rule sets first, then enabled inline rules by priority. The first match wins." }
+                        form method="get" action="/admin/routing" class="inline-form topology-inspector" {
+                            input type="text" name="domain" value=(inspect_domain) placeholder="host.example" maxlength="253" aria-label="Domain to inspect";
+                            button class="secondary compact" type="submit" { "Inspect domain" }
+                        }
+                        @if let Some(result) = inspection {
+                            div class=(format!("notice topology-result {}", inspection_class(result.outcome))) role="status" {
+                                strong { (inspection_label(result.outcome)) ": " (&result.domain) }
+                                p { (&result.explanation) }
+                                @if let Some(path) = &result.path {
+                                    code { "#" (path.order) " " (&path.source) " -> " (&path.target) }
+                                }
+                            }
+                        }
+                        (topology_svg(topology))
+                        (topology_table(topology))
+                        @if !topology.pools.is_empty() {
+                            h3 { "Transport pool resolution" }
+                            div class="table-wrap" { table {
+                                thead { tr { th { "Pool" } th { "Type" } th { "Members" } th { "State" } } }
+                                tbody { @for pool in &topology.pools { tr {
+                                    td { code { (&pool.id) } }
+                                    td { (&pool.kind) }
+                                    td { (pool.members.join(", ")) }
+                                    td { span class=(format!("badge {}", match pool.state {
+                                        stealthhub_core::routing_topology::TopologyState::Ready => "ok",
+                                        stealthhub_core::routing_topology::TopologyState::Dynamic => "warn",
+                                        _ => "off",
+                                    })) { (pool.state.label()) } }
+                                } } }
+                            } }
+                        }
+                        @if !topology.issues.is_empty() {
+                            div class="notice warning" {
+                                strong { "Topology requires attention" }
+                                ul {
+                                    @for issue in &topology.issues {
+                                        li { code { (&issue.subject) } ": " (&issue.detail) }
+                                    }
+                                }
+                            }
                         }
                     }
 
@@ -194,6 +247,97 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
             .into_string(),
         )
         .into_response()
+}
+
+fn topology_svg(topology: &RoutingTopology) -> Markup {
+    let shown = topology.paths.iter().take(12).collect::<Vec<_>>();
+    let height = 42 + shown.len() * 48;
+    html! {
+        div class="topology-canvas" {
+            svg viewBox=(format!("0 0 920 {height}")) role="img" aria-labelledby="topology-title topology-description" {
+                title id="topology-title" { "Ordered Mihomo routing topology" }
+                desc id="topology-description" { "Each row flows from an ordered rule source through its matcher to a target and selected runtime." }
+                @for (index, path) in shown.iter().enumerate() {
+                    @let y = 26 + index * 48;
+                    line x1="250" y1=(y) x2="350" y2=(y) class="topology-edge" {}
+                    line x1="590" y1=(y) x2="690" y2=(y) class="topology-edge" {}
+                    rect x="10" y=(y - 17) width="240" height="34" class=(format!("topology-node {}", topology_state_class(path))) {}
+                    rect x="350" y=(y - 17) width="240" height="34" class="topology-node" {}
+                    rect x="690" y=(y - 17) width="220" height="34" class=(format!("topology-node {}", topology_state_class(path))) {}
+                    text x="20" y=(y + 4) { "#" (path.order) " " (truncate(&path.source, 27)) }
+                    text x="360" y=(y + 4) { (truncate(&path.matcher, 27)) }
+                    text x="700" y=(y + 4) { (truncate(&target_label(path), 24)) }
+                }
+            }
+        }
+        @if topology.paths.len() > shown.len() {
+            p class="muted" { "Diagram shows the first " (shown.len()) " of " (topology.paths.len()) " paths. The complete ordered table follows." }
+        }
+    }
+}
+
+fn topology_table(topology: &RoutingTopology) -> Markup {
+    html! {
+        div class="table-wrap topology-fallback" {
+            table {
+                caption { "Complete accessible routing topology" }
+                thead { tr { th { "Order" } th { "Source" } th { "Matcher" } th { "Entries" } th { "Target / runtime" } th { "State" } } }
+                tbody {
+                    @for path in &topology.paths {
+                        tr {
+                            td { (path.order) }
+                            td { code { (&path.source) } }
+                            td { (path.matcher) }
+                            td { (path.entry_count) }
+                            td { code { (&path.target) } @if let Some(runtime) = &path.runtime { br; small { "runtime " (runtime) } } }
+                            td { span class=(format!("badge {}", topology_state_class(path))) { (path.state.label()) } br; small { (&path.detail) } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn target_label(path: &TopologyPath) -> String {
+    path.runtime.as_ref().map_or_else(
+        || path.target.clone(),
+        |runtime| format!("{} / {runtime}", path.target),
+    )
+}
+
+fn topology_state_class(path: &TopologyPath) -> &'static str {
+    match path.state {
+        stealthhub_core::routing_topology::TopologyState::Ready => "ok",
+        stealthhub_core::routing_topology::TopologyState::Dynamic => "warn",
+        stealthhub_core::routing_topology::TopologyState::Unresolved
+        | stealthhub_core::routing_topology::TopologyState::Unsupported => "off",
+    }
+}
+
+const fn inspection_label(outcome: InspectionOutcome) -> &'static str {
+    match outcome {
+        InspectionOutcome::Matched => "Definite first match",
+        InspectionOutcome::Default => "No explicit match",
+        InspectionOutcome::Uncertain => "Runtime-dependent result",
+        InspectionOutcome::Invalid => "Invalid domain",
+    }
+}
+
+const fn inspection_class(outcome: InspectionOutcome) -> &'static str {
+    match outcome {
+        InspectionOutcome::Matched => "ok",
+        InspectionOutcome::Default | InspectionOutcome::Uncertain => "warning",
+        InspectionOutcome::Invalid => "danger-zone",
+    }
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut result = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        result.push_str("...");
+    }
+    result
 }
 
 fn transport_pool_editor(
@@ -579,4 +723,41 @@ fn rule_kind_filter(selected: &str) -> Markup {
         RuleKind::Classical,
     ];
     html! { select name="kind" aria-label="Rule kind filter" { option value="" { "All kinds" } @for kind in kinds { option value=(kind.mihomo_name()) selected[selected == kind.mihomo_name()] { (kind.mihomo_name()) } } } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stealthhub_core::{
+        policy::ClientPolicy, routing_topology::TopologyAvailability, rules::RoutingRuleSet,
+    };
+
+    #[test]
+    fn topology_fallback_is_escaped_and_contains_no_profile_config() {
+        let rule_set = RoutingRuleSet {
+            slug: "unsafe<script>".into(),
+            title: "Fixture".into(),
+            effect: String::new(),
+            target: "DIRECT".into(),
+            enabled: true,
+            payload: "DOMAIN,example.com".into(),
+        };
+        let topology = RoutingTopology::build(
+            &[rule_set],
+            &ClientPolicy {
+                pools: vec![],
+                rules: vec![],
+            },
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &TopologyAvailability::default(),
+        );
+        let rendered =
+            html! { (topology_svg(&topology)) (topology_table(&topology)) }.into_string();
+        assert!(rendered.contains("Complete accessible routing topology"));
+        assert!(rendered.contains("unsafe&lt;script&gt;"));
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("password"));
+    }
 }

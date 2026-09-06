@@ -15,8 +15,8 @@ pub(crate) fn render_home() -> Response {
                 h1 { (APP_NAME) }
                 div class="cards" {
                     a class="card" href="/admin" {
-                        h2 { "Dashboard" }
-                        p { "Admin session, storage, subscription status." }
+                        h2 { "Health" }
+                        p { "Node readiness, reconciliation and runtime status." }
                     }
                     a class="card" href="/admin/users" {
                         h2 { "Users" }

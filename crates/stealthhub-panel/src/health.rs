@@ -15,6 +15,7 @@ use crate::{
     views::health::{Component, Report},
     AppState,
 };
+use stealthhub_core::storage::get_reconcile_state;
 
 static APP_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 
@@ -74,13 +75,21 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
                 Default::default()
             }
         };
-    let context = DashboardContext {
+    let reconcile = match get_reconcile_state(&state.pool).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!("health reconciliation state unavailable: {error}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "health state unavailable").into_response();
+        }
+    };
+    let context = HealthContext {
         host: &host,
         service_states: &service_states,
         inventory: &inventory,
+        reconcile: &reconcile,
     };
     match readiness {
-        Ok(()) => render_dashboard(
+        Ok(()) => render_health(
             &auth,
             StatusCode::OK,
             "ready",
@@ -109,7 +118,7 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
             ],
             context,
         ),
-        Err((status, message)) => render_dashboard(
+        Err((status, message)) => render_health(
             &auth,
             status,
             "degraded",
@@ -143,19 +152,20 @@ pub(crate) async fn admin_health(State(state): State<AppState>, headers: HeaderM
 }
 
 #[derive(Clone, Copy)]
-struct DashboardContext<'a> {
+struct HealthContext<'a> {
     host: &'a crate::ops::HostSnapshot,
     service_states: &'a [crate::ops::ServiceState],
     inventory: &'a stealthhub_core::inventory::AdapterInventory,
+    reconcile: &'a stealthhub_core::storage::ReconcileStateRecord,
 }
 
-fn render_dashboard(
+fn render_health(
     auth: &crate::AuthenticatedAdmin,
     status: StatusCode,
     state_label: &'static str,
     summary: &'static str,
     components: &[Component],
-    context: DashboardContext<'_>,
+    context: HealthContext<'_>,
 ) -> Response {
     crate::views::health::render(
         auth,
@@ -167,6 +177,7 @@ fn render_dashboard(
             host: context.host,
             service_states: context.service_states,
             inventory: context.inventory,
+            reconcile: context.reconcile,
             uptime: app_uptime_label(),
         },
     )

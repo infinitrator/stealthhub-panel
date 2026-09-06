@@ -141,6 +141,18 @@ tbody tr:hover { background: #ffffff08; }
 .details { display: grid; grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); gap: 7px 14px; }
 .details dt { color: var(--muted); }
 .details dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.topology-inspector { margin: 10px 0; }
+.topology-canvas { overflow-x: auto; border: 1px solid var(--border); background: var(--surface-recessed); padding: 8px; }
+.topology-canvas svg { display: block; width: 100%; min-width: 720px; height: auto; font: 11px var(--font-data); }
+.topology-node { fill: var(--surface-raised); stroke: var(--border-highlight); }
+.topology-node.ok { stroke: var(--success); }
+.topology-node.warn { stroke: var(--warning); }
+.topology-node.off { stroke: var(--danger); }
+.topology-edge { stroke: var(--muted); stroke-width: 1; }
+.topology-canvas text { fill: var(--text-secondary); }
+.topology-fallback { margin-top: 12px; }
+.topology-fallback caption { text-align: left; padding: 6px 8px; color: var(--muted); }
+.topology-result { margin: 8px 0; }
 .danger-zone, .confirm-panel { border-left: 4px solid var(--danger); }
 .workspace-footer { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 12px; margin-top: 24px; font-size: 9px; }
 @media (min-width: 1600px) { .content { padding-left: 32px; padding-right: 32px; } .health-grid, .sys-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }

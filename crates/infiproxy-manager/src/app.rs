@@ -7,10 +7,11 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub const SCREENS: &[&str] = &[
-    "Dashboard",
+    "Health",
     "System",
     "Users",
     "Profiles",
+    "Routing",
     "Runtimes",
     "Updates",
     "Logs",
@@ -53,7 +54,7 @@ impl App {
     pub fn new(guided: bool) -> Self {
         Self {
             snapshot: Snapshot::default(),
-            screen: if guided { 10 } else { 0 },
+            screen: if guided { 11 } else { 0 },
             selected: 0,
             focus: 0,
             scroll: 0,
@@ -95,6 +96,16 @@ impl App {
                 "\nCompleted this session: {}",
                 self.completed_steps.join(", ")
             ));
+        }
+        if self.screen_name() == "Routing" {
+            if let Some(detail) = self.snapshot.routing_paths.get(self.selected) {
+                value.push_str(&format!(
+                    "\n\nSELECTED PATH {} / {} (Left/Right)\n{}",
+                    self.selected + 1,
+                    self.snapshot.routing_paths.len(),
+                    detail
+                ));
+            }
         }
         format!("{}\n\n{}", value, self.output)
     }
@@ -192,6 +203,13 @@ impl App {
             KeyCode::Tab => self.focus = (self.focus + 1) % 3,
             KeyCode::BackTab => self.focus = (self.focus + 2) % 3,
             KeyCode::Esc => self.focus = 0,
+            KeyCode::Left if self.screen_name() == "Routing" => {
+                self.selected = self.selected.saturating_sub(1);
+            }
+            KeyCode::Right if self.screen_name() == "Routing" => {
+                self.selected =
+                    (self.selected + 1).min(self.snapshot.routing_paths.len().saturating_sub(1));
+            }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
                 0 => {
                     self.screen = self.screen.saturating_sub(1);
@@ -279,5 +297,17 @@ mod tests {
         app.focus = 1;
         press(&mut app, KeyCode::Enter);
         assert!(app.form.is_none());
+    }
+
+    #[test]
+    fn routing_selection_is_read_only_and_bounded() {
+        let mut app = App::new(false);
+        app.screen = SCREENS.iter().position(|name| *name == "Routing").unwrap();
+        app.snapshot.routing_paths = vec!["first".into(), "second".into()];
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.selected, 1);
+        assert!(app.content().contains("second"));
+        assert!(app.actions().is_empty());
     }
 }

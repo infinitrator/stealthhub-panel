@@ -48,7 +48,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration as StdDuration, Instant},
@@ -60,6 +60,7 @@ use stealthhub_core::{
     mihomo::{generate_mihomo_yaml_detailed, MihomoGenerationInput},
     models::{ProtocolProfile, SubscriptionUser},
     policy::{parse_role, PoolKind, PoolMember, RoutingPolicyRule, TransportPool},
+    routing_topology::{RoutingTopology, RuntimeResolution, TopologyAvailability},
     rules::{
         routing_rule_payload_yaml, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
         RuleSourceFormat,
@@ -357,6 +358,8 @@ struct RoutingFilter {
     search: String,
     #[serde(default)]
     kind: String,
+    #[serde(default)]
+    domain: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,7 +513,7 @@ async fn main() -> anyhow::Result<()> {
             "/admin/account",
             get(account_page).post(change_password_action),
         )
-        .route("/admin", get(admin_dashboard))
+        .route("/admin", get(admin_health))
         .route("/admin/audit", get(audit_page))
         .route("/admin/users", get(users_page))
         .route(
@@ -1155,24 +1158,6 @@ fn account_password_error(status: StatusCode, message: &'static str) -> Response
     )
 }
 
-async fn admin_dashboard(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let auth = match require_admin(&state, &headers).await {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-
-    let reconcile = match get_reconcile_state(&state.pool).await {
-        Ok(value) => value,
-        Err(error) => return internal_error("load reconciliation state", error),
-    };
-    let inventory =
-        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
-            Ok(value) => value,
-            Err(error) => return internal_error("load runtime inventory", error),
-        };
-    views::dashboard::render(&auth, &reconcile, &inventory.inventory)
-}
-
 async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let auth = match require_admin(&state, &headers).await {
         Ok(value) => value,
@@ -1189,7 +1174,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 "Settings unavailable",
                 "Panel settings could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -1203,7 +1188,7 @@ async fn settings_page(State(state): State<AppState>, headers: HeaderMap) -> Res
                 "Update state unavailable",
                 "Panel update state could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -1428,7 +1413,7 @@ async fn cores_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                     "Module state unavailable",
                     "Module state could not be loaded. Review the server journal.",
                     "/admin",
-                    "Back to Dashboard",
+                    "Back to Health",
                 );
             }
         };
@@ -1904,7 +1889,7 @@ async fn routing_page(
                 "Routing unavailable",
                 "Routing rules could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -1918,7 +1903,7 @@ async fn routing_page(
                 "Routing unavailable",
                 "Client transport policy could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -1932,7 +1917,7 @@ async fn routing_page(
                 "Routing unavailable",
                 "DNS policy could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -1940,31 +1925,83 @@ async fn routing_page(
         Ok(value) => value,
         Err(error) => return internal_error("load routing profiles", error),
     };
-    let mut entries = BTreeMap::new();
+    let mut all_entries = BTreeMap::new();
     let mut sources = BTreeMap::new();
     for rule_set in &rule_sets {
-        let mut rule_entries = match load_rule_entries(&state.pool, &rule_set.slug).await {
+        let rule_entries = match load_rule_entries(&state.pool, &rule_set.slug).await {
             Ok(value) => value,
             Err(error) => return internal_error("load normalized rules", error),
         };
-        let search = filter.search.trim().to_ascii_lowercase();
-        let kind = filter.kind.trim().to_ascii_uppercase();
-        rule_entries.retain(|entry| {
-            (search.is_empty()
-                || entry.value.to_ascii_lowercase().contains(&search)
-                || entry
-                    .comment
-                    .as_deref()
-                    .is_some_and(|value| value.to_ascii_lowercase().contains(&search)))
-                && (kind.is_empty() || entry.kind.mihomo_name() == kind)
-        });
         let rule_sources = match load_rule_sources(&state.pool, &rule_set.slug).await {
             Ok(value) => value,
             Err(error) => return internal_error("load remote rule sources", error),
         };
-        entries.insert(rule_set.slug.clone(), rule_entries);
+        all_entries.insert(rule_set.slug.clone(), rule_entries);
         sources.insert(rule_set.slug.clone(), rule_sources);
     }
+    let panel_inventory =
+        match inventory::load(&state.pool, &state.protocol_registry, &state.core_registry).await {
+            Ok(value) => value.inventory,
+            Err(error) => return internal_error("load routing inventory", error),
+        };
+    let protocol_adapters = panel_inventory
+        .adapters
+        .iter()
+        .filter(|entry| {
+            entry.kind == stealthhub_core::inventory::adapter_kind::PROTOCOL && entry.present
+        })
+        .map(|entry| entry.id.clone())
+        .collect::<BTreeSet<_>>();
+    let profile_runtimes = panel_inventory
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == stealthhub_core::inventory::adapter_kind::PROTOCOL)
+        .map(|resource| {
+            let runtime_id = resource.runtime_id.as_deref().unwrap_or("unresolved");
+            let runtime = panel_inventory
+                .runtimes
+                .iter()
+                .find(|item| item.id == runtime_id);
+            (
+                resource.display_name.clone(),
+                RuntimeResolution {
+                    id: runtime_id.to_string(),
+                    available: runtime.is_some_and(|item| item.installed == Some(true)),
+                    adapter_present: runtime.is_none_or(|item| item.adapter_present),
+                },
+            )
+        })
+        .collect();
+    let topology = RoutingTopology::build(
+        &rule_sets,
+        &policy,
+        &profiles,
+        &all_entries,
+        &sources,
+        &TopologyAvailability {
+            protocol_adapters,
+            profile_runtimes,
+        },
+    );
+    let inspection =
+        (!filter.domain.trim().is_empty()).then(|| topology.inspect_domain(&filter.domain));
+    let search = filter.search.trim().to_ascii_lowercase();
+    let kind = filter.kind.trim().to_ascii_uppercase();
+    let entries = all_entries
+        .into_iter()
+        .map(|(slug, mut rule_entries)| {
+            rule_entries.retain(|entry| {
+                (search.is_empty()
+                    || entry.value.to_ascii_lowercase().contains(&search)
+                    || entry
+                        .comment
+                        .as_deref()
+                        .is_some_and(|value| value.to_ascii_lowercase().contains(&search)))
+                    && (kind.is_empty() || entry.kind.mihomo_name() == kind)
+            });
+            (slug, rule_entries)
+        })
+        .collect::<BTreeMap<_, _>>();
 
     views::routing::render(
         &auth,
@@ -1977,6 +2014,9 @@ async fn routing_page(
             sources: &sources,
             search: &filter.search,
             kind_filter: &filter.kind,
+            inspect_domain: &filter.domain,
+            topology: &topology,
+            inspection: inspection.as_ref(),
         },
     )
 }
@@ -2979,7 +3019,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "Protocols unavailable",
                 "Panel settings could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -2994,7 +3034,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "Protocols unavailable",
                 "Protocol profiles could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -3009,7 +3049,7 @@ async fn protocols_page(State(state): State<AppState>, headers: HeaderMap) -> Re
                 "Protocols unavailable",
                 "Protocol secret names could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -3408,7 +3448,7 @@ async fn users_page(State(state): State<AppState>, headers: HeaderMap) -> Respon
                 "Users unavailable",
                 "Users could not be loaded. Review the server journal.",
                 "/admin",
-                "Back to Dashboard",
+                "Back to Health",
             );
         }
     };
@@ -4298,7 +4338,7 @@ fn csrf_error_response(auth: &AuthenticatedAdmin, csrf_token: &str) -> Option<Re
         "Request blocked",
         "Security token is missing or invalid. Please reload the page and try again.",
         "/admin",
-        "Back to Dashboard",
+        "Back to Health",
     ))
 }
 

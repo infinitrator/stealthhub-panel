@@ -4,11 +4,20 @@ use crate::command;
 use anyhow::{bail, Result};
 use chrono::Utc;
 use serde::Serialize;
-use sqlx::{sqlite::SqliteConnectOptions, Connection, Row, SqliteConnection};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row,
+};
 use std::{collections::BTreeMap, fs, io::Read, path::Path, str::FromStr, time::Duration};
 use stealthhub_core::{
     access::UserAccessState,
+    adapters::{core_registry, protocol_registry},
     module_manifest::{load_registry, ReadOptions},
+    routing_topology::{RoutingTopology, RuntimeResolution, TopologyAvailability},
+    storage::{
+        list_protocol_profiles_decoded, load_client_policy, load_routing_rule_sets,
+        load_rule_entries, load_rule_sources,
+    },
 };
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -22,6 +31,7 @@ pub struct Snapshot {
     pub services: Vec<String>,
     pub active_runtimes: usize,
     pub panel_url: String,
+    pub routing_paths: Vec<String>,
 }
 
 /// Bounds both allocation and input size; files are data and never sourced.
@@ -76,8 +86,11 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
         .read_only(true)
         .create_if_missing(false)
         .busy_timeout(Duration::from_secs(2));
-    let mut db = SqliteConnection::connect_with(&options).await?;
-    let row = sqlx::query("SELECT desired_generation,applied_generation,status,last_error FROM reconcile_state WHERE singleton=1").fetch_one(&mut db).await?;
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await?;
+    let row = sqlx::query("SELECT desired_generation,applied_generation,status,last_error FROM reconcile_state WHERE singleton=1").fetch_one(&db).await?;
     snapshot.reconcile = row.try_get("status")?;
     snapshot.sections.insert(
         "Reconcile".into(),
@@ -92,7 +105,7 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
             )
         ),
     );
-    let users = sqlx::query("SELECT id,username,enabled,expires_at,traffic_limit_bytes,traffic_used_bytes FROM users ORDER BY id DESC LIMIT 500").fetch_all(&mut db).await?;
+    let users = sqlx::query("SELECT id,username,enabled,expires_at,traffic_limit_bytes,traffic_used_bytes FROM users ORDER BY id DESC LIMIT 500").fetch_all(&db).await?;
     let now = Utc::now();
     let mut lines = vec![
         "ID / USER / EFFECTIVE ACCESS / EXPIRY (UTC)".into(),
@@ -131,7 +144,7 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
     snapshot
         .sections
         .insert("Users".into(), command::safe_output(&lines.join("\n")));
-    let profiles = sqlx::query("SELECT name,kind,enabled,server,port,preferred_core_id FROM protocol_profiles ORDER BY name LIMIT 500").fetch_all(&mut db).await?;
+    let profiles = sqlx::query("SELECT name,kind,enabled,server,port,preferred_core_id FROM protocol_profiles ORDER BY name LIMIT 500").fetch_all(&db).await?;
     let lines = profiles
         .iter()
         .map(|p| {
@@ -157,7 +170,7 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
     let policy = sqlx::query(
         "SELECT key,value FROM settings WHERE key IN ('panel_update_enabled','panel_update_time')",
     )
-    .fetch_all(&mut db)
+    .fetch_all(&db)
     .await?;
     for row in policy {
         snapshot
@@ -170,7 +183,104 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
                 row.try_get::<String, _>("value")?
             ));
     }
-    db.close().await?;
+    let routing_profiles = list_protocol_profiles_decoded(&db).await?;
+    let policy = load_client_policy(&db).await?;
+    let rule_sets = load_routing_rule_sets(&db).await?;
+    let mut entries = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    for rule_set in &rule_sets {
+        entries.insert(
+            rule_set.slug.clone(),
+            load_rule_entries(&db, &rule_set.slug).await?,
+        );
+        sources.insert(
+            rule_set.slug.clone(),
+            load_rule_sources(&db, &rule_set.slug).await?,
+        );
+    }
+    let protocols = protocol_registry()?;
+    let cores = core_registry()?;
+    let mut availability = TopologyAvailability {
+        protocol_adapters: protocols
+            .manifests()
+            .into_iter()
+            .map(|item| item.id)
+            .collect(),
+        profile_runtimes: BTreeMap::new(),
+    };
+    for profile in &routing_profiles {
+        let Some(protocol) = protocols.get(&profile.protocol_id) else {
+            continue;
+        };
+        let selected = cores.select(
+            &protocol.manifest().required_core_capabilities,
+            profile.preferred_core_id.as_deref(),
+        );
+        if let Ok(Some(runtime)) = selected {
+            availability.profile_runtimes.insert(
+                profile.name.clone(),
+                RuntimeResolution {
+                    id: runtime.manifest().id.clone(),
+                    available: true,
+                    adapter_present: true,
+                },
+            );
+        } else {
+            let runtime = profile
+                .preferred_core_id
+                .as_ref()
+                .and_then(|id| cores.get(id))
+                .or_else(|| {
+                    let required = &protocol.manifest().required_core_capabilities;
+                    cores
+                        .manifests()
+                        .into_iter()
+                        .filter(|item| required.is_subset(&item.capabilities))
+                        .max_by_key(|item| item.selection_priority)
+                        .and_then(|item| cores.get(&item.id))
+                });
+            availability.profile_runtimes.insert(
+                profile.name.clone(),
+                RuntimeResolution {
+                    id: runtime
+                        .as_ref()
+                        .map_or_else(|| "unresolved".into(), |item| item.manifest().id.clone()),
+                    available: false,
+                    adapter_present: runtime.is_some(),
+                },
+            );
+        }
+    }
+    let topology = RoutingTopology::build(
+        &rule_sets,
+        &policy,
+        &routing_profiles,
+        &entries,
+        &sources,
+        &availability,
+    );
+    snapshot.routing_paths = topology
+        .paths
+        .iter()
+        .map(|path| {
+            format!(
+                "#{} {}\n{} -> {}\nState: {}\n{}{}",
+                path.order,
+                path.source,
+                path.matcher,
+                path.target,
+                path.state.label(),
+                path.detail,
+                path.runtime
+                    .as_ref()
+                    .map_or(String::new(), |id| format!("\nRuntime: {id}"))
+            )
+        })
+        .collect();
+    snapshot
+        .sections
+        .insert("Routing".into(), topology.text_tree());
+    db.close().await;
     Ok(())
 }
 
@@ -323,7 +433,7 @@ pub async fn collect() -> Snapshot {
         ),
         probe("ss", &["-lntu"])
     );
-    s.sections.insert("Dashboard".into(), format!("NODE: {}\nPANEL PROCESS: {}\nDEPLOYED REV: {}\n{}\nUPTIME: {}\nRegistered runtimes: {}\nHEALTH: {}\nREADY: {}\n\n{}",s.hostname,s.panel,s.revision,s.sections.get("Reconcile").unwrap_or(&"Reconcile unavailable".into()),uptime.trim(),s.modules.len(),health.trim(),ready.trim(),s.sections.get("Database").unwrap_or(&String::new())));
+    s.sections.insert("Health".into(), format!("NODE: {}\nPANEL PROCESS: {}\nDEPLOYED REV: {}\n{}\nUPTIME: {}\nRegistered runtimes: {}\nHEALTH: {}\nREADY: {}\n\n{}",s.hostname,s.panel,s.revision,s.sections.get("Reconcile").unwrap_or(&"Reconcile unavailable".into()),uptime.trim(),s.modules.len(),health.trim(),ready.trim(),s.sections.get("Database").unwrap_or(&String::new())));
     s.sections.insert(
         "Diagnostics".into(),
         format!(
@@ -360,7 +470,7 @@ pub async fn collect() -> Snapshot {
         "http://127.0.0.1:8080/admin (SSH tunnel)".into(),
         |domain| format!("https://{domain}/admin"),
     );
-    for name in ["Dashboard", "System"] {
+    for name in ["Health", "System"] {
         s.sections
             .entry(name.into())
             .or_default()

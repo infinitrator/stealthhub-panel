@@ -299,7 +299,7 @@ mod tests {
             .collect()
     }
     #[test]
-    fn renders_dashboard_at_minimum_size_and_resize() {
+    fn renders_health_at_minimum_size_and_resize() {
         let mut app = App::new(false);
         app.snapshot.hostname = "very-long-node-name.example.com".repeat(5);
         app.snapshot.panel = "active".into();
@@ -319,7 +319,10 @@ mod tests {
     fn modal_never_renders_secret_and_all_screens_fit() {
         let mut app = App::new(false);
         app.busy = false;
-        app.screen = 8;
+        app.screen = SCREENS
+            .iter()
+            .position(|screen| *screen == "Secrets")
+            .expect("Secrets workspace exists");
         app.focus = 1;
         app.key(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Enter,
@@ -334,6 +337,10 @@ mod tests {
         assert!(!output.contains("SECRET_CANARY"));
         assert!(output.contains("********"));
         app.form = None;
+        app.snapshot.routing_paths = vec![format!("route-{}", "x".repeat(300))];
+        app.snapshot
+            .sections
+            .insert("Routing".into(), format!("provider:{}", "x".repeat(300)));
         for (index, screen) in SCREENS.iter().enumerate() {
             app.screen = index;
             assert!(render(&app, 80, 24, theme).contains(screen));

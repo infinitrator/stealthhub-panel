@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
             } else {
                 println!(
                     "{}",
-                    snapshot.sections.get("Dashboard").unwrap_or(&String::new())
+                    snapshot.sections.get("Health").unwrap_or(&String::new())
                 );
             }
             return Ok(());
@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
             let snapshot = data::collect().await;
             println!(
                 "{}\n{}",
-                snapshot.sections.get("Dashboard").unwrap_or(&String::new()),
+                snapshot.sections.get("Health").unwrap_or(&String::new()),
                 snapshot
                     .sections
                     .get("Diagnostics")

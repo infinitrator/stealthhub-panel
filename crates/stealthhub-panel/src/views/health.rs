@@ -1,4 +1,4 @@
-//! Health dashboard presentation.
+//! Canonical authenticated node-health presentation.
 
 use crate::{
     admin_bar,
@@ -16,6 +16,7 @@ use axum::{
 };
 use maud::{html, Markup};
 use stealthhub_core::inventory::{adapter_kind, AdapterInventory};
+use stealthhub_core::storage::ReconcileStateRecord;
 
 pub(crate) struct Component {
     pub(crate) name: &'static str,
@@ -31,6 +32,7 @@ pub(crate) struct Report<'a> {
     pub(crate) host: &'a HostSnapshot,
     pub(crate) service_states: &'a [ServiceState],
     pub(crate) inventory: &'a AdapterInventory,
+    pub(crate) reconcile: &'a ReconcileStateRecord,
     pub(crate) uptime: String,
 }
 
@@ -67,7 +69,20 @@ pub(crate) fn render(auth: &crate::AuthenticatedAdmin, report: Report<'_>) -> Re
                             div class="metric" { span { "Version" } strong { (env!("CARGO_PKG_VERSION")) } }
                             div class="metric" { span { "Uptime" } strong { (&report.uptime) } }
                             div class="metric" { span { "Deployment" } strong { (DEPLOYMENT_MODE) } }
-                            div class="metric" { span { "Probe mode" } strong { "private dashboard" } }
+                            div class="metric" { span { "Desired generation" } strong { (report.reconcile.desired_generation) } }
+                            div class="metric" { span { "Applied generation" } strong { (report.reconcile.applied_generation) } }
+                            div class="metric" { span { "Reconciliation" } strong { (&report.reconcile.status) } }
+                        }
+                        @if let Some(error) = &report.reconcile.last_error {
+                            div class="notice danger-zone" { strong { "Last reconciliation error" } p { (error) } }
+                        }
+                        div class="module-actions" {
+                            a class="button secondary compact" href="/admin/users" { "Users" }
+                            a class="button secondary compact" href="/admin/routing" { "Routing" }
+                            a class="button secondary compact" href="/admin/protocols" { "Protocols" }
+                            a class="button secondary compact" href="/admin/cores" { "Modules" }
+                            a class="button secondary compact" href="/admin/settings" { "Settings" }
+                            a class="button secondary compact" href="/admin/system" { "System" }
                         }
                     }
                     section {

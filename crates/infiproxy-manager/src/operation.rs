@@ -55,7 +55,7 @@ fn action(
 pub fn actions(screen: &str, snapshot: &Snapshot) -> Vec<Action> {
     let module = || choice("Registered module", &snapshot.modules);
     match screen {
-        "Dashboard" => vec![action(
+        "Health" => vec![action(
             "Run reconciliation",
             "reconcile",
             vec![],
