@@ -16,6 +16,9 @@ IOSchedulingPriority=6
 PrivateTmp=true
 PrivateDevices=true
 NoNewPrivileges=true
+# TLS readiness bootstrap impersonates the unprivileged runtime identity
+# to verify effective access to root-owned TLS material.
+AmbientCapabilities=CAP_SETUID
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
