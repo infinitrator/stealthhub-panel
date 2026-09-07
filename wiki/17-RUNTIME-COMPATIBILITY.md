@@ -67,6 +67,8 @@ Version marker сам по себе не означает compatibility. Adapter
 установленную версию, validated version, fallback и sanitized compatibility
 status. `outside contract` означает, что бинарник нельзя применять к этому
 профилю до возврата на проверенный pin или повторной полной валидации.
+GUI использует canonical `version_compatible` из runtime probe и не сравнивает
+presentation-строки вроде `1.19.30` и `v1.19.30` напрямую.
 
 ## Как перепроверить pins
 

@@ -253,7 +253,7 @@ const fn compatibility_note(implementation: Implementation) -> Option<&'static s
         Implementation::VlessWrapped(_) => {
             Some("This TCP profile uses exactly one TLS camouflage wrapper and no Vision flow.")
         }
-        Implementation::AnyTlsLegacy | Implementation::AnyTls(_) => {
+        Implementation::AnyTls(SecurityWrapper::Reality) => {
             Some("AnyTLS with REALITY is unsupported by Mihomo.")
         }
         Implementation::TrustTunnelH2 => {
@@ -1775,6 +1775,33 @@ mod tests {
             output.status.success(),
             "Mihomo v1.19.30 rejected generated client config: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(test)]
+mod anytls_compatibility_note_tests {
+    use super::{compatibility_note, Implementation, SecurityWrapper};
+
+    #[test]
+    fn current_anytls_profiles_do_not_claim_reality_incompatibility() {
+        assert_eq!(compatibility_note(Implementation::AnyTlsLegacy), None);
+
+        for wrapper in [
+            SecurityWrapper::StandardTls,
+            SecurityWrapper::ShadowTlsV3,
+            SecurityWrapper::ResTls,
+            SecurityWrapper::Jls,
+        ] {
+            assert_eq!(compatibility_note(Implementation::AnyTls(wrapper)), None);
+        }
+    }
+
+    #[test]
+    fn anytls_reality_warning_is_scoped_to_reality_only() {
+        assert_eq!(
+            compatibility_note(Implementation::AnyTls(SecurityWrapper::Reality)),
+            Some("AnyTLS with REALITY is unsupported by Mihomo.")
         );
     }
 }

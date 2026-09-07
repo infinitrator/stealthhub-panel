@@ -10,8 +10,9 @@ use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
 use stealthhub_core::{
     adapter::{AdapterMaturity, ConfigField, ConfigFieldKind, ProtocolRegistry},
-    inventory::{adapter_kind, AdapterInventory},
+    inventory::{adapter_kind, AdapterInventory, RuntimeInventoryEntry},
     models::{PanelSettings, ProtocolProfile, ProxyRole},
+    module_manifest::normalized_release_version,
     storage::{ProtocolProfileRecord, ReconcileStateRecord, UserSyncStatusRecord},
 };
 
@@ -491,6 +492,35 @@ fn runtime_contract(
     }
 }
 
+fn runtime_contract_status(
+    runtime: &RuntimeInventoryEntry,
+    contract_version: &str,
+) -> (&'static str, &'static str) {
+    if runtime.installed != Some(true) {
+        return ("neutral", "pending runtime");
+    }
+
+    // Binary probing, marker validation and release-version normalization belong
+    // to the core adapter. Presentation code must not re-interpret display
+    // strings such as `1.19.30` and `v1.19.30` as different releases.
+    //
+    // We still verify that the protocol adapter's declared runtime contract and
+    // the core adapter's validated contract describe the same release. This
+    // prevents a future protocol/core contract drift from being shown green.
+    let declared_contract_matches = runtime
+        .validated_version
+        .as_deref()
+        .and_then(normalized_release_version)
+        .zip(normalized_release_version(contract_version))
+        .is_some_and(|(runtime_contract, profile_contract)| runtime_contract == profile_contract);
+
+    match (runtime.version_compatible, declared_contract_matches) {
+        (Some(true), true) => ("ok", "validated"),
+        (Some(false), _) | (Some(true), false) => ("off", "outside contract"),
+        (None, _) => ("neutral", "not observed"),
+    }
+}
+
 fn compatibility_status(
     profile: &ProtocolProfile,
     registry: &ProtocolRegistry,
@@ -505,15 +535,7 @@ fn compatibility_status(
             .runtimes
             .iter()
             .find(|runtime| runtime.id == contract.adapter_id)
-            .map(|runtime| {
-                if runtime.version.as_deref() == Some(contract.version.as_str()) {
-                    ("ok", "validated")
-                } else if runtime.installed == Some(true) {
-                    ("off", "outside contract")
-                } else {
-                    ("neutral", "pending runtime")
-                }
-            })
+            .map(|runtime| runtime_contract_status(runtime, &contract.version))
     });
     let (class, label) = status.unwrap_or(("neutral", "not observed"));
     html! {
@@ -536,5 +558,93 @@ const fn proxy_role_label(role: &ProxyRole) -> &'static str {
         ProxyRole::Compatibility => "COMPAT",
         ProxyRole::RuAccess => "RU-ACCESS",
         ProxyRole::Manual => "MANUAL",
+    }
+}
+
+#[cfg(test)]
+mod protocol_runtime_contract_tests {
+    use std::collections::BTreeSet;
+
+    use stealthhub_core::inventory::{RuntimeInventoryEntry, RuntimeInventoryState};
+
+    use super::runtime_contract_status;
+
+    fn runtime(
+        version_compatible: Option<bool>,
+        validated_version: Option<&str>,
+    ) -> RuntimeInventoryEntry {
+        RuntimeInventoryEntry {
+            id: "mihomo".to_string(),
+            display_name: "Mihomo".to_string(),
+            state: RuntimeInventoryState::InstalledInactive,
+            adapter_present: true,
+            installed: Some(true),
+            desired: false,
+            applied: false,
+            active: Some(false),
+            healthy: None,
+            listeners_healthy: None,
+            service: Some("infiproxy-mihomo.service".to_string()),
+            // Deliberately lacks the `v` prefix. This is the real presentation
+            // shape that previously produced the false "outside contract".
+            version: Some("1.19.30".to_string()),
+            validated_version: validated_version.map(str::to_string),
+            version_compatible,
+            telemetry: None,
+            capabilities: BTreeSet::new(),
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_probe_prevents_false_v_prefix_mismatch() {
+        let observed = runtime(Some(true), Some("v1.19.30"));
+
+        assert_eq!(observed.version.as_deref(), Some("1.19.30"));
+        assert_eq!(
+            runtime_contract_status(&observed, "v1.19.30"),
+            ("ok", "validated")
+        );
+    }
+
+    #[test]
+    fn known_binary_or_marker_mismatch_remains_outside_contract() {
+        let observed = runtime(Some(false), Some("v1.19.30"));
+
+        assert_eq!(
+            runtime_contract_status(&observed, "v1.19.30"),
+            ("off", "outside contract")
+        );
+    }
+
+    #[test]
+    fn protocol_and_core_contract_drift_fails_closed() {
+        let observed = runtime(Some(true), Some("v1.20.0"));
+
+        assert_eq!(
+            runtime_contract_status(&observed, "v1.19.30"),
+            ("off", "outside contract")
+        );
+    }
+
+    #[test]
+    fn unavailable_probe_is_not_misreported_as_version_mismatch() {
+        let observed = runtime(None, Some("v1.19.30"));
+
+        assert_eq!(
+            runtime_contract_status(&observed, "v1.19.30"),
+            ("neutral", "not observed")
+        );
+    }
+
+    #[test]
+    fn missing_runtime_is_pending() {
+        let mut observed = runtime(Some(false), Some("v1.19.30"));
+        observed.installed = Some(false);
+
+        assert_eq!(
+            runtime_contract_status(&observed, "v1.19.30"),
+            ("neutral", "pending runtime")
+        );
     }
 }

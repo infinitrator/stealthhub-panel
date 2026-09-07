@@ -184,6 +184,19 @@ pub fn build_inventory(facts: InventoryFacts<'_>) -> AdapterInventory {
     }
 }
 
+fn runtime_fact_can_back_protocol(
+    required: &BTreeSet<String>,
+    runtime: &RuntimeInventoryFact,
+) -> bool {
+    required.is_subset(&runtime.capabilities)
+        && runtime.probe.installed == Some(true)
+        && runtime.probe.version_compatible != Some(false)
+}
+
+fn runtime_entry_is_usable(runtime: &RuntimeInventoryEntry) -> bool {
+    runtime.installed == Some(true) && runtime.version_compatible != Some(false)
+}
+
 fn build_protocol_adapters(
     facts: &InventoryFacts<'_>,
     manifests: &BTreeMap<&str, &ProtocolAdapterManifest>,
@@ -225,10 +238,7 @@ fn build_protocol_adapters(
             });
             let compatible_installed = manifest.is_some_and(|manifest| {
                 runtimes.values().any(|runtime| {
-                    manifest
-                        .required_core_capabilities
-                        .is_subset(&runtime.capabilities)
-                        && runtime.probe.installed == Some(true)
+                    runtime_fact_can_back_protocol(&manifest.required_core_capabilities, runtime)
                 })
             });
             let (state, detail) = if manifest.is_none() {
@@ -244,7 +254,7 @@ fn build_protocol_adapters(
             } else if !compatible_installed {
                 (
                     AdapterInventoryState::AdapterOnly,
-                    "Adapter available; compatible core not installed",
+                    "Adapter available; compatible core unavailable",
                 )
             } else {
                 (AdapterInventoryState::Available, "Adapter available")
@@ -469,7 +479,7 @@ fn build_resources(
                 || manifest.is_some_and(|item| profile.schema_version > item.schema_version)
             {
                 ResourceInventoryState::Unsupported
-            } else if runtime_entry.is_none_or(|entry| entry.installed != Some(true)) {
+            } else if runtime_entry.is_none_or(|entry| !runtime_entry_is_usable(entry)) {
                 ResourceInventoryState::CoreUnavailable
             } else if facts.desired_generation > facts.applied_generation {
                 ResourceInventoryState::ConfiguredPending
@@ -543,9 +553,7 @@ fn select_runtime<'a>(
     let required = &manifest?.required_core_capabilities;
     runtimes
         .values()
-        .find(|runtime| {
-            required.is_subset(&runtime.capabilities) && runtime.probe.installed == Some(true)
-        })
+        .find(|runtime| runtime_fact_can_back_protocol(required, runtime))
         .map(|runtime| runtime.id.as_str())
 }
 
@@ -744,5 +752,81 @@ mod tests {
             .iter()
             .any(|entry| entry.id == "missing-protocol"
                 && entry.state == AdapterInventoryState::UnsupportedSchema));
+    }
+}
+
+#[cfg(test)]
+mod protocol_runtime_contract_inventory_tests {
+    use std::collections::BTreeSet;
+
+    use crate::adapter::CoreRuntimeProbe;
+
+    use super::{
+        runtime_entry_is_usable, runtime_fact_can_back_protocol, RuntimeInventoryEntry,
+        RuntimeInventoryFact, RuntimeInventoryState,
+    };
+
+    #[test]
+    fn known_incompatible_core_cannot_back_protocol_inventory() {
+        let required = BTreeSet::from(["any-tls".to_string()]);
+        let mut runtime = RuntimeInventoryFact {
+            capabilities: required.clone(),
+            probe: CoreRuntimeProbe {
+                installed: Some(true),
+                version_compatible: Some(false),
+                ..CoreRuntimeProbe::default()
+            },
+            ..RuntimeInventoryFact::default()
+        };
+
+        assert!(!runtime_fact_can_back_protocol(&required, &runtime));
+
+        runtime.probe.version_compatible = Some(true);
+        assert!(runtime_fact_can_back_protocol(&required, &runtime));
+    }
+
+    #[test]
+    fn unknown_probe_state_is_not_invented_as_hard_failure() {
+        let required = BTreeSet::from(["any-tls".to_string()]);
+        let runtime = RuntimeInventoryFact {
+            capabilities: required.clone(),
+            probe: CoreRuntimeProbe {
+                installed: Some(true),
+                version_compatible: None,
+                ..CoreRuntimeProbe::default()
+            },
+            ..RuntimeInventoryFact::default()
+        };
+
+        assert!(runtime_fact_can_back_protocol(&required, &runtime));
+    }
+
+    #[test]
+    fn known_incompatible_runtime_entry_is_not_usable() {
+        let mut runtime = RuntimeInventoryEntry {
+            id: "sing-box".to_string(),
+            display_name: "sing-box".to_string(),
+            state: RuntimeInventoryState::InstalledInactive,
+            adapter_present: true,
+            installed: Some(true),
+            desired: false,
+            applied: false,
+            active: Some(false),
+            healthy: None,
+            listeners_healthy: None,
+            service: Some("infiproxy-sing-box.service".to_string()),
+            version: Some("1.14.0".to_string()),
+            validated_version: Some("v1.13.20".to_string()),
+            version_compatible: Some(false),
+            telemetry: None,
+            capabilities: BTreeSet::new(),
+            detail: String::new(),
+        };
+
+        assert!(!runtime_entry_is_usable(&runtime));
+
+        runtime.version = Some("1.13.20".to_string());
+        runtime.version_compatible = Some(true);
+        assert!(runtime_entry_is_usable(&runtime));
     }
 }
