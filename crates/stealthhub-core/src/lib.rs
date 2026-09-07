@@ -20,3 +20,4 @@ pub mod reconcile;
 pub mod routing_topology;
 pub mod rules;
 pub mod storage;
+pub mod telemetry;

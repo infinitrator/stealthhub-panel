@@ -1,0 +1,11 @@
+{
+  "name": "Infiproxy",
+  "short_name": "Infiproxy",
+  "start_url": "/admin",
+  "display": "standalone",
+  "background_color": "#17191c",
+  "theme_color": "#17191c",
+  "icons": [
+    { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

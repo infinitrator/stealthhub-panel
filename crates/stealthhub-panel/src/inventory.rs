@@ -16,6 +16,7 @@ use stealthhub_core::{
     storage::{
         decode_adapter_state, get_reconcile_state, list_adapter_state_records, load_desired_state,
     },
+    telemetry::{TelemetryMetric, TelemetryState},
 };
 
 use crate::{
@@ -90,6 +91,7 @@ pub(crate) async fn load(
             adapter_present: true,
             state_schema_version: observation.state_schema_version,
             probe: observation.probe.clone(),
+            telemetry: Some(observation.telemetry.clone()),
         })
         .map(|fact| (fact.id.clone(), fact))
         .collect::<BTreeMap<_, _>>();
@@ -106,11 +108,17 @@ pub(crate) async fn load(
                 adapter_present: true,
                 state_schema_version: 1,
                 probe: Default::default(),
+                telemetry: None,
             });
         fact.probe.installed = Some(status.installed);
-        fact.probe.version =
+        let managed_version =
             (status.installed_version != "unknown").then(|| status.installed_version.clone());
-        fact.probe.detail = Some(status.status.clone());
+        if fact.probe.version.is_none() {
+            fact.probe.version = managed_version;
+        }
+        if fact.probe.detail.is_none() {
+            fact.probe.detail = Some(status.status.clone());
+        }
     }
 
     let units = runtime_facts
@@ -136,6 +144,24 @@ pub(crate) async fn load(
             ServiceStatus::Failed => Some(false),
             ServiceStatus::Inactive | ServiceStatus::Unknown => None,
         };
+        if let Some(telemetry) = fact.telemetry.as_mut() {
+            telemetry.metrics.insert(
+                TelemetryMetric::ProcessState,
+                if fact.probe.active.is_some() {
+                    TelemetryState::Supported
+                } else {
+                    TelemetryState::Unavailable
+                },
+            );
+            telemetry.metrics.insert(
+                TelemetryMetric::ListenerState,
+                if fact.probe.listeners_healthy.is_some() {
+                    TelemetryState::Supported
+                } else {
+                    TelemetryState::Unavailable
+                },
+            );
+        }
     }
 
     let protocol_manifests = protocols.manifests();

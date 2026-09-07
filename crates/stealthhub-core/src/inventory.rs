@@ -13,6 +13,7 @@ use crate::{
     adapter::{CoreAdapterManifest, CoreRuntimeProbe, ProtocolAdapterManifest},
     desired::InfrastructureResource,
     models::ProtocolProfile,
+    telemetry::RuntimeTelemetryObservation,
 };
 
 /// Stable persistence namespaces. Unknown strings remain valid durable data.
@@ -82,6 +83,9 @@ pub struct RuntimeInventoryEntry {
     pub listeners_healthy: Option<bool>,
     pub service: Option<String>,
     pub version: Option<String>,
+    pub validated_version: Option<String>,
+    pub version_compatible: Option<bool>,
+    pub telemetry: Option<RuntimeTelemetryObservation>,
     pub capabilities: BTreeSet<String>,
     pub detail: String,
 }
@@ -132,6 +136,7 @@ pub struct RuntimeInventoryFact {
     pub adapter_present: bool,
     pub state_schema_version: u32,
     pub probe: CoreRuntimeProbe,
+    pub telemetry: Option<RuntimeTelemetryObservation>,
 }
 
 pub struct InventoryFacts<'a> {
@@ -390,6 +395,9 @@ fn build_runtimes(
                 listeners_healthy: fact.and_then(|item| item.probe.listeners_healthy),
                 service: fact.and_then(|item| item.service.clone()),
                 version: fact.and_then(|item| item.probe.version.clone()),
+                validated_version: fact.and_then(|item| item.probe.validated_version.clone()),
+                version_compatible: fact.and_then(|item| item.probe.version_compatible),
+                telemetry: fact.and_then(|item| item.telemetry.clone()),
                 capabilities: fact.map_or_else(BTreeSet::new, |item| item.capabilities.clone()),
                 detail: fact
                     .and_then(|item| item.probe.detail.clone())
@@ -605,6 +613,7 @@ mod tests {
                 listeners_healthy: Some(healthy),
                 ..CoreRuntimeProbe::default()
             },
+            telemetry: None,
         }
     }
     fn inventory(

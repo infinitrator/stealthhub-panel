@@ -380,6 +380,21 @@ chmod +x "${FAKE_BIN}/curl"
     [[ "$sing_box_status" == *'latest=v1.13.20'* \
         && "$sing_box_status" == *'installed version outside validated contract'* ]] \
         || fail "production sing-box pin did not report a newer installed version safely"
+    rm -rf "${INFIPROXY_CORE_ROOT}/sing-box/current"
+    mkdir -p "${INFIPROXY_CORE_ROOT}/sing-box/1.14.0"
+    printf '#!/usr/bin/env bash\nexit 0\n' \
+        >"${INFIPROXY_CORE_ROOT}/sing-box/1.14.0/sing-box"
+    chmod +x "${INFIPROXY_CORE_ROOT}/sing-box/1.14.0/sing-box"
+    ln -s "${INFIPROXY_CORE_ROOT}/sing-box/1.14.0" \
+        "${INFIPROXY_CORE_ROOT}/sing-box/current"
+    printf 'v1.13.20\n' >"${MODULE_VERSION_DIR}/sing-box.version"
+    load_module sing-box
+    [[ "$(installed_version sing-box)" == "1.14.0" ]] \
+        || fail "stale marker concealed the installed sing-box symlink version"
+    sing_box_status="$(check_module sing-box)"
+    [[ "$sing_box_status" == *'installed=1.14.0'* \
+        && "$sing_box_status" == *'installed version outside validated contract'* ]] \
+        || fail "sing-box marker/binary mismatch was not visible"
     install_release_module() {
         printf '%s\n' "$1" >"${TMP_DIR}/sing-box-allow-downgrade"
     }

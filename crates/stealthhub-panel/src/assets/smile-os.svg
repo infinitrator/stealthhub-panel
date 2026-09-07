@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Infiproxy Smile OS">
+  <rect width="256" height="256" rx="38" fill="#17191c"/>
+  <path d="M27 28h202v200H27z" fill="#25282d" stroke="#bd4149" stroke-width="10"/>
+  <path d="M53 61h150v119H53z" fill="#0d0f11" stroke="#727881" stroke-width="6"/>
+  <path d="M75 96h26v18H75zm80 0h26v18h-26z" fill="#91c79f"/>
+  <path d="M76 139c16 20 35 29 52 29s36-9 52-29" fill="none" stroke="#91c79f" stroke-width="11" stroke-linecap="square"/>
+  <path d="M53 200h94" stroke="#bd4149" stroke-width="8"/>
+  <path d="M163 196h40v8h-40z" fill="#727881"/>
+</svg>

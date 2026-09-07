@@ -148,7 +148,14 @@ state_value() {
 }
 
 installed_version() {
-  local file="${MODULE_VERSION_DIR}/$1.version"
+  local file="${MODULE_VERSION_DIR}/$1.version" target
+  if [[ "$1" == "${M_ID:-}" && -x "$(module_binary)" ]]; then
+    target="$(readlink -f "$(runtime_root)/current" 2>/dev/null || true)"
+    if [[ -n "$target" && "$(basename "$target")" != "current" ]]; then
+      basename "$target"
+      return
+    fi
+  fi
   if [[ -s "$file" ]]; then
     tr -d '[:space:]' <"$file"
   else

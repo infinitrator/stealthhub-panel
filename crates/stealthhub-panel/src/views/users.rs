@@ -43,7 +43,7 @@ pub(crate) fn render_index(
                         label {
                             span { "Traffic limit, GiB" }
                             input type="number" name="traffic_limit_gb" min="0" step="1" placeholder="empty = unlimited";
-                            small { "Stored access gate only; live traffic collection is not implemented." }
+                            small { "Stored access gate only. Runtime traffic accounting is explicitly unsupported until a validated local collector is configured." }
                         }
 
                         label {
@@ -82,7 +82,7 @@ pub(crate) fn render_index(
                                             td {
                                                 (format_user_traffic(user))
                                                 br;
-                                                small { "No live collector" }
+                                                small { "Runtime accounting unsupported" }
                                             }
                                             td { (format_user_expiry(user)) }
                                             td {
@@ -144,7 +144,7 @@ pub(crate) fn render_edit(auth: &AuthenticatedAdmin, user: &UserRecord) -> Respo
                         label {
                             span { "Traffic limit, GiB" }
                             input type="number" name="traffic_limit_gb" min="0" step="1" value=(traffic_limit_gib) placeholder="empty = unlimited";
-                            small { "Blank or 0 means unlimited. Stored usage is read-only and no live collector is present." }
+                            small { "Blank or 0 means unlimited. Stored usage is read-only; unsupported runtime telemetry is never shown as zero." }
                         }
                         label {
                             span { "Expiry, UTC" }

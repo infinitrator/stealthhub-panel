@@ -147,6 +147,46 @@ async fn database(snapshot: &mut Snapshot) -> Result<()> {
     snapshot
         .sections
         .insert("Users".into(), command::safe_output(&lines.join("\n")));
+    let telemetry = match sqlx::query(
+        "SELECT runtime_id,observed_at,observation_json FROM runtime_telemetry_latest ORDER BY runtime_id LIMIT 64",
+    )
+    .fetch_all(&db)
+    .await
+    {
+        Ok(rows) => rows
+            .into_iter()
+            .filter_map(|row| {
+                let runtime = row.try_get::<String, _>("runtime_id").ok()?;
+                let observed = row.try_get::<String, _>("observed_at").ok()?;
+                let observation = row.try_get::<String, _>("observation_json").ok()?;
+                let parsed = serde_json::from_str::<
+                    stealthhub_core::telemetry::RuntimeTelemetryObservation,
+                >(&observation)
+                .ok()?;
+                let metrics = parsed
+                    .metrics
+                    .iter()
+                    .map(|(metric, state)| format!("{metric:?}={state:?}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let freshness = if Utc::now().signed_duration_since(parsed.observed_at)
+                    > chrono::Duration::minutes(10)
+                {
+                    "STALE"
+                } else {
+                    "fresh"
+                };
+                Some(format!(
+                    "{runtime} / observed {observed} / {freshness}\n{metrics}"
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Err(_) => "Telemetry history unavailable (upgrade migration may be pending).".into(),
+    };
+    snapshot
+        .sections
+        .insert("Telemetry".into(), command::safe_output(&telemetry));
     let protocol_adapters = protocol_registry()?;
     let profiles = sqlx::query("SELECT name,display_name,kind,enabled,server,port,preferred_core_id FROM protocol_profiles ORDER BY display_name,name LIMIT 500").fetch_all(&db).await?;
     let lines = profiles
@@ -425,11 +465,17 @@ pub async fn collect() -> Snapshot {
     }
     s.sections.insert(
         "Runtimes".into(),
-        if runtime_lines.is_empty() {
-            "No registered runtime modules".into()
-        } else {
-            command::safe_output(&runtime_lines.join("\n"))
-        },
+        format!(
+            "{}\n\nTELEMETRY\n{}",
+            if runtime_lines.is_empty() {
+                "No registered runtime modules".into()
+            } else {
+                command::safe_output(&runtime_lines.join("\n"))
+            },
+            s.sections
+                .get("Telemetry")
+                .map_or("Unavailable", String::as_str)
+        ),
     );
     let (uptime, health, ready, listeners) = tokio::join!(
         probe("uptime", &[]),

@@ -102,7 +102,7 @@ pub(crate) fn runtime_inventory_table(inventory: &AdapterInventory) -> Markup {
     html! {
         div class="table-wrap" {
             table {
-                thead { tr { th { "Runtime" } th { "State" } th { "Installed" } th { "Desired" } th { "Applied" } th { "Active" } th { "Health" } th { "Listeners" } th { "Service / version" } th { "Detail" } } }
+                thead { tr { th { "Runtime" } th { "State" } th { "Installed" } th { "Desired" } th { "Applied" } th { "Active" } th { "Health" } th { "Listeners" } th { "Service / version" } th { "Telemetry" } th { "Detail" } } }
                 tbody {
                     @for runtime in &inventory.runtimes {
                         tr {
@@ -114,13 +114,46 @@ pub(crate) fn runtime_inventory_table(inventory: &AdapterInventory) -> Markup {
                             td { (yes_no(runtime.active)) }
                             td { (yes_no(runtime.healthy)) }
                             td { (yes_no(runtime.listeners_healthy)) }
-                            td { code { (runtime.service.as_deref().unwrap_or("not declared")) } br; small { (runtime.version.as_deref().unwrap_or("version unknown")) } }
+                            td {
+                                code { (runtime.service.as_deref().unwrap_or("not declared")) }
+                                br;
+                                small { "installed " (runtime.version.as_deref().unwrap_or("unknown")) }
+                                br;
+                                small { "validated " (runtime.validated_version.as_deref().unwrap_or("not declared")) }
+                                @if runtime.version_compatible == Some(false) {
+                                    br; span class="badge off" { "version mismatch" }
+                                }
+                            }
+                            td {
+                                @if let Some(telemetry) = &runtime.telemetry {
+                                    small { (telemetry.observed_at.to_rfc3339()) }
+                                    br;
+                                    @for (metric, state) in &telemetry.metrics {
+                                        code { (format!("{metric:?}")) } " "
+                                        span class=(format!("badge {}", telemetry_badge(*state))) { (format!("{state:?}")) }
+                                        br;
+                                    }
+                                } @else {
+                                    span class="badge neutral" { "unavailable" }
+                                }
+                            }
                             td { (&runtime.detail) }
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn telemetry_badge(state: stealthhub_core::telemetry::TelemetryState) -> &'static str {
+    use stealthhub_core::telemetry::TelemetryState;
+    match state {
+        TelemetryState::Supported => "ok",
+        TelemetryState::Unsupported | TelemetryState::Unavailable | TelemetryState::Stale => {
+            "neutral"
+        }
+        TelemetryState::Error => "off",
     }
 }
 
@@ -243,9 +276,18 @@ pub(crate) fn error_response(
             layout(
                 title,
                 html! {
-                    h1 { (title) }
-                    div class="notice error" role="alert" { (message) }
-                    a class="button" href=(back_href) { (back_label) }
+                    section class="error-console" {
+                        span class="eyebrow" { "SMILE OS / REQUEST CONTROL" }
+                        h1 { (title) }
+                        p class="error-code" { (status.as_u16()) " / " (status.canonical_reason().unwrap_or("Error")) }
+                        div class="notice error" role="alert" { (message) }
+                        div class="actions" {
+                            a class="button" href=(back_href) { (back_label) }
+                            a class="button secondary" href="/admin/users" { "Users" }
+                            a class="button secondary" href="/admin/routing" { "Routing" }
+                            a class="button secondary" href="/admin/protocols" { "Protocols" }
+                        }
+                    }
                 },
             )
             .into_string(),

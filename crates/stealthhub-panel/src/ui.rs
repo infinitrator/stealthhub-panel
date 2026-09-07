@@ -7,6 +7,11 @@ use maud::{html, Markup, DOCTYPE};
 
 pub(crate) const APP_NAME: &str = "Infiproxy";
 pub(crate) const PANEL_CSS: &str = include_str!("assets/panel.css");
+pub(crate) const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
+pub(crate) const FAVICON_16: &[u8] = include_bytes!("assets/favicon-16x16.png");
+pub(crate) const FAVICON_32: &[u8] = include_bytes!("assets/favicon-32x32.png");
+pub(crate) const APPLE_TOUCH_ICON: &[u8] = include_bytes!("assets/apple-touch-icon.png");
+pub(crate) const SITE_MANIFEST: &str = include_str!("assets/site.webmanifest");
 
 const NAVIGATION: &[(&str, &str, &str)] = &[
     ("Node", "/admin", "Health"),
@@ -45,6 +50,12 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
+                meta name="theme-color" content="#17191c";
+                link rel="icon" href="/favicon.ico" sizes="any";
+                link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png";
+                link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png";
+                link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png";
+                link rel="manifest" href="/site.webmanifest";
                 link rel="stylesheet" href="/assets/panel.css";
             }
             body {

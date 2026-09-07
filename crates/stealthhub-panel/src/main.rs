@@ -13,6 +13,7 @@ mod modules;
 mod ops;
 mod reconcile_request;
 mod rule_sources;
+mod telemetry;
 mod ui;
 mod update;
 mod user_lifecycle;
@@ -26,7 +27,9 @@ use crate::{
         config_files, control_plane_service_states, host_snapshot, read_config_spec,
         uninstall_plan, write_config_file,
     },
-    ui::{APP_NAME, PANEL_CSS},
+    ui::{
+        APPLE_TOUCH_ICON, APP_NAME, FAVICON_16, FAVICON_32, FAVICON_ICO, PANEL_CSS, SITE_MANIFEST,
+    },
 };
 use argon2::{
     password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
@@ -495,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
     modules::spawn_checker(pool.clone());
     rule_sources::spawn_checker(pool.clone());
     user_lifecycle::spawn_checker(pool.clone());
+    telemetry::spawn_collector(pool.clone(), Arc::clone(&core_registry));
 
     let state = AppState {
         pool,
@@ -510,6 +514,11 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/assets/panel.css", get(panel_css))
+        .route("/favicon.ico", get(favicon_ico))
+        .route("/favicon-16x16.png", get(favicon_16))
+        .route("/favicon-32x32.png", get(favicon_32))
+        .route("/apple-touch-icon.png", get(apple_touch_icon))
+        .route("/site.webmanifest", get(site_manifest))
         .route(
             "/admin/setup",
             get(setup_admin_page).post(setup_admin_action),
@@ -672,8 +681,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/sub/{token}", get(subscription_page))
         .route("/sub/{token}/mihomo.yaml", get(mihomo_subscription))
         .route("/rules/{name}", get(rule_provider))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .with_state(state)
         .layer(DefaultBodyLimit::max(DEFAULT_FORM_LIMIT_BYTES))
+        .layer(middleware::from_fn(browser_error_shell))
         .layer(middleware::from_fn(security_headers))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request<Body>| {
@@ -894,6 +906,110 @@ async fn panel_css() -> impl IntoResponse {
         ],
         PANEL_CSS,
     )
+}
+
+fn static_asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+async fn favicon_ico() -> Response {
+    static_asset("image/x-icon", FAVICON_ICO)
+}
+
+async fn favicon_16() -> Response {
+    static_asset("image/png", FAVICON_16)
+}
+
+async fn favicon_32() -> Response {
+    static_asset("image/png", FAVICON_32)
+}
+
+async fn apple_touch_icon() -> Response {
+    static_asset("image/png", APPLE_TOUCH_ICON)
+}
+
+async fn site_manifest() -> Response {
+    static_asset(
+        "application/manifest+json; charset=utf-8",
+        SITE_MANIFEST.as_bytes(),
+    )
+}
+
+async fn not_found() -> Response {
+    html_error_response_with_back(
+        StatusCode::NOT_FOUND,
+        "404 / Route not found",
+        "Хочешь меня налюбить?! This route is not connected to the control plane.",
+        "/admin",
+        "Back to Health",
+    )
+}
+
+async fn method_not_allowed() -> Response {
+    html_error_response_with_back(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "405 / Method rejected",
+        "The route exists, but this HTTP method is not accepted.",
+        "/admin",
+        "Back to Health",
+    )
+}
+
+async fn browser_error_shell(request: Request<Body>, next: Next) -> Response {
+    let admin_route = request.uri().path().starts_with("/admin");
+    let response = next.run(request).await;
+    if !admin_route || !response.status().is_client_error() && !response.status().is_server_error()
+    {
+        return response;
+    }
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"))
+    {
+        return response;
+    }
+    let status = response.status();
+    let (title, message) = match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => (
+            "Request rejected",
+            "The submitted request is malformed or contains invalid fields.",
+        ),
+        StatusCode::UNAUTHORIZED => ("Authentication required", "Sign in to continue."),
+        StatusCode::FORBIDDEN => (
+            "Operation forbidden",
+            "This account or request cannot perform the operation.",
+        ),
+        StatusCode::PAYLOAD_TOO_LARGE => (
+            "Request too large",
+            "The submitted payload exceeds the configured safety limit.",
+        ),
+        StatusCode::TOO_MANY_REQUESTS => (
+            "Request throttled",
+            "The operation is temporarily rate limited. Wait and retry.",
+        ),
+        StatusCode::SERVICE_UNAVAILABLE => (
+            "Control plane unavailable",
+            "A required local component is not ready. Check Health and retry.",
+        ),
+        _ if status.is_server_error() => (
+            "Request failed",
+            "An internal error occurred. Review the server journal for context.",
+        ),
+        _ => (
+            "Request rejected",
+            "The control plane rejected this request.",
+        ),
+    };
+    html_error_response_with_back(status, title, message, "/admin", "Back to Health")
 }
 
 async fn setup_admin_page(State(state): State<AppState>, headers: HeaderMap) -> Response {

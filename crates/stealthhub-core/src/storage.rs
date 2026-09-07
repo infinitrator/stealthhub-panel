@@ -35,9 +35,20 @@ use crate::{
         validate_classical_rule_payload, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
         RuleSourceFormat,
     },
+    telemetry::RuntimeTelemetryObservation,
 };
 
 pub type DbPool = SqlitePool;
+
+/// One bounded telemetry history row. The JSON payload is a typed, non-secret observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeTelemetryRecord {
+    pub id: i64,
+    pub runtime_id: String,
+    pub user_id: Option<i64>,
+    pub observed_at: DateTime<Utc>,
+    pub observation: RuntimeTelemetryObservation,
+}
 
 /// One append-only administrative audit row returned to the owner UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -699,6 +710,8 @@ const ONE_TIME_BOOTSTRAP_MIGRATION: i64 = 8;
 const ADMIN_AUDIT_MIGRATION: i64 = 9;
 const AUDIT_APPEND_ONLY_TRIGGERS_MIGRATION: i64 = 10;
 const USER_LIFECYCLE_MIGRATION: i64 = 11;
+const RUNTIME_TELEMETRY_MIGRATION: i64 = 12;
+const TELEMETRY_HISTORY_LIMIT: i64 = 4096;
 
 async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
     let mut transaction = pool.begin().await?;
@@ -1090,8 +1103,114 @@ async fn run_versioned_migrations(pool: &SqlitePool) -> Result<()> {
             .execute(&mut *transaction)
             .await?;
     }
+    let applied =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM schema_migrations WHERE version = ?")
+            .bind(RUNTIME_TELEMETRY_MIGRATION)
+            .fetch_one(&mut *transaction)
+            .await?;
+    if applied == 0 {
+        for statement in [
+            r"CREATE TABLE runtime_telemetry_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                runtime_id TEXT NOT NULL CHECK(length(runtime_id) BETWEEN 1 AND 64),
+                user_id INTEGER NULL,
+                observed_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL CHECK(length(observation_json) <= 16384),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+            )",
+            "CREATE INDEX idx_runtime_telemetry_runtime_time ON runtime_telemetry_samples(runtime_id,observed_at DESC,id DESC)",
+            "CREATE INDEX idx_runtime_telemetry_user_time ON runtime_telemetry_samples(user_id,observed_at DESC,id DESC) WHERE user_id IS NOT NULL",
+            r"CREATE TABLE runtime_telemetry_latest (
+                runtime_id TEXT PRIMARY KEY CHECK(length(runtime_id) BETWEEN 1 AND 64),
+                observed_at TEXT NOT NULL,
+                observation_json TEXT NOT NULL CHECK(length(observation_json) <= 16384)
+            )",
+        ] {
+            sqlx::query(statement).execute(&mut *transaction).await?;
+        }
+        sqlx::query("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)")
+            .bind(RUNTIME_TELEMETRY_MIGRATION)
+            .bind("add bounded runtime telemetry history")
+            .bind(Utc::now())
+            .execute(&mut *transaction)
+            .await?;
+    }
     transaction.commit().await?;
     Ok(())
+}
+
+/// Persists one sanitized observation and prunes the global history bound.
+pub async fn record_runtime_telemetry(
+    pool: &SqlitePool,
+    observation: &RuntimeTelemetryObservation,
+    user_id: Option<i64>,
+) -> Result<()> {
+    if !valid_adapter_id(&observation.runtime_id) {
+        bail!("invalid telemetry runtime ID");
+    }
+    let encoded = serde_json::to_string(observation)?;
+    if encoded.len() > 16 * 1024 {
+        bail!("telemetry observation exceeds 16 KiB");
+    }
+    let mut transaction = pool.begin().await?;
+    sqlx::query("INSERT INTO runtime_telemetry_samples (runtime_id,user_id,observed_at,observation_json) VALUES (?,?,?,?)")
+        .bind(&observation.runtime_id)
+        .bind(user_id)
+        .bind(observation.observed_at)
+        .bind(&encoded)
+        .execute(&mut *transaction)
+        .await?;
+    if user_id.is_none() {
+        sqlx::query("INSERT INTO runtime_telemetry_latest (runtime_id,observed_at,observation_json) VALUES (?,?,?) ON CONFLICT(runtime_id) DO UPDATE SET observed_at=excluded.observed_at,observation_json=excluded.observation_json WHERE excluded.observed_at >= runtime_telemetry_latest.observed_at")
+            .bind(&observation.runtime_id)
+            .bind(observation.observed_at)
+            .bind(&encoded)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    sqlx::query("DELETE FROM runtime_telemetry_samples WHERE id NOT IN (SELECT id FROM runtime_telemetry_samples ORDER BY id DESC LIMIT ?)")
+        .bind(TELEMETRY_HISTORY_LIMIT)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+/// Loads latest aggregate observations in deterministic runtime-ID order.
+pub async fn list_latest_runtime_telemetry(
+    pool: &SqlitePool,
+) -> Result<Vec<RuntimeTelemetryObservation>> {
+    let rows =
+        sqlx::query("SELECT observation_json FROM runtime_telemetry_latest ORDER BY runtime_id")
+            .fetch_all(pool)
+            .await?;
+    rows.into_iter()
+        .map(|row| Ok(serde_json::from_str(row.try_get("observation_json")?)?))
+        .collect()
+}
+
+/// Loads a bounded newest-first user history without changing stored quota usage.
+pub async fn list_user_runtime_telemetry(
+    pool: &SqlitePool,
+    user_id: i64,
+    limit: u32,
+) -> Result<Vec<RuntimeTelemetryRecord>> {
+    let rows = sqlx::query("SELECT id,runtime_id,user_id,observed_at,observation_json FROM runtime_telemetry_samples WHERE user_id=? ORDER BY observed_at DESC,id DESC LIMIT ?")
+        .bind(user_id)
+        .bind(i64::from(limit.clamp(1, 200)))
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(RuntimeTelemetryRecord {
+                id: row.try_get("id")?,
+                runtime_id: row.try_get("runtime_id")?,
+                user_id: row.try_get("user_id")?,
+                observed_at: row.try_get("observed_at")?,
+                observation: serde_json::from_str(row.try_get("observation_json")?)?,
+            })
+        })
+        .collect()
 }
 
 async fn append_audit_event_in_transaction(
@@ -4817,7 +4936,7 @@ mod tests {
         let migrations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations")
             .fetch_one(&pool)
             .await?;
-        assert_eq!(migrations, 11);
+        assert_eq!(migrations, 12);
 
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
             .fetch_one(&pool)
@@ -7075,6 +7194,54 @@ mod tests {
             .context("profile missing after migration")?;
         assert_eq!(profile.name, "legacy-profile");
         assert_eq!(profile.display_name, "legacy-profile");
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn telemetry_migration_is_idempotent_and_history_is_bounded() -> Result<()> {
+        use crate::telemetry::{RuntimeTelemetryObservation, TelemetryMetric, TelemetryState};
+        use std::collections::BTreeMap;
+
+        let (pool, path) = test_pool().await?;
+        init_db(&pool).await?;
+        init_db(&pool).await?;
+        let migrated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version=?")
+                .bind(RUNTIME_TELEMETRY_MIGRATION)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(migrated, 1);
+
+        for sequence in 0..(TELEMETRY_HISTORY_LIMIT + 8) {
+            record_runtime_telemetry(
+                &pool,
+                &RuntimeTelemetryObservation {
+                    runtime_id: "sing-box".into(),
+                    observed_at: Utc::now() + chrono::Duration::milliseconds(sequence),
+                    source: "core-adapter".into(),
+                    metrics: BTreeMap::from([(
+                        TelemetryMetric::AggregateTraffic,
+                        TelemetryState::Unsupported,
+                    )]),
+                    traffic: None,
+                    detail: None,
+                },
+                None,
+            )
+            .await?;
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runtime_telemetry_samples")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(rows, TELEMETRY_HISTORY_LIMIT);
+        let latest = list_latest_runtime_telemetry(&pool).await?;
+        assert_eq!(latest.len(), 1);
+        assert_eq!(
+            latest[0].metrics[&TelemetryMetric::AggregateTraffic],
+            TelemetryState::Unsupported
+        );
+        assert_eq!(list_user_runtime_telemetry(&pool, 1, 500).await?.len(), 0);
         close_and_remove(pool, &path).await;
         Ok(())
     }

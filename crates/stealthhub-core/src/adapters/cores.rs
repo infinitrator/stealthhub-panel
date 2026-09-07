@@ -6,19 +6,21 @@
 
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Map, Value};
 
 use crate::adapter::{
-    CoreAdapter, CoreAdapterManifest, CorePlan, CoreRegistry, CoreSnapshot, UserSyncObservation,
-    ADAPTER_API_VERSION,
+    CoreAdapter, CoreAdapterManifest, CorePlan, CoreRegistry, CoreRuntimeProbe, CoreSnapshot,
+    UserSyncObservation, ADAPTER_API_VERSION,
 };
 use crate::module_manifest::normalized_release_version;
 
@@ -285,14 +287,14 @@ impl ManagedCoreAdapter {
             Flavor::SingBox | Flavor::Hysteria => &["version"],
             Flavor::Tuic => &["--version"],
         };
-        let output = Command::new(&self.binary).args(arguments).output().ok()?;
-        if !output.status.success() {
+        let (success, stdout, stderr) = bounded_command_output(&self.binary, arguments).ok()?;
+        if !success {
             return None;
         }
         let output = format!(
             "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
         );
         let prefix = match self.flavor {
             Flavor::Xray => Some("Xray "),
@@ -374,6 +376,46 @@ impl ManagedCoreAdapter {
     }
 }
 
+fn bounded_command_output(program: &Path, arguments: &[&str]) -> Result<(bool, Vec<u8>, Vec<u8>)> {
+    const OUTPUT_LIMIT: u64 = 64 * 1024;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("runtime version probe timed out");
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    child
+        .stdout
+        .take()
+        .context("runtime probe stdout is unavailable")?
+        .take(OUTPUT_LIMIT + 1)
+        .read_to_end(&mut stdout)?;
+    child
+        .stderr
+        .take()
+        .context("runtime probe stderr is unavailable")?
+        .take(OUTPUT_LIMIT + 1)
+        .read_to_end(&mut stderr)?;
+    if stdout.len() > OUTPUT_LIMIT as usize || stderr.len() > OUTPUT_LIMIT as usize {
+        bail!("runtime version probe output exceeds 64 KiB");
+    }
+    Ok((status.success(), stdout, stderr))
+}
+
 fn tls_requirements_are_ready(
     required: &std::collections::BTreeSet<String>,
     mode: TlsReadinessMode,
@@ -408,6 +450,56 @@ impl CoreAdapter for ManagedCoreAdapter {
             Err(error) => return Err(error.into()),
         };
         Ok(marker_matches && self.probed_version() == Some(expected))
+    }
+
+    fn probe(&self) -> CoreRuntimeProbe {
+        let installed = self.binary.is_file();
+        let active = installed.then(|| {
+            bounded_command_output(
+                Path::new("/usr/bin/systemctl"),
+                &["is-active", "--quiet", &self.manifest.service],
+            )
+            .ok()
+            .map(|(success, _, _)| success)
+        });
+        let active = active.flatten();
+        let expected = normalized_release_version(self.validated_version);
+        let actual = installed.then(|| self.probed_version()).flatten();
+        let marker = fs::read_to_string(&self.version_file)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let marker_matches = marker
+            .as_deref()
+            .and_then(normalized_release_version)
+            .zip(expected)
+            .map(|(marker, expected)| marker == expected);
+        let version_compatible =
+            installed.then(|| actual == expected && marker_matches.unwrap_or(true));
+        let detail = match (installed, actual, expected, marker_matches) {
+            (false, _, _, _) => Some("runtime binary is not installed".to_string()),
+            (true, None, _, _) => Some("runtime binary version probe failed".to_string()),
+            (true, _, None, _) => Some("validated runtime version is invalid".to_string()),
+            (true, Some(actual), Some(expected), _) if actual != expected => Some(format!(
+                "runtime version mismatch: installed {}, validated {}",
+                format_release_version(actual),
+                self.validated_version
+            )),
+            (true, _, _, Some(false)) => {
+                Some("runtime version marker does not match the validated contract".to_string())
+            }
+            _ => None,
+        };
+        CoreRuntimeProbe {
+            installed: Some(installed),
+            active,
+            healthy: active,
+            version: actual.map(format_release_version),
+            validated_version: Some(self.validated_version.to_string()),
+            version_compatible,
+            detail,
+            ..CoreRuntimeProbe::default()
+        }
     }
 
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
@@ -1015,6 +1107,10 @@ fn strict_release_version(value: &str) -> Option<[u64; 3]> {
     components.next().is_none().then_some(version)
 }
 
+fn format_release_version(version: [u64; 3]) -> String {
+    format!("{}.{}.{}", version[0], version[1], version[2])
+}
+
 fn listener_line_has_port(line: &str, port: u16) -> bool {
     let marker = format!(":{port}");
     line.split_whitespace()
@@ -1582,6 +1678,67 @@ mod tests {
         let adapter = test_adapter(Flavor::Xray, &binary, &config, &marker, "v26.3.27")?;
         assert!(!adapter.compatible(&BTreeSet::new())?);
         fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sing_box_exact_contract_rejects_newer_and_stale_markers() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "infiproxy-sing-box-version-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory)?;
+        let binary = directory.join("sing-box");
+        let config = directory.join("config.json");
+        let marker = directory.join("sing-box.version");
+        let adapter = test_adapter(Flavor::SingBox, &binary, &config, &marker, "v1.13.20")?;
+
+        write_probe(&binary, "version", "sing-box version 1.13.20")?;
+        fs::write(&marker, "v1.13.20\n")?;
+        assert!(adapter.compatible(&BTreeSet::new())?);
+
+        write_probe(&binary, "version", "sing-box version 1.14.0")?;
+        assert!(!adapter.compatible(&BTreeSet::new())?);
+        let probe = adapter.probe();
+        assert_eq!(probe.version.as_deref(), Some("1.14.0"));
+        assert_eq!(probe.validated_version.as_deref(), Some("v1.13.20"));
+        assert_eq!(probe.version_compatible, Some(false));
+        assert!(probe.detail.unwrap().contains("version mismatch"));
+
+        write_probe(&binary, "version", "sing-box version 1.13.20")?;
+        fs::write(&marker, "v1.14.0\n")?;
+        assert!(!adapter.compatible(&BTreeSet::new())?);
+        fs::remove_file(&marker)?;
+        assert!(adapter.compatible(&BTreeSet::new())?);
+
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn built_in_telemetry_never_claims_unconfigured_traffic_apis() -> Result<()> {
+        use crate::telemetry::{TelemetryMetric, TelemetryState};
+
+        let observations = registry(TlsReadinessMode::Static)?.observations();
+        assert_eq!(observations.len(), 5);
+        for observation in observations {
+            assert_eq!(
+                observation.telemetry.metrics[&TelemetryMetric::AggregateTraffic],
+                TelemetryState::Unsupported,
+                "{} claimed aggregate traffic",
+                observation.manifest.id
+            );
+            assert_eq!(
+                observation.telemetry.metrics[&TelemetryMetric::PerUserTraffic],
+                TelemetryState::Unsupported,
+                "{} claimed per-user traffic",
+                observation.manifest.id
+            );
+            let serialized = serde_json::to_string(&observation.telemetry)?;
+            for forbidden in ["password", "private_key", "authorization", "token"] {
+                assert!(!serialized.to_ascii_lowercase().contains(forbidden));
+            }
+        }
         Ok(())
     }
 

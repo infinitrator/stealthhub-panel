@@ -481,11 +481,13 @@ async fn setting_or_default(
 
 fn installed_version(spec: &ModuleSpec) -> String {
     let state_path = version_dir().join(format!("{}.version", spec.id));
-    fs::read_to_string(state_path)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| version_from_symlink(&spec.binary_path))
+    version_from_symlink(&spec.binary_path)
+        .or_else(|| {
+            fs::read_to_string(state_path)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        })
         .unwrap_or_else(|| "unknown".to_string())
 }
 

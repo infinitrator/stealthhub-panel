@@ -154,6 +154,8 @@ tbody tr:hover { background: #ffffff08; }
 .topology-fallback caption { text-align: left; padding: 6px 8px; color: var(--muted); }
 .topology-result { margin: 8px 0; }
 .danger-zone, .confirm-panel { border-left: 4px solid var(--danger); }
+.error-console { max-width: 760px; border-left: 4px solid var(--danger); }
+.error-code { font: bold clamp(22px, 6vw, 58px)/1 var(--font-data); color: var(--muted); margin: 14px 0; overflow-wrap: anywhere; }
 .workspace-footer { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 12px; margin-top: 24px; font-size: 9px; }
 @media (min-width: 1600px) { .content { padding-left: 32px; padding-right: 32px; } .health-grid, .sys-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 @media (max-width: 1050px) { .inline-settings { grid-template-columns: 1fr 1fr; } .cards .card, .grid section { grid-template-columns: 140px minmax(0, 1fr); } .grid section .button { grid-column: 2; justify-self: start; } }
@@ -173,6 +175,10 @@ tbody tr:hover { background: #ffffff08; }
     .details { grid-template-columns: 1fr; gap: 4px; }
     .details dd { margin-bottom: 8px; }
     .workspace-footer { flex-direction: column; gap: 3px; }
+    .button, button { min-height: 42px; padding: 10px 12px; }
+    .table-wrap { overscroll-behavior-x: contain; }
 }
+@media (max-width: 430px) { .content { padding: 9px; } section { padding: 10px; } .status-strip { grid-template-columns: 1fr; } .masthead-label { display: none; } }
+@media (max-width: 350px) { .masthead-meta { display: none; } .top-nav a { padding: 8px 7px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
 @media (forced-colors: active) { .badge, .button, button, .switch-ui { border: 1px solid ButtonText; } .switch-field input:checked + .switch-ui::after { background: Highlight; } }

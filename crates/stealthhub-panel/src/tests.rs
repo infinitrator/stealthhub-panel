@@ -496,7 +496,7 @@ async fn user_views_show_lifecycle_without_exposing_credentials() {
     for status in ["Disabled", "Expired", "Quota blocked"] {
         assert!(rendered.contains(status));
     }
-    assert!(rendered.contains("No live collector"));
+    assert!(rendered.contains("Runtime accounting unsupported"));
     assert!(!rendered.contains("uuid-secret-sentinel"));
     assert!(!rendered.contains("subscription-secret-sentinel"));
 
@@ -733,6 +733,9 @@ fn shared_inventory_components_render_dynamic_and_historical_entries() {
             listeners_healthy: None,
             service: Some("manifest-runtime.service".to_string()),
             version: Some("1.2.3".to_string()),
+            validated_version: Some("v1.2.3".to_string()),
+            version_compatible: Some(true),
+            telemetry: None,
             capabilities: BTreeSet::new(),
             detail: "Core installed but unused".to_string(),
         }],
@@ -745,6 +748,8 @@ fn shared_inventory_components_render_dynamic_and_historical_entries() {
     assert!(adapters.contains("historical"));
     assert!(runtimes.contains("runtime-from-manifest"));
     assert!(runtimes.contains("installed inactive"));
+    assert!(runtimes.contains("validated v1.2.3"));
+    assert!(runtimes.contains("unavailable"));
 }
 
 #[test]

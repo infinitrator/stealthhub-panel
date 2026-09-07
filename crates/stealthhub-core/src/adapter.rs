@@ -15,7 +15,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::models::{ProtocolProfile, SubscriptionUser};
+use crate::{
+    models::{ProtocolProfile, SubscriptionUser},
+    telemetry::{RuntimeTelemetryObservation, TelemetryMetric, TelemetryState},
+};
 
 /// Stable adapter protocol understood by this release line.
 pub const ADAPTER_API_VERSION: u32 = 1;
@@ -357,6 +360,8 @@ pub struct CoreRuntimeProbe {
     pub healthy: Option<bool>,
     pub listeners_healthy: Option<bool>,
     pub version: Option<String>,
+    pub validated_version: Option<String>,
+    pub version_compatible: Option<bool>,
     pub detail: Option<String>,
 }
 
@@ -564,6 +569,7 @@ pub struct CoreAdapterObservation {
     pub manifest: CoreAdapterManifest,
     pub state_schema_version: u32,
     pub probe: CoreRuntimeProbe,
+    pub telemetry: RuntimeTelemetryObservation,
 }
 
 /// Privileged runtime behavior used by the generic transaction engine.
@@ -596,6 +602,45 @@ pub trait CoreAdapter: Send + Sync {
                 detail: Some("runtime installation probe failed".to_string()),
                 ..CoreRuntimeProbe::default()
             },
+        }
+    }
+    /// Describes only metrics this adapter can observe without exposing a
+    /// management endpoint or crossing its existing privilege boundary.
+    fn telemetry(&self, probe: &CoreRuntimeProbe) -> RuntimeTelemetryObservation {
+        let observed = |value: Option<bool>| match value {
+            Some(_) => TelemetryState::Supported,
+            None => TelemetryState::Unavailable,
+        };
+        RuntimeTelemetryObservation {
+            runtime_id: self.manifest().id.clone(),
+            observed_at: chrono::Utc::now(),
+            source: "core-adapter".to_string(),
+            metrics: BTreeMap::from([
+                (TelemetryMetric::ProcessState, observed(probe.active)),
+                (
+                    TelemetryMetric::ListenerState,
+                    observed(probe.listeners_healthy),
+                ),
+                (
+                    TelemetryMetric::RuntimeVersion,
+                    if probe.version.is_some() {
+                        TelemetryState::Supported
+                    } else {
+                        TelemetryState::Unavailable
+                    },
+                ),
+                (
+                    TelemetryMetric::ActiveConnections,
+                    TelemetryState::Unsupported,
+                ),
+                (
+                    TelemetryMetric::AggregateTraffic,
+                    TelemetryState::Unsupported,
+                ),
+                (TelemetryMetric::PerUserTraffic, TelemetryState::Unsupported),
+            ]),
+            traffic: None,
+            detail: probe.detail.clone(),
         }
     }
     fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf>;
@@ -742,10 +787,14 @@ impl CoreRegistry {
     pub fn observations(&self) -> Vec<CoreAdapterObservation> {
         self.adapters
             .values()
-            .map(|adapter| CoreAdapterObservation {
-                manifest: adapter.manifest().clone(),
-                state_schema_version: adapter.state_schema_version(),
-                probe: adapter.probe(),
+            .map(|adapter| {
+                let probe = adapter.probe();
+                CoreAdapterObservation {
+                    manifest: adapter.manifest().clone(),
+                    state_schema_version: adapter.state_schema_version(),
+                    telemetry: adapter.telemetry(&probe),
+                    probe,
+                }
             })
             .collect()
     }
