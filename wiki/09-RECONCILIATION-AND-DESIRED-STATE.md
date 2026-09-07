@@ -241,6 +241,13 @@ adapter может мигрировать собственную opaque schema.
 7. native config validator принимает candidate;
 8. systemd unit может запуститься в sandbox.
 
+Web-проверка TLS не выполняет `setuid` и не требует доступа панели к private
+key. Она использует последний root-verified metadata report, если режим
+`0750 root:infiproxy-runtime` закрывает прямой обход каталога. Итоговое решение
+всегда принимает root worker по текущему состоянию файлов; при недоступности
+runtime identity, traversal/read или сертификата он завершает проход до
+мутации runtime.
+
 ## 12. Безопасное повторение
 
 После исправления причины не редактируйте applied.json или generation вручную.

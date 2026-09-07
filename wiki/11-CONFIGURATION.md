@@ -186,6 +186,15 @@ Expected identity/modes:
 Readiness independently resolves actual infiproxy-runtime uid/gid. Совпадение
 file/directory с одинаковой, но неверной group не принимается.
 
+Панель работает без membership в infiproxy-runtime и поэтому не пытается
+переключать UID/GID. Root reconciler после живой проверки атомарно публикует
+bounded metadata-only report в
+`/var/lib/infiproxy-maintenance/tls-readiness.json`; web pre-validation читает
+его только когда корректный TLS directory закрывает прямой доступ к дочерним
+файлам. Перед любым изменением runtime root reconciler повторяет проверку
+effective traversal/read, сертификата и версии, поэтому report не является
+разрешением на запуск.
+
 Symlink разрешен только к regular target. Installer не chown/chmod target
 symlink, а readiness проверяет metadata resolved target и effective traversal
 всех ancestors. Certificate проверяется openssl: parse, hostname, expiry и

@@ -23,7 +23,8 @@ use crate::adapter::{
 use crate::module_manifest::normalized_release_version;
 
 use super::tls::{
-    capabilities_require_tls, tls_material_readiness, CERTIFICATE_PATH, PRIVATE_KEY_PATH,
+    capabilities_require_tls, tls_material_readiness_with_mode, TlsReadinessMode, CERTIFICATE_PATH,
+    PRIVATE_KEY_PATH,
 };
 const RUNTIME_GROUP: &str = "infiproxy-runtime";
 const XRAY_CAPABILITIES: &[&str] = &["vless-reality-tcp", "vless-reality-xhttp"];
@@ -107,6 +108,7 @@ struct ManagedCoreAdapter {
     config: PathBuf,
     validated_version: &'static str,
     version_file: PathBuf,
+    tls_readiness_mode: TlsReadinessMode,
     listeners: Mutex<ListenerState>,
 }
 
@@ -121,6 +123,7 @@ struct ManagedCoreSpec<'a> {
     selection_priority: i32,
     validated_version: &'static str,
     version_file: Option<&'a str>,
+    tls_readiness_mode: TlsReadinessMode,
 }
 
 impl ManagedCoreAdapter {
@@ -151,6 +154,7 @@ impl ManagedCoreAdapter {
                 },
                 PathBuf::from,
             ),
+            tls_readiness_mode: spec.tls_readiness_mode,
             listeners: Mutex::new(ListenerState::default()),
         }
     }
@@ -370,6 +374,14 @@ impl ManagedCoreAdapter {
     }
 }
 
+fn tls_requirements_are_ready(
+    required: &std::collections::BTreeSet<String>,
+    mode: TlsReadinessMode,
+    mut readiness: impl FnMut(TlsReadinessMode) -> bool,
+) -> bool {
+    !capabilities_require_tls(required.iter()) || readiness(mode)
+}
+
 impl CoreAdapter for ManagedCoreAdapter {
     fn manifest(&self) -> &CoreAdapterManifest {
         &self.manifest
@@ -383,7 +395,9 @@ impl CoreAdapter for ManagedCoreAdapter {
         if !self.binary.is_file() {
             return Ok(false);
         }
-        if capabilities_require_tls(required.iter()) && !tls_material_readiness(None).ready {
+        if !tls_requirements_are_ready(required, self.tls_readiness_mode, |mode| {
+            tls_material_readiness_with_mode(None, mode).ready
+        }) {
             return Ok(false);
         }
         let expected = normalized_release_version(self.validated_version)
@@ -1185,7 +1199,7 @@ fn mihomo_array_user_identity(entry: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
+fn built_in_adapters(tls_readiness_mode: TlsReadinessMode) -> [ManagedCoreAdapter; 5] {
     [
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "xray",
@@ -1198,6 +1212,7 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             selection_priority: 100,
             validated_version: "v26.3.27",
             version_file: None,
+            tls_readiness_mode,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "mihomo",
@@ -1210,6 +1225,7 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             selection_priority: 200,
             validated_version: "v1.19.30",
             version_file: None,
+            tls_readiness_mode,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "sing-box",
@@ -1222,6 +1238,7 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             selection_priority: 50,
             validated_version: "v1.13.20",
             version_file: None,
+            tls_readiness_mode,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "hysteria",
@@ -1234,6 +1251,7 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             selection_priority: 200,
             validated_version: "app/v2.12.2",
             version_file: None,
+            tls_readiness_mode,
         }),
         ManagedCoreAdapter::new(ManagedCoreSpec {
             id: "tuic",
@@ -1246,13 +1264,14 @@ fn built_in_adapters() -> [ManagedCoreAdapter; 5] {
             selection_priority: 200,
             validated_version: "tuic-server-1.0.0",
             version_file: None,
+            tls_readiness_mode,
         }),
     ]
 }
 
-pub(super) fn registry() -> Result<CoreRegistry> {
+pub(super) fn registry(tls_readiness_mode: TlsReadinessMode) -> Result<CoreRegistry> {
     let mut registry = CoreRegistry::default();
-    for adapter in built_in_adapters() {
+    for adapter in built_in_adapters(tls_readiness_mode) {
         registry.register(Arc::new(adapter))?;
     }
     Ok(registry)
@@ -1336,6 +1355,7 @@ mod tests {
                     .to_str()
                     .context("temporary marker path is not UTF-8")?,
             ),
+            tls_readiness_mode: TlsReadinessMode::Static,
         }))
     }
 
@@ -1676,7 +1696,7 @@ mod tests {
 
     #[test]
     fn shipped_core_registry_declares_every_initial_capability() {
-        let registry = registry().unwrap();
+        let registry = registry(TlsReadinessMode::Static).unwrap();
         let capabilities = registry
             .manifests()
             .into_iter()
@@ -1699,7 +1719,7 @@ mod tests {
 
     #[test]
     fn built_in_capability_manifests_match_their_composers() {
-        for adapter in built_in_adapters() {
+        for adapter in built_in_adapters(TlsReadinessMode::Static) {
             for capability in &adapter.manifest.capabilities {
                 adapter
                     .compose(&minimal_plan(&adapter.manifest.id, capability))
@@ -1714,8 +1734,33 @@ mod tests {
     }
 
     #[test]
+    fn built_in_registry_tls_readiness_mode_is_explicit() {
+        assert!(built_in_adapters(TlsReadinessMode::Static)
+            .iter()
+            .all(|adapter| adapter.tls_readiness_mode == TlsReadinessMode::Static));
+        assert!(built_in_adapters(TlsReadinessMode::Privileged)
+            .iter()
+            .all(|adapter| adapter.tls_readiness_mode == TlsReadinessMode::Privileged));
+    }
+
+    #[test]
+    fn anytls_panel_compatibility_uses_static_tls_readiness() {
+        let required = BTreeSet::from(["anytls-tls".to_string()]);
+        assert!(tls_requirements_are_ready(
+            &required,
+            TlsReadinessMode::Static,
+            |mode| mode == TlsReadinessMode::Static
+        ));
+        assert!(!tls_requirements_are_ready(
+            &required,
+            TlsReadinessMode::Privileged,
+            |_| false
+        ));
+    }
+
+    #[test]
     fn mihomo_only_capabilities_are_not_advertised_or_selected_by_sing_box() -> Result<()> {
-        let built_ins = registry()?;
+        let built_ins = registry(TlsReadinessMode::Static)?;
         let manifests = built_ins.manifests();
         let mihomo = manifests
             .iter()
@@ -1748,6 +1793,7 @@ mod tests {
             selection_priority: 10,
             validated_version: "v1.13.20",
             version_file: None,
+            tls_readiness_mode: TlsReadinessMode::Static,
         })))?;
 
         for capability in MIHOMO_EXCLUSIVE_CAPABILITIES {
@@ -1782,6 +1828,7 @@ mod tests {
                     .to_str()
                     .context("temporary path is not UTF-8")?,
             ),
+            tls_readiness_mode: TlsReadinessMode::Static,
         })))?;
         let required = BTreeSet::from(["vless-reality-tcp".to_string()]);
         assert!(registry.select(&required, None)?.is_none());

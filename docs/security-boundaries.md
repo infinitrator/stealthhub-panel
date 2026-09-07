@@ -23,8 +23,14 @@ stores references. Private-key content must never enter logs, operation JSON,
 status mirrors, backups intended as public diagnostics, or subscriptions.
 
 TLS readiness resolves the real `infiproxy-runtime` group and checks ownership,
-safe modes, ancestor traversal, and effective access. Symlink targets are
-validated but never chmod/chown-normalized by the installer.
+safe modes, ancestor traversal, and effective access. The root reconciler
+atomically publishes a bounded, content-free readiness report at
+`/var/lib/infiproxy-maintenance/tls-readiness.json`. The unprivileged panel may
+read this report when directory traversal intentionally prevents direct file
+inspection; it cannot modify the report and never receives runtime-group
+membership. The report is advisory only: the root reconciler repeats live
+effective-access and certificate checks before runtime mutation. Symlink
+targets are validated but never chmod/chown-normalized by the installer.
 
 ## HTTP Boundary
 

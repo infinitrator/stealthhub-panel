@@ -11,7 +11,11 @@ use std::{
 use anyhow::{bail, Context, Result};
 use stealthhub_core::{
     adapter::{ProtocolRegistry, SecretRef, SecretResolver, SecretValue},
-    adapters::{core_registry, desired_resources, protocol_registry},
+    adapters::{
+        desired_resources, privileged_core_registry, privileged_tls_material_readiness,
+        profile_requires_tls, profile_tls_hostname, protocol_registry,
+        publish_privileged_tls_readiness,
+    },
     desired::{ReconcileRequest, ReconcileStatus},
     models::PanelSettings,
     reconcile::{FileReconcileStore, ReconcileStore, Reconciler},
@@ -163,7 +167,23 @@ async fn process(request_path: Option<&Path>) -> Result<()> {
     };
     desired.infrastructure.extend(desired_resources(&settings));
     let protocols = protocol_registry()?;
-    let cores = core_registry()?;
+    publish_privileged_tls_readiness().context("publish privileged TLS readiness")?;
+    for profile in desired
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled && profile_requires_tls(&profile.protocol_id))
+    {
+        let hostname = profile_tls_hostname(&profile.protocol_id, &profile.config);
+        let readiness = privileged_tls_material_readiness(hostname.as_deref());
+        if !readiness.ready {
+            bail!(
+                "TLS readiness failed for enabled profile `{}`: {}",
+                profile.name,
+                readiness.detail
+            );
+        }
+    }
+    let cores = privileged_core_registry()?;
     migrate_available_adapter_states(&pool, &protocols, &cores).await?;
     let secret_protocols = protocols.clone();
     let state_dir = env_path("INFIPROXY_RECONCILE_STATE_DIR", DEFAULT_STATE_DIR);

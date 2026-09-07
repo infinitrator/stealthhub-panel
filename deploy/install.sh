@@ -520,6 +520,7 @@ systemctl enable --now infiproxy-module-update.timer
 systemctl enable --now infiproxy-module-update.path
 systemctl enable --now infiproxy-reconcile.timer
 systemctl enable --now infiproxy-reconcile.path
+systemctl start infiproxy-reconcile.service
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"
