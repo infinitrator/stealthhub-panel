@@ -100,7 +100,14 @@ its generation are committed together; the small checkpoint outbox is cleared
 only after the bounded reconcile request is published. HTTP subscription access
 always evaluates the authoritative row directly, so it does not wait for the
 background task. External trusted usage writers can reuse the full transition
-evaluation, but this release includes no live runtime traffic collector.
+evaluation. Phase 3 includes a low-frequency runtime observation collector, but
+no live runtime traffic collector: traffic APIs stay disabled and accounting is
+explicitly unsupported rather than represented as zero.
+
+Telemetry is independent observed state. Adapter-owned observations are sampled
+every five minutes, persisted with bounded history, and may become stale or
+unavailable without blocking reconciliation. They never advance desired/applied
+generations and never enforce quotas; that remains Phase 4 work.
 
 Only allowed users enter `DesiredState.users`. `PerUserUuid` adapters consume
 that set. `SharedCredential` adapters deliberately render no per-user identity

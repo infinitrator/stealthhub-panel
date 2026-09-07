@@ -11,9 +11,9 @@ configuration through the root reconciler using the built-in adapter registry.
 
 > **Status:** `0.1.0-beta.1`. The architecture and migration contracts are
 > tested, but production operators must keep verified backups and validate real
-> client handshakes. Traffic limit and usage fields are stored metadata; this
-> release has no live runtime traffic collector. Stored values can gate access,
-> but they are not independently measured traffic accounting.
+> client handshakes. Phase 3 persists bounded runtime observations; native
+> traffic APIs remain disabled and explicitly unsupported. Traffic limit and
+> usage fields are stored metadata, not independently measured accounting.
 
 ## Deployment Model
 
@@ -60,6 +60,8 @@ User-facing:
   entries, remote sources, and YAML rule providers.
 - Runtime inventory, desired/applied generations, and count-only user-sync
   observations.
+- Five-minute, bounded runtime telemetry observations with explicit freshness
+  and unsupported states; no traffic value is fabricated when an API is off.
 
 Operator-facing:
 

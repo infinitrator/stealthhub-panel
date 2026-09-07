@@ -18,6 +18,7 @@
 - [Релиз и совместимость](15-RELEASE-AND-COMPATIBILITY)
 - [Архитектура адаптеров](16-ADAPTER-ARCHITECTURE)
 - [Runtime compatibility](17-RUNTIME-COMPATIBILITY)
+- [Runtime telemetry](18-RUNTIME-TELEMETRY)
 
 **Служебное**
 

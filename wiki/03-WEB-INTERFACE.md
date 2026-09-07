@@ -289,6 +289,10 @@ Authenticated Health показывает:
 Публичные /health и /ready возвращают минимальный plain text. /ready проверяет
 SQLite, но не все proxy listeners.
 
+Runtime table также различает installed и validated version и показывает
+telemetry capability/freshness. `unsupported` не означает нулевой трафик.
+Подробный контракт приведен в [Runtime telemetry](18-RUNTIME-TELEMETRY).
+
 ## 16. Credits и коды ответа
 
 Credits содержит repository link и список компонентов. Open GitHub уводит на
@@ -309,3 +313,8 @@ Credits содержит repository link и список компонентов.
 
 Ошибка UI не означает автоматический rollback всех внешних ручных действий.
 Для runtime mutation всегда проверяйте reconcile status и journal.
+
+Browser-facing ошибки и неизвестные routes используют общий Smile OS shell;
+404 содержит навигацию к Health, Users, Routing и Protocols. `/health` и
+`/ready` сохраняют машинный plain-text контракт. Оригинальные локальные favicon,
+Apple Touch icon и минимальный web manifest не требуют CDN или JavaScript.

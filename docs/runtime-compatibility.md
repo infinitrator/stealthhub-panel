@@ -44,6 +44,14 @@ installed version is reported as outside the validated contract and is not
 automatically downgraded. Runtime automatic updates are **off unless an
 operator explicitly enables them**.
 
+Compatibility requires the actual binary probe to equal the exact pin. An
+existing marker must agree as an additional check; a missing marker never
+bypasses the binary probe. Updater and panel inventory prefer the versioned
+`current` symlink target over a stale marker, so a `1.14.0` target cannot be
+reported as validated sing-box `1.13.20`. The automatic path still refuses a
+downgrade to avoid a restart/downgrade loop; returning to the pin is an explicit
+operator action with the prior target retained for rollback.
+
 ## Supported compositions
 
 All new profiles are inserted disabled. `Experimental` means the exact parser

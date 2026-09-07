@@ -17,6 +17,7 @@ backup/restore procedures rather than editing the live database.
 | User sync | `runtime_user_sync` | Per-runtime authorization observations for a generation |
 | Routing | `client_dns_policy`, `client_transport_pools`, `client_transport_pool_members`, `client_routing_rules`, `routing_rule_sets`, `routing_rule_entries`, `routing_rule_sources` | Mihomo DNS, groups, ordered rules and providers |
 | Administrative audit | `audit_events` | Actor/action/object/outcome snapshots with bounded secret-free metadata, append-only through normal application interfaces |
+| Runtime telemetry | `runtime_telemetry_latest`, `runtime_telemetry_samples` | Sanitized latest state and globally bounded observation history; optional user attribution is reserved for reliable adapter-owned collectors |
 
 The exact schema is authoritative in `crates/stealthhub-core/src/storage.rs`.
 Unknown columns must be preserved by migrations and restore tooling.
@@ -45,9 +46,10 @@ checkpoint deletion.
 An active username change, an effective-access boundary, UUID rotation, and
 creation of a user can create a generation. A future expiry does not create a
 second generation until its deadline; reset of only the subscription bearer
-token never changes runtime authorization. Traffic counters and limits are
-stored and displayed, but this release does not provide a live runtime traffic
-collector.
+token never changes runtime authorization. Migration 12 adds sanitized
+telemetry latest/history tables with a 16 KiB row limit and 4096-row global
+retention bound. Current adapters collect runtime state while traffic metrics
+remain explicitly unsupported; telemetry never writes stored usage or quotas.
 
 ## Backup and Recovery
 

@@ -50,9 +50,16 @@ automatic runtime update означает `false`. Updater не переходи
 - ShadowQUIC не получает отдельный `jls-opts`, потому что JLS встроен в протокол.
 - Sudoku никогда не генерирует `aead-method: none`.
 
-Отсутствующий version marker больше не означает compatibility. Adapter запускает
-только фиксированную version-команду своего binary и принимает исключительно
-точный pin; ошибка, неразбираемый вывод и более новая версия дают `outside contract`.
+Version marker сам по себе не означает compatibility. Adapter запускает только
+фиксированную version-команду binary и принимает исключительно точный pin;
+ошибка, неразбираемый вывод и более новая версия дают `outside contract`.
+Если marker отсутствует, точный binary probe остается обязательным. Если marker
+существует, он также обязан совпасть с contract. Updater и GUI предпочитают
+версию target текущего symlink marker-файлу, поэтому stale marker не скрывает
+локально установленный `1.14.0`.
+
+Наблюдаемое runtime-состояние и границы accounting описаны в
+[Runtime telemetry](18-RUNTIME-TELEMETRY).
 
 ## Что показывает GUI
 

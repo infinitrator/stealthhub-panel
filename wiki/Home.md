@@ -46,6 +46,8 @@ Mihomo.
     protocol/core/infrastructure contracts.
 17. [Runtime compatibility](17-RUNTIME-COMPATIBILITY) - точные pins и проверенные
     сочетания.
+18. [Runtime telemetry](18-RUNTIME-TELEMETRY) - observed state, freshness,
+    bounded history и честные unsupported metrics.
 
 ## Быстрый выбор раздела
 
@@ -79,8 +81,8 @@ Mihomo.
 
 ## Что не следует предполагать
 
-- Поля traffic limit/used не означают live accounting: collector и quota
-  enforcement отсутствуют.
+- Поля traffic limit/used не означают live accounting: Phase 3 collector хранит
+  runtime observations, но native traffic APIs и quota enforcement отсутствуют.
 - /health проверяет процесс, а /ready - SQLite; это не data-plane probe.
 - Установленный runtime не обязательно активен или выбран профилем.
 - Успешный binary smoke test не доказывает реальный клиентский handshake.

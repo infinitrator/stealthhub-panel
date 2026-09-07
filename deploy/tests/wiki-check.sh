@@ -28,6 +28,7 @@ required_pages=(
   wiki/15-RELEASE-AND-COMPATIBILITY.md
   wiki/16-ADAPTER-ARCHITECTURE.md
   wiki/17-RUNTIME-COMPATIBILITY.md
+  wiki/18-RUNTIME-TELEMETRY.md
 )
 
 for page in "${required_pages[@]}"; do
