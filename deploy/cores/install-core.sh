@@ -280,7 +280,9 @@ case "$ARCHIVE_PATH" in
         # Read at most one MiB beyond the configured ceiling. This bounds a
         # gzip bomb before its output can consume unbounded disk space.
         gzip -cd -- "$ARCHIVE_PATH" \
-            | dd bs=1048576 count=1025 of="${EXTRACT_DIR}/${BINARY}" 2>/dev/null
+            | dd iflag=fullblock bs=1048576 \
+                count=1025 \
+                of="${EXTRACT_DIR}/${BINARY}" 2>/dev/null
         extracted_size="$(wc -c <"${EXTRACT_DIR}/${BINARY}" | tr -d '[:space:]')"
         if [[ ! "$extracted_size" =~ ^[0-9]+$ ]] \
             || ((extracted_size > MAX_EXTRACTED_BYTES)); then

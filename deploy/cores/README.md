@@ -82,7 +82,10 @@ sudo deploy/cores/install-core.sh \
 The script refuses to switch `current` if checksum verification fails or the
 staged binary does not answer its runtime-specific version command. Mihomo uses
 `-v`; its single-file `.gz` release is decompressed under the same bounded
-extraction policy as archive-based cores.
+1 GiB extraction policy as archive-based cores. The gzip stream is consumed in
+full blocks so normal short pipe reads cannot truncate a valid binary; an
+oversize, interrupted or invalid stream fails before a version directory or
+`current` link is published.
 
 Exact supported pins and adapter capabilities are defined in
 [`docs/runtime-compatibility.md`](../../docs/runtime-compatibility.md).
