@@ -41,6 +41,16 @@ module updater -> version directory -> atomic current symlink -> service restore
 Все активные bundled modules используют GitHub release tags и проверяемые
 release assets. Source-build drivers в активном продукте отсутствуют.
 
+При установке и обновлении панели bundled manifests атомарно синхронизируются
+из release checkout одновременно в active registry и available catalog. Это
+обновляет только product-owned контракты из таблицы выше: custom manifests не
+затрагиваются, а disabled marker не позволяет снова активировать модуль.
+Синхронизация manifest сама по себе не меняет binary, config или состояние
+service и не выполняет автоматический downgrade. Если установленная версия
+новее проверенного pin, проверка показывает `installed version outside
+validated contract`; возврат к pin возможен только явной командой оператора
+`infiproxy-module-update --update <id>`.
+
 ## Manifest contract
 
 Manifest — простые `key=value`, не shell. Он задает:

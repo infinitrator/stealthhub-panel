@@ -188,6 +188,12 @@ Updater не меняет current symlink при failed verification. Если s
     sudo INFIPROXY_FORCE_IPV4=true \
       /usr/local/sbin/infiproxy-module-update --update <id>
 
+Если `current` отсутствует после неудачной первой установки, не создавайте
+symlink вручную и не запускайте файл из staging. Сначала выполните `--check`,
+устраните указанную причину, затем явно повторите `--update <id>`. Updater снова
+проверит точный pinned asset, SHA-256, предел распаковки и version smoke test и
+только после этого атомарно опубликует version directory и `current`.
+
 ## 10. Panel update failed
 
     sudo cat /etc/infiproxy-update.conf

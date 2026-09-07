@@ -171,6 +171,24 @@ retire_legacy_module() {
     rm -f -- "/etc/systemd/system/${service}"
 }
 
+install_bundled_manifest() {
+    local source="$1" target="$2" staging temporary
+    staging="$(mktemp -d "$(dirname "$target")/.manifest.XXXXXX")"
+    temporary="${staging}/$(basename "$target")"
+    if ! install -m 0644 -o root -g root "$source" "$temporary" \
+        || ! "$MODULE_MANIFEST_HELPER" validate "$temporary" --root-owned; then
+        rm -f -- "$temporary"
+        rmdir -- "$staging"
+        return 1
+    fi
+    if ! mv -Tf -- "$temporary" "$target"; then
+        rm -f -- "$temporary"
+        rmdir -- "$staging"
+        return 1
+    fi
+    rmdir -- "$staging"
+}
+
 wait_panel_ready() {
     local bind host port attempts=15
     bind="$(awk -F= '$1 == "INFIPROXY_BIND" { sub("^[^=]*=", ""); print; exit }' \
@@ -397,10 +415,14 @@ retire_legacy_module mtproto infiproxy-mtproto.service
 
 for manifest in "${bundled_manifests[@]}"; do
     module_id="$(basename "$manifest" .module)"
-    install -m 0644 -o root -g root "$manifest" "$MODULE_AVAILABLE_DIR/${module_id}.module"
-    if [[ ! -e "$ROOT_STATE_DIR/module-disabled/${module_id}" \
-        && ! -e "$MODULE_MANIFEST_DIR/${module_id}.module" ]]; then
-        install -m 0644 -o root -g root "$manifest" "$MODULE_MANIFEST_DIR/${module_id}.module"
+    install_bundled_manifest \
+        "$manifest" "$MODULE_AVAILABLE_DIR/${module_id}.module"
+    if [[ -e "$ROOT_STATE_DIR/module-disabled/${module_id}" \
+        || -L "$ROOT_STATE_DIR/module-disabled/${module_id}" ]]; then
+        rm -f -- "$MODULE_MANIFEST_DIR/${module_id}.module"
+    else
+        install_bundled_manifest \
+            "$manifest" "$MODULE_MANIFEST_DIR/${module_id}.module"
     fi
 done
 

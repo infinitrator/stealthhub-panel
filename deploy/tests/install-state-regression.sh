@@ -157,6 +157,18 @@ exit 0
 EOF
     chmod +x "${installer_checkout}/target/release/${binary}"
 done
+cat >"${installer_checkout}/target/release/infiproxy-module-manifest" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    list) exit 0 ;;
+    validate)
+        id="$(awk -F= '$1 == "id" { print $2; exit }' "${2:-}")"
+        [[ -n "$id" && "$(basename "${2:-}")" == "${id}.module" ]] || exit 1
+        ;;
+    *) exit 1 ;;
+esac
+EOF
+chmod +x "${installer_checkout}/target/release/infiproxy-module-manifest"
 
 cat >"${installer_fake_bin}/id" <<'EOF'
 #!/usr/bin/env bash
@@ -168,6 +180,7 @@ fi
 EOF
 cat >"${installer_fake_bin}/install" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$*" >>"${INSTALL_LOG:-/dev/null}"
 args=()
 while [[ "$#" -gt 0 ]]; do
     if [[ "$1" == "-o" || "$1" == "-g" ]]; then
@@ -181,7 +194,20 @@ destination="${args[${#args[@]}-1]}"
 [[ "$destination" == /etc/systemd/system/* ]] && exit 0
 exec /usr/bin/install "${args[@]}"
 EOF
-for command in chown flock getent groupadd systemctl useradd; do
+cat >"${installer_fake_bin}/mv" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-Tf" && "$#" -eq 4 && "${2:-}" == "--" ]]; then
+    rm -f -- "$4"
+    exec /bin/mv -f -- "$3" "$4"
+fi
+exec /bin/mv "$@"
+EOF
+cat >"${installer_fake_bin}/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:-/dev/null}"
+exit 0
+EOF
+for command in chown flock getent groupadd useradd; do
     cat >"${installer_fake_bin}/${command}" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -229,6 +255,8 @@ run_installer_case() {
         export INFIPROXY_UPDATE_CONFIG_FILE="$update_config"
         export INFIPROXY_PANEL_APPLIED_SHA="${scenario}/root-state/panel-last-applied.sha"
         export INFIPROXY_DEFER_APPLIED_SHA=true
+        export INSTALL_LOG="${scenario}/install.log"
+        export SYSTEMCTL_LOG="${scenario}/systemctl.log"
         unset INFIPROXY_UPDATE_REF
         [[ -n "$reviewed_ref" ]] && export INFIPROXY_UPDATE_REF="$reviewed_ref"
         bash "${installer_checkout}/deploy/install.sh" >/dev/null
@@ -257,6 +285,78 @@ override_config="${TMP_DIR}/override-install/update.conf"
 run_installer_case "${TMP_DIR}/override-install" "$override_config" some-reviewed-ref
 assert_update_config "$override_config" some-reviewed-ref \
     || { echo 'explicit reviewed update ref was not preserved' >&2; exit 1; }
+
+manifest_scenario="${TMP_DIR}/manifest-install"
+mkdir -p \
+    "${manifest_scenario}/etc/modules.d" \
+    "${manifest_scenario}/etc/modules.available.d" \
+    "${manifest_scenario}/root-state/module-disabled" \
+    "${manifest_scenario}/root-state/module-versions" \
+    "${manifest_scenario}/cores/sing-box/current" \
+    "${manifest_scenario}/etc/cores/sing-box"
+for module in mihomo sing-box xray; do
+    sed -e 's/^upstream=.*/upstream=release/' -e 's/^ref=.*/ref=/' \
+        "${ROOT_DIR}/deploy/modules.d/${module}.module" \
+        >"${manifest_scenario}/etc/modules.d/${module}.module"
+    cp "${manifest_scenario}/etc/modules.d/${module}.module" \
+        "${manifest_scenario}/etc/modules.available.d/${module}.module"
+done
+printf 'disabled\n' >"${manifest_scenario}/root-state/module-disabled/xray"
+custom_manifest='id=operator-custom
+custom=manifest-must-remain-byte-identical'
+printf '%s\n' "$custom_manifest" \
+    >"${manifest_scenario}/etc/modules.d/operator-custom.module"
+printf '%s\n' "$custom_manifest" \
+    >"${manifest_scenario}/etc/modules.available.d/operator-custom.module"
+printf '#!/usr/bin/env bash\nexit 0\n' \
+    >"${manifest_scenario}/cores/sing-box/current/sing-box"
+chmod 0755 "${manifest_scenario}/cores/sing-box/current/sing-box"
+printf '{"preserved":true}\n' \
+    >"${manifest_scenario}/etc/cores/sing-box/config.json"
+printf 'v1.14.0\n' \
+    >"${manifest_scenario}/root-state/module-versions/sing-box.version"
+
+manifest_config="${manifest_scenario}/update.conf"
+run_installer_case "$manifest_scenario" "$manifest_config"
+for module in xray sing-box hysteria tuic mihomo; do
+    cmp -s "${ROOT_DIR}/deploy/modules.d/${module}.module" \
+        "${manifest_scenario}/etc/modules.available.d/${module}.module" \
+        || { echo "bundled available manifest was not synchronized: ${module}" >&2; exit 1; }
+    if [[ "$module" != xray ]]; then
+        cmp -s "${ROOT_DIR}/deploy/modules.d/${module}.module" \
+            "${manifest_scenario}/etc/modules.d/${module}.module" \
+            || { echo "bundled active manifest was not synchronized: ${module}" >&2; exit 1; }
+        [[ "$(file_mode "${manifest_scenario}/etc/modules.d/${module}.module")" == 644 ]] \
+            || { echo "bundled active manifest mode is not 0644: ${module}" >&2; exit 1; }
+    fi
+    [[ "$(file_mode "${manifest_scenario}/etc/modules.available.d/${module}.module")" == 644 ]] \
+        || { echo "bundled available manifest mode is not 0644: ${module}" >&2; exit 1; }
+done
+[[ ! -e "${manifest_scenario}/etc/modules.d/xray.module" ]] \
+    || { echo 'disabled bundled module was reactivated' >&2; exit 1; }
+[[ "$(cat "${manifest_scenario}/etc/modules.d/operator-custom.module")" == "$custom_manifest" \
+    && "$(cat "${manifest_scenario}/etc/modules.available.d/operator-custom.module")" == "$custom_manifest" ]] \
+    || { echo 'custom manifest was changed' >&2; exit 1; }
+[[ "$(cat "${manifest_scenario}/root-state/module-versions/sing-box.version")" == v1.14.0 \
+    && "$(cat "${manifest_scenario}/etc/cores/sing-box/config.json")" == '{"preserved":true}' \
+    && -x "${manifest_scenario}/cores/sing-box/current/sing-box" ]] \
+    || { echo 'manifest migration changed runtime state or config' >&2; exit 1; }
+if grep -Fq 'infiproxy-sing-box.service' "${manifest_scenario}/systemctl.log"; then
+    echo 'manifest migration changed the sing-box service state' >&2
+    exit 1
+fi
+grep -Eq -- '-m 0644 -o root -g root .+modules\.d/\.manifest\..+/.+\.module' \
+    "${manifest_scenario}/install.log" \
+    || { echo 'active manifests were not staged as root:root 0644' >&2; exit 1; }
+grep -Eq -- '-m 0644 -o root -g root .+modules\.available\.d/\.manifest\..+/.+\.module' \
+    "${manifest_scenario}/install.log" \
+    || { echo 'available manifests were not staged as root:root 0644' >&2; exit 1; }
+
+run_installer_case "$manifest_scenario" "$manifest_config"
+[[ "$(cat "${manifest_scenario}/root-state/module-versions/sing-box.version")" == v1.14.0 \
+    && "$(cat "${manifest_scenario}/etc/cores/sing-box/config.json")" == '{"preserved":true}' \
+    && "$(cat "${manifest_scenario}/etc/modules.d/operator-custom.module")" == "$custom_manifest" ]] \
+    || { echo 'repeated manifest synchronization was not idempotent' >&2; exit 1; }
 
 if INFIPROXY_UPDATE_REPO=infinitrator/stealthhub-panel \
     INFIPROXY_UPDATE_REF='../unsafe' \

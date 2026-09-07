@@ -19,6 +19,10 @@ assert_file_contains() {
         || fail "${file} does not contain exact line: ${expected}"
 }
 
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 FAKE_BIN="${TMP_DIR}/bin"
 mkdir -p "$FAKE_BIN"
 cat >"${FAKE_BIN}/id" <<'EOF'
@@ -54,6 +58,41 @@ done
 exec /usr/bin/install "${args[@]}"
 EOF
 chmod +x "${FAKE_BIN}/install"
+cat >"${FAKE_BIN}/dd" <<'EOF'
+#!/usr/bin/env bash
+fullblock=0
+block_size=512
+count=0
+output=""
+for argument in "$@"; do
+    case "$argument" in
+        iflag=fullblock) fullblock=1 ;;
+        bs=*) block_size="${argument#bs=}" ;;
+        count=*) count="${argument#count=}" ;;
+        of=*) output="${argument#of=}" ;;
+        *) exit 2 ;;
+    esac
+done
+[[ "$fullblock" -eq 1 && "$block_size" =~ ^[0-9]+$ \
+    && "$count" =~ ^[0-9]+$ && -n "$output" ]] || exit 2
+if [[ "${FAKE_DD_FORCE_OVERSIZE:-false}" == "true" ]]; then
+    cat >/dev/null
+    /bin/dd if=/dev/zero of="$output" bs=1 count=0 seek=1073741825 2>/dev/null
+else
+    /usr/bin/head -c "$((block_size * count))" >"$output"
+fi
+EOF
+chmod +x "${FAKE_BIN}/dd"
+cat >"${FAKE_BIN}/gzip" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${FAKE_GZIP_SHORT_WRITES:-false}" != "true" ]]; then
+    exec /usr/bin/gzip "$@"
+fi
+/usr/bin/gzip "$@" | while IFS= read -r line || [[ -n "$line" ]]; do
+    printf '%s\n' "$line"
+done
+EOF
+chmod +x "${FAKE_BIN}/gzip"
 
 make_fake_core() {
     local target="$1"
@@ -97,13 +136,16 @@ install_fake_core mihomo -v "$CORE_ROOT"
 install_fake_core custom --version "$CORE_ROOT"
 
 MIHOMO_GZIP_SOURCE="${TMP_DIR}/mihomo-gzip-source"
-MIHOMO_GZIP_ARCHIVE="${TMP_DIR}/mihomo-release.gz"
+MIHOMO_GZIP_ARCHIVE="${TMP_DIR}/mihomo-linux-amd64-v1.19.30.gz"
 MIHOMO_GZIP_ARGS="${TMP_DIR}/mihomo-gzip-smoke.args"
 : >"$MIHOMO_GZIP_ARGS"
 make_fake_core "$MIHOMO_GZIP_SOURCE"
+awk 'BEGIN { for (i = 0; i < 20000; i++) print "# short-read fixture" }' \
+    >>"$MIHOMO_GZIP_SOURCE"
 gzip -c "$MIHOMO_GZIP_SOURCE" >"$MIHOMO_GZIP_ARCHIVE"
 MIHOMO_GZIP_SHA="$(sha256sum "$MIHOMO_GZIP_ARCHIVE" | awk '{print $1}')"
 PATH="${FAKE_BIN}:${PATH}" \
+    FAKE_GZIP_SHORT_WRITES=true \
     INFIPROXY_CORE_ROOT="${TMP_DIR}/gzip-cores" \
     INFIPROXY_CORE_STAGING="${TMP_DIR}/gzip-staging" \
     SMOKE_ARGS_FILE="$MIHOMO_GZIP_ARGS" SMOKE_ACCEPT="-v" \
@@ -111,6 +153,29 @@ PATH="${FAKE_BIN}:${PATH}" \
         --core mihomo --version test-gzip --archive "$MIHOMO_GZIP_ARCHIVE" \
         --sha256 "$MIHOMO_GZIP_SHA" --binary mihomo >/dev/null
 assert_file_contains "$MIHOMO_GZIP_ARGS" -v
+MIHOMO_GZIP_BINARY="${TMP_DIR}/gzip-cores/mihomo/test-gzip/mihomo"
+[[ -x "$MIHOMO_GZIP_BINARY" ]] \
+    || fail "large Mihomo gzip did not install an executable binary"
+[[ "$(file_mode "$MIHOMO_GZIP_BINARY")" == 755 ]] \
+    || fail "installed Mihomo gzip binary mode is not 0755"
+gzip -cd "$MIHOMO_GZIP_ARCHIVE" | cmp -s - "$MIHOMO_GZIP_BINARY" \
+    || fail "large Mihomo gzip was truncated during extraction"
+
+OVERSIZE_ROOT="${TMP_DIR}/oversize-gzip-cores"
+if PATH="${FAKE_BIN}:${PATH}" \
+    FAKE_DD_FORCE_OVERSIZE=true \
+    INFIPROXY_CORE_ROOT="$OVERSIZE_ROOT" \
+    INFIPROXY_CORE_STAGING="${TMP_DIR}/oversize-gzip-staging" \
+    SMOKE_ARGS_FILE="${TMP_DIR}/oversize-gzip-smoke.args" SMOKE_ACCEPT="-v" \
+    bash "${ROOT_DIR}/deploy/cores/install-core.sh" \
+        --core mihomo --version too-large --archive "$MIHOMO_GZIP_ARCHIVE" \
+        --sha256 "$MIHOMO_GZIP_SHA" --binary mihomo >/dev/null 2>&1
+then
+    fail "gzip output larger than 1 GiB unexpectedly installed"
+fi
+[[ ! -e "${OVERSIZE_ROOT}/mihomo/current" \
+    && ! -e "${OVERSIZE_ROOT}/mihomo/too-large" ]] \
+    || fail "oversize gzip published a binary or current symlink"
 
 install_fake_core xray --version "$CORE_ROOT"
 assert_file_contains "${TMP_DIR}/xray-smoke.args" version
@@ -212,6 +277,53 @@ chmod +x "${FAKE_BIN}/curl"
     install_release_module false
     [[ "$(cat "${MODULE_VERSION_DIR}/demo.version")" == "v1.1.0" ]] \
         || fail "automatic pinned update downgraded a newer installed runtime"
+
+    load_module() {
+        [[ "$1" == sing-box ]] || return 1
+        M_ID="sing-box"
+        M_REPO="SagerNet/sing-box"
+        M_UPSTREAM="pinned-release"
+        M_REF="v1.13.20"
+        M_DRIVER="release"
+        M_ROOT="cores"
+        M_BINARY="sing-box"
+        M_SERVICE="infiproxy-sing-box.service"
+        M_CONFIG="${TMP_DIR}/configs/sing-box/config.json"
+        M_ASSET_AMD64='sing-box-{version}-linux-amd64.tar.gz'
+        M_ASSET_ARM64='sing-box-{version}-linux-arm64.tar.gz'
+    }
+    github_json() {
+        local tag="v1.14.0"
+        [[ "$1" == */releases/tags/v1.13.20 ]] && tag="v1.13.20"
+        printf '{"tag_name":"%s","draft":false,"prerelease":false,"assets":[{"name":"sing-box-%s-linux-amd64.tar.gz","browser_download_url":"https://github.com/SagerNet/sing-box/releases/download/%s/sing-box-%s-linux-amd64.tar.gz","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},{"name":"sing-box-%s-linux-arm64.tar.gz","browser_download_url":"https://github.com/SagerNet/sing-box/releases/download/%s/sing-box-%s-linux-arm64.tar.gz","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}' \
+            "$tag" "${tag#v}" "$tag" "${tag#v}" "${tag#v}" "$tag" "${tag#v}"
+    }
+    mkdir -p "${INFIPROXY_CORE_ROOT}/sing-box/current"
+    printf 'v1.14.0\n' >"${MODULE_VERSION_DIR}/sing-box.version"
+    printf '#!/usr/bin/env bash\nexit 0\n' \
+        >"${INFIPROXY_CORE_ROOT}/sing-box/current/sing-box"
+    chmod +x "${INFIPROXY_CORE_ROOT}/sing-box/current/sing-box"
+    sing_box_status="$(check_module sing-box)"
+    [[ "$sing_box_status" == *'latest=v1.13.20'* \
+        && "$sing_box_status" == *'installed version outside validated contract'* ]] \
+        || fail "production sing-box pin did not report a newer installed version safely"
+    install_release_module() {
+        printf '%s\n' "$1" >"${TMP_DIR}/sing-box-allow-downgrade"
+    }
+    update_module sing-box true
+    assert_file_contains "${TMP_DIR}/sing-box-allow-downgrade" true
+
+    M_ID="mihomo"
+    M_REPO="MetaCubeX/mihomo"
+    M_UPSTREAM="pinned-release"
+    M_REF="v1.19.30"
+    M_ASSET_AMD64='mihomo-linux-amd64-v{version}.gz'
+    github_json() {
+        printf '{"tag_name":"v1.19.30","draft":false,"prerelease":false,"assets":[{"name":"mihomo-linux-amd64-v1.19.30.gz","browser_download_url":"https://github.com/MetaCubeX/mihomo/releases/download/v1.19.30/mihomo-linux-amd64-v1.19.30.gz","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}]}'
+    }
+    [[ "$(release_metadata amd64 | cut -d'|' -f1-2)" \
+        == 'v1.19.30|mihomo-linux-amd64-v1.19.30.gz' ]] \
+        || fail "production Mihomo pin did not resolve its gzip release asset"
 
     M_ID="sing-box"
     M_ROOT="cores"
