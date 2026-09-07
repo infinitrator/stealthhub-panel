@@ -12,6 +12,8 @@ EnvironmentFile=/etc/infiproxy/infiproxy.env
 ExecStart=/usr/local/libexec/infiproxy-reconcile
 UMask=0077
 NoNewPrivileges=true
+# infiproxy-reconcile.service
+AmbientCapabilities=CAP_SETUID
 PrivateTmp=true
 PrivateDevices=true
 ProtectHome=true
