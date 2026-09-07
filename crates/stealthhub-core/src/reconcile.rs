@@ -992,6 +992,7 @@ mod tests {
         rollbacks: usize,
         activations: Vec<bool>,
         delay_ms: u64,
+        compatible: bool,
     }
 
     impl Default for FakeCoreState {
@@ -1005,6 +1006,7 @@ mod tests {
                 rollbacks: 0,
                 activations: Vec::new(),
                 delay_ms: 0,
+                compatible: true,
             }
         }
     }
@@ -1035,6 +1037,10 @@ mod tests {
         fn fail_at(&self, failure: Failure) {
             self.state.lock().unwrap().failure = failure;
         }
+
+        fn deny_compatibility(&self) {
+            self.state.lock().unwrap().compatible = false;
+        }
     }
 
     impl CoreAdapter for FakeCore {
@@ -1044,6 +1050,10 @@ mod tests {
 
         fn installed(&self) -> Result<bool> {
             Ok(true)
+        }
+
+        fn compatible(&self, _required: &BTreeSet<String>) -> Result<bool> {
+            Ok(self.state.lock().unwrap().compatible)
         }
 
         fn stage_config(&self, plan: &CorePlan, transaction_dir: &Path) -> Result<PathBuf> {
@@ -1515,6 +1525,31 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, ReconcileStatus::Unsupported);
         assert_eq!(core.state.lock().unwrap().installs, 0);
+    }
+
+    #[test]
+    fn privileged_compatibility_failure_prevents_runtime_mutation() {
+        let protocol = FakeProtocol::new("tls-protocol", "tls-capability");
+        let core = FakeCore::new("tls-core", &["tls-capability"]);
+        core.deny_compatibility();
+        let (protocols, cores) = registries(vec![protocol], vec![core.clone()]);
+        let reconciler = Reconciler::new(protocols, cores, FakeStore::new(1), temp_dir());
+        let outcome = reconciler
+            .reconcile(
+                &desired(
+                    1,
+                    vec![profile("tls-protocol", Some("tls-core"), true)],
+                    &[],
+                ),
+                &resolver(&[]),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.status, ReconcileStatus::Unsupported);
+        let state = core.state.lock().unwrap();
+        assert_eq!(state.installs, 0);
+        assert!(state.activations.is_empty());
+        assert_eq!(state.current, "known-good");
     }
 
     #[test]

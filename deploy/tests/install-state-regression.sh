@@ -273,6 +273,9 @@ feature_config="${TMP_DIR}/feature-install/update.conf"
 run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
 assert_update_config "$feature_config" main \
     || { echo 'feature checkout changed the default update ref' >&2; exit 1; }
+grep -Fqx 'start infiproxy-reconcile.service' \
+    "${TMP_DIR}/feature-install/systemctl.log" \
+    || { echo 'installer did not bootstrap root TLS readiness' >&2; exit 1; }
 
 git -C "$installer_checkout" checkout --detach -q
 cp "${ROOT_DIR}/deploy/install.sh" "${installer_checkout}/deploy/install.sh"
