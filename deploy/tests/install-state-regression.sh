@@ -157,6 +157,13 @@ exit 0
 EOF
     chmod +x "${installer_checkout}/target/release/${binary}"
 done
+cat >"${installer_checkout}/target/release/infiproxy-reconcile" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${RECONCILE_HELPER_LOG:?}"
+[[ "$#" -eq 1 && "$1" == "--publish-tls-readiness" ]] || exit 2
+[[ "${RECONCILE_BOOTSTRAP_FAIL:-false}" != true ]]
+EOF
+chmod +x "${installer_checkout}/target/release/infiproxy-reconcile"
 cat >"${installer_checkout}/target/release/infiproxy-module-manifest" <<'EOF'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -205,6 +212,10 @@ EOF
 cat >"${installer_fake_bin}/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${SYSTEMCTL_LOG:-/dev/null}"
+if [[ "${FULL_RECONCILE_FAIL:-false}" == true \
+    && "$*" == "start infiproxy-reconcile.service" ]]; then
+    exit 1
+fi
 exit 0
 EOF
 for command in chown flock getent groupadd useradd; do
@@ -217,6 +228,7 @@ chmod +x "${installer_fake_bin}"/*
 
 run_installer_case() {
     local scenario="$1" update_config="$2" reviewed_ref="${3:-}"
+    local bootstrap_fail="${4:-false}" full_reconcile_fail="${5:-false}"
     mkdir -p "$scenario/systemd" "$scenario/profile"
     (
         export PATH="${installer_fake_bin}:${PATH}"
@@ -257,6 +269,9 @@ run_installer_case() {
         export INFIPROXY_DEFER_APPLIED_SHA=true
         export INSTALL_LOG="${scenario}/install.log"
         export SYSTEMCTL_LOG="${scenario}/systemctl.log"
+        export RECONCILE_HELPER_LOG="${scenario}/reconcile-helper.log"
+        export RECONCILE_BOOTSTRAP_FAIL="$bootstrap_fail"
+        export FULL_RECONCILE_FAIL="$full_reconcile_fail"
         unset INFIPROXY_UPDATE_REF
         [[ -n "$reviewed_ref" ]] && export INFIPROXY_UPDATE_REF="$reviewed_ref"
         bash "${installer_checkout}/deploy/install.sh" >/dev/null
@@ -273,9 +288,27 @@ feature_config="${TMP_DIR}/feature-install/update.conf"
 run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
 assert_update_config "$feature_config" main \
     || { echo 'feature checkout changed the default update ref' >&2; exit 1; }
-grep -Fqx 'start infiproxy-reconcile.service' \
-    "${TMP_DIR}/feature-install/systemctl.log" \
+grep -Fqx -- '--publish-tls-readiness' \
+    "${TMP_DIR}/feature-install/reconcile-helper.log" \
     || { echo 'installer did not bootstrap root TLS readiness' >&2; exit 1; }
+if grep -Fqx 'start infiproxy-reconcile.service' \
+    "${TMP_DIR}/feature-install/systemctl.log"; then
+    echo 'installer coupled snapshot bootstrap to full reconciliation' >&2
+    exit 1
+fi
+
+decoupled_config="${TMP_DIR}/decoupled-install/update.conf"
+run_installer_case "${TMP_DIR}/decoupled-install" "$decoupled_config" "" false true
+grep -Fqx -- '--publish-tls-readiness' \
+    "${TMP_DIR}/decoupled-install/reconcile-helper.log" \
+    || { echo 'valid bootstrap was skipped when full reconcile would fail' >&2; exit 1; }
+
+failed_bootstrap_config="${TMP_DIR}/failed-bootstrap-install/update.conf"
+if run_installer_case \
+    "${TMP_DIR}/failed-bootstrap-install" "$failed_bootstrap_config" "" true false; then
+    echo 'installer ignored TLS readiness bootstrap failure' >&2
+    exit 1
+fi
 
 git -C "$installer_checkout" checkout --detach -q
 cp "${ROOT_DIR}/deploy/install.sh" "${installer_checkout}/deploy/install.sh"
