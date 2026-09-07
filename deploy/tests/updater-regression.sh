@@ -59,28 +59,62 @@ exec /usr/bin/install "${args[@]}"
 EOF
 chmod +x "${FAKE_BIN}/install"
 cat >"${FAKE_BIN}/dd" <<'EOF'
-#!/usr/bin/env bash
-fullblock=0
-block_size=512
-count=0
-output=""
-for argument in "$@"; do
-    case "$argument" in
-        iflag=fullblock) fullblock=1 ;;
-        bs=*) block_size="${argument#bs=}" ;;
-        count=*) count="${argument#count=}" ;;
-        of=*) output="${argument#of=}" ;;
-        *) exit 2 ;;
-    esac
-done
-[[ "$fullblock" -eq 1 && "$block_size" =~ ^[0-9]+$ \
-    && "$count" =~ ^[0-9]+$ && -n "$output" ]] || exit 2
-if [[ "${FAKE_DD_FORCE_OVERSIZE:-false}" == "true" ]]; then
-    cat >/dev/null
-    /bin/dd if=/dev/zero of="$output" bs=1 count=0 seek=1073741825 2>/dev/null
-else
-    /usr/bin/head -c "$((block_size * count))" >"$output"
-fi
+#!/usr/bin/env perl
+use strict;
+use warnings;
+
+my ($fullblock, $block_size, $count, $output) = (0, 512, 0, q{});
+for my $argument (@ARGV) {
+    if ($argument eq 'iflag=fullblock') {
+        $fullblock = 1;
+    } elsif ($argument =~ /^bs=([0-9]+)$/) {
+        $block_size = $1;
+    } elsif ($argument =~ /^count=([0-9]+)$/) {
+        $count = $1;
+    } elsif ($argument =~ /^of=(.+)$/) {
+        $output = $1;
+    } else {
+        exit 2;
+    }
+}
+exit 2 if $block_size < 1 || $count < 1 || $output eq q{};
+
+binmode STDIN;
+open my $target, '>:raw', $output or die "open output: $!";
+if (($ENV{FAKE_DD_FORCE_OVERSIZE} // 'false') eq 'true') {
+    my $buffer;
+    1 while sysread(STDIN, $buffer, 4096);
+    truncate $target, 1_073_741_825 or die "truncate output: $!";
+    close $target or die "close output: $!";
+    exit 0;
+}
+
+my $records = 0;
+my $eof = 0;
+while ($records < $count && !$eof) {
+    my $record_bytes = 0;
+    while ($record_bytes < $block_size) {
+        my $remaining = $block_size - $record_bytes;
+        my $read_size = $remaining < 4096 ? $remaining : 4096;
+        my $buffer;
+        my $read = sysread(STDIN, $buffer, $read_size);
+        die "read input: $!" unless defined $read;
+        if ($read == 0) {
+            $eof = 1;
+            last;
+        }
+        my $offset = 0;
+        while ($offset < $read) {
+            my $written = syswrite($target, $buffer, $read - $offset, $offset);
+            die "write output: $!" unless defined $written && $written > 0;
+            $offset += $written;
+        }
+        $record_bytes += $read;
+        last unless $fullblock;
+    }
+    $records++ if $record_bytes > 0;
+}
+close $target or die "close output: $!";
 EOF
 chmod +x "${FAKE_BIN}/dd"
 cat >"${FAKE_BIN}/gzip" <<'EOF'
@@ -88,9 +122,24 @@ cat >"${FAKE_BIN}/gzip" <<'EOF'
 if [[ "${FAKE_GZIP_SHORT_WRITES:-false}" != "true" ]]; then
     exec /usr/bin/gzip "$@"
 fi
-/usr/bin/gzip "$@" | while IFS= read -r line || [[ -n "$line" ]]; do
-    printf '%s\n' "$line"
-done
+/usr/bin/gzip "$@" | /usr/bin/perl -e '
+    use strict;
+    use warnings;
+    binmode STDIN;
+    binmode STDOUT;
+    while (1) {
+        my $buffer;
+        my $read = sysread(STDIN, $buffer, 4096);
+        die "read decompressor: $!" unless defined $read;
+        last if $read == 0;
+        my $offset = 0;
+        while ($offset < $read) {
+            my $written = syswrite(STDOUT, $buffer, $read - $offset, $offset);
+            die "write decompressor: $!" unless defined $written && $written > 0;
+            $offset += $written;
+        }
+    }
+'
 EOF
 chmod +x "${FAKE_BIN}/gzip"
 
@@ -140,10 +189,34 @@ MIHOMO_GZIP_ARCHIVE="${TMP_DIR}/mihomo-linux-amd64-v1.19.30.gz"
 MIHOMO_GZIP_ARGS="${TMP_DIR}/mihomo-gzip-smoke.args"
 : >"$MIHOMO_GZIP_ARGS"
 make_fake_core "$MIHOMO_GZIP_SOURCE"
-awk 'BEGIN { for (i = 0; i < 20000; i++) print "# short-read fixture" }' \
+awk 'BEGIN { for (i = 0; i < 300000; i++) print "# short-read fixture" }' \
     >>"$MIHOMO_GZIP_SOURCE"
 gzip -c "$MIHOMO_GZIP_SOURCE" >"$MIHOMO_GZIP_ARCHIVE"
 MIHOMO_GZIP_SHA="$(sha256sum "$MIHOMO_GZIP_ARCHIVE" | awk '{print $1}')"
+
+BINARY_STREAM_SOURCE="${TMP_DIR}/short-read-binary-source"
+BINARY_STREAM_ARCHIVE="${TMP_DIR}/short-read-binary.gz"
+OLD_DD_OUTPUT="${TMP_DIR}/short-read-old-output"
+FULLBLOCK_DD_OUTPUT="${TMP_DIR}/short-read-fullblock-output"
+/usr/bin/perl -e 'binmode STDOUT; print pack("C*", 0 .. 255) x 24576' \
+    >"$BINARY_STREAM_SOURCE"
+gzip -c "$BINARY_STREAM_SOURCE" >"$BINARY_STREAM_ARCHIVE"
+if FAKE_GZIP_SHORT_WRITES=true "${FAKE_BIN}/gzip" -cd "$BINARY_STREAM_ARCHIVE" \
+    | "${FAKE_BIN}/dd" bs=1048576 count=1025 of="$OLD_DD_OUTPUT" 2>/dev/null; then
+    :
+fi
+OLD_DD_SIZE="$(wc -c <"$OLD_DD_OUTPUT" | tr -d '[:space:]')"
+[[ "$OLD_DD_SIZE" == "$((4096 * 1025))" ]] \
+    || fail "dd without fullblock did not consume one count per short read"
+if cmp -s "$BINARY_STREAM_SOURCE" "$OLD_DD_OUTPUT"; then
+    fail "dd without fullblock unexpectedly preserved the short-read stream"
+fi
+FAKE_GZIP_SHORT_WRITES=true "${FAKE_BIN}/gzip" -cd "$BINARY_STREAM_ARCHIVE" \
+    | "${FAKE_BIN}/dd" iflag=fullblock bs=1048576 count=1025 \
+        of="$FULLBLOCK_DD_OUTPUT" 2>/dev/null
+cmp -s "$BINARY_STREAM_SOURCE" "$FULLBLOCK_DD_OUTPUT" \
+    || fail "dd with fullblock truncated the binary short-read stream"
+
 PATH="${FAKE_BIN}:${PATH}" \
     FAKE_GZIP_SHORT_WRITES=true \
     INFIPROXY_CORE_ROOT="${TMP_DIR}/gzip-cores" \
