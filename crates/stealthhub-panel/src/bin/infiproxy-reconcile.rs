@@ -12,9 +12,9 @@ use anyhow::{bail, Context, Result};
 use stealthhub_core::{
     adapter::{ProtocolRegistry, SecretRef, SecretResolver, SecretValue},
     adapters::{
-        desired_resources, privileged_core_registry, privileged_tls_material_readiness,
-        profile_requires_tls, profile_tls_hostname, protocol_registry,
-        publish_privileged_tls_readiness,
+        bootstrap_privileged_tls_readiness, desired_resources, privileged_core_registry,
+        privileged_tls_material_readiness, profile_requires_tls, profile_tls_hostname,
+        protocol_registry, publish_privileged_tls_readiness,
     },
     desired::{ReconcileRequest, ReconcileStatus},
     models::PanelSettings,
@@ -114,6 +114,10 @@ impl SecretResolver for PrivilegedSecrets {
 async fn main() -> Result<()> {
     require_root()?;
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments.as_slice() == ["--publish-tls-readiness"] {
+        bootstrap_privileged_tls_readiness()?;
+        return Ok(());
+    }
     if arguments
         .first()
         .is_some_and(|value| value == "--adopt-server-secret")

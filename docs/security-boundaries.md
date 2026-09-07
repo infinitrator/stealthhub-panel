@@ -32,6 +32,14 @@ membership. The report is advisory only: the root reconciler repeats live
 effective-access and certificate checks before runtime mutation. Symlink
 targets are validated but never chmod/chown-normalized by the installer.
 
+Installation bootstraps this observation through the root-only
+`infiproxy-reconcile --publish-tls-readiness` mode. That mode performs the same
+live privileged TLS inspection and atomic publication, but does not open the
+panel database, claim a reconcile request, build desired-state plans, or mutate
+runtime configuration. Full reconciliation remains independently fail-closed
+under the systemd path and timer units; unrelated desired-state drift therefore
+cannot roll back an otherwise healthy panel update during snapshot bootstrap.
+
 ## HTTP Boundary
 
 Authentication, authorization, CSRF validation, bounded bodies, trusted proxy

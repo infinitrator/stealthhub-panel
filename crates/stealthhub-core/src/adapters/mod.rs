@@ -15,8 +15,9 @@ use crate::adapter::{CoreRegistry, ProtocolRegistry};
 pub use infrastructure::desired_resources;
 pub use protocols::{default_profiles, legacy_runtime_preference};
 pub use tls::{
-    privileged_tls_material_readiness, profile_requires_tls, profile_tls_hostname,
-    publish_privileged_tls_readiness, tls_material_readiness, TlsMaterialReadiness,
+    bootstrap_privileged_tls_readiness, privileged_tls_material_readiness, profile_requires_tls,
+    profile_tls_hostname, publish_privileged_tls_readiness, tls_material_readiness,
+    TlsMaterialReadiness,
 };
 
 /// Builds the trusted protocol registry shipped with this binary.

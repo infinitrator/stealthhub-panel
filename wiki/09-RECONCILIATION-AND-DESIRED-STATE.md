@@ -248,6 +248,14 @@ key. Она использует последний root-verified metadata repor
 runtime identity, traversal/read или сертификата он завершает проход до
 мутации runtime.
 
+Installer вызывает отдельный root-only режим
+`infiproxy-reconcile --publish-tls-readiness`. Он выполняет live TLS validation
+и atomic snapshot publication, но не открывает desired-state transaction, не
+обрабатывает reconcile request и не меняет runtime. Это разделяет успешность
+обновления control plane и результат последующей полной reconciliation:
+periodic/path worker по-прежнему честно сообщает собственную ошибку, но она не
+превращает уже проверенную установку binary в rollback.
+
 ## 12. Безопасное повторение
 
 После исправления причины не редактируйте applied.json или generation вручную.

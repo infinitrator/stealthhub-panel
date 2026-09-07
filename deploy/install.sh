@@ -462,6 +462,7 @@ install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mihomo"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
 normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/fullchain.pem" "$RUNTIME_GROUP"
 normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/privkey.pem" "$RUNTIME_GROUP"
+"$RECONCILE_HELPER" --publish-tls-readiness
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
     install -m 0640 -o root -g "$RUNTIME_GROUP" "${ROOT_DIR}/deploy/cores/configs/xray.config.example.json" "$CORE_CONFIG_DIR/xray/config.json"
@@ -520,7 +521,6 @@ systemctl enable --now infiproxy-module-update.timer
 systemctl enable --now infiproxy-module-update.path
 systemctl enable --now infiproxy-reconcile.timer
 systemctl enable --now infiproxy-reconcile.path
-systemctl start infiproxy-reconcile.service
 
 echo "Infiproxy installed."
 echo "Status: systemctl status infiproxy.service"

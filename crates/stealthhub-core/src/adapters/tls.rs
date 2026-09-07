@@ -632,6 +632,24 @@ pub fn publish_privileged_tls_readiness() -> anyhow::Result<TlsMaterialReadiness
     Ok(report)
 }
 
+fn bootstrap_report_is_acceptable(report: &TlsMaterialReadiness) -> bool {
+    report.ready || (!report.certificate.present && !report.private_key.present)
+}
+
+/// Publishes live root-verified TLS readiness without reconciling desired state.
+///
+/// A fresh installation may publish an explicit missing-material observation.
+/// Partially present or unsafe material fails the bootstrap after the sanitized
+/// observation has been written atomically.
+pub fn bootstrap_privileged_tls_readiness() -> anyhow::Result<TlsMaterialReadiness> {
+    runtime_identity().ok_or_else(|| anyhow::anyhow!("runtime identity is unavailable"))?;
+    let report = publish_privileged_tls_readiness()?;
+    if !bootstrap_report_is_acceptable(&report) {
+        anyhow::bail!("TLS readiness bootstrap failed: {}", report.detail);
+    }
+    Ok(report)
+}
+
 /// Performs authoritative live TLS checks for the root reconciliation worker.
 #[must_use]
 pub fn privileged_tls_material_readiness(hostname: Option<&str>) -> TlsMaterialReadiness {
@@ -1052,6 +1070,44 @@ mod tests {
             || panic!("an unsafe TLS directory must not consume a snapshot"),
         );
         assert!(!unsafe_directory.ready);
+    }
+
+    #[test]
+    fn bootstrap_accepts_ready_or_fully_absent_material_and_rejects_unsafe_partial_state() {
+        let ready = build_readiness(ready_path(), ready_path(), None, false, |arguments| {
+            Some(command_output(
+                true,
+                if arguments.contains(&"-enddate") {
+                    "notAfter=Jan 01 00:00:00 2038 GMT\n"
+                } else {
+                    ""
+                },
+            ))
+        });
+        assert!(bootstrap_report_is_acceptable(&ready));
+
+        let missing = TlsPathReadiness {
+            present: false,
+            kind: "missing".to_string(),
+            target_is_regular: false,
+            safe_permissions: false,
+        };
+        let absent = build_readiness(missing.clone(), missing, None, false, |_| None);
+        assert!(bootstrap_report_is_acceptable(&absent));
+
+        let unsafe_partial = build_readiness(
+            ready_path(),
+            TlsPathReadiness {
+                present: true,
+                kind: "regular".to_string(),
+                target_is_regular: true,
+                safe_permissions: false,
+            },
+            None,
+            false,
+            |_| None,
+        );
+        assert!(!bootstrap_report_is_acceptable(&unsafe_partial));
     }
 
     #[test]
