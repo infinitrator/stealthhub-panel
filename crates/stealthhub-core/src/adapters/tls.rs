@@ -553,13 +553,20 @@ fn child_metadata_is_permission_denied(path: &Path) -> bool {
 
 fn static_or_direct_readiness(
     mode: TlsReadinessMode,
-    directory_ready: bool,
     child_metadata_denied: bool,
     hostname_requested: bool,
     direct: TlsMaterialReadiness,
     mut snapshot: impl FnMut() -> Option<TlsMaterialReadiness>,
 ) -> TlsMaterialReadiness {
-    if mode == TlsReadinessMode::Static && directory_ready && child_metadata_denied {
+    // The web process intentionally is not a member of infiproxy-runtime.
+    // A PermissionDenied result while inspecting child TLS metadata therefore
+    // means the static observer cannot establish readiness directly; it does
+    // not mean the runtime itself lacks access. Only in that explicit access-
+    // boundary case may Static mode consume the bounded, root-owned snapshot.
+    //
+    // Other direct failures remain fail-closed, and Privileged mode never
+    // trusts the snapshot: the reconciler repeats live checks before mutation.
+    if mode == TlsReadinessMode::Static && child_metadata_denied {
         return snapshot()
             .map(|mut report| {
                 if hostname_requested {
@@ -615,7 +622,6 @@ pub(super) fn tls_material_readiness_with_mode(
     );
     static_or_direct_readiness(
         mode,
-        directory_ready,
         child_metadata_denied,
         hostname.is_some(),
         direct,
@@ -1041,9 +1047,11 @@ mod tests {
             ))
         });
 
+        // This is the production panel boundary: child metadata cannot be
+        // inspected by the unprivileged web process, but root has published a
+        // trusted content-free observation for exactly that condition.
         let selected = static_or_direct_readiness(
             TlsReadinessMode::Static,
-            true,
             true,
             false,
             direct.clone(),
@@ -1052,24 +1060,47 @@ mod tests {
         assert!(selected.ready);
         assert!(!selected.certificate_validation_deferred);
 
-        let privileged = static_or_direct_readiness(
-            TlsReadinessMode::Privileged,
-            true,
+        // A missing/untrusted snapshot must not turn an unknown direct state
+        // into success.
+        let missing_snapshot = static_or_direct_readiness(
+            TlsReadinessMode::Static,
             true,
             false,
             direct.clone(),
-            || panic!("privileged readiness must never consume a snapshot"),
+            || None,
         );
-        assert!(!privileged.ready);
-        let unsafe_directory = static_or_direct_readiness(
+        assert!(!missing_snapshot.ready);
+
+        // If metadata is directly observable, Static mode must use the direct
+        // result and must not consult a possibly stale snapshot.
+        let directly_observable = static_or_direct_readiness(
             TlsReadinessMode::Static,
             false,
-            true,
             false,
-            direct,
-            || panic!("an unsafe TLS directory must not consume a snapshot"),
+            direct.clone(),
+            || panic!("directly observable TLS state must not consume a snapshot"),
         );
-        assert!(!unsafe_directory.ready);
+        assert!(!directly_observable.ready);
+
+        // Hostname claims from a content-free snapshot remain deferred to the
+        // privileged reconciler, which performs the authoritative live check.
+        let hostname_deferred = static_or_direct_readiness(
+            TlsReadinessMode::Static,
+            true,
+            true,
+            direct.clone(),
+            || Some(verified.clone()),
+        );
+        assert!(hostname_deferred.ready);
+        assert!(hostname_deferred.certificate_validation_deferred);
+        assert_eq!(hostname_deferred.hostname_covered, None);
+
+        // Privileged reconciliation must never trust the snapshot.
+        let privileged =
+            static_or_direct_readiness(TlsReadinessMode::Privileged, true, false, direct, || {
+                panic!("privileged readiness must never consume a snapshot")
+            });
+        assert!(!privileged.ready);
     }
 
     #[test]

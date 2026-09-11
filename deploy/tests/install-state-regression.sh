@@ -284,6 +284,20 @@ assert_update_config() {
         && grep -Fqx "REF=${expected_ref}" "$config"
 }
 
+# The web process must remain outside the runtime TLS group on every fresh
+# installation/update. TLS compatibility crosses this boundary through the
+# bounded root-owned readiness snapshot, never by granting the panel key access.
+panel_unit="${ROOT_DIR}/deploy/infiproxy.service"
+grep -Fqx 'User=infiproxy' "$panel_unit" \
+    || { echo 'panel service user boundary changed' >&2; exit 1; }
+grep -Fqx 'Group=infiproxy' "$panel_unit" \
+    || { echo 'panel service group boundary changed' >&2; exit 1; }
+if grep -Eq '^SupplementaryGroups=.*(^|[[:space:]])infiproxy-runtime($|[[:space:]])' \
+    "$panel_unit"; then
+    echo 'panel service gained forbidden runtime-group membership' >&2
+    exit 1
+fi
+
 feature_config="${TMP_DIR}/feature-install/update.conf"
 run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
 assert_update_config "$feature_config" main \

@@ -86,6 +86,16 @@ frontend и node DNS readiness.
 - secret references;
 - runtime compatibility pin/readiness.
 
+Web process намеренно не входит в `infiproxy-runtime` и не получает доступ к
+private TLS key. Если static compatibility не может прочитать child metadata
+из-за `PermissionDenied`, panel использует только bounded root-owned
+`tls-readiness.json`. Если TLS metadata доступна напрямую, unsafe state
+проверяется напрямую и snapshot ее не маскирует. Root reconciler перед каждой
+runtime mutation повторяет live TLS/certificate/hostname checks. Installer и
+panel update публикуют snapshot через отдельный root-only
+`infiproxy-reconcile --publish-tls-readiness`, поэтому тот же privilege boundary
+сохраняется на чистой установке и после обновлений.
+
 Unknown profile или future schema сохраняется в inventory как historical/
 unsupported; данные не удаляются автоматически.
 

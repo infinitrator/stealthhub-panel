@@ -25,12 +25,14 @@ status mirrors, backups intended as public diagnostics, or subscriptions.
 TLS readiness resolves the real `infiproxy-runtime` group and checks ownership,
 safe modes, ancestor traversal, and effective access. The root reconciler
 atomically publishes a bounded, content-free readiness report at
-`/var/lib/infiproxy-maintenance/tls-readiness.json`. The unprivileged panel may
-read this report when directory traversal intentionally prevents direct file
-inspection; it cannot modify the report and never receives runtime-group
-membership. The report is advisory only: the root reconciler repeats live
-effective-access and certificate checks before runtime mutation. Symlink
-targets are validated but never chmod/chown-normalized by the installer.
+`/var/lib/infiproxy-maintenance/tls-readiness.json`. The unprivileged panel
+never receives runtime-group membership and therefore may be unable to inspect
+TLS child metadata directly. When that inspection fails specifically with
+`PermissionDenied`, static compatibility may consume only the trusted
+root-owned readiness snapshot; directly observable unsafe state does not fall
+back to a snapshot. The report is advisory only: the root reconciler repeats
+live effective-access, certificate and hostname checks before runtime mutation.
+Symlink targets are validated but never chmod/chown-normalized by the installer.
 
 Installation bootstraps this observation through the root-only
 `infiproxy-reconcile --publish-tls-readiness` mode. That mode performs the same
