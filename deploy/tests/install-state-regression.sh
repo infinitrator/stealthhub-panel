@@ -298,6 +298,18 @@ if grep -Eq '^SupplementaryGroups=.*(^|[[:space:]])infiproxy-runtime($|[[:space:
     exit 1
 fi
 
+# Candidate Nginx validation owns its scratch tree. The root reconciler must
+# never gain write access to Nginx's global runtime or log directories.
+reconcile_unit="${ROOT_DIR}/deploy/infiproxy-reconcile.service"
+grep -Fqx 'ProtectSystem=strict' "$reconcile_unit" \
+    || { echo 'reconciler filesystem protection changed' >&2; exit 1; }
+grep -Fqx 'NoNewPrivileges=true' "$reconcile_unit" \
+    || { echo 'reconciler privilege boundary changed' >&2; exit 1; }
+if grep -E '^ReadWritePaths=.*(/var/lib/nginx|/var/log/nginx)' "$reconcile_unit"; then
+    echo 'reconciler gained write access to global Nginx state' >&2
+    exit 1
+fi
+
 feature_config="${TMP_DIR}/feature-install/update.conf"
 run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
 assert_update_config "$feature_config" main \

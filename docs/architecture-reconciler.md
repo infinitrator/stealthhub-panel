@@ -60,6 +60,11 @@ Durable phases are `Prepared`, `Staged`, `Validated`, `Snapshotted`, `Installed`
 Live mutation cannot start before every candidate validates and every required
 snapshot is durable.
 
+Staged subscription Nginx validation uses a transaction-local configuration,
+PID path, and private temp directories. Native `nginx -t` is mandatory and
+fail-closed. The reconciler needs no write access to global Nginx runtime or
+temp directories; live Nginx state remains owned by `nginx.service`.
+
 ## Failure and Recovery
 
 A post-mutation error restores all adapter snapshots and previous service

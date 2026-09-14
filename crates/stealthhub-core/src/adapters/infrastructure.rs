@@ -10,7 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
@@ -29,6 +29,96 @@ use crate::{
 const SUBSCRIPTION_ADAPTER_ID: &str = "subscription-frontend";
 const NODE_ADAPTER_ID: &str = "node-readiness";
 const MAX_NGINX_SITE_BYTES: u64 = 1024 * 1024;
+
+const NGINX_TEST_TEMP_DIRECTORIES: [(&str, &str); 5] = [
+    ("client_body_temp_path", "client-body"),
+    ("proxy_temp_path", "proxy"),
+    ("fastcgi_temp_path", "fastcgi"),
+    ("uwsgi_temp_path", "uwsgi"),
+    ("scgi_temp_path", "scgi"),
+];
+
+struct NginxTestPaths<'a> {
+    candidate: &'a Path,
+    transaction: &'a Path,
+}
+
+impl<'a> NginxTestPaths<'a> {
+    fn new(candidate: &'a Path) -> Result<Self> {
+        let transaction = candidate.parent().context("candidate has no parent")?;
+        if candidate.file_name().and_then(|name| name.to_str()) != Some("subscription.conf") {
+            bail!("unexpected Nginx candidate name");
+        }
+        // The reconciler creates this path; reject characters that could alter
+        // Nginx directive syntax rather than interpolating an untrusted path.
+        for path in [transaction, candidate] {
+            let value = path.to_str().context("Nginx test path is not UTF-8")?;
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+            {
+                bail!("Nginx test path has unsupported characters");
+            }
+        }
+        Ok(Self {
+            candidate,
+            transaction,
+        })
+    }
+
+    fn config(&self) -> PathBuf {
+        self.transaction.join("nginx-test.conf")
+    }
+
+    fn runtime(&self) -> PathBuf {
+        self.transaction.join("nginx-test-runtime")
+    }
+
+    fn prepare(&self) -> Result<()> {
+        let runtime = self.runtime();
+        fs::create_dir_all(&runtime)?;
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))?;
+        for (_, directory) in NGINX_TEST_TEMP_DIRECTORIES {
+            let path = runtime.join(directory);
+            fs::create_dir_all(&path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    fn render_config(&self) -> String {
+        let mut config = format!(
+            "pid {};\nerror_log stderr;\nevents {{}}\nhttp {{\n    access_log off;\n    include /etc/nginx/mime.types;\n",
+            self.transaction.join("nginx.pid").display()
+        );
+        for (directive, directory) in NGINX_TEST_TEMP_DIRECTORIES {
+            config.push_str(&format!(
+                "    {directive} {};\n",
+                self.runtime().join(directory).display()
+            ));
+        }
+        config.push_str(&format!("    include {};\n}}\n", self.candidate.display()));
+        config
+    }
+}
+
+fn run_nginx_candidate_test(executable: &Path, paths: &NginxTestPaths<'_>) -> Result<()> {
+    let status = Command::new(executable)
+        .args(["-t", "-p"])
+        .arg(paths.transaction)
+        .arg("-c")
+        .arg(paths.config())
+        .status()
+        .context("run Nginx candidate validation")?;
+    if !status.success() {
+        bail!("nginx rejected staged subscription configuration");
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 struct SubscriptionPaths {
@@ -149,25 +239,10 @@ impl SubscriptionFrontendAdapter {
     }
 
     fn nginx_test(candidate: &Path) -> Result<()> {
-        let test_root = candidate.parent().context("candidate has no parent")?;
-        let test_config = test_root.join("nginx-test.conf");
-        fs::write(
-            &test_config,
-            format!(
-                "pid {};\nevents {{}}\nhttp {{ include /etc/nginx/mime.types; include {}; }}\n",
-                test_root.join("nginx.pid").display(),
-                candidate.display()
-            ),
-        )?;
-        let status = Command::new("/usr/sbin/nginx")
-            .args(["-t", "-c"])
-            .arg(test_config)
-            .status()
-            .context("run Nginx candidate validation")?;
-        if !status.success() {
-            bail!("nginx rejected staged subscription configuration");
-        }
-        Ok(())
+        let paths = NginxTestPaths::new(candidate)?;
+        paths.prepare()?;
+        fs::write(paths.config(), paths.render_config())?;
+        run_nginx_candidate_test(Path::new("/usr/sbin/nginx"), &paths)
     }
 
     fn atomic_site_install(&self, source: &Path) -> Result<()> {
@@ -725,6 +800,55 @@ mod tests {
         assert!(site.contains("location / {\n        return 404;"));
         assert!(!site.contains("nexus.example.test"));
         assert!(!site.contains("node.example.test"));
+    }
+
+    #[test]
+    fn staged_nginx_validation_uses_only_transaction_local_writable_paths() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("infiproxy-nginx-{}", uuid::Uuid::new_v4()));
+        let candidate = root.join("subscription.conf");
+        fs::create_dir(&root)?;
+        fs::write(&candidate, "server { listen 443; }")?;
+        let paths = NginxTestPaths::new(&candidate)?;
+        paths.prepare()?;
+        let config = paths.render_config();
+
+        assert!(config.contains(&format!("pid {};", root.join("nginx.pid").display())));
+        assert!(config.contains("error_log stderr;"));
+        assert!(config.contains("access_log off;"));
+        assert!(config.contains(&format!("include {};", candidate.display())));
+        assert!(config.contains("include /etc/nginx/mime.types;"));
+        for (directive, directory) in NGINX_TEST_TEMP_DIRECTORIES {
+            let temp = paths.runtime().join(directory);
+            assert!(config.contains(&format!("{directive} {};", temp.display())));
+            assert!(temp.is_dir());
+            assert_eq!(fs::metadata(temp)?.permissions().mode() & 0o777, 0o700);
+        }
+        assert!(!config.contains("/var/lib/nginx"));
+        assert!(!config.contains("/var/log/nginx"));
+        assert_eq!(
+            fs::metadata(paths.runtime())?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn staged_nginx_validation_rejects_path_injection_and_native_test_failure() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("infiproxy-nginx-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root)?;
+        assert!(NginxTestPaths::new(&root.join("bad;name/subscription.conf")).is_err());
+        assert!(NginxTestPaths::new(&root.join("../escape/subscription.conf")).is_err());
+        assert!(NginxTestPaths::new(&root.join("other.conf")).is_err());
+        let candidate = root.join("subscription.conf");
+        fs::write(&candidate, "server { listen 443; }")?;
+        let paths = NginxTestPaths::new(&candidate)?;
+        paths.prepare()?;
+        fs::write(paths.config(), paths.render_config())?;
+        assert!(run_nginx_candidate_test(Path::new("/usr/bin/false"), &paths).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
