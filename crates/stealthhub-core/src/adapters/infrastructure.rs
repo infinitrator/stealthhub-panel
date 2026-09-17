@@ -12,6 +12,8 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +31,8 @@ use crate::{
 const SUBSCRIPTION_ADAPTER_ID: &str = "subscription-frontend";
 const NODE_ADAPTER_ID: &str = "node-readiness";
 const MAX_NGINX_SITE_BYTES: u64 = 1024 * 1024;
+const SUBSCRIPTION_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const SUBSCRIPTION_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 const NGINX_TEST_TEMP_DIRECTORIES: [(&str, &str); 5] = [
     ("client_body_temp_path", "client-body"),
@@ -140,6 +144,47 @@ fn validate_restored_nginx_site_with(
     let candidate = validation_root.join("subscription.conf");
     fs::copy(site, &candidate)?;
     validate_nginx_candidate_with(executable, &candidate)
+}
+
+fn subscription_readiness_command(domain: &str, max_time: Duration) -> Command {
+    let max_time = max_time.max(Duration::from_millis(1));
+    let mut command = Command::new("/usr/bin/curl");
+    command.args([
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--max-time",
+        &format!("{:.3}", max_time.as_secs_f64()),
+        "--noproxy",
+        "*",
+        "--resolve",
+        &format!("{domain}:443:127.0.0.1"),
+        &format!("https://{domain}/ready"),
+    ]);
+    command
+}
+
+fn wait_for_subscription_readiness(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut probe: impl FnMut(Duration) -> bool,
+    mut elapsed: impl FnMut() -> Duration,
+    mut wait: impl FnMut(Duration),
+) -> Result<()> {
+    loop {
+        let before_probe = elapsed();
+        if before_probe >= timeout {
+            bail!("subscription HTTPS readiness check failed");
+        }
+        if probe(timeout - before_probe) {
+            return Ok(());
+        }
+        let after_probe = elapsed();
+        if after_probe >= timeout {
+            bail!("subscription HTTPS readiness check failed");
+        }
+        wait(poll_interval.min(timeout - after_probe));
+    }
 }
 
 #[derive(Clone)]
@@ -367,24 +412,18 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
         if !systemctl_is("is-active", "nginx.service") {
             bail!("nginx service is not active");
         }
-        let status = Command::new("/usr/bin/curl")
-            .args([
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "10",
-                "--noproxy",
-                "*",
-                "--resolve",
-            ])
-            .arg(format!("{domain}:443:127.0.0.1"))
-            .arg(format!("https://{domain}/ready"))
-            .status()?;
-        if !status.success() {
-            bail!("subscription HTTPS readiness check failed");
-        }
-        Ok(())
+        let started = Instant::now();
+        wait_for_subscription_readiness(
+            SUBSCRIPTION_READY_TIMEOUT,
+            SUBSCRIPTION_READY_POLL_INTERVAL,
+            |remaining| {
+                subscription_readiness_command(domain, remaining)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            },
+            || started.elapsed(),
+            thread::sleep,
+        )
     }
 
     fn verify_listeners(&self, plan: &CorePlan) -> Result<()> {
@@ -817,9 +856,89 @@ mod tests {
             .unwrap();
         assert!(site.contains("location ^~ /sub/"));
         assert!(site.contains("location ^~ /rules/"));
+        assert!(site.contains("location = /ready"));
         assert!(site.contains("location / {\n        return 404;"));
+        assert!(site.find("location = /ready").unwrap() < site.find("location / {").unwrap());
         assert!(!site.contains("nexus.example.test"));
         assert!(!site.contains("node.example.test"));
+    }
+
+    #[test]
+    fn subscription_readiness_succeeds_immediately() {
+        let probes = std::cell::Cell::new(0);
+        let waits = std::cell::Cell::new(0);
+        wait_for_subscription_readiness(
+            Duration::from_millis(500),
+            Duration::from_millis(100),
+            |_| {
+                probes.set(probes.get() + 1);
+                true
+            },
+            || Duration::ZERO,
+            |_| waits.set(waits.get() + 1),
+        )
+        .unwrap();
+        assert_eq!(probes.get(), 1);
+        assert_eq!(waits.get(), 0);
+    }
+
+    #[test]
+    fn subscription_readiness_retries_http_failures_until_success() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let probes = std::cell::Cell::new(0);
+        wait_for_subscription_readiness(
+            Duration::from_millis(500),
+            Duration::from_millis(100),
+            |_| {
+                let observation = probes.get() + 1;
+                probes.set(observation);
+                observation == 3
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        )
+        .unwrap();
+        assert_eq!(probes.get(), 3);
+        assert_eq!(elapsed.get(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn subscription_readiness_fails_after_bounded_exhaustion() {
+        let elapsed = std::cell::Cell::new(Duration::ZERO);
+        let probes = std::cell::Cell::new(0);
+        let result = wait_for_subscription_readiness(
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            |_| {
+                probes.set(probes.get() + 1);
+                false
+            },
+            || elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert!(result.is_err());
+        assert_eq!(probes.get(), 3);
+        assert_eq!(elapsed.get(), Duration::from_millis(250));
+    }
+
+    #[test]
+    fn subscription_probe_preserves_loopback_tls_hostname_verification() {
+        let command =
+            subscription_readiness_command("siberia.example.test", Duration::from_secs(5));
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), Path::new("/usr/bin/curl"));
+        assert!(arguments
+            .windows(2)
+            .any(|pair| { pair == ["--resolve", "siberia.example.test:443:127.0.0.1"] }));
+        assert!(arguments.contains(&"https://siberia.example.test/ready".to_string()));
+        assert!(arguments.contains(&"--fail".to_string()));
+        assert!(!arguments.iter().any(|argument| {
+            argument == "--insecure" || argument == "-k" || argument == "--http0.9"
+        }));
     }
 
     #[test]
