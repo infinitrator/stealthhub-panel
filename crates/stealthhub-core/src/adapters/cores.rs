@@ -29,6 +29,8 @@ use super::tls::{
     PRIVATE_KEY_PATH,
 };
 const RUNTIME_GROUP: &str = "infiproxy-runtime";
+const RUNTIME_LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_LISTENER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const XRAY_CAPABILITIES: &[&str] = &["vless-reality-tcp", "vless-reality-xhttp"];
 const SING_BOX_CAPABILITIES: &[&str] = &[
     "vless-reality-tcp",
@@ -339,41 +341,87 @@ impl ManagedCoreAdapter {
     }
 
     fn verify_port_set(&self, required: &[(u16, bool)], forbidden: &[(u16, bool)]) -> Result<()> {
-        let output = Command::new("/usr/bin/ss")
-            .args(["-H", "-ltnup"])
-            .output()
-            .context("inspect runtime listeners")?;
-        if !output.status.success() {
-            bail!("listener discovery failed");
-        }
-        let listeners = String::from_utf8(output.stdout)?;
-        let pid = if required.is_empty() {
-            None
-        } else {
-            Some(self.main_pid()?)
-        };
-        for (port, udp) in required {
-            let protocol = if *udp { "udp" } else { "tcp" };
-            let pid_marker = format!("pid={}", pid.context("missing runtime PID")?);
-            if !listeners.lines().any(|line| {
-                line.starts_with(protocol)
-                    && listener_line_has_port(line, *port)
-                    && line.contains(&pid_marker)
-            }) {
-                bail!("required listener is absent or owned by another process");
-            }
-        }
-        for (port, udp) in forbidden {
-            let protocol = if *udp { "udp" } else { "tcp" };
-            if listeners
-                .lines()
-                .any(|line| line.starts_with(protocol) && listener_line_has_port(line, *port))
-            {
-                bail!("stale listener remains active");
-            }
-        }
-        Ok(())
+        let attempts = (RUNTIME_LISTENER_READY_TIMEOUT.as_millis()
+            / RUNTIME_LISTENER_POLL_INTERVAL.as_millis()) as usize
+            + 1;
+        wait_for_listener_readiness(
+            required,
+            forbidden,
+            attempts,
+            || {
+                let output = Command::new("/usr/bin/ss")
+                    .args(["-H", "-ltnup"])
+                    .output()
+                    .context("inspect runtime listeners")?;
+                if !output.status.success() {
+                    bail!("listener discovery failed");
+                }
+                Ok(ListenerObservation {
+                    listeners: String::from_utf8(output.stdout)?,
+                    main_pid: if required.is_empty() {
+                        None
+                    } else {
+                        Some(self.main_pid()?)
+                    },
+                })
+            },
+            || thread::sleep(RUNTIME_LISTENER_POLL_INTERVAL),
+        )
     }
+}
+
+struct ListenerObservation {
+    listeners: String,
+    main_pid: Option<u32>,
+}
+
+fn verify_listener_observation(
+    required: &[(u16, bool)],
+    forbidden: &[(u16, bool)],
+    observation: &ListenerObservation,
+) -> Result<()> {
+    for (port, udp) in required {
+        let protocol = if *udp { "udp" } else { "tcp" };
+        let pid = observation.main_pid.context("missing runtime PID")?;
+        if !observation.listeners.lines().any(|line| {
+            listener_line_has_protocol(line, protocol)
+                && listener_line_has_port(line, *port)
+                && listener_line_has_pid(line, pid)
+        }) {
+            bail!("required listener is absent or owned by another process");
+        }
+    }
+    for (port, udp) in forbidden {
+        let protocol = if *udp { "udp" } else { "tcp" };
+        if observation.listeners.lines().any(|line| {
+            listener_line_has_protocol(line, protocol) && listener_line_has_port(line, *port)
+        }) {
+            bail!("stale listener remains active");
+        }
+    }
+    Ok(())
+}
+
+fn wait_for_listener_readiness(
+    required: &[(u16, bool)],
+    forbidden: &[(u16, bool)],
+    attempts: usize,
+    mut observe: impl FnMut() -> Result<ListenerObservation>,
+    mut wait: impl FnMut(),
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match observe()
+            .and_then(|observation| verify_listener_observation(required, forbidden, &observation))
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts.max(1) {
+            wait();
+        }
+    }
+    Err(last_error.context("listener readiness check did not run")?)
 }
 
 fn bounded_command_output(program: &Path, arguments: &[&str]) -> Result<(bool, Vec<u8>, Vec<u8>)> {
@@ -1117,6 +1165,19 @@ fn listener_line_has_port(line: &str, port: u16) -> bool {
         .any(|field| field.ends_with(&marker))
 }
 
+fn listener_line_has_protocol(line: &str, protocol: &str) -> bool {
+    line.split_whitespace().next() == Some(protocol)
+}
+
+fn listener_line_has_pid(line: &str, pid: u32) -> bool {
+    let marker = format!("pid={pid}");
+    line.match_indices(&marker).any(|(offset, marker)| {
+        line.as_bytes()
+            .get(offset + marker.len())
+            .is_none_or(|byte| !byte.is_ascii_digit())
+    })
+}
+
 fn discover_config_ports(flavor: Flavor, bytes: &[u8]) -> Result<Vec<(u16, bool)>> {
     let mut ports = Vec::new();
     match flavor {
@@ -1470,6 +1531,88 @@ mod tests {
     fn listener_matching_does_not_confuse_port_suffixes() {
         assert!(listener_line_has_port("tcp LISTEN 0 128 [::]:7443", 7443));
         assert!(!listener_line_has_port("tcp LISTEN 0 128 [::]:17443", 7443));
+    }
+
+    #[test]
+    fn listener_readiness_retries_until_the_owned_listener_appears() {
+        let mut observations = 0;
+        let mut waits = 0;
+        wait_for_listener_readiness(
+            &[(11444, true)],
+            &[],
+            3,
+            || {
+                observations += 1;
+                Ok(ListenerObservation {
+                    listeners: if observations == 3 {
+                        "udp UNCONN 0 0 *:11444 *:* users:((\"hysteria\",pid=4321,fd=3))"
+                            .to_string()
+                    } else {
+                        String::new()
+                    },
+                    main_pid: Some(4321),
+                })
+            },
+            || waits += 1,
+        )
+        .unwrap();
+        assert_eq!(observations, 3);
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn listener_readiness_is_bounded_when_listener_never_appears() {
+        let mut observations = 0;
+        let mut waits = 0;
+        let result = wait_for_listener_readiness(
+            &[(11444, true)],
+            &[],
+            3,
+            || {
+                observations += 1;
+                Ok(ListenerObservation {
+                    listeners: String::new(),
+                    main_pid: Some(4321),
+                })
+            },
+            || waits += 1,
+        );
+        assert!(result.is_err());
+        assert_eq!(observations, 3);
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn listener_readiness_rejects_wrong_pid_and_protocol() {
+        let udp = "udp UNCONN 0 0 *:11444 *:* users:((\"hysteria\",pid=43210,fd=3))";
+        assert!(verify_listener_observation(
+            &[(11444, true)],
+            &[],
+            &ListenerObservation {
+                listeners: udp.to_string(),
+                main_pid: Some(4321),
+            }
+        )
+        .is_err());
+        assert!(verify_listener_observation(
+            &[(11444, false)],
+            &[],
+            &ListenerObservation {
+                listeners: udp.to_string(),
+                main_pid: Some(43210),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn listener_readiness_accepts_production_hysteria_ss_format() {
+        let observation = ListenerObservation {
+            listeners: "udp UNCONN 0 0 *:11444 *:* users:((\"hysteria\",pid=9876,fd=3))"
+                .to_string(),
+            main_pid: Some(9876),
+        };
+        verify_listener_observation(&[(11444, true)], &[], &observation).unwrap();
     }
 
     #[test]

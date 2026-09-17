@@ -120,6 +120,28 @@ fn run_nginx_candidate_test(executable: &Path, paths: &NginxTestPaths<'_>) -> Re
     Ok(())
 }
 
+fn validate_nginx_candidate_with(executable: &Path, candidate: &Path) -> Result<()> {
+    let paths = NginxTestPaths::new(candidate)?;
+    paths.prepare()?;
+    fs::write(paths.config(), paths.render_config())?;
+    run_nginx_candidate_test(executable, &paths)
+}
+
+fn validate_restored_nginx_site_with(
+    executable: &Path,
+    site: &Path,
+    validation_root: &Path,
+) -> Result<()> {
+    if !site.is_file() {
+        return Ok(());
+    }
+    fs::create_dir_all(validation_root)?;
+    fs::set_permissions(validation_root, fs::Permissions::from_mode(0o700))?;
+    let candidate = validation_root.join("subscription.conf");
+    fs::copy(site, &candidate)?;
+    validate_nginx_candidate_with(executable, &candidate)
+}
+
 #[derive(Clone)]
 struct SubscriptionPaths {
     site: PathBuf,
@@ -239,10 +261,7 @@ impl SubscriptionFrontendAdapter {
     }
 
     fn nginx_test(candidate: &Path) -> Result<()> {
-        let paths = NginxTestPaths::new(candidate)?;
-        paths.prepare()?;
-        fs::write(paths.config(), paths.render_config())?;
-        run_nginx_candidate_test(Path::new("/usr/sbin/nginx"), &paths)
+        validate_nginx_candidate_with(Path::new("/usr/sbin/nginx"), candidate)
     }
 
     fn atomic_site_install(&self, source: &Path) -> Result<()> {
@@ -378,10 +397,11 @@ impl CoreAdapter for SubscriptionFrontendAdapter {
 
     fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()> {
         self.restore_owned_files(&snapshot.path)?;
-        let test = Command::new("/usr/sbin/nginx").arg("-t").status()?;
-        if !test.success() {
-            bail!("restored Nginx configuration is invalid");
-        }
+        validate_restored_nginx_site_with(
+            Path::new("/usr/sbin/nginx"),
+            &self.paths.site,
+            &snapshot.path.join("nginx-rollback-validation"),
+        )?;
         restore_service_state(snapshot, "nginx.service")
     }
 }
@@ -847,6 +867,48 @@ mod tests {
         paths.prepare()?;
         fs::write(paths.config(), paths.render_config())?;
         assert!(run_nginx_candidate_test(Path::new("/usr/bin/false"), &paths).is_err());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_nginx_validation_uses_the_restored_site_and_local_runtime() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("infiproxy-nginx-{}", uuid::Uuid::new_v4()));
+        let site = root.join("sites-available/infiproxy-subscription.conf");
+        let validation = root.join("transaction/snapshot/nginx-rollback-validation");
+        fs::create_dir_all(site.parent().unwrap())?;
+        fs::write(&site, "server { listen 443 ssl; }")?;
+
+        validate_restored_nginx_site_with(Path::new("/usr/bin/true"), &site, &validation)?;
+
+        let candidate = validation.join("subscription.conf");
+        assert_eq!(fs::read(&candidate)?, fs::read(&site)?);
+        let config = fs::read_to_string(validation.join("nginx-test.conf"))?;
+        assert!(config.contains(&format!("include {};", candidate.display())));
+        assert!(!config.contains("/var/log/nginx"));
+        assert!(!config.contains("/var/lib/nginx"));
+        assert_eq!(
+            fs::metadata(&validation)?.permissions().mode() & 0o777,
+            0o700
+        );
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_nginx_validation_fails_closed_on_native_test_failure() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("infiproxy-nginx-{}", uuid::Uuid::new_v4()));
+        let site = root.join("sites-available/infiproxy-subscription.conf");
+        let validation = root.join("transaction/snapshot/nginx-rollback-validation");
+        fs::create_dir_all(site.parent().unwrap())?;
+        fs::write(&site, "invalid restored configuration")?;
+
+        assert!(
+            validate_restored_nginx_site_with(Path::new("/usr/bin/false"), &site, &validation,)
+                .is_err()
+        );
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

@@ -50,8 +50,9 @@ For generation G, the worker:
 7. snapshots files, service states, listeners, and adapter-owned resources;
 8. verifies that G is still the desired generation;
 9. installs candidates atomically and transitions services deterministically;
-10. verifies health, required listeners, forbidden listeners, and feasible user
-    authorization observations;
+10. verifies health, then waits for a bounded readiness window for required and
+    forbidden listeners while proving protocol, port, and runtime PID ownership,
+    and performs feasible user authorization observations;
 11. publishes `applied_generation = G` with compare-and-swap semantics;
 12. records a sanitized terminal operation and removes private staging data.
 
@@ -60,17 +61,24 @@ Durable phases are `Prepared`, `Staged`, `Validated`, `Snapshotted`, `Installed`
 Live mutation cannot start before every candidate validates and every required
 snapshot is durable.
 
-Staged subscription Nginx validation uses a transaction-local configuration,
-PID path, and private temp directories. Native `nginx -t` is mandatory and
-fail-closed. The reconciler needs no write access to global Nginx runtime or
-temp directories; live Nginx state remains owned by `nginx.service`.
+Staged and rollback subscription Nginx validation use a transaction-local
+configuration, PID path, and private temp directories. Rollback validates an
+exact transaction-local copy of the restored adapter-owned site. Native
+`nginx -t` is mandatory and fail-closed. The reconciler needs no write access
+to global Nginx runtime, log, or temp directories; live Nginx state remains
+owned by `nginx.service`.
 
 ## Failure and Recovery
 
-A post-mutation error restores all adapter snapshots and previous service
-states in reverse order, then verifies the restored state. Verified
+A durable snapshot does not mean that a resource was mutated. A post-mutation
+error restores only journal resources whose `mutation_started` marker is
+durable, in reverse mutation order, then verifies the restored state. This same
+rule applies to startup recovery, so an earlier runtime failure cannot invoke
+rollback or native validation for a later untouched resource. Verified
 compensation produces `RolledBack`. Failed or unprovable compensation produces
-`RecoveryRequired`; it never advances the applied generation.
+`RecoveryRequired`; it never advances the applied generation. The sanitized
+primary application failure remains in the journal and outcome together with
+the rollback or recovery verification result.
 
 At startup, journals before live mutation are safely failed and their staging
 is discarded. A nonterminal journal after mutation is rolled back unless both

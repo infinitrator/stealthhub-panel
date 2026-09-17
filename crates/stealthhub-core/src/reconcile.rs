@@ -137,6 +137,24 @@ struct PreparedCore {
     snapshot: CoreSnapshot,
 }
 
+fn mutated_resources_in_rollback_order(
+    journal: &JournalEntry,
+) -> impl Iterator<Item = &JournalResource> {
+    journal
+        .resources
+        .iter()
+        .rev()
+        .filter(|resource| resource.mutation_started)
+}
+
+fn failure_with_rollback_outcome(primary: &str, outcome: &str) -> String {
+    if primary.contains(outcome) {
+        primary.to_string()
+    } else {
+        format!("{primary}; {outcome}")
+    }
+}
+
 type CorePlans = BTreeMap<String, (Arc<dyn CoreAdapter>, CorePlan)>;
 
 impl Reconciler {
@@ -461,10 +479,7 @@ impl Reconciler {
                 message: None,
             }));
         }
-        let resources = journal
-            .resources
-            .iter()
-            .filter(|resource| resource.mutation_started)
+        let resources = mutated_resources_in_rollback_order(&journal)
             .cloned()
             .collect::<Vec<_>>();
         if resources.is_empty() {
@@ -482,11 +497,15 @@ impl Reconciler {
 
         journal.phase = JournalPhase::RollbackStarted;
         journal.status = ReconcileStatus::Applying;
-        journal.error = Some("recovering interrupted transaction".to_string());
+        let primary_error = journal
+            .error
+            .clone()
+            .unwrap_or_else(|| "interrupted transaction".to_string());
+        journal.error = Some(primary_error.clone());
         self.store.save_journal(&journal)?;
         let expected_root = self.transaction_root.join(journal.generation.to_string());
         let mut failed = false;
-        for resource in resources.into_iter().rev() {
+        for resource in resources {
             let expected_core_root = expected_root.join(&resource.core_id);
             if validate_resource_id(&resource.core_id).is_err()
                 || !resource.snapshot_path.starts_with(&expected_core_root)
@@ -512,7 +531,10 @@ impl Reconciler {
         if failed {
             journal.phase = JournalPhase::RecoveryRequired;
             journal.status = ReconcileStatus::RecoveryRequired;
-            journal.error = Some("automatic recovery could not verify every resource".to_string());
+            journal.error = Some(failure_with_rollback_outcome(
+                &primary_error,
+                "recovery rollback verification failed",
+            ));
         } else {
             let restored = if applied.generation == journal.generation {
                 self.store.compare_and_set_applied(
@@ -528,14 +550,17 @@ impl Reconciler {
             if restored {
                 journal.phase = JournalPhase::RolledBack;
                 journal.status = ReconcileStatus::RolledBack;
-                journal.error = Some("interrupted transaction rolled back".to_string());
+                journal.error = Some(failure_with_rollback_outcome(
+                    &primary_error,
+                    "recovery rollback verified",
+                ));
             } else {
                 journal.phase = JournalPhase::RecoveryRequired;
                 journal.status = ReconcileStatus::RecoveryRequired;
-                journal.error = Some(
-                    "runtime rollback succeeded but applied generation changed concurrently"
-                        .to_string(),
-                );
+                journal.error = Some(failure_with_rollback_outcome(
+                    &primary_error,
+                    "recovery rollback verified but applied generation changed concurrently",
+                ));
             }
         }
         self.store.save_journal(&journal)?;
@@ -768,19 +793,31 @@ impl Reconciler {
         journal.status = ReconcileStatus::Failed;
         journal.error = Some(error.to_string());
         self.store.save_journal(&journal)?;
-        let mut rollback_error = None;
-        for prepared in snapshots.into_iter().rev() {
-            if let Err(error) = prepared.core.rollback_config(&prepared.snapshot) {
-                rollback_error = Some(error);
+        let mut snapshots = snapshots
+            .into_iter()
+            .map(|prepared| (prepared.plan.core_id.clone(), prepared))
+            .collect::<BTreeMap<_, _>>();
+        let mut rollback_failed = false;
+        for resource in mutated_resources_in_rollback_order(&journal) {
+            let Some(prepared) = snapshots.remove(&resource.core_id) else {
+                rollback_failed = true;
+                continue;
+            };
+            if prepared.core.rollback_config(&prepared.snapshot).is_err() {
+                rollback_failed = true;
             }
         }
-        if rollback_error.is_some() {
+        if rollback_failed {
             journal.phase = JournalPhase::RecoveryRequired;
             journal.status = ReconcileStatus::RecoveryRequired;
-            journal.error = Some("rollback verification failed".to_string());
+            journal.error = Some(failure_with_rollback_outcome(
+                error,
+                "rollback verification failed",
+            ));
         } else {
             journal.phase = JournalPhase::RolledBack;
             journal.status = ReconcileStatus::RolledBack;
+            journal.error = Some(failure_with_rollback_outcome(error, "rollback verified"));
         }
         journal.completed_at = Some(chrono::Utc::now().to_rfc3339());
         self.store.save_journal(&journal)?;
@@ -1014,10 +1051,19 @@ mod tests {
     struct FakeCore {
         manifest: CoreAdapterManifest,
         state: Arc<Mutex<FakeCoreState>>,
+        rollback_log: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeCore {
         fn new(id: &str, capabilities: &[&str]) -> Arc<Self> {
+            Self::with_rollback_log(id, capabilities, Arc::new(Mutex::new(Vec::new())))
+        }
+
+        fn with_rollback_log(
+            id: &str,
+            capabilities: &[&str],
+            rollback_log: Arc<Mutex<Vec<String>>>,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 manifest: CoreAdapterManifest {
                     api_version: ADAPTER_API_VERSION,
@@ -1031,6 +1077,7 @@ mod tests {
                     selection_priority: 0,
                 },
                 state: Arc::new(Mutex::new(FakeCoreState::default())),
+                rollback_log,
             })
         }
 
@@ -1159,6 +1206,10 @@ mod tests {
         }
 
         fn rollback_config(&self, snapshot: &CoreSnapshot) -> Result<()> {
+            self.rollback_log
+                .lock()
+                .unwrap()
+                .push(self.manifest.id.clone());
             let mut state = self.state.lock().unwrap();
             state.rollbacks += 1;
             if state.failure == Failure::Rollback {
@@ -1723,6 +1774,82 @@ mod tests {
     }
 
     #[test]
+    fn rollback_does_not_touch_snapshotted_but_unmutated_resources() {
+        let hysteria_protocol = FakeProtocol::new("hysteria-protocol", "hysteria-capability");
+        let frontend_protocol = FakeProtocol::new("frontend-protocol", "frontend-capability");
+        let hysteria = FakeCore::new("hysteria", &["hysteria-capability"]);
+        let frontend = FakeCore::new("subscription-frontend", &["frontend-capability"]);
+        hysteria.fail_at(Failure::Install);
+        let (protocols, cores) = registries(
+            vec![hysteria_protocol, frontend_protocol],
+            vec![hysteria.clone(), frontend.clone()],
+        );
+        let reconciler = Reconciler::new(protocols, cores, FakeStore::new(1), temp_dir());
+
+        let outcome = reconciler
+            .reconcile(
+                &desired(
+                    1,
+                    vec![
+                        profile("hysteria-protocol", Some("hysteria"), true),
+                        profile("frontend-protocol", Some("subscription-frontend"), true),
+                    ],
+                    &[],
+                ),
+                &resolver(&[]),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.status, ReconcileStatus::RolledBack);
+        assert_eq!(hysteria.state.lock().unwrap().rollbacks, 1);
+        assert_eq!(frontend.state.lock().unwrap().installs, 0);
+        assert_eq!(frontend.state.lock().unwrap().rollbacks, 0);
+    }
+
+    #[test]
+    fn rollback_order_for_multiple_mutated_resources_is_reverse_mutation_order() {
+        let rollback_log = Arc::new(Mutex::new(Vec::new()));
+        let core_a = FakeCore::with_rollback_log("core-a", &["capability-a"], rollback_log.clone());
+        let core_b = FakeCore::with_rollback_log("core-b", &["capability-b"], rollback_log.clone());
+        let core_c = FakeCore::with_rollback_log("core-c", &["capability-c"], rollback_log.clone());
+        core_c.fail_at(Failure::Install);
+        let (protocols, cores) = registries(
+            vec![
+                FakeProtocol::new("protocol-a", "capability-a"),
+                FakeProtocol::new("protocol-b", "capability-b"),
+                FakeProtocol::new("protocol-c", "capability-c"),
+            ],
+            vec![core_a, core_b, core_c],
+        );
+        let reconciler = Reconciler::new(protocols, cores, FakeStore::new(1), temp_dir());
+
+        let outcome = reconciler
+            .reconcile(
+                &desired(
+                    1,
+                    vec![
+                        profile("protocol-a", Some("core-a"), true),
+                        profile("protocol-b", Some("core-b"), true),
+                        profile("protocol-c", Some("core-c"), true),
+                    ],
+                    &[],
+                ),
+                &resolver(&[]),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.status, ReconcileStatus::RolledBack);
+        assert_eq!(
+            *rollback_log.lock().unwrap(),
+            vec![
+                "core-c".to_string(),
+                "core-b".to_string(),
+                "core-a".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn rollback_failure_is_recovery_required() {
         let protocol = FakeProtocol::new("fake-protocol", "fake-capability");
         let core = FakeCore::new("fake-core", &["fake-capability"]);
@@ -1738,6 +1865,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.status, ReconcileStatus::RecoveryRequired);
+        let message = outcome.message.unwrap();
+        assert!(message.contains("applied generation changed concurrently"));
+        assert!(message.contains("rollback verification failed"));
     }
 
     #[test]
@@ -1767,6 +1897,45 @@ mod tests {
         let outcome = reconciler.recover().unwrap().unwrap();
         assert_eq!(outcome.status, ReconcileStatus::RolledBack);
         assert_eq!(core.state.lock().unwrap().current, "known-good");
+    }
+
+    #[test]
+    fn recovery_restores_only_mutated_resources_and_preserves_primary_failure() {
+        let mutated = FakeCore::new("hysteria", &["hysteria-capability"]);
+        let untouched = FakeCore::new("subscription-frontend", &["frontend-capability"]);
+        mutated.state.lock().unwrap().current = "partially-applied".to_string();
+        let root = temp_dir();
+        let mut journal = JournalEntry::prepared(1, 0);
+        journal.status = ReconcileStatus::Applying;
+        journal.phase = JournalPhase::Installed;
+        journal.error = Some("listener verification failed".to_string());
+        for (core_id, mutation_started) in [("hysteria", true), ("subscription-frontend", false)] {
+            let snapshot_path = root.join("1").join(core_id).join("snapshot");
+            fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+            fs::write(&snapshot_path, "known-good").unwrap();
+            journal.resources.push(JournalResource {
+                core_id: core_id.to_string(),
+                snapshot_path,
+                service_was_enabled: false,
+                service_was_active: false,
+                mutation_started,
+                verified: false,
+            });
+        }
+        let store = FakeStore::new(1);
+        store.save_journal(&journal).unwrap();
+        let (protocols, cores) = registries(Vec::new(), vec![mutated.clone(), untouched.clone()]);
+        let reconciler = Reconciler::new(protocols, cores, store, &root);
+
+        let outcome = reconciler.recover().unwrap().unwrap();
+
+        assert_eq!(outcome.status, ReconcileStatus::RolledBack);
+        assert_eq!(mutated.state.lock().unwrap().rollbacks, 1);
+        assert_eq!(mutated.state.lock().unwrap().current, "known-good");
+        assert_eq!(untouched.state.lock().unwrap().rollbacks, 0);
+        let message = outcome.message.unwrap();
+        assert!(message.contains("listener verification failed"));
+        assert!(message.contains("recovery rollback verified"));
     }
 
     #[test]
