@@ -128,6 +128,11 @@ Panel updater перед checkout/build сохраняет:
 - Nginx sites;
 - previous source commit и service metadata.
 
+Updater считает SQLite backup успешным только если Online Backup API завершился,
+файл непустой, не является symlink и отдельный `PRAGMA integrity_check` вернул
+ровно `ok`. Перед автоматическим rollback та же проверка выполняется еще раз;
+непроверенная копия не заменяет рабочую БД.
+
 Root backups находятся в:
 
     /var/lib/infiproxy-maintenance/update-backups

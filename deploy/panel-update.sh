@@ -164,6 +164,23 @@ backup_database() {
     }
     sqlite3 "$DATABASE_FILE" ".backup '${backup_dir}/infiproxy.sqlite'" || return 1
     chmod 0600 "${backup_dir}/infiproxy.sqlite" || return 1
+    verify_sqlite_backup "${backup_dir}/infiproxy.sqlite"
+}
+
+verify_sqlite_backup() {
+    local backup_file="$1" integrity
+    [[ -s "$backup_file" && ! -L "$backup_file" ]] || {
+        log "SQLite backup is missing, empty, or unsafe: ${backup_file}"
+        return 1
+    }
+    integrity="$(sqlite3 "$backup_file" 'PRAGMA integrity_check;' 2>/dev/null)" || {
+        log "SQLite backup integrity check could not run"
+        return 1
+    }
+    [[ "$integrity" == "ok" ]] || {
+        log "SQLite backup failed integrity verification"
+        return 1
+    }
 }
 
 backup_control_binaries() {
@@ -290,6 +307,12 @@ restore_control_binaries() {
 
 restore_update_backup() {
     local backup_dir="$1" database_was_present="$2"
+    if [[ "$database_was_present" -eq 1 && ! -f "${backup_dir}/infiproxy.sqlite" ]]; then
+        log "SQLite backup is missing before rollback: ${backup_dir}/infiproxy.sqlite"
+        return 1
+    elif [[ -f "${backup_dir}/infiproxy.sqlite" ]]; then
+        verify_sqlite_backup "${backup_dir}/infiproxy.sqlite" || return 1
+    fi
     systemctl stop infiproxy.service 2>/dev/null || true
     if [[ -f "${backup_dir}/system-configs.tar.gz" ]]; then
         tar -C / -xzf "${backup_dir}/system-configs.tar.gz" || return 1

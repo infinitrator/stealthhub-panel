@@ -433,8 +433,22 @@ cat >"${FAKE_BIN}/sqlite3" <<'EOF'
 database="$1"
 command="$2"
 target="$(printf '%s\n' "$command" | sed -n "s/^\\.backup '\(.*\)'$/\1/p")"
-[[ -n "$target" ]] || exit 1
-cp "$database" "$target"
+if [[ -n "$target" ]]; then
+    if [[ "${SQLITE_EMPTY:-false}" == "true" ]]; then
+        : >"$target"
+    else
+        cp "$database" "$target"
+    fi
+elif [[ "$command" == 'PRAGMA integrity_check;' ]]; then
+    [[ -s "$database" ]] || exit 1
+    if [[ "${SQLITE_INTEGRITY_FAIL:-false}" == "true" ]]; then
+        printf 'database disk image is malformed\n'
+    else
+        printf 'ok\n'
+    fi
+else
+    exit 1
+fi
 EOF
 chmod +x "${FAKE_BIN}/sqlite3"
 
@@ -671,6 +685,23 @@ EOF
     backup_system_configs "$PANEL_BACKUP"
     if SQLITE_FAIL=true backup_database "${TMP_DIR}/failed-panel-backup"; then
         fail "failed SQLite backup was reported as successful"
+    fi
+    mkdir -p "${TMP_DIR}/empty-panel-backup" "${TMP_DIR}/corrupt-panel-backup"
+    if SQLITE_EMPTY=true backup_database "${TMP_DIR}/empty-panel-backup"; then
+        fail "empty SQLite backup was reported as successful"
+    fi
+    if SQLITE_INTEGRITY_FAIL=true backup_database "${TMP_DIR}/corrupt-panel-backup"; then
+        fail "corrupt SQLite backup was reported as successful"
+    fi
+    mkdir -p "${TMP_DIR}/missing-restore-backup"
+    if restore_update_backup "${TMP_DIR}/missing-restore-backup" 1; then
+        fail "rollback accepted a missing SQLite backup"
+    fi
+    mkdir -p "${TMP_DIR}/corrupt-restore-backup"
+    printf 'corrupt backup\n' >"${TMP_DIR}/corrupt-restore-backup/infiproxy.sqlite"
+    if SQLITE_INTEGRITY_FAIL=true \
+        restore_update_backup "${TMP_DIR}/corrupt-restore-backup" 1; then
+        fail "rollback accepted a corrupt SQLite backup"
     fi
     cmp "$DATABASE_FILE" "${PANEL_BACKUP}/infiproxy.sqlite" \
         || fail "panel database backup differs from its source"
