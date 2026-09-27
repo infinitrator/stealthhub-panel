@@ -40,6 +40,24 @@ enum Completion {
     Operation(&'static str, Result<String>),
 }
 
+struct RedrawGate {
+    dirty: bool,
+}
+
+impl RedrawGate {
+    fn initially_dirty() -> Self {
+        Self { dirty: true }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -116,12 +134,14 @@ async fn main() -> Result<()> {
             .send(Completion::Snapshot(Box::new(data::collect().await)))
             .await;
     });
+    let mut redraw = RedrawGate::initially_dirty();
     let result = (|| -> Result<()> {
         loop {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
             while let Ok(message) = receiver.try_recv() {
+                redraw.mark_dirty();
                 app.busy = false;
                 match message {
                     Completion::Snapshot(snapshot) => {
@@ -137,32 +157,39 @@ async fn main() -> Result<()> {
                     },
                 }
             }
-            terminal.draw(|frame| render::draw(frame, &app, theme))?;
+            if redraw.take_dirty() {
+                terminal.draw(|frame| render::draw(frame, &app, theme))?;
+            }
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Release {
-                        continue;
-                    }
-                    match app.key(key) {
-                        Intent::None => {}
-                        Intent::Quit => break,
-                        Intent::Refresh => {
-                            let tx = sender.clone();
-                            task = tokio::spawn(async move {
-                                let _ = tx
-                                    .send(Completion::Snapshot(Box::new(data::collect().await)))
-                                    .await;
-                            });
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Release {
+                            continue;
                         }
-                        Intent::Execute(action, values) => {
-                            let tx = sender.clone();
-                            task = tokio::spawn(async move {
-                                let label = action.label;
-                                let result = operation::execute(action, values).await;
-                                let _ = tx.send(Completion::Operation(label, result)).await;
-                            });
+                        redraw.mark_dirty();
+                        match app.key(key) {
+                            Intent::None => {}
+                            Intent::Quit => break,
+                            Intent::Refresh => {
+                                let tx = sender.clone();
+                                task = tokio::spawn(async move {
+                                    let _ = tx
+                                        .send(Completion::Snapshot(Box::new(data::collect().await)))
+                                        .await;
+                                });
+                            }
+                            Intent::Execute(action, values) => {
+                                let tx = sender.clone();
+                                task = tokio::spawn(async move {
+                                    let label = action.label;
+                                    let result = operation::execute(action, values).await;
+                                    let _ = tx.send(Completion::Operation(label, result)).await;
+                                });
+                            }
                         }
                     }
+                    Event::Resize(_, _) => redraw.mark_dirty(),
+                    _ => {}
                 }
             }
         }
@@ -171,4 +198,26 @@ async fn main() -> Result<()> {
     task.abort();
     let _ = task.await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedrawGate;
+
+    #[test]
+    fn redraw_gate_stays_clean_across_idle_wakes() {
+        let mut redraw = RedrawGate::initially_dirty();
+        assert!(redraw.take_dirty(), "the initial frame must render");
+
+        for _ in 0..20 {
+            assert!(
+                !redraw.take_dirty(),
+                "periodic idle wakes must not trigger a redraw"
+            );
+        }
+
+        redraw.mark_dirty();
+        assert!(redraw.take_dirty(), "an event must trigger one redraw");
+        assert!(!redraw.take_dirty(), "the event redraw must be consumed");
+    }
 }
