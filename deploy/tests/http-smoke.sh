@@ -129,6 +129,10 @@ request 200 /ready
 request 200 /assets/panel.css
 grep -Fqi 'content-type: text/css' "$HEADER_FILE" || fail "CSS content type is missing"
 body_contains ':root'
+body_contains 'gold-accent'
+request 200 /assets/underworld-gate.svg
+grep -Fqi 'content-type: image/svg+xml' "$HEADER_FILE" || fail "SVG mark content type is missing"
+body_contains 'Infiproxy Obsidian Gate mark'
 request 200 /favicon.ico
 grep -Fqi 'content-type: image/x-icon' "$HEADER_FILE" || fail "favicon content type is missing"
 request 200 /apple-touch-icon.png
@@ -137,13 +141,13 @@ request 200 /site.webmanifest
 grep -Fqi 'content-type: application/manifest+json' "$HEADER_FILE" \
     || fail "manifest content type is missing"
 request 404 /route-that-does-not-exist
-body_contains 'Хочешь меня налюбить?!'
+body_contains 'The requested route is not connected to the control plane.'
 body_contains 'href="/admin/routing"'
 request 405 /health --request POST
 body_contains '405 / Method rejected'
 request 422 /admin/login --request POST --data-urlencode username=owner
 body_contains 'Request rejected'
-body_contains 'SMILE OS / REQUEST CONTROL'
+body_contains 'OBSIDIAN GATE / REQUEST CONTROL'
 
 request 200 /admin/setup
 body_contains 'Initial admin setup'

@@ -277,7 +277,7 @@ pub(crate) fn error_response(
                 title,
                 html! {
                     section class="error-console" {
-                        span class="eyebrow" { "SMILE OS / REQUEST CONTROL" }
+                        span class="eyebrow" { "OBSIDIAN GATE / REQUEST CONTROL" }
                         h1 { (title) }
                         p class="error-code" { (status.as_u16()) " / " (status.canonical_reason().unwrap_or("Error")) }
                         div class="notice error" role="alert" { (message) }

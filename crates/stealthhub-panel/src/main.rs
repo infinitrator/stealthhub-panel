@@ -29,6 +29,7 @@ use crate::{
     },
     ui::{
         APPLE_TOUCH_ICON, APP_NAME, FAVICON_16, FAVICON_32, FAVICON_ICO, PANEL_CSS, SITE_MANIFEST,
+        UNDERWORLD_GATE_SVG,
     },
 };
 use argon2::{
@@ -514,6 +515,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
         .route("/assets/panel.css", get(panel_css))
+        .route("/assets/underworld-gate.svg", get(underworld_gate_svg))
         .route("/favicon.ico", get(favicon_ico))
         .route("/favicon-16x16.png", get(favicon_16))
         .route("/favicon-32x32.png", get(favicon_32))
@@ -908,6 +910,10 @@ async fn panel_css() -> impl IntoResponse {
     )
 }
 
+async fn underworld_gate_svg() -> Response {
+    static_asset("image/svg+xml", UNDERWORLD_GATE_SVG)
+}
+
 fn static_asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
     (
         [
@@ -946,7 +952,7 @@ async fn not_found() -> Response {
     html_error_response_with_back(
         StatusCode::NOT_FOUND,
         "404 / Route not found",
-        "Хочешь меня налюбить?! This route is not connected to the control plane.",
+        "The requested route is not connected to the control plane.",
         "/admin",
         "Back to Health",
     )

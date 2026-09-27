@@ -7,6 +7,7 @@ use maud::{html, Markup, DOCTYPE};
 
 pub(crate) const APP_NAME: &str = "Infiproxy";
 pub(crate) const PANEL_CSS: &str = include_str!("assets/panel.css");
+pub(crate) const UNDERWORLD_GATE_SVG: &[u8] = include_bytes!("assets/underworld-gate.svg");
 pub(crate) const FAVICON_ICO: &[u8] = include_bytes!("assets/favicon.ico");
 pub(crate) const FAVICON_16: &[u8] = include_bytes!("assets/favicon-16x16.png");
 pub(crate) const FAVICON_32: &[u8] = include_bytes!("assets/favicon-32x32.png");
@@ -50,7 +51,8 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
                 title { (title) }
-                meta name="theme-color" content="#17191c";
+                meta name="theme-color" content="#120e12";
+                link rel="icon" type="image/svg+xml" href="/assets/underworld-gate.svg";
                 link rel="icon" href="/favicon.ico" sizes="any";
                 link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png";
                 link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png";
@@ -63,8 +65,11 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                 div class="app-chrome" {
                     header class="masthead" {
                         div class="masthead-title" {
-                            a href="/admin" class="wordmark" { (APP_NAME) }
-                            span class="masthead-label" { "NODE CONTROL" }
+                            img class="brand-mark" src="/assets/underworld-gate.svg" alt="" width="42" height="42";
+                            div class="brand-copy" {
+                                a href="/admin" class="wordmark" { (APP_NAME) }
+                                span class="masthead-label" { "OBSIDIAN GATE / NODE CONTROL" }
+                            }
                         }
                         div class="masthead-meta" { "SINGLE NODE / " (env!("CARGO_PKG_VERSION")) }
                     }
@@ -73,17 +78,17 @@ pub(crate) fn layout(title: &str, body: Markup) -> Markup {
                             @for (index, (group, href, label)) in NAVIGATION.iter().enumerate() {
                                 @if index == 0 || NAVIGATION[index - 1].0 != *group { div class="nav-section" { (group) } }
                                 a href=(href) aria-current=[active_navigation(title, label).then_some("page")] {
-                                    span class="nav-index" aria-hidden="true" { ">" } (label)
+                                    span class="nav-index" aria-hidden="true" { "◆" } (label)
                                 }
                             }
                         }
                         main class="content" id="workspace" tabindex="-1" {
                             div class="window-titlebar" {
                                 span { (title) }
-                                span aria-hidden="true" { "[ = ]" }
+                                span class="window-sigil" aria-hidden="true" { "◆ ◇ ◆" }
                             }
                             (body)
-                            footer class="workspace-footer" { "INFIPROXY / NODE CONTROL" span { "Server-rendered control plane" } }
+                            footer class="workspace-footer" { "INFIPROXY / OBSIDIAN GATE" span { "Server-rendered control plane" } }
                         }
                     }
                 }
@@ -105,8 +110,31 @@ mod tests {
         assert!(rendered.contains("aria-current=\"page\""));
         assert!(rendered.contains("href=\"#workspace\""));
         assert!(!rendered.contains("<script"));
-        assert!(PANEL_CSS.contains("--accent:"));
+        for token in [
+            "--page-background:",
+            "--surface-elevated:",
+            "--surface-panel:",
+            "--surface-hover:",
+            "--border-muted:",
+            "--border-accent:",
+            "--text-primary:",
+            "--text-secondary:",
+            "--text-muted:",
+            "--gold-accent:",
+            "--crimson-accent:",
+            "--danger:",
+            "--warning:",
+            "--success:",
+            "--info:",
+            "--focus:",
+            "--disabled:",
+        ] {
+            assert!(PANEL_CSS.contains(token), "missing design token {token}");
+        }
         assert!(PANEL_CSS.contains("prefers-reduced-motion"));
+        assert!(rendered.contains("href=\"/assets/underworld-gate.svg\""));
+        assert!(rendered.contains("OBSIDIAN GATE / NODE CONTROL"));
+        assert_eq!(UNDERWORLD_GATE_SVG.first(), Some(&b'<'));
         assert!(!rendered.contains(">Dashboard<"));
         assert!(rendered.contains("href=\"/admin\" aria-current=\"page\">"));
     }

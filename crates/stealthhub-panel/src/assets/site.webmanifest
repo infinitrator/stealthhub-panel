@@ -3,9 +3,11 @@
   "short_name": "Infiproxy",
   "start_url": "/admin",
   "display": "standalone",
-  "background_color": "#17191c",
-  "theme_color": "#17191c",
+  "background_color": "#0e0b0f",
+  "theme_color": "#120e12",
   "icons": [
+    { "src": "/assets/underworld-gate.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/favicon-32x32.png", "sizes": "32x32", "type": "image/png" },
     { "src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
   ]
 }

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64" role="img" aria-label="Infiproxy Obsidian Gate mark">
+  <rect width="64" height="64" rx="8" fill="#120e12"/>
+  <path d="M12 53V27C12 15.4 20.8 7 32 7s20 8.4 20 20v26" fill="none" stroke="#d6ad58" stroke-width="5"/>
+  <path d="M20 53V28c0-7.2 5-13 12-13s12 5.8 12 13v25" fill="#211820" stroke="#7f6638" stroke-width="3"/>
+  <path d="M32 21c2.2 7.1 8 10.8 8 18.1C40 46.3 35.7 51 32 55c-3.7-4-8-8.7-8-15.9 0-5 2.7-8.7 6-12.8.5 4.7 2.2 7 4.1 9.2.8-4.5-.4-8.9-2.1-14.5Z" fill="#a93646"/>
+  <path d="M32 37c1.8 3 3 5.2 3 8 0 2.1-1.2 4.5-3 7-1.8-2.5-3-4.9-3-7 0-2.8 1.2-5 3-8Z" fill="#f1d9a3"/>
+  <path d="M7 55h50M10 60h44" stroke="#d6ad58" stroke-width="3" stroke-linecap="round"/>
+</svg>
