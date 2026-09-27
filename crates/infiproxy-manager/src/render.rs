@@ -1,4 +1,4 @@
-//! Terminal-safe Node Control theme and responsive rendering.
+//! Terminal-safe Obsidian Gate theme and responsive rendering.
 
 use crate::app::{App, SCREENS};
 use ratatui::{
@@ -49,21 +49,37 @@ impl Theme {
     fn base(self) -> Style {
         match self.mode {
             ColorMode::TrueColor => Style::default()
-                .fg(Color::Rgb(240, 238, 232))
-                .bg(Color::Rgb(23, 25, 28)),
+                .fg(Color::Rgb(243, 234, 216))
+                .bg(Color::Rgb(14, 11, 15)),
             ColorMode::Indexed => Style::default()
-                .fg(Color::Indexed(255))
-                .bg(Color::Indexed(234)),
+                .fg(Color::Indexed(230))
+                .bg(Color::Indexed(233)),
             ColorMode::Ansi => Style::default().fg(Color::White).bg(Color::Black),
             ColorMode::None => Style::default(),
         }
     }
     fn accent(self) -> Style {
         match self.mode {
-            ColorMode::TrueColor => self.base().bg(Color::Rgb(147, 58, 61)),
-            ColorMode::Indexed => self.base().bg(Color::Indexed(88)),
+            ColorMode::TrueColor => self.base().bg(Color::Rgb(169, 54, 70)),
+            ColorMode::Indexed => self.base().bg(Color::Indexed(124)),
             ColorMode::Ansi => self.base().bg(Color::Red),
             ColorMode::None => Style::default().add_modifier(Modifier::REVERSED),
+        }
+    }
+    fn gold(self) -> Style {
+        match self.mode {
+            ColorMode::TrueColor => self.base().fg(Color::Rgb(214, 173, 88)),
+            ColorMode::Indexed => self.base().fg(Color::Indexed(179)),
+            ColorMode::Ansi => self.base().fg(Color::Yellow),
+            ColorMode::None => Style::default().add_modifier(Modifier::BOLD),
+        }
+    }
+    fn muted(self) -> Style {
+        match self.mode {
+            ColorMode::TrueColor => self.base().fg(Color::Rgb(169, 154, 137)),
+            ColorMode::Indexed => self.base().fg(Color::Indexed(144)),
+            ColorMode::Ansi => self.base().fg(Color::DarkGray),
+            ColorMode::None => Style::default(),
         }
     }
     fn border(self) -> border::Set<'static> {
@@ -87,7 +103,7 @@ impl Theme {
             .borders(Borders::ALL)
             .border_set(self.border())
             .title(title.to_string())
-            .border_style(if focused { self.accent() } else { self.base() })
+            .border_style(if focused { self.gold() } else { self.muted() })
     }
 }
 
@@ -136,7 +152,7 @@ pub fn draw(frame: &mut Frame, app: &App, theme: Theme) {
     .split(area);
     let heading = vec![
         Line::from(Span::styled(
-            " INFIPROXY  /  NODE CONTROL",
+            " INFIPROXY  /  OBSIDIAN GATE  /  NODE CONTROL",
             theme.accent().add_modifier(Modifier::BOLD),
         )),
         Line::from(terminal_text(
@@ -196,7 +212,7 @@ pub fn draw(frame: &mut Frame, app: &App, theme: Theme) {
             Some(app.selected)
         }),
     );
-    frame.render_widget(Paragraph::new(" Arrows: navigate  Tab: focus  Enter: open  PgUp/PgDn: scroll\n R: refresh  ?: help  Esc: back/cancel  Q: quit").style(theme.accent()),vertical[2]);
+    frame.render_widget(Paragraph::new(" Arrows: navigate  Tab: focus  Enter: open  PgUp/PgDn: scroll\n R: refresh  ?: help  Esc: back/cancel  Q: quit").style(theme.gold()),vertical[2]);
     if app.help {
         let area = center(area, 74, 14);
         frame.render_widget(Clear, area);
@@ -354,5 +370,17 @@ mod tests {
         };
         assert_eq!(theme.base().fg, None);
         assert_eq!(theme.accent().bg, None);
+        assert_eq!(theme.gold().fg, None);
+    }
+
+    #[test]
+    fn true_color_theme_uses_obsidian_gold_and_crimson_palette() {
+        let theme = Theme {
+            mode: ColorMode::TrueColor,
+            ascii: false,
+        };
+        assert_eq!(theme.base().bg, Some(Color::Rgb(14, 11, 15)));
+        assert_eq!(theme.gold().fg, Some(Color::Rgb(214, 173, 88)));
+        assert_eq!(theme.accent().bg, Some(Color::Rgb(169, 54, 70)));
     }
 }
