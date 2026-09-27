@@ -161,6 +161,12 @@ if git grep -niE 'refactor/atomic-adapter-reconciler|stealthhub\.service' -- REA
   exit 1
 fi
 
+if git grep -niE 'ultrakill|ultra kill|smile[ -]os|smile-os' -- \
+    README.md docs wiki crates deploy ':!deploy/tests/wiki-check.sh'; then
+  echo 'wiki check failed: retired visual identity remains in a release surface' >&2
+  exit 1
+fi
+
 grep -Fq "UPDATE_REF=\"\${INFIPROXY_UPDATE_REF:-main}\"" deploy/install.sh || {
   echo 'wiki check failed: installer no longer defaults the update ref to main' >&2
   exit 1

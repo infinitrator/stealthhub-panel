@@ -314,7 +314,11 @@ Credits содержит repository link и список компонентов.
 Ошибка UI не означает автоматический rollback всех внешних ручных действий.
 Для runtime mutation всегда проверяйте reconcile status и journal.
 
-Browser-facing ошибки и неизвестные routes используют общий Smile OS shell;
+Browser-facing ошибки и неизвестные routes используют общий Obsidian Gate shell;
 404 содержит навигацию к Health, Users, Routing и Protocols. `/health` и
-`/ready` сохраняют машинный plain-text контракт. Оригинальные локальные favicon,
-Apple Touch icon и минимальный web manifest не требуют CDN или JavaScript.
+`/ready` сохраняют машинный plain-text контракт. Визуальная система основана на
+оригинальной геометрии врат и огня из античной мифологии и не использует ассеты,
+логотипы или шрифты игр и других правообладателей. Локальные SVG/favicon, Apple
+Touch icon и минимальный web manifest не требуют CDN или JavaScript. Цвета
+статусов всегда дополнены текстом; keyboard focus, skip link, reduced motion и
+адаптивная одноколоночная раскладка входят в контракт интерфейса.

@@ -233,6 +233,7 @@ The full threat model and residual risks are in
 - [Reconciliation contract](docs/architecture-reconciler.md)
 - [Runtime compatibility](docs/runtime-compatibility.md)
 - [Storage schema](docs/storage-schema.md)
+- [Obsidian Gate design system](docs/design-system.md)
 - [Development guide](docs/development.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security reporting](SECURITY.md)

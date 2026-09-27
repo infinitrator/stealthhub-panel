@@ -34,6 +34,9 @@ sudo infiproxy-manager update check
 
 Минимальный размер терминала — 80x24. Поддерживаются truecolor, 256 цветов,
 базовый ANSI, `NO_COLOR=1` и ASCII-режим `INFIPROXY_TUI_ASCII=1`.
+Тема Obsidian Gate использует ту же иерархию obsidian/ivory/gold/crimson, что и
+web-панель, но не меняет dirty-redraw gate: при отсутствии событий TUI не
+перерисовывает экран. Цвет не является единственным признаком статуса.
 
 ## 2. Клавиатура
 

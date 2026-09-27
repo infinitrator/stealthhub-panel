@@ -40,12 +40,15 @@ bash deploy/tests/runtime-compatibility.sh
 ## Local Panel
 
 Set a disposable database URL and bind only to loopback. The initial visit to
-`/setup` creates the first owner account.
+`/admin/setup` creates the first owner account. Setup refuses to start without
+a token of at least 32 characters.
 
 ```bash
 mkdir -p .runtime
-export DATABASE_URL=sqlite://$PWD/.runtime/infiproxy.sqlite?mode=rwc
+export INFIPROXY_DB=sqlite://$PWD/.runtime/infiproxy.sqlite?mode=rwc
 export INFIPROXY_BIND=127.0.0.1:8080
+export INFIPROXY_COOKIE_SECURE=false
+export INFIPROXY_SETUP_TOKEN="$(openssl rand -hex 32)"
 cargo run -p stealthhub-panel
 ```
 
@@ -59,6 +62,8 @@ command. UI state may therefore show unavailable privileged resources.
 - Use stable migrations; never rewrite existing operator data destructively.
 - Preserve redaction in errors, Debug output, snapshots, and fixtures.
 - Update README/Wiki/contracts in the same change when behavior or pins change.
+- Keep web and TUI changes aligned with `docs/design-system.md`; regenerate all
+  favicon derivatives when the source mark changes.
 - Add tests at the narrowest contract boundary and run the full workspace gates.
 
 See `CONTRIBUTING.md` for pull-request expectations.
