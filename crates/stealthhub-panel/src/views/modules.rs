@@ -3,7 +3,7 @@
 use crate::{
     admin_bar, csrf_field, is_owner_admin,
     modules::{self, ModuleSpec, ModuleStatus},
-    ui::layout,
+    ui::themed_layout,
     views::components::{runtime_inventory_table, user_sync_badges},
     AuthenticatedAdmin,
 };
@@ -27,8 +27,8 @@ pub(crate) fn render(
     let auto_count = statuses.iter().filter(|status| status.auto_update).count();
 
     Html(
-            layout(
-                "Runtimes",
+            themed_layout(
+                "Runtimes", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Runtimes" }

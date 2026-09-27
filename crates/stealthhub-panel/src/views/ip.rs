@@ -5,7 +5,7 @@ use crate::{
     ip::{ip_risk_note, ip_scope, ip_version, Diagnostics},
     ops::{CommandStep, IP_REPUTATION_SOURCES},
     percent_encode,
-    ui::layout,
+    ui::themed_layout,
     AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
@@ -18,8 +18,8 @@ pub(crate) fn render(
     result: Option<Result<Diagnostics, ()>>,
 ) -> Response {
     Html(
-        layout(
-            "IP Check",
+        themed_layout(
+            "IP Check", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "IP Check" }

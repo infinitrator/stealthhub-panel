@@ -65,6 +65,30 @@ fn csrf_token_is_derived_from_session_token() {
     );
 }
 
+#[tokio::test]
+async fn admin_theme_preference_persists_and_unknown_values_fall_back() {
+    let path = std::env::temp_dir().join(format!("infiproxy-theme-{}.sqlite", Uuid::new_v4()));
+    let pool = open_pool(&format!("sqlite://{}?mode=rwc", path.display()))
+        .await
+        .expect("open theme test database");
+    init_db(&pool)
+        .await
+        .expect("initialize theme test database");
+
+    assert_eq!(load_admin_theme(&pool, 7).await, ui::Theme::ObsidianGate);
+    upsert_setting(&pool, &admin_theme_setting_key(7), "ultrakill")
+        .await
+        .expect("persist theme");
+    assert_eq!(load_admin_theme(&pool, 7).await, ui::Theme::Ultrakill);
+    upsert_setting(&pool, &admin_theme_setting_key(7), "future-theme")
+        .await
+        .expect("persist unknown theme fixture");
+    assert_eq!(load_admin_theme(&pool, 7).await, ui::Theme::ObsidianGate);
+
+    pool.close().await;
+    std::fs::remove_file(path).expect("remove theme test database");
+}
+
 #[test]
 fn owner_admin_is_first_created_admin() {
     let owner = AuthenticatedAdmin {
@@ -72,12 +96,14 @@ fn owner_admin_is_first_created_admin() {
         is_owner: true,
         csrf_token: "csrf".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     let regular = AuthenticatedAdmin {
         admin: test_admin(2),
         is_owner: false,
         csrf_token: "csrf".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
 
     assert!(is_owner_admin(&owner));
@@ -91,12 +117,14 @@ fn audit_history_is_owner_only() {
         is_owner: true,
         csrf_token: "csrf".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     let regular = AuthenticatedAdmin {
         admin: test_admin(2),
         is_owner: false,
         csrf_token: "csrf".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     assert!(can_view_audit(&owner));
     assert!(!can_view_audit(&regular));
@@ -119,6 +147,7 @@ async fn audit_view_escapes_metadata_and_never_receives_secret_fields() {
         is_owner: true,
         csrf_token: "csrf".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     let event = AuditEventRecord {
         id: 1,
@@ -328,6 +357,7 @@ async fn profile_detail_exposes_lifecycle_controls_without_opaque_secret_state()
         is_owner: true,
         csrf_token: "csrf".into(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     let now = Utc::now();
     let mut profile = stealthhub_core::adapters::default_profiles()
@@ -478,6 +508,7 @@ async fn user_views_show_lifecycle_without_exposing_credentials() {
         is_owner: false,
         csrf_token: "csrf-sentinel".to_string(),
         update_notice: None,
+        theme: ui::Theme::ObsidianGate,
     };
     let now = Utc::now();
     let mut user = fixture_user();

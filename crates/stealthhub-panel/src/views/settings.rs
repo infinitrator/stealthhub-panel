@@ -1,6 +1,6 @@
 //! Settings-page presentation.
 
-use crate::{admin_bar, csrf_field, is_owner_admin, ui::layout, update, AuthenticatedAdmin};
+use crate::{admin_bar, csrf_field, is_owner_admin, ui::themed_layout, update, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
 use stealthhub_core::models::PanelSettings;
@@ -11,8 +11,8 @@ pub(crate) fn render(
     update_status: &update::Status,
 ) -> Response {
     Html(
-            layout(
-                "Settings",
+            themed_layout(
+                "Settings", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Settings" }

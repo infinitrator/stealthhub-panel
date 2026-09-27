@@ -3,7 +3,7 @@
 use crate::{
     admin_bar, csrf_field,
     ops::{HostSnapshot, ServiceState, UninstallPlan, CONTROL_PLANE_TARGETS},
-    ui::layout,
+    ui::themed_layout,
     views::components::{meter_bar, runtime_inventory_table, service_state_badge},
     AuthenticatedAdmin, DEPLOYMENT_MODE,
 };
@@ -20,8 +20,8 @@ pub(crate) fn render(
     inventory: &AdapterInventory,
 ) -> Response {
     Html(
-            layout(
-                "System",
+            themed_layout(
+                "System", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "System" }
@@ -262,8 +262,9 @@ pub(crate) fn render(
 
 pub(crate) fn render_uninstall(auth: &AuthenticatedAdmin, plan: &UninstallPlan) -> Response {
     Html(
-        layout(
+        themed_layout(
             "Uninstall preview",
+            auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Uninstall preview" }

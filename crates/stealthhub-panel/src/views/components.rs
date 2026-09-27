@@ -253,6 +253,17 @@ pub(crate) fn admin_bar(auth: &AuthenticatedAdmin) -> Markup {
                         " " span class="badge ok" { "owner" }
                     }
                 }
+                form method="post" action="/admin/theme" class="inline-form theme-control" {
+                    (csrf_field(&auth.csrf_token))
+                    label {
+                        span { "Theme" }
+                        select name="theme" aria-label="Operator theme" {
+                            option value="obsidian-gate" selected[auth.theme == crate::ui::Theme::ObsidianGate] { "Hades / Obsidian Gate" }
+                            option value="ultrakill" selected[auth.theme == crate::ui::Theme::Ultrakill] { "ULTRAKILL" }
+                        }
+                    }
+                    button type="submit" class="compact" { "Apply" }
+                }
                 form method="post" action="/admin/logout" class="inline-form" {
                     (csrf_field(&auth.csrf_token))
                     button type="submit" { "Logout" }

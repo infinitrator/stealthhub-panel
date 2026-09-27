@@ -28,7 +28,9 @@ use crate::{
         uninstall_plan, write_config_file,
     },
     ui::{
-        APPLE_TOUCH_ICON, APP_NAME, FAVICON_16, FAVICON_32, FAVICON_ICO, PANEL_CSS, SITE_MANIFEST,
+        Theme, APPLE_TOUCH_ICON, APP_NAME, FAVICON_16, FAVICON_32, FAVICON_ICO,
+        OBSIDIAN_GATE_MANIFEST, PANEL_CSS, SITE_MANIFEST, ULTRAKILL_APPLE_TOUCH_ICON,
+        ULTRAKILL_FAVICON_16, ULTRAKILL_FAVICON_32, ULTRAKILL_MANIFEST, ULTRAKILL_MARK_SVG,
         UNDERWORLD_GATE_SVG,
     },
 };
@@ -81,7 +83,7 @@ use stealthhub_core::{
         delete_secret_audited, delete_transport_pool_audited, delete_user_audited,
         ensure_default_protocol_profiles, ensure_default_routing_rule_sets,
         ensure_default_settings, get_admin_by_id, get_admin_by_username,
-        get_protocol_profile_by_name, get_reconcile_state, get_secret, get_user_by_id,
+        get_protocol_profile_by_name, get_reconcile_state, get_secret, get_setting, get_user_by_id,
         get_user_by_token, get_valid_admin_session, init_db, is_owner_admin_id, list_audit_events,
         list_protocol_profiles, list_protocol_profiles_decoded, list_runtime_user_sync,
         list_secret_names, list_users, load_client_policy, load_dns_policy, load_panel_settings,
@@ -175,6 +177,13 @@ struct VersionedUserForm {
 
 #[derive(Debug, Deserialize)]
 struct CsrfForm {
+    #[serde(default)]
+    csrf_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ThemeForm {
+    theme: String,
     #[serde(default)]
     csrf_token: String,
 }
@@ -450,6 +459,7 @@ pub(crate) struct AuthenticatedAdmin {
     is_owner: bool,
     csrf_token: String,
     update_notice: Option<update::Notice>,
+    theme: Theme,
 }
 
 #[tokio::main]
@@ -516,6 +526,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/", get(index))
         .route("/assets/panel.css", get(panel_css))
         .route("/assets/underworld-gate.svg", get(underworld_gate_svg))
+        .route("/assets/ultrakill-mark.svg", get(ultrakill_mark_svg))
+        .route("/assets/ultrakill-16x16.png", get(ultrakill_favicon_16))
+        .route("/assets/ultrakill-32x32.png", get(ultrakill_favicon_32))
+        .route(
+            "/assets/ultrakill-apple-touch-icon.png",
+            get(ultrakill_apple_touch_icon),
+        )
+        .route(
+            "/assets/manifest-obsidian-gate.webmanifest",
+            get(obsidian_gate_manifest),
+        )
+        .route(
+            "/assets/manifest-ultrakill.webmanifest",
+            get(ultrakill_manifest),
+        )
         .route("/favicon.ico", get(favicon_ico))
         .route("/favicon-16x16.png", get(favicon_16))
         .route("/favicon-32x32.png", get(favicon_32))
@@ -527,6 +552,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/admin/login", get(login_page).post(login_action))
         .route("/admin/logout", post(logout_action))
+        .route("/admin/theme", post(theme_action))
         .route(
             "/admin/account",
             get(account_page).post(change_password_action),
@@ -914,11 +940,15 @@ async fn underworld_gate_svg() -> Response {
     static_asset("image/svg+xml", UNDERWORLD_GATE_SVG)
 }
 
+async fn ultrakill_mark_svg() -> Response {
+    static_asset("image/svg+xml", ULTRAKILL_MARK_SVG)
+}
+
 fn static_asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
     (
         [
             (header::CONTENT_TYPE, content_type),
-            (header::CACHE_CONTROL, "public, max-age=86400"),
+            (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
         ],
         bytes,
     )
@@ -926,7 +956,14 @@ fn static_asset(content_type: &'static str, bytes: &'static [u8]) -> Response {
 }
 
 async fn favicon_ico() -> Response {
-    static_asset("image/x-icon", FAVICON_ICO)
+    (
+        [
+            (header::CONTENT_TYPE, "image/x-icon"),
+            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+        ],
+        FAVICON_ICO,
+    )
+        .into_response()
 }
 
 async fn favicon_16() -> Response {
@@ -941,10 +978,43 @@ async fn apple_touch_icon() -> Response {
     static_asset("image/png", APPLE_TOUCH_ICON)
 }
 
+async fn ultrakill_favicon_16() -> Response {
+    static_asset("image/png", ULTRAKILL_FAVICON_16)
+}
+
+async fn ultrakill_favicon_32() -> Response {
+    static_asset("image/png", ULTRAKILL_FAVICON_32)
+}
+
+async fn ultrakill_apple_touch_icon() -> Response {
+    static_asset("image/png", ULTRAKILL_APPLE_TOUCH_ICON)
+}
+
 async fn site_manifest() -> Response {
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "application/manifest+json; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-cache, no-store, must-revalidate"),
+        ],
+        SITE_MANIFEST,
+    )
+        .into_response()
+}
+
+async fn obsidian_gate_manifest() -> Response {
     static_asset(
         "application/manifest+json; charset=utf-8",
-        SITE_MANIFEST.as_bytes(),
+        OBSIDIAN_GATE_MANIFEST.as_bytes(),
+    )
+}
+
+async fn ultrakill_manifest() -> Response {
+    static_asset(
+        "application/manifest+json; charset=utf-8",
+        ULTRAKILL_MANIFEST.as_bytes(),
     )
 }
 
@@ -1206,6 +1276,42 @@ async fn logout_action(
     append_session_cookie(&mut response, expired_session_cookie(&state));
     append_session_cookie(&mut response, expired_legacy_session_cookie(&state));
     response
+}
+
+async fn theme_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ThemeForm>,
+) -> Response {
+    let auth = match require_admin(&state, &headers).await {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(response) = csrf_error_response(&auth, &form.csrf_token) {
+        return response;
+    }
+    let Some(theme) = Theme::parse(&form.theme) else {
+        return html_error_response_with_back(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Theme rejected",
+            "Select one of the supported operator themes.",
+            "/admin",
+            "Back to Health",
+        );
+    };
+    let key = admin_theme_setting_key(auth.admin.id);
+    match upsert_setting(&state.pool, &key, theme.as_str()).await {
+        Ok(()) => Redirect::to("/admin").into_response(),
+        Err(error) => logged_error_with_back(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "save administrator theme",
+            error,
+            "Theme was not saved",
+            "The cosmetic preference could not be stored. Authentication and runtime operation are unchanged.",
+            "/admin",
+            "Back to Health",
+        ),
+    }
 }
 
 async fn account_page(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -4774,13 +4880,30 @@ async fn current_admin(
         return Ok(None);
     };
     let is_owner = is_owner_admin_id(&state.pool, admin.id).await?;
+    let theme = load_admin_theme(&state.pool, admin.id).await;
 
     Ok(Some(AuthenticatedAdmin {
         admin,
         is_owner,
         csrf_token: csrf_token_for_session_token(&token),
         update_notice,
+        theme,
     }))
+}
+
+fn admin_theme_setting_key(admin_id: i64) -> String {
+    format!("admin.{admin_id}.theme")
+}
+
+async fn load_admin_theme(pool: &SqlitePool, admin_id: i64) -> Theme {
+    match get_setting(pool, &admin_theme_setting_key(admin_id)).await {
+        Ok(Some(setting)) => Theme::parse(&setting.value).unwrap_or_default(),
+        Ok(None) => Theme::default(),
+        Err(error) => {
+            tracing::warn!(%error, admin_id, "theme preference unavailable; using default");
+            Theme::default()
+        }
+    }
 }
 
 async fn create_session_redirect(state: &AppState, admin_id: i64, location: &str) -> Response {
@@ -5218,7 +5341,7 @@ async fn security_headers(request: Request<Body>, next: Next) -> Response {
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; style-src 'self'; img-src 'self' data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+            "default-src 'none'; style-src 'self'; img-src 'self' data:; manifest-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
         ),
     );
     headers.insert(

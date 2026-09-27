@@ -1,6 +1,6 @@
 //! Routing-page presentation.
 
-use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
+use crate::{admin_bar, csrf_field, ui::themed_layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
 use std::collections::BTreeMap;
@@ -50,8 +50,8 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
         )
         .collect::<Vec<_>>();
     Html(
-            layout(
-                "Routing",
+            themed_layout(
+                "Routing", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Routing" }

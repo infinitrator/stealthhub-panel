@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use app::{App, Intent};
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, LeaveAlternateScreen},
 };
@@ -62,7 +62,7 @@ impl RedrawGate {
 async fn main() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|v| v == "--help" || v == "-h") {
-        println!("Infiproxy Node Control\nUsage: infiproxy-manager [--guided | status [--json] | diagnostics | update check]\nInteractive: arrows, Tab, Enter, Esc, R, ?, Q.\nNO_COLOR and INFIPROXY_TUI_ASCII are supported.\nLegacy recovery: infiproxy-manager --legacy");
+        println!("Infiproxy Node Control\nUsage: infiproxy-manager [--guided | status [--json] | diagnostics | update check]\nInteractive: arrows, Tab, Enter, Esc, R, T (theme), ?, Q.\nINFIPROXY_TUI_THEME=obsidian-gate|hades|ultrakill, NO_COLOR and INFIPROXY_TUI_ASCII are supported.\nLegacy recovery: infiproxy-manager --legacy");
         return Ok(());
     }
     match args
@@ -125,7 +125,7 @@ async fn main() -> Result<()> {
     }));
     let _guard = TerminalGuard;
     let mut terminal = ratatui::try_init()?;
-    let theme = render::Theme::from_environment();
+    let mut theme = render::Theme::from_environment();
     let mut app = App::new(args.first().is_some_and(|v| v == "--guided"));
     let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
     let tx = sender.clone();
@@ -167,6 +167,13 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         redraw.mark_dirty();
+                        if app.form.is_none()
+                            && matches!(key.code, KeyCode::Char('t' | 'T'))
+                            && key.modifiers == KeyModifiers::NONE
+                        {
+                            theme.toggle();
+                            continue;
+                        }
                         match app.key(key) {
                             Intent::None => {}
                             Intent::Quit => break,

@@ -34,8 +34,11 @@ sudo infiproxy-manager update check
 
 Минимальный размер терминала — 80x24. Поддерживаются truecolor, 256 цветов,
 базовый ANSI, `NO_COLOR=1` и ASCII-режим `INFIPROXY_TUI_ASCII=1`.
-Тема Obsidian Gate использует ту же иерархию obsidian/ivory/gold/crimson, что и
-web-панель, но не меняет dirty-redraw gate: при отсутствии событий TUI не
+Default-тема Hades / Obsidian Gate использует obsidian/ivory/gold/crimson;
+ULTRAKILL использует graphite/black/hard red. Нажмите `T` вне формы для смены в
+текущем сеансе или задайте
+`INFIPROXY_TUI_THEME=obsidian-gate|hades|ultrakill` при запуске. Палитра не меняет
+status semantics или dirty-redraw gate: при отсутствии событий TUI не
 перерисовывает экран. Цвет не является единственным признаком статуса.
 
 ## 2. Клавиатура
@@ -47,6 +50,7 @@ web-панель, но не меняет dirty-redraw gate: при отсутс�
 | `Enter` | Открыть раздел/форму или перейти к следующему полю. |
 | `Esc` | Вернуться либо отменить форму без операции. |
 | `R` | Повторно собрать локальное состояние. |
+| `T` | Переключить Hades / Obsidian Gate и ULTRAKILL без runtime-операции. |
 | `PgUp`/`PgDn`, `Home`/`End` | Прокрутить вывод. |
 | `←`/`→` в Routing | Выбрать логический routing path и показать его детали. |
 | `?` | Открыть справку. Любая клавиша закрывает её. |

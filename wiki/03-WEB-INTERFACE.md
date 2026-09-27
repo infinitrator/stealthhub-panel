@@ -314,11 +314,19 @@ Credits содержит repository link и список компонентов.
 Ошибка UI не означает автоматический rollback всех внешних ручных действий.
 Для runtime mutation всегда проверяйте reconcile status и journal.
 
-Browser-facing ошибки и неизвестные routes используют общий Obsidian Gate shell;
+Browser-facing ошибки и неизвестные routes используют безопасный default shell;
 404 содержит навигацию к Health, Users, Routing и Protocols. `/health` и
-`/ready` сохраняют машинный plain-text контракт. Визуальная система основана на
-оригинальной геометрии врат и огня из античной мифологии и не использует ассеты,
-логотипы или шрифты игр и других правообладателей. Локальные SVG/favicon, Apple
-Touch icon и минимальный web manifest не требуют CDN или JavaScript. Цвета
-статусов всегда дополнены текстом; keyboard focus, skip link, reduced motion и
-адаптивная одноколоночная раскладка входят в контракт интерфейса.
+`/ready` сохраняют машинный plain-text контракт.
+
+Авторизованный header позволяет выбрать **Hades / Obsidian Gate** (default) или
+**ULTRAKILL**. Выбор хранится отдельно для каждого admin в SQLite, переживает
+logout/login и влияет только на представление. Неизвестное сохраненное значение
+возвращает Hades; ошибка cosmetic preference store не блокирует login.
+Setup/login всегда имеют детерминированный Hades branding.
+
+Обе темы используют оригинальные проектные SVG и не включают ассеты, логотипы
+или шрифты игр и других правообладателей. HTML выбирает versioned favicon,
+Apple Touch icon и manifest активной темы; `/favicon.ico` остается Hades
+fallback без долговременного кэша. CDN и JavaScript не нужны. Цвета статусов
+всегда дополнены текстом; keyboard focus, skip link, reduced motion и адаптивная
+одноколоночная раскладка входят в контракт интерфейса.

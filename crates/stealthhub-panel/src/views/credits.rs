@@ -1,13 +1,13 @@
 //! Project credits page.
 
-use crate::{admin_bar, ui::layout, ui::APP_NAME, AuthenticatedAdmin};
+use crate::{admin_bar, ui::themed_layout, ui::APP_NAME, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
 
 pub(crate) fn render(auth: &AuthenticatedAdmin) -> Response {
     Html(
-        layout(
-            "Credits",
+        themed_layout(
+            "Credits", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Credits" }

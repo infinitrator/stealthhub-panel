@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 64 64" role="img" aria-label="Infiproxy ULTRAKILL industrial mark">
+  <rect width="64" height="64" fill="#0b0c0e"/>
+  <path d="M5 5h54v54H5z" fill="#17191d" stroke="#e33b44" stroke-width="4"/>
+  <path d="M12 13h40L42 23H22zM12 51h40L42 41H22z" fill="#2a2d33" stroke="#777d87" stroke-width="2"/>
+  <path d="M18 27h10v10H18zm18 0h10v10H36z" fill="#e33b44"/>
+  <path d="M29 20h6v24h-6z" fill="#f2efe8"/>
+  <path d="m7 32 8-6v12zm50 0-8-6v12z" fill="#e33b44"/>
+</svg>

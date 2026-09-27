@@ -1,13 +1,13 @@
 //! Administrator credential rotation page.
 
-use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
+use crate::{admin_bar, csrf_field, ui::themed_layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
 
 pub(crate) fn render(auth: &AuthenticatedAdmin) -> Response {
     Html(
-        layout(
-            "Account",
+        themed_layout(
+            "Account", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Account" }

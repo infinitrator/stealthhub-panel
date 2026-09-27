@@ -1,6 +1,6 @@
 //! Owner-only, bounded administrative audit history.
 
-use crate::{admin_bar, ui::layout, AuthenticatedAdmin};
+use crate::{admin_bar, ui::themed_layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
 use stealthhub_core::{audit::AuditMetadata, storage::AuditEventRecord};
@@ -18,7 +18,7 @@ pub(crate) fn render(
     has_next: bool,
 ) -> Response {
     let previous = page.saturating_sub(1);
-    Html(layout("Audit", html! {
+    Html(themed_layout("Audit", auth.theme, html! {
         (admin_bar(auth))
         h1 { "Administrative audit" }
         p class="muted" { "Append-only application history. A requested privileged action is not a completion result." }

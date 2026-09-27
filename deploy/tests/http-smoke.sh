@@ -129,17 +129,28 @@ request 200 /ready
 request 200 /assets/panel.css
 grep -Fqi 'content-type: text/css' "$HEADER_FILE" || fail "CSS content type is missing"
 body_contains ':root'
-body_contains 'gold-accent'
+body_contains 'accent-primary'
+body_contains 'data-theme="ultrakill"'
 request 200 /assets/underworld-gate.svg
 grep -Fqi 'content-type: image/svg+xml' "$HEADER_FILE" || fail "SVG mark content type is missing"
 body_contains 'Infiproxy Obsidian Gate mark'
 request 200 /favicon.ico
 grep -Fqi 'content-type: image/x-icon' "$HEADER_FILE" || fail "favicon content type is missing"
+grep -Fqi 'cache-control: no-cache, no-store, must-revalidate' "$HEADER_FILE" \
+    || fail "unversioned favicon fallback can remain stale"
 request 200 /apple-touch-icon.png
 grep -Fqi 'content-type: image/png' "$HEADER_FILE" || fail "Apple icon content type is missing"
 request 200 /site.webmanifest
 grep -Fqi 'content-type: application/manifest+json' "$HEADER_FILE" \
     || fail "manifest content type is missing"
+body_contains 'underworld-gate.svg?v=og-20260927'
+request 200 /assets/ultrakill-mark.svg
+body_contains 'Infiproxy ULTRAKILL industrial mark'
+request 200 /assets/ultrakill-16x16.png
+grep -Fqi 'content-type: image/png' "$HEADER_FILE" || fail "ULTRAKILL favicon is missing"
+request 200 /assets/manifest-ultrakill.webmanifest
+body_contains 'ultrakill-mark.svg?v=uk-20260927'
+request 404 /assets/smile-os.svg
 request 404 /route-that-does-not-exist
 body_contains 'The requested route is not connected to the control plane.'
 body_contains 'href="/admin/routing"'
@@ -151,6 +162,9 @@ body_contains 'OBSIDIAN GATE / REQUEST CONTROL'
 
 request 200 /admin/setup
 body_contains 'Initial admin setup'
+body_contains 'data-theme="obsidian-gate"'
+body_contains 'underworld-gate.svg?v=og-20260927'
+body_excludes 'smile'
 request 403 /admin/setup --request POST \
     --data-urlencode setup_token=wrong \
     --data-urlencode username=owner \
@@ -173,12 +187,33 @@ body_contains '>Health<'
 body_excludes '>Dashboard<'
 body_contains 'Desired generation'
 body_contains 'Reconciliation'
+body_contains 'data-theme="obsidian-gate"'
+body_contains 'manifest-obsidian-gate.webmanifest?v=og-20260927'
+body_excludes 'smile'
 grep -Fqi "content-security-policy: default-src 'none'; style-src 'self';" "$HEADER_FILE" \
     || fail "strict CSP is missing"
+grep -Fqi "manifest-src 'self'" "$HEADER_FILE" \
+    || fail "same-origin web manifests are blocked by CSP"
 if grep -Fqi "unsafe-inline" "$HEADER_FILE"; then
     fail "CSP still permits unsafe inline styles"
 fi
 grep -Fqi 'cache-control: no-store' "$HEADER_FILE" || fail "admin cache policy is missing"
+CSRF_TOKEN="$(csrf_from_body)"
+
+request 422 /admin/theme --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode theme=unknown
+request 200 /admin
+body_contains 'data-theme="obsidian-gate"'
+CSRF_TOKEN="$(csrf_from_body)"
+request 303 /admin/theme --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode theme=ultrakill
+request 200 /admin
+body_contains 'data-theme="ultrakill"'
+body_contains 'ultrakill-mark.svg?v=uk-20260927'
+body_contains 'manifest-ultrakill.webmanifest?v=uk-20260927'
+body_excludes 'underworld-gate.svg?v=og-20260927'
 CSRF_TOKEN="$(csrf_from_body)"
 
 for path in \
@@ -483,6 +518,8 @@ request 303 /admin/login --request POST \
     --data-urlencode username=owner \
     --data-urlencode password="$NEW_PASSWORD"
 request 200 /admin
+body_contains 'data-theme="ultrakill"'
+body_contains 'ultrakill-mark.svg?v=uk-20260927'
 
 {
     printf 'csrf_token=invalid&username='

@@ -1,6 +1,6 @@
 //! Owner-only secret-store presentation.
 
-use crate::{admin_bar, csrf_field, ui::layout, AuthenticatedAdmin};
+use crate::{admin_bar, csrf_field, ui::themed_layout, AuthenticatedAdmin};
 use axum::response::{Html, IntoResponse, Response};
 use maud::html;
 use stealthhub_core::{adapter::ProtocolRegistry, models::ProtocolProfile};
@@ -12,8 +12,8 @@ pub(crate) fn render(
     registry: &ProtocolRegistry,
 ) -> Response {
     Html(
-        layout(
-            "Secrets",
+        themed_layout(
+            "Secrets", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Secrets" }

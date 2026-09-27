@@ -3,7 +3,7 @@
 use crate::{
     admin_bar,
     ops::{HostSnapshot, ServiceState, CONTROL_PLANE_TARGETS},
-    ui::layout,
+    ui::themed_layout,
     views::components::{
         adapter_inventory_table, meter_bar, resource_inventory_table, runtime_inventory_table,
         service_state_badge,
@@ -40,8 +40,8 @@ pub(crate) fn render(auth: &crate::AuthenticatedAdmin, report: Report<'_>) -> Re
     (
         report.status,
         Html(
-            layout(
-                "Health",
+            themed_layout(
+                "Health", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Health" }

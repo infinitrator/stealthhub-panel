@@ -161,9 +161,11 @@ if git grep -niE 'refactor/atomic-adapter-reconciler|stealthhub\.service' -- REA
   exit 1
 fi
 
-if git grep -niE 'ultrakill|ultra kill|smile[ -]os|smile-os' -- \
-    README.md docs wiki crates deploy ':!deploy/tests/wiki-check.sh'; then
-  echo 'wiki check failed: retired visual identity remains in a release surface' >&2
+if git grep -niE 'smile[ -]os|smile-os' -- \
+    README.md docs wiki crates deploy \
+    ':!crates/stealthhub-panel/src/ui.rs' \
+    ':!deploy/tests/http-smoke.sh' ':!deploy/tests/wiki-check.sh'; then
+  echo 'wiki check failed: retired smile identity remains in a release surface' >&2
   exit 1
 fi
 

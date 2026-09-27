@@ -62,8 +62,10 @@ command. UI state may therefore show unavailable privileged resources.
 - Use stable migrations; never rewrite existing operator data destructively.
 - Preserve redaction in errors, Debug output, snapshots, and fixtures.
 - Update README/Wiki/contracts in the same change when behavior or pins change.
-- Keep web and TUI changes aligned with `docs/design-system.md`; regenerate all
-  favicon derivatives when the source mark changes.
+- Keep web and TUI changes aligned with `docs/design-system.md`. New themes
+  override semantic token values rather than component rules. When a source
+  mark changes, regenerate its favicon derivatives and change the versioned
+  icon/manifest URL so deployed browsers cannot reuse the previous identity.
 - Add tests at the narrowest contract boundary and run the full workspace gates.
 
 See `CONTRIBUTING.md` for pull-request expectations.

@@ -1,4 +1,4 @@
-//! Terminal-safe Obsidian Gate theme and responsive rendering.
+//! Terminal-safe switchable themes and responsive rendering.
 
 use crate::app::{App, SCREENS};
 use ratatui::{
@@ -22,6 +22,38 @@ pub enum ColorMode {
 pub struct Theme {
     pub mode: ColorMode,
     pub ascii: bool,
+    pub kind: ThemeKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ThemeKind {
+    #[default]
+    ObsidianGate,
+    Ultrakill,
+}
+
+impl ThemeKind {
+    fn from_environment() -> Self {
+        match std::env::var("INFIPROXY_TUI_THEME").as_deref() {
+            Ok("ultrakill") => Self::Ultrakill,
+            Ok("obsidian-gate" | "hades") | Err(_) => Self::ObsidianGate,
+            Ok(_) => Self::ObsidianGate,
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::ObsidianGate => Self::Ultrakill,
+            Self::Ultrakill => Self::ObsidianGate,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::ObsidianGate => "OBSIDIAN GATE",
+            Self::Ultrakill => "ULTRAKILL",
+        }
+    }
 }
 impl Theme {
     pub fn from_environment() -> Self {
@@ -44,34 +76,59 @@ impl Theme {
             mode,
             ascii: std::env::var_os("INFIPROXY_TUI_ASCII").is_some()
                 || !(locale.contains("utf-8") || locale.contains("utf8")),
+            kind: ThemeKind::from_environment(),
         }
     }
+    pub fn toggle(&mut self) {
+        self.kind = self.kind.toggled();
+    }
     fn base(self) -> Style {
-        match self.mode {
-            ColorMode::TrueColor => Style::default()
+        match (self.kind, self.mode) {
+            (ThemeKind::Ultrakill, ColorMode::TrueColor) => Style::default()
+                .fg(Color::Rgb(242, 239, 232))
+                .bg(Color::Rgb(11, 12, 14)),
+            (ThemeKind::Ultrakill, ColorMode::Indexed) => Style::default()
+                .fg(Color::Indexed(255))
+                .bg(Color::Indexed(233)),
+            (ThemeKind::Ultrakill, ColorMode::Ansi) => {
+                Style::default().fg(Color::White).bg(Color::Black)
+            }
+            (ThemeKind::Ultrakill, ColorMode::None) => Style::default(),
+            (ThemeKind::ObsidianGate, ColorMode::TrueColor) => Style::default()
                 .fg(Color::Rgb(243, 234, 216))
                 .bg(Color::Rgb(14, 11, 15)),
-            ColorMode::Indexed => Style::default()
+            (ThemeKind::ObsidianGate, ColorMode::Indexed) => Style::default()
                 .fg(Color::Indexed(230))
                 .bg(Color::Indexed(233)),
-            ColorMode::Ansi => Style::default().fg(Color::White).bg(Color::Black),
-            ColorMode::None => Style::default(),
+            (ThemeKind::ObsidianGate, ColorMode::Ansi) => {
+                Style::default().fg(Color::White).bg(Color::Black)
+            }
+            (ThemeKind::ObsidianGate, ColorMode::None) => Style::default(),
         }
     }
     fn accent(self) -> Style {
-        match self.mode {
-            ColorMode::TrueColor => self.base().bg(Color::Rgb(169, 54, 70)),
-            ColorMode::Indexed => self.base().bg(Color::Indexed(124)),
-            ColorMode::Ansi => self.base().bg(Color::Red),
-            ColorMode::None => Style::default().add_modifier(Modifier::REVERSED),
+        match (self.kind, self.mode) {
+            (ThemeKind::Ultrakill, ColorMode::TrueColor) => self.base().bg(Color::Rgb(227, 59, 68)),
+            (ThemeKind::Ultrakill, ColorMode::Indexed) => self.base().bg(Color::Indexed(160)),
+            (_, ColorMode::TrueColor) => self.base().bg(Color::Rgb(169, 54, 70)),
+            (_, ColorMode::Indexed) => self.base().bg(Color::Indexed(124)),
+            (_, ColorMode::Ansi) => self.base().bg(Color::Red),
+            (_, ColorMode::None) => Style::default().add_modifier(Modifier::REVERSED),
         }
     }
-    fn gold(self) -> Style {
-        match self.mode {
-            ColorMode::TrueColor => self.base().fg(Color::Rgb(214, 173, 88)),
-            ColorMode::Indexed => self.base().fg(Color::Indexed(179)),
-            ColorMode::Ansi => self.base().fg(Color::Yellow),
-            ColorMode::None => Style::default().add_modifier(Modifier::BOLD),
+    fn highlight(self) -> Style {
+        match (self.kind, self.mode) {
+            (ThemeKind::Ultrakill, ColorMode::TrueColor) => {
+                self.base().fg(Color::Rgb(255, 107, 115))
+            }
+            (ThemeKind::Ultrakill, ColorMode::Indexed) => self.base().fg(Color::Indexed(203)),
+            (ThemeKind::Ultrakill, ColorMode::Ansi) => self.base().fg(Color::Red),
+            (ThemeKind::ObsidianGate, ColorMode::TrueColor) => {
+                self.base().fg(Color::Rgb(214, 173, 88))
+            }
+            (ThemeKind::ObsidianGate, ColorMode::Indexed) => self.base().fg(Color::Indexed(179)),
+            (ThemeKind::ObsidianGate, ColorMode::Ansi) => self.base().fg(Color::Yellow),
+            (_, ColorMode::None) => Style::default().add_modifier(Modifier::BOLD),
         }
     }
     fn muted(self) -> Style {
@@ -103,7 +160,11 @@ impl Theme {
             .borders(Borders::ALL)
             .border_set(self.border())
             .title(title.to_string())
-            .border_style(if focused { self.gold() } else { self.muted() })
+            .border_style(if focused {
+                self.highlight()
+            } else {
+                self.muted()
+            })
     }
 }
 
@@ -152,7 +213,7 @@ pub fn draw(frame: &mut Frame, app: &App, theme: Theme) {
     .split(area);
     let heading = vec![
         Line::from(Span::styled(
-            " INFIPROXY  /  OBSIDIAN GATE  /  NODE CONTROL",
+            format!(" INFIPROXY  /  {}  /  NODE CONTROL", theme.kind.label()),
             theme.accent().add_modifier(Modifier::BOLD),
         )),
         Line::from(terminal_text(
@@ -212,11 +273,11 @@ pub fn draw(frame: &mut Frame, app: &App, theme: Theme) {
             Some(app.selected)
         }),
     );
-    frame.render_widget(Paragraph::new(" Arrows: navigate  Tab: focus  Enter: open  PgUp/PgDn: scroll\n R: refresh  ?: help  Esc: back/cancel  Q: quit").style(theme.gold()),vertical[2]);
+    frame.render_widget(Paragraph::new(" Arrows: navigate  Tab: focus  Enter: open  PgUp/PgDn: scroll\n R: refresh  T: theme  ?: help  Esc: back/cancel  Q: quit").style(theme.highlight()),vertical[2]);
     if app.help {
         let area = center(area, 74, 14);
         frame.render_widget(Clear, area);
-        frame.render_widget(Paragraph::new("INFIPROXY KEYBOARD\n\nTab / Shift-Tab moves between navigation, actions and output.\nArrows choose workspaces/actions; PgUp/PgDn scroll output.\nEnter opens a form, then advances to its confirmation.\nLeft/Right selects registered modules/services in a choice field.\nEsc cancels a form without running any operation.\nQ / Ctrl-C exits. Closing cancels the active helper process group.\nAn interrupted operation may have partially completed: inspect state.\n\nAny key closes help.").wrap(Wrap {trim:false}).style(theme.base()).block(theme.block(" HELP ",true)),area);
+        frame.render_widget(Paragraph::new("INFIPROXY KEYBOARD\n\nTab / Shift-Tab moves between navigation, actions and output.\nArrows choose workspaces/actions; PgUp/PgDn scroll output.\nEnter opens a form, then advances to its confirmation.\nLeft/Right selects registered modules/services in a choice field.\nT switches the visual theme without changing runtime state.\nEsc cancels a form without running any operation.\nQ / Ctrl-C exits. Closing cancels the active helper process group.\nAn interrupted operation may have partially completed: inspect state.\n\nAny key closes help.").wrap(Wrap {trim:false}).style(theme.base()).block(theme.block(" HELP ",true)),area);
     }
     if let Some(form) = &app.form {
         let area = center(area, 74, (form.values.len() as u16 * 3 + 8).min(23));
@@ -322,6 +383,7 @@ mod tests {
         let theme = Theme {
             mode: ColorMode::None,
             ascii: true,
+            kind: ThemeKind::ObsidianGate,
         };
         for (w, h) in [(80, 24), (120, 40), (200, 60)] {
             let output = render(&app, w, h, theme);
@@ -348,6 +410,7 @@ mod tests {
         let theme = Theme {
             mode: ColorMode::Indexed,
             ascii: false,
+            kind: ThemeKind::ObsidianGate,
         };
         let output = render(&app, 80, 24, theme);
         assert!(!output.contains("SECRET_CANARY"));
@@ -367,10 +430,11 @@ mod tests {
         let theme = Theme {
             mode: ColorMode::None,
             ascii: true,
+            kind: ThemeKind::ObsidianGate,
         };
         assert_eq!(theme.base().fg, None);
         assert_eq!(theme.accent().bg, None);
-        assert_eq!(theme.gold().fg, None);
+        assert_eq!(theme.highlight().fg, None);
     }
 
     #[test]
@@ -378,9 +442,25 @@ mod tests {
         let theme = Theme {
             mode: ColorMode::TrueColor,
             ascii: false,
+            kind: ThemeKind::ObsidianGate,
         };
         assert_eq!(theme.base().bg, Some(Color::Rgb(14, 11, 15)));
-        assert_eq!(theme.gold().fg, Some(Color::Rgb(214, 173, 88)));
+        assert_eq!(theme.highlight().fg, Some(Color::Rgb(214, 173, 88)));
         assert_eq!(theme.accent().bg, Some(Color::Rgb(169, 54, 70)));
+    }
+
+    #[test]
+    fn ultrakill_theme_uses_graphite_and_hard_red_without_changing_color_mode() {
+        let mut theme = Theme {
+            mode: ColorMode::TrueColor,
+            ascii: false,
+            kind: ThemeKind::ObsidianGate,
+        };
+        theme.toggle();
+        assert_eq!(theme.kind, ThemeKind::Ultrakill);
+        assert_eq!(theme.mode, ColorMode::TrueColor);
+        assert_eq!(theme.base().bg, Some(Color::Rgb(11, 12, 14)));
+        assert_eq!(theme.highlight().fg, Some(Color::Rgb(255, 107, 115)));
+        assert_eq!(theme.accent().bg, Some(Color::Rgb(227, 59, 68)));
     }
 }

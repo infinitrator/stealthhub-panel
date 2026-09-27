@@ -3,7 +3,7 @@
 use crate::{
     admin_bar, csrf_field,
     ops::{ConfigFileSnapshot, ConfigWriteReport},
-    ui::layout,
+    ui::themed_layout,
     views::components::resource_inventory_table,
     AuthenticatedAdmin,
 };
@@ -20,8 +20,8 @@ pub(crate) fn render_index(
     inventory: &AdapterInventory,
 ) -> Response {
     Html(
-            layout(
-                "Configs",
+            themed_layout(
+                "Configs", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Configs" }
@@ -160,8 +160,9 @@ pub(crate) fn render_save(
     (
         status,
         Html(
-            layout(
+            themed_layout(
                 "Config save",
+                auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Config save" }

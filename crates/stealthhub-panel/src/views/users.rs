@@ -1,8 +1,8 @@
 //! User lifecycle presentation without exposing credentials in list views.
 
 use crate::{
-    admin_bar, csrf_field, format_bytes, format_user_expiry, format_user_traffic, ui::layout,
-    views::components::user_sync_badges, AuthenticatedAdmin,
+    admin_bar, csrf_field, format_bytes, format_user_expiry, format_user_traffic,
+    ui::themed_layout, views::components::user_sync_badges, AuthenticatedAdmin,
 };
 use axum::response::{Html, IntoResponse, Response};
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -18,8 +18,8 @@ pub(crate) fn render_index(
     now: DateTime<Utc>,
 ) -> Response {
     Html(
-        layout(
-            "Users",
+        themed_layout(
+            "Users", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Users" }
@@ -127,8 +127,8 @@ pub(crate) fn render_edit(auth: &AuthenticatedAdmin, user: &UserRecord) -> Respo
         .map(|value| value.to_rfc3339_opts(SecondsFormat::Nanos, true))
         .unwrap_or_default();
     Html(
-        layout(
-            "Edit user",
+        themed_layout(
+            "Edit user", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Edit user" }
@@ -180,8 +180,8 @@ pub(crate) fn render_subscription_access(
     import_url: &str,
 ) -> Response {
     Html(
-        layout(
-            "Subscription access",
+        themed_layout(
+            "Subscription access", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Subscription access" }
@@ -218,8 +218,8 @@ pub(crate) fn render_subscription_access(
 
 pub(crate) fn render_reset(auth: &AuthenticatedAdmin, user: &UserRecord) -> Response {
     Html(
-        layout(
-            "Reset subscription URL",
+        themed_layout(
+            "Reset subscription URL", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Reset subscription URL" }
@@ -248,8 +248,8 @@ pub(crate) fn render_reset(auth: &AuthenticatedAdmin, user: &UserRecord) -> Resp
 
 pub(crate) fn render_rotate_identity(auth: &AuthenticatedAdmin, user: &UserRecord) -> Response {
     Html(
-        layout(
-            "Rotate runtime identity",
+        themed_layout(
+            "Rotate runtime identity", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Rotate runtime identity" }
@@ -281,8 +281,8 @@ pub(crate) fn render_rotate_identity(auth: &AuthenticatedAdmin, user: &UserRecor
 
 pub(crate) fn render_delete(auth: &AuthenticatedAdmin, user: &UserRecord) -> Response {
     Html(
-        layout(
-            "Delete user",
+        themed_layout(
+            "Delete user", auth.theme,
             html! {
                 (admin_bar(auth))
                 h1 { "Delete user" }

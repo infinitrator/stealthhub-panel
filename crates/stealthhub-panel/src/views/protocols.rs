@@ -2,7 +2,7 @@
 
 use crate::{
     admin_bar, csrf_field,
-    ui::layout,
+    ui::themed_layout,
     views::components::{adapter_inventory_table, user_sync_badges},
     AuthenticatedAdmin,
 };
@@ -37,8 +37,8 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, page: ProtocolPage<'_>) -> Respo
         reconcile,
     } = page;
     Html(
-            layout(
-                "Protocols",
+            themed_layout(
+                "Protocols", auth.theme,
                 html! {
                     (admin_bar(auth))
                     h1 { "Protocols" }
@@ -236,7 +236,7 @@ pub(crate) fn render_detail(
     reconcile: &ReconcileStateRecord,
     references: u64,
 ) -> Response {
-    Html(layout("Profile", html! {
+    Html(themed_layout("Profile", auth.theme, html! {
         (admin_bar(auth))
         h1 { (&profile.display_name) }
         div class="actions" { a class="button compact" href="/admin/protocols" { "Back to profiles" } }
@@ -282,7 +282,7 @@ pub(crate) fn render_delete(
     record: &ProtocolProfileRecord,
     references: u64,
 ) -> Response {
-    Html(layout("Delete profile", html! {
+    Html(themed_layout("Delete profile", auth.theme, html! {
         (admin_bar(auth))
         h1 { "Delete profile" }
         section class="confirm-panel danger-zone" {
@@ -311,7 +311,7 @@ pub(crate) fn render_new(
 ) -> Response {
     let manifests = registry.manifests();
     let selected = selected_adapter.and_then(|id| registry.get(id));
-    Html(layout("Create profile", html! {
+    Html(themed_layout("Create profile", auth.theme, html! {
         (admin_bar(auth))
         h1 { "Create protocol profile" }
         div class="actions" { a class="button compact" href="/admin/protocols" { "Back to profiles" } }

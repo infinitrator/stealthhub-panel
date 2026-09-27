@@ -1,0 +1,13 @@
+{
+  "name": "Infiproxy — ULTRAKILL",
+  "short_name": "Infiproxy",
+  "start_url": "/admin",
+  "display": "standalone",
+  "background_color": "#0b0c0e",
+  "theme_color": "#17191d",
+  "icons": [
+    { "src": "/assets/ultrakill-mark.svg?v=uk-20260927", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/assets/ultrakill-32x32.png?v=uk-20260927", "sizes": "32x32", "type": "image/png" },
+    { "src": "/assets/ultrakill-apple-touch-icon.png?v=uk-20260927", "sizes": "180x180", "type": "image/png" }
+  ]
+}
