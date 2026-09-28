@@ -41,6 +41,18 @@ const CLASSICAL_CONDITION_TYPES: &[&str] = &[
     "DSCP",
 ];
 
+const NO_RESOLVE_CONDITION_TYPES: &[&str] = &[
+    "IP-CIDR",
+    "IP-CIDR6",
+    "IP-SUFFIX",
+    "IP-ASN",
+    "GEOIP",
+    "SRC-GEOIP",
+    "SRC-IP-ASN",
+    "SRC-IP-CIDR",
+    "SRC-IP-SUFFIX",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingRuleSet {
     pub slug: String,
@@ -407,6 +419,43 @@ pub fn validate_classical_rule_payload(payload: &str) -> Result<Vec<String>> {
     Ok(rules)
 }
 
+/// Completes one validated classical condition with its separately managed target.
+pub fn classical_rule_with_target(condition: &str, target: &str) -> Result<String> {
+    if target.is_empty()
+        || target.trim() != target
+        || target.contains(',')
+        || target.chars().any(char::is_control)
+    {
+        bail!("invalid routing target");
+    }
+
+    let mut validated = validate_classical_rule_payload(condition)?;
+    if validated.len() != 1 {
+        bail!("inline routing condition must contain exactly one rule");
+    }
+    let rule = validated.pop().expect("validated rule is present");
+    let mut fields = rule.split(',').map(str::trim).collect::<Vec<_>>();
+    let kind = fields[0];
+    let modifier = fields
+        .last()
+        .is_some_and(|value| value.eq_ignore_ascii_case("no-resolve"));
+    if modifier {
+        if !NO_RESOLVE_CONDITION_TYPES.contains(&kind) {
+            bail!("no-resolve is unsupported for this rule type");
+        }
+        fields.pop();
+    }
+    if fields.len() != 2 {
+        bail!("classical routing condition has ambiguous fields");
+    }
+
+    let mut completed = vec![fields[0], fields[1], target];
+    if modifier {
+        completed.push("no-resolve");
+    }
+    Ok(completed.join(","))
+}
+
 pub fn routing_rule_payload_yaml(payload: &str) -> Result<String> {
     let rules = validate_classical_rule_payload(payload)?;
     Ok(serde_norway::to_string(&ProviderPayload {
@@ -444,6 +493,73 @@ mod tests {
         assert!(validate_classical_rule_payload("UNKNOWN,value").is_err());
         assert!(validate_classical_rule_payload("DOMAIN,example.com,REJECT").is_err());
         assert!(validate_classical_rule_payload("AND,((DOMAIN,a),(DOMAIN,b))").is_err());
+    }
+
+    #[test]
+    fn classical_rule_target_precedes_trailing_modifiers() {
+        for (condition, target, expected) in [
+            (
+                "DOMAIN-SUFFIX,example.com",
+                "AUTO-SAFE",
+                "DOMAIN-SUFFIX,example.com,AUTO-SAFE",
+            ),
+            ("IP-CIDR,10.0.0.0/8", "DIRECT", "IP-CIDR,10.0.0.0/8,DIRECT"),
+            (
+                "IP-CIDR,10.0.0.0/8,no-resolve",
+                "DIRECT",
+                "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            ),
+            (
+                "IP-CIDR6,fd00::/8,no-resolve",
+                "DIRECT",
+                "IP-CIDR6,fd00::/8,DIRECT,no-resolve",
+            ),
+            ("DOMAIN,example.com", "DIRECT", "DOMAIN,example.com,DIRECT"),
+            (
+                "DOMAIN-KEYWORD,example",
+                "DIRECT",
+                "DOMAIN-KEYWORD,example,DIRECT",
+            ),
+            ("GEOIP,RU", "DIRECT", "GEOIP,RU,DIRECT"),
+            ("GEOSITE,category", "DIRECT", "GEOSITE,category,DIRECT"),
+            (
+                "SRC-IP-CIDR,192.0.2.0/24",
+                "DIRECT",
+                "SRC-IP-CIDR,192.0.2.0/24,DIRECT",
+            ),
+            ("DST-PORT,443", "DIRECT", "DST-PORT,443,DIRECT"),
+            ("SRC-PORT,5353", "DIRECT", "SRC-PORT,5353,DIRECT"),
+            (
+                "PROCESS-NAME,example",
+                "DIRECT",
+                "PROCESS-NAME,example,DIRECT",
+            ),
+            (
+                "PROCESS-PATH,/usr/bin/example",
+                "DIRECT",
+                "PROCESS-PATH,/usr/bin/example,DIRECT",
+            ),
+        ] {
+            assert_eq!(
+                classical_rule_with_target(condition, target).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn classical_rule_completion_rejects_policy_injection_and_catch_alls() {
+        for condition in [
+            "DOMAIN,example.com,DIRECT",
+            "DOMAIN,example.com,AUTO-SAFE",
+            "RULE-SET,other",
+            "SUB-RULE,other",
+            "MATCH",
+        ] {
+            assert!(classical_rule_with_target(condition, "DIRECT").is_err());
+        }
+        assert!(classical_rule_with_target("DOMAIN,example.com,custom-policy", "DIRECT").is_err());
+        assert!(classical_rule_with_target("DOMAIN,example.com,no-resolve", "DIRECT").is_err());
     }
 
     #[test]

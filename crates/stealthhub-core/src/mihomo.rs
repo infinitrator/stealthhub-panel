@@ -13,7 +13,7 @@ use crate::{
     adapter::{ClientRenderContext, MapSecretResolver, ProtocolRegistry},
     models::{PanelSettings, ProtocolProfile, SubscriptionUser},
     policy::{default_client_policy, default_dns_policy, ClientPolicy, DnsPolicy},
-    rules::RoutingRuleSet,
+    rules::{classical_rule_with_target, RoutingRuleSet},
 };
 
 /// Generates a Mihomo document with the trusted built-in adapter registry.
@@ -258,7 +258,14 @@ fn routing_rules(
         policy
             .resolved_rules(profiles)?
             .into_iter()
-            .map(|(condition, target)| format!("{condition},{target}")),
+            .map(|(condition, target)| {
+                if condition.trim() == "MATCH" {
+                    Ok(format!("MATCH,{target}"))
+                } else {
+                    classical_rule_with_target(condition.trim(), &target)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?,
     );
     Ok(rules)
 }
@@ -272,7 +279,7 @@ mod tests {
     };
     use crate::models::ProxyRole;
     use crate::rules::default_routing_rule_sets;
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::{collections::BTreeSet, fs, process::Command, sync::Arc};
 
     struct ExternalProtocol {
         manifest: ProtocolAdapterManifest,
@@ -408,6 +415,62 @@ mod tests {
         assert!(parsed["dns"]["nameserver-policy"]["rule-set:proxy-ai"][0]
             .as_str()
             .is_some_and(|resolver| resolver.starts_with("https://")));
+        let generated_rules = parsed["rules"]
+            .as_sequence()
+            .expect("generated rules must be a sequence")
+            .iter()
+            .filter_map(serde_norway::Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(generated_rules.ends_with(&[
+            "GEOIP,RU,DIRECT",
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+            "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+            "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+            "MATCH,MANUAL",
+        ]));
+    }
+
+    #[test]
+    fn exact_mihomo_parser_accepts_generated_standard_routing_rules() -> Result<()> {
+        let Some(binary) = std::env::var_os("INFIPROXY_TEST_MIHOMO_BIN") else {
+            return Ok(());
+        };
+        let settings = fixture_settings();
+        let user = fixture_user();
+        let profiles = vec![fixture_profile()];
+        let secrets = HashMap::from([
+            (
+                "xray.reality.public_key".to_string(),
+                "w1LlLliIbRGiRssXh-yKrLONwRaYlezwfihTFaCEaUw".to_string(),
+            ),
+            (
+                "xray.reality.short_id".to_string(),
+                "0123456789abcdef".to_string(),
+            ),
+        ]);
+        let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &[])?;
+        let directory = std::env::temp_dir().join(format!(
+            "infiproxy-mihomo-subscription-routing-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let validation_home = directory.join("mihomo/home");
+        fs::create_dir_all(&validation_home)?;
+        let candidate = directory.join("subscription.yaml");
+        fs::write(&candidate, yaml)?;
+        let output = Command::new(binary)
+            .arg("-d")
+            .arg(&validation_home)
+            .args(["-t", "-f"])
+            .arg(&candidate)
+            .output()?;
+        fs::remove_dir_all(directory)?;
+        if !output.status.success() {
+            bail!(
+                "Mihomo v1.19.30 rejected generated subscription routing: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
     }
 
     #[test]

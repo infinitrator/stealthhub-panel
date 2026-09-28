@@ -176,7 +176,7 @@ enabled inline policies по priority:
 RULE-SET,<slug>,<target>
 ...
 GEOIP,RU,DIRECT
-IP-CIDR,10.0.0.0/8,no-resolve,DIRECT
+IP-CIDR,10.0.0.0/8,DIRECT,no-resolve
 ...
 MATCH,MANUAL
 ```

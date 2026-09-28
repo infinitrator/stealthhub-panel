@@ -9,7 +9,10 @@ use std::collections::BTreeSet;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ProtocolProfile, ProxyRole};
+use crate::{
+    models::{ProtocolProfile, ProxyRole},
+    rules::classical_rule_with_target,
+};
 
 /// Mihomo proxy-group behavior represented independently of YAML.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,6 +247,9 @@ impl ClientPolicy {
             }
             if rule.condition.trim().is_empty() || rule.condition.contains('\n') {
                 bail!("routing policy condition is invalid");
+            }
+            if rule.condition.trim() != "MATCH" {
+                classical_rule_with_target(rule.condition.trim(), &rule.target)?;
             }
             let target_valid = matches!(rule.target.as_str(), "DIRECT" | "REJECT")
                 || pool_ids.contains(rule.target.as_str())
