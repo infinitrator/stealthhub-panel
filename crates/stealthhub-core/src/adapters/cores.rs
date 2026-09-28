@@ -666,7 +666,10 @@ impl CoreAdapter for ManagedCoreAdapter {
         let config = self
             .read_current_config()?
             .context("runtime user observation requires a live config")?;
-        let observed = discover_config_users(self.flavor, &config)?;
+        let observed = match self.flavor {
+            Flavor::Mihomo => discover_mihomo_config_users(&config, plan)?,
+            _ => discover_config_users(self.flavor, &config)?,
+        };
         Ok(UserSyncObservation::compare(&expected, &observed))
     }
 
@@ -1337,33 +1340,87 @@ fn discover_config_users(
             );
         }
         Flavor::Hysteria => {}
-        Flavor::Mihomo => {
-            let value: Value = serde_norway::from_slice(bytes)?;
-            for listener in value
-                .get("listeners")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-            {
-                match listener.get("users") {
-                    Some(Value::Array(entries)) => {
-                        users.extend(entries.iter().filter_map(mihomo_array_user_identity));
-                    }
-                    Some(Value::Object(entries)) => users.extend(entries.keys().cloned()),
-                    _ => {}
-                }
-            }
-        }
+        Flavor::Mihomo => bail!("Mihomo user discovery requires the active core plan"),
     }
     Ok(users)
 }
 
-fn mihomo_array_user_identity(entry: &Value) -> Option<String> {
-    entry
-        .get("uuid")
-        .and_then(Value::as_str)
-        .or_else(|| entry.get("username").and_then(Value::as_str))
-        .map(str::to_string)
+fn discover_mihomo_config_users(
+    bytes: &[u8],
+    plan: &CorePlan,
+) -> Result<std::collections::BTreeSet<String>> {
+    let mut selected = std::collections::BTreeMap::new();
+    for fragment in plan
+        .fragments
+        .iter()
+        .filter(|fragment| fragment.expected_user_ids.is_some())
+    {
+        if selected
+            .insert(fragment.profile_id.as_str(), fragment.capability.as_str())
+            .is_some()
+        {
+            bail!("duplicate per-user Mihomo profile identifier");
+        }
+    }
+
+    let value: Value = serde_norway::from_slice(bytes)?;
+    let mut matched = std::collections::BTreeSet::new();
+    let mut users = std::collections::BTreeSet::new();
+    for listener in value
+        .get("listeners")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = listener.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(capability) = selected.get(name).copied() else {
+            continue;
+        };
+        if !matched.insert(name) {
+            bail!("duplicate per-user Mihomo listener identifier");
+        }
+
+        let (listener_type, representation) = match capability {
+            capability if capability.starts_with("vless-") => ("vless", "uuid-array"),
+            capability if capability.starts_with("trojan-") => ("trojan", "username-array"),
+            "mieru" => ("mieru", "object-keys"),
+            "trusttunnel-h2" => ("trusttunnel", "username-array"),
+            "shadowquic" => ("shadowquic", "username-array"),
+            _ => bail!("unsupported per-user Mihomo listener capability"),
+        };
+        if listener.get("type").and_then(Value::as_str) != Some(listener_type) {
+            bail!("Mihomo per-user listener type does not match the active plan");
+        }
+        match representation {
+            "uuid-array" | "username-array" => {
+                let field = if representation == "uuid-array" {
+                    "uuid"
+                } else {
+                    "username"
+                };
+                users.extend(
+                    listener
+                        .get("users")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry| entry.get(field).and_then(Value::as_str))
+                        .map(str::to_string),
+                );
+            }
+            "object-keys" => users.extend(
+                listener
+                    .get("users")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(|entries| entries.keys().cloned()),
+            ),
+            _ => unreachable!("fixed Mihomo user representation"),
+        }
+    }
+    Ok(users)
 }
 
 fn built_in_adapters(tls_readiness_mode: TlsReadinessMode) -> [ManagedCoreAdapter; 5] {
@@ -1684,7 +1741,7 @@ case "$validation_home" in /root|/root/*) exit 71 ;; esac
     }
 
     #[test]
-    fn live_user_discovery_is_runtime_specific_and_ignores_shared_credentials() {
+    fn non_mihomo_user_discovery_is_runtime_specific() {
         let xray = br#"{"inbounds":[{"settings":{"clients":[{"id":"user-a"},{"id":"user-b"}]}}]}"#;
         assert_eq!(
             discover_config_users(Flavor::Xray, xray).unwrap(),
@@ -1701,28 +1758,6 @@ case "$validation_home" in /root|/root/*) exit 71 ;; esac
         assert_eq!(
             discover_config_users(Flavor::Tuic, tuic).unwrap(),
             BTreeSet::from(["user-a".to_string(), "user-b".to_string()])
-        );
-
-        let mihomo = br#"listeners:
-  - type: vless
-    users:
-      - username: alice
-        uuid: 11111111-1111-4111-8111-111111111111
-  - type: trojan
-    users:
-      - username: user-a
-        password: user-a
-  - type: mieru
-    users:
-      user-b: secret
-"#;
-        assert_eq!(
-            discover_config_users(Flavor::Mihomo, mihomo).unwrap(),
-            BTreeSet::from([
-                "11111111-1111-4111-8111-111111111111".to_string(),
-                "user-a".to_string(),
-                "user-b".to_string(),
-            ])
         );
     }
 
@@ -1743,8 +1778,8 @@ case "$validation_home" in /root|/root/*) exit 71 ;; esac
         created.fragments[0].expected_user_ids = Some(BTreeSet::from([expected_uuid.to_string()]));
         fs::write(&config, adapter.compose(&created)?)?;
         assert_eq!(
-            discover_config_users(Flavor::Mihomo, &fs::read(&config)?)?,
-            BTreeSet::from([expected_uuid.to_string()])
+            discover_mihomo_config_users(&fs::read(&config)?, &created)?.len(),
+            1
         );
         assert_eq!(
             adapter.observe_users(&created)?,
@@ -1794,30 +1829,148 @@ case "$validation_home" in /root|/root/*) exit 71 ;; esac
     }
 
     #[test]
-    fn mixed_mihomo_listeners_observe_only_adapter_selected_identities() -> Result<()> {
-        let config = br#"listeners:
-  - type: vless
-    users:
-      - username: alice
-        uuid: 11111111-1111-4111-8111-111111111111
-  - type: trojan
-    users:
-      - username: 22222222-2222-4222-8222-222222222222
-        password: never-observe-this-password
-  - type: mieru
-    users:
-      33333333-3333-4333-8333-333333333333: never-observe-this-password
-"#;
-        let observed = discover_config_users(Flavor::Mihomo, config)?;
+    fn mixed_mihomo_plan_observes_only_per_user_listener_identities() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "infiproxy-mihomo-mixed-users-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&directory)?;
+        let binary = directory.join("mihomo");
+        let config = directory.join("config.yaml");
+        let marker = directory.join("mihomo.version");
+        fs::write(&binary, b"installed")?;
+        let adapter = test_adapter(Flavor::Mihomo, &binary, &config, &marker, "v1.19.30")?;
+        let user_a = "11111111-1111-4111-8111-111111111111";
+        let user_b = "22222222-2222-4222-8222-222222222222";
+        let unexpected = "33333333-3333-4333-8333-333333333333";
+        let expected = BTreeSet::from([user_a.to_string(), user_b.to_string()]);
+        let users = json!([
+            {"username":"alice","uuid":user_a},
+            {"username":"bob","uuid":user_b}
+        ]);
+        let fragment = |profile_id: &str,
+                        capability: &str,
+                        port: u16,
+                        expected_user_ids: Option<BTreeSet<String>>| {
+            let mut fragment = minimal_plan("test-runtime", capability).fragments.remove(0);
+            fragment.profile_id = profile_id.to_string();
+            fragment.payload["port"] = json!(port);
+            fragment.payload["users"] = users.clone();
+            fragment.expected_user_ids = expected_user_ids;
+            fragment
+        };
+        let plan = CorePlan {
+            generation: 23,
+            core_id: "test-runtime".to_string(),
+            fragments: vec![
+                fragment(
+                    "VLESS-JLS-COMPATIBILITY",
+                    "vless-jls",
+                    11443,
+                    Some(expected.clone()),
+                ),
+                fragment(
+                    "TROJAN-TLS-COMPATIBILITY",
+                    "trojan-tls",
+                    12443,
+                    Some(expected.clone()),
+                ),
+                fragment(
+                    "MIERU-TCP-COMPATIBILITY",
+                    "mieru",
+                    14443,
+                    Some(expected.clone()),
+                ),
+                fragment(
+                    "TRUSTTUNNEL-H2-EXPERIMENTAL",
+                    "trusttunnel-h2",
+                    15443,
+                    Some(expected.clone()),
+                ),
+                fragment(
+                    "SHADOWQUIC-EXPERIMENTAL",
+                    "shadowquic",
+                    16443,
+                    Some(expected.clone()),
+                ),
+                fragment("ANYTLS-JLS-SHARED", "anytls-jls", 17443, None),
+            ],
+        };
+        let rendered = adapter.compose(&plan)?;
+        fs::write(&config, &rendered)?;
         assert_eq!(
-            observed,
-            BTreeSet::from([
-                "11111111-1111-4111-8111-111111111111".to_string(),
-                "22222222-2222-4222-8222-222222222222".to_string(),
-                "33333333-3333-4333-8333-333333333333".to_string(),
-            ])
+            adapter.observe_users(&plan)?,
+            UserSyncObservation::InSync { user_count: 2 }
         );
-        assert!(!format!("{observed:?}").contains("never-observe"));
+
+        let mut missing: Value = serde_norway::from_slice(&rendered)?;
+        for listener in missing["listeners"]
+            .as_array_mut()
+            .context("Mihomo listeners must be an array")?
+        {
+            match listener.get_mut("users") {
+                Some(Value::Array(entries)) => entries.retain(|entry| {
+                    entry.get("uuid").and_then(Value::as_str) != Some(user_b)
+                        && entry.get("username").and_then(Value::as_str) != Some(user_b)
+                }),
+                Some(Value::Object(entries)) => {
+                    entries.remove(user_b);
+                }
+                _ => {}
+            }
+        }
+        fs::write(&config, serde_norway::to_string(&missing)?)?;
+        let missing_observation = adapter.observe_users(&plan)?;
+        assert_eq!(
+            missing_observation,
+            UserSyncObservation::Drift {
+                expected_count: 2,
+                observed_count: 1,
+                missing_count: 1,
+                unexpected_count: 0,
+            }
+        );
+
+        let mut extra: Value = serde_norway::from_slice(&rendered)?;
+        let shadowquic = extra["listeners"]
+            .as_array_mut()
+            .context("Mihomo listeners must be an array")?
+            .iter_mut()
+            .find(|listener| listener["name"] == "SHADOWQUIC-EXPERIMENTAL")
+            .context("ShadowQUIC listener is absent")?;
+        shadowquic["users"]
+            .as_array_mut()
+            .context("ShadowQUIC users must be an array")?
+            .push(json!({"username":unexpected,"password":"never-observe-this-password"}));
+        fs::write(&config, serde_norway::to_string(&extra)?)?;
+        let extra_observation = adapter.observe_users(&plan)?;
+        assert_eq!(
+            extra_observation,
+            UserSyncObservation::Drift {
+                expected_count: 2,
+                observed_count: 3,
+                missing_count: 0,
+                unexpected_count: 1,
+            }
+        );
+        for diagnostic in [
+            serde_json::to_string(&missing_observation)?,
+            serde_json::to_string(&extra_observation)?,
+        ] {
+            for secret in [
+                user_a,
+                user_b,
+                unexpected,
+                "never-observe-this-password",
+                "shadow-tls-password",
+                "restls-password",
+                "jls-password",
+                "private-key",
+            ] {
+                assert!(!diagnostic.contains(secret));
+            }
+        }
+        fs::remove_dir_all(directory)?;
         Ok(())
     }
 
