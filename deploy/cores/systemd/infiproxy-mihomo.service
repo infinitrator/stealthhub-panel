@@ -7,6 +7,7 @@ After=network-online.target
 Type=simple
 User=infiproxy-runtime
 Group=infiproxy-runtime
+Environment=SAFE_PATHS=/etc/infiproxy-cores/tls
 ExecStart=/opt/infiproxy/cores/mihomo/current/mihomo -d /var/lib/infiproxy-mihomo -f /etc/infiproxy-cores/mihomo/config.yaml
 Restart=on-failure
 RestartSec=3

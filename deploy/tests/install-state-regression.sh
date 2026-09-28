@@ -149,6 +149,8 @@ cp "${ROOT_DIR}/deploy/control-plane-artifacts" \
     "${installer_checkout}/deploy/control-plane-artifacts"
 chmod 0755 "${installer_checkout}/deploy/build-control-plane.sh"
 cp "${ROOT_DIR}/deploy/lib/manager-operations.sh" "${installer_checkout}/deploy/lib/manager-operations.sh"
+cp "${ROOT_DIR}/deploy/cores/systemd/infiproxy-mihomo.service" \
+    "${installer_checkout}/deploy/cores/systemd/infiproxy-mihomo.service"
 mkdir -p "${installer_checkout}/target/release"
 for binary in stealthhub-panel infiproxy-module-manifest infiproxy-reconcile infiproxy-tui; do
     cat >"${installer_checkout}/target/release/${binary}" <<'EOF'
@@ -198,7 +200,10 @@ while [[ "$#" -gt 0 ]]; do
     fi
 done
 destination="${args[${#args[@]}-1]}"
-[[ "$destination" == /etc/systemd/system/* ]] && exit 0
+if [[ "$destination" == /etc/systemd/system/* ]]; then
+    destination="${SYSTEMD_CORE_DIR:?}/$(basename "$destination")"
+    args[${#args[@]}-1]="$destination"
+fi
 exec /usr/bin/install "${args[@]}"
 EOF
 cat >"${installer_fake_bin}/mv" <<'EOF'
@@ -268,6 +273,7 @@ run_installer_case() {
         export INFIPROXY_PANEL_APPLIED_SHA="${scenario}/root-state/panel-last-applied.sha"
         export INFIPROXY_DEFER_APPLIED_SHA=true
         export INSTALL_LOG="${scenario}/install.log"
+        export SYSTEMD_CORE_DIR="${scenario}/systemd"
         export SYSTEMCTL_LOG="${scenario}/systemctl.log"
         export RECONCILE_HELPER_LOG="${scenario}/reconcile-helper.log"
         export RECONCILE_BOOTSTRAP_FAIL="$bootstrap_fail"
@@ -282,6 +288,23 @@ assert_update_config() {
     local config="$1" expected_ref="$2"
     grep -Fqx 'REPO=infinitrator/stealthhub-panel' "$config" \
         && grep -Fqx "REF=${expected_ref}" "$config"
+}
+
+assert_mihomo_runtime_unit() {
+    local unit="$1"
+    grep -Fqx 'User=infiproxy-runtime' "$unit" \
+        && grep -Fqx 'Group=infiproxy-runtime' "$unit" \
+        && grep -Fqx 'Environment=SAFE_PATHS=/etc/infiproxy-cores/tls' "$unit" \
+        && grep -Fqx 'ExecStart=/opt/infiproxy/cores/mihomo/current/mihomo -d /var/lib/infiproxy-mihomo -f /etc/infiproxy-cores/mihomo/config.yaml' "$unit" \
+        && grep -Fqx 'ProtectSystem=strict' "$unit" \
+        && grep -Fqx 'ProtectHome=true' "$unit" \
+        && grep -Fqx 'NoNewPrivileges=true' "$unit" \
+        && grep -Fqx 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$unit" \
+        && grep -Fqx 'ReadOnlyPaths=/etc/infiproxy-cores/mihomo' "$unit" \
+        && grep -Fqx 'ReadOnlyPaths=/opt/infiproxy/cores/mihomo' "$unit" \
+        && grep -Fqx 'ReadWritePaths=/var/lib/infiproxy-mihomo /var/log/infiproxy-cores' "$unit" \
+        && ! grep -Fq 'SKIP_SAFE_PATH_CHECK' "$unit" \
+        && [[ "$(grep -c '^Environment=SAFE_PATHS=' "$unit")" -eq 1 ]]
 }
 
 # The web process must remain outside the runtime TLS group on every fresh
@@ -314,6 +337,10 @@ if grep -E '^ReadWritePaths=.*(/var/lib/nginx|/var/log/nginx)' "$reconcile_unit"
     exit 1
 fi
 
+assert_mihomo_runtime_unit \
+    "${ROOT_DIR}/deploy/cores/systemd/infiproxy-mihomo.service" \
+    || { echo 'Mihomo runtime unit security contract changed' >&2; exit 1; }
+
 feature_config="${TMP_DIR}/feature-install/update.conf"
 run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
 assert_update_config "$feature_config" main \
@@ -326,6 +353,13 @@ if grep -Fqx 'start infiproxy-reconcile.service' \
     echo 'installer coupled snapshot bootstrap to full reconciliation' >&2
     exit 1
 fi
+assert_mihomo_runtime_unit \
+    "${TMP_DIR}/feature-install/systemd/infiproxy-mihomo.service" \
+    || { echo 'fresh install omitted the Mihomo runtime unit contract' >&2; exit 1; }
+run_installer_case "${TMP_DIR}/feature-install" "$feature_config"
+assert_mihomo_runtime_unit \
+    "${TMP_DIR}/feature-install/systemd/infiproxy-mihomo.service" \
+    || { echo 'upgrade omitted the Mihomo runtime unit contract' >&2; exit 1; }
 
 decoupled_config="${TMP_DIR}/decoupled-install/update.conf"
 run_installer_case "${TMP_DIR}/decoupled-install" "$decoupled_config" "" false true

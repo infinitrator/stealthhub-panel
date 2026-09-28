@@ -2287,6 +2287,104 @@ case "$validation_home" in /root|/root/*) exit 71 ;; esac
     }
 
     #[test]
+    fn exact_mihomo_runtime_tls_listener_honors_narrow_safe_paths() -> Result<()> {
+        let Some(binary) = std::env::var_os("INFIPROXY_TEST_MIHOMO_BIN") else {
+            return Ok(());
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "infiproxy-mihomo-safe-paths-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let home = directory.join("home");
+        let config_directory = directory.join("config");
+        let tls_directory = directory.join("tls");
+        fs::create_dir_all(&home)?;
+        fs::create_dir_all(&config_directory)?;
+        fs::create_dir_all(&tls_directory)?;
+        let certificate = tls_directory.join("fullchain.pem");
+        let private_key = tls_directory.join("privkey.pem");
+        let certificate_status = Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes"])
+            .args(["-subj", "/CN=example.com", "-days", "1"])
+            .arg("-keyout")
+            .arg(&private_key)
+            .arg("-out")
+            .arg(&certificate)
+            .output()?;
+        if !certificate_status.status.success() {
+            bail!("could not generate isolated Mihomo TLS fixture");
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        let mut rendered = compose_mihomo(&minimal_plan("mihomo", "trojan-tls"))?;
+        replace_string(
+            &mut rendered,
+            CERTIFICATE_PATH,
+            certificate
+                .to_str()
+                .context("certificate path is not UTF-8")?,
+        );
+        replace_string(
+            &mut rendered,
+            PRIVATE_KEY_PATH,
+            private_key
+                .to_str()
+                .context("private key path is not UTF-8")?,
+        );
+        rendered["listeners"][0]["listen"] = json!("127.0.0.1");
+        rendered["listeners"][0]["port"] = json!(port);
+        let candidate = config_directory.join("config.yaml");
+        fs::write(&candidate, serde_norway::to_string(&rendered)?)?;
+
+        let mut denied = Command::new(&binary)
+            .arg("-d")
+            .arg(&home)
+            .arg("-f")
+            .arg(&candidate)
+            .env_remove("SAFE_PATHS")
+            .env_remove("SKIP_SAFE_PATH_CHECK")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        thread::sleep(Duration::from_millis(500));
+        if let Some(denied_status) = denied.try_wait()? {
+            let mut denied_stderr = String::new();
+            denied
+                .stderr
+                .take()
+                .context("Mihomo rejection stderr is unavailable")?
+                .read_to_string(&mut denied_stderr)?;
+            if cfg!(target_os = "linux")
+                && (denied_status.success()
+                    || !(denied_stderr.contains("SAFE_PATHS")
+                        && denied_stderr.contains("subpath of home directory")))
+            {
+                bail!("Mihomo did not reject external TLS paths through its safe-path contract");
+            }
+        } else {
+            denied.kill()?;
+            denied.wait()?;
+            if cfg!(target_os = "linux") {
+                bail!("Mihomo unexpectedly accepted external TLS paths without SAFE_PATHS");
+            }
+        }
+
+        assert_starts_under_timeout(
+            Command::new(&binary)
+                .arg("-d")
+                .arg(&home)
+                .arg("-f")
+                .arg(&candidate)
+                .env("SAFE_PATHS", &tls_directory)
+                .env_remove("SKIP_SAFE_PATH_CHECK"),
+            "Mihomo v1.19.30 with narrow TLS SAFE_PATHS",
+        )?;
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn exact_runtime_version_probes_accept_pinned_binaries() -> Result<()> {
         let cases = [
             ("INFIPROXY_TEST_XRAY_BIN", Flavor::Xray, "v26.3.27"),
