@@ -205,12 +205,22 @@ impl ManagedCoreAdapter {
                     .arg(candidate)
                     .status()?,
             ),
-            Flavor::Mihomo => Some(
-                Command::new(&self.binary)
-                    .args(["-t", "-f"])
-                    .arg(candidate)
-                    .status()?,
-            ),
+            Flavor::Mihomo => {
+                let transaction_dir = candidate
+                    .parent()
+                    .context("Mihomo candidate has no transaction directory")?;
+                let validation_home = transaction_dir.join("home");
+                fs::create_dir_all(&validation_home)
+                    .context("create transaction-local Mihomo validation home")?;
+                Some(
+                    Command::new(&self.binary)
+                        .arg("-d")
+                        .arg(&validation_home)
+                        .args(["-t", "-f"])
+                        .arg(candidate)
+                        .status()?,
+                )
+            }
             Flavor::Hysteria | Flavor::Tuic => None,
         };
         if status.is_some_and(|status| !status.success()) {
@@ -1534,6 +1544,64 @@ mod tests {
     }
 
     #[test]
+    fn mihomo_candidate_validation_uses_transaction_local_home() -> Result<()> {
+        let directory = std::env::temp_dir().join(format!(
+            "infiproxy-mihomo-validation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let transaction_dir = directory.join("generation/mihomo");
+        fs::create_dir_all(&transaction_dir)?;
+        let binary = directory.join("fake-mihomo");
+        let candidate = transaction_dir.join("candidate.yaml");
+        let config = directory.join("live-config.yaml");
+        let marker = directory.join("mihomo.version");
+        fs::write(
+            &binary,
+            r##"#!/bin/sh
+validation_home=
+candidate=
+test_mode=false
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -d)
+            [ "$#" -ge 2 ] || exit 64
+            validation_home="$2"
+            shift 2
+            ;;
+        -t)
+            test_mode=true
+            shift
+            ;;
+        -f)
+            [ "$#" -ge 2 ] || exit 65
+            candidate="$2"
+            shift 2
+            ;;
+        *) exit 66 ;;
+    esac
+done
+[ "$test_mode" = true ] || exit 67
+[ -n "$candidate" ] && [ -f "$candidate" ] || exit 68
+[ -n "$validation_home" ] && [ -d "$validation_home" ] || exit 69
+[ "$validation_home" = "$(dirname "$candidate")/home" ] || exit 70
+case "$validation_home" in /root|/root/*) exit 71 ;; esac
+"##,
+        )?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700))?;
+        fs::write(&candidate, "listeners: []\n")?;
+        let adapter = test_adapter(Flavor::Mihomo, &binary, &config, &marker, "v1.19.30")?;
+
+        adapter.validate_config(&candidate)?;
+
+        let validation_home = transaction_dir.join("home");
+        assert!(validation_home.is_dir());
+        assert!(validation_home.starts_with(&transaction_dir));
+        assert!(!directory.join("live-runtime-data").exists());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
     fn listener_readiness_retries_until_the_owned_listener_appears() {
         let mut observations = 0;
         let mut waits = 0;
@@ -2164,6 +2232,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("infiproxy-mihomo-server-{}", uuid::Uuid::new_v4()));
         fs::create_dir(&directory)?;
+        let validation_home = directory.join("mihomo/home");
+        fs::create_dir_all(&validation_home)?;
         let certificate = directory.join("certificate.pem");
         let private_key = directory.join("private-key.pem");
         let certificate_status = Command::new("openssl")
@@ -2200,6 +2270,8 @@ mod tests {
             let candidate = directory.join(format!("{capability}.yaml"));
             fs::write(&candidate, serde_norway::to_string(&rendered)?)?;
             let output = Command::new(&binary)
+                .arg("-d")
+                .arg(&validation_home)
                 .args(["-t", "-f"])
                 .arg(&candidate)
                 .output()?;

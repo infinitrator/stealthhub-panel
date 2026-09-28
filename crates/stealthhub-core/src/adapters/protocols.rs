@@ -1760,17 +1760,20 @@ mod tests {
             "proxy-groups": [{"name":"COMPATIBILITY","type":"select","proxies":names}],
             "rules": ["MATCH,COMPATIBILITY"]
         });
-        let path = std::env::temp_dir().join(format!(
-            "infiproxy-mihomo-client-{}.yaml",
-            uuid::Uuid::new_v4()
-        ));
+        let directory =
+            std::env::temp_dir().join(format!("infiproxy-mihomo-client-{}", uuid::Uuid::new_v4()));
+        let validation_home = directory.join("mihomo/home");
+        fs::create_dir_all(&validation_home).unwrap();
+        let path = directory.join("candidate.yaml");
         fs::write(&path, serde_norway::to_string(&config).unwrap()).unwrap();
         let output = Command::new(binary)
+            .arg("-d")
+            .arg(&validation_home)
             .args(["-t", "-f"])
             .arg(&path)
             .output()
             .unwrap();
-        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
         assert!(
             output.status.success(),
             "Mihomo v1.19.30 rejected generated client config: {}",

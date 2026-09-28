@@ -303,8 +303,12 @@ fi
 reconcile_unit="${ROOT_DIR}/deploy/infiproxy-reconcile.service"
 grep -Fqx 'ProtectSystem=strict' "$reconcile_unit" \
     || { echo 'reconciler filesystem protection changed' >&2; exit 1; }
+grep -Fqx 'ProtectHome=true' "$reconcile_unit" \
+    || { echo 'reconciler home protection changed' >&2; exit 1; }
 grep -Fqx 'NoNewPrivileges=true' "$reconcile_unit" \
     || { echo 'reconciler privilege boundary changed' >&2; exit 1; }
+grep -Fqx 'ReadWritePaths=/etc/infiproxy-cores /etc/infiproxy/secrets.d /etc/nginx/sites-available /etc/nginx/sites-enabled /var/lib/infiproxy /var/lib/infiproxy-maintenance' "$reconcile_unit" \
+    || { echo 'reconciler writable path boundary changed' >&2; exit 1; }
 if grep -E '^ReadWritePaths=.*(/var/lib/nginx|/var/log/nginx)' "$reconcile_unit"; then
     echo 'reconciler gained write access to global Nginx state' >&2
     exit 1
