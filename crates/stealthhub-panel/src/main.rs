@@ -2584,6 +2584,7 @@ fn parse_pool_member(value: &str) -> anyhow::Result<PoolMember> {
         "profile" => Ok(PoolMember::Profile(value.trim().to_string())),
         "capability" => Ok(PoolMember::Capability(value.trim().to_string())),
         "role" => Ok(PoolMember::Role(parse_role(value.trim())?)),
+        "all-except-role" => Ok(PoolMember::AllExceptRole(parse_role(value.trim())?)),
         "pool" => Ok(PoolMember::Pool(value.trim().to_string())),
         _ => anyhow::bail!("unknown transport pool member kind"),
     }

@@ -263,6 +263,9 @@ pub struct DefaultRoutingRuleSet {
 
 pub const ROUTING_TARGETS: &[&str] = &[
     "DIRECT",
+    "SMART-AUTO",
+    "FAST-AUTO",
+    "REST-AUTO",
     "AUTO-SAFE",
     "SPEED",
     "RU-ACCESS",
@@ -297,8 +300,6 @@ const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[
         payload: &[
             "DOMAIN-SUFFIX,local",
             "DOMAIN-SUFFIX,lan",
-            "DOMAIN-SUFFIX,ru",
-            "DOMAIN-SUFFIX,рф",
             "IP-CIDR,10.0.0.0/8,no-resolve",
             "IP-CIDR,172.16.0.0/12,no-resolve",
             "IP-CIDR,192.168.0.0/16,no-resolve",
@@ -307,8 +308,8 @@ const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[
     DefaultRoutingRuleSet {
         slug: "proxy-ai",
         title: "AI and development",
-        effect: "Route selected AI/development domains through AUTO-SAFE.",
-        target: "AUTO-SAFE",
+        effect: "Route selected AI/development domains through SMART-AUTO.",
+        target: "SMART-AUTO",
         payload: &[
             "DOMAIN-SUFFIX,openai.com",
             "DOMAIN-SUFFIX,chatgpt.com",
@@ -321,8 +322,8 @@ const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[
     DefaultRoutingRuleSet {
         slug: "streaming",
         title: "Streaming",
-        effect: "Route high-bandwidth media domains through SPEED.",
-        target: "SPEED",
+        effect: "Route high-bandwidth media domains through SMART-AUTO.",
+        target: "SMART-AUTO",
         payload: &[
             "DOMAIN-SUFFIX,youtube.com",
             "DOMAIN-SUFFIX,googlevideo.com",

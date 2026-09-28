@@ -496,6 +496,7 @@ fn member_label(member: &PoolMember) -> String {
         PoolMember::Profile(value) => format!("profile:{value}"),
         PoolMember::Capability(value) => format!("capability:{value}"),
         PoolMember::Role(value) => format!("role:{value:?}"),
+        PoolMember::AllExceptRole(value) => format!("all-except-role:{value:?}"),
         PoolMember::Pool(value) => format!("pool:{value}"),
         PoolMember::AllProfiles => "all-enabled-profiles".into(),
         PoolMember::Direct => "DIRECT".into(),

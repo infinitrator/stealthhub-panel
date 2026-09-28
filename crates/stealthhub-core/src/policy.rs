@@ -43,6 +43,7 @@ pub enum PoolMember {
     Profile(String),
     Capability(String),
     Role(ProxyRole),
+    AllExceptRole(ProxyRole),
     Pool(String),
     AllProfiles,
     Direct,
@@ -299,6 +300,12 @@ impl ClientPolicy {
                                 .filter(|profile| profile.role == *role)
                                 .map(|profile| profile.name.clone()),
                         ),
+                        PoolMember::AllExceptRole(role) => members.extend(
+                            enabled
+                                .iter()
+                                .filter(|profile| profile.role != *role)
+                                .map(|profile| profile.name.clone()),
+                        ),
                         PoolMember::AllProfiles => {
                             members.extend(enabled.iter().map(|profile| profile.name.clone()))
                         }
@@ -385,204 +392,165 @@ fn detect_cycle<'a>(
     Ok(())
 }
 
-/// Compatibility bootstrap inserted once by the storage migration.
+/// Categories verified against GrimbirdUsers/ru-routing-dat `data-geosite`.
+pub const DEFAULT_DIRECT_GEOSITE_CATEGORIES: &[&str] = &[
+    "private",
+    "category-ru-whitelist",
+    "category-gov-ru",
+    "ru-banks",
+    "ru-payments",
+    "ru-finance",
+    "ru-marking",
+    "ru-cdn",
+    "ru-retail-extra",
+    "ru-transport",
+    "ru-tv",
+    "yandex",
+    "mailru-group",
+    "vk",
+    "ozon",
+    "wildberries",
+    "x5",
+    "avito",
+    "dzen",
+    "rutube",
+    "ok",
+    "okko",
+    "wink",
+    "2gis",
+];
+
+/// Daily-use client policy installed by the one-time storage bootstrap/migration.
 #[must_use]
 pub fn default_client_policy() -> ClientPolicy {
-    use PoolMember::{AllProfiles, Capability, Direct, Pool, Role};
-    let pool = |id: &str,
-                kind: PoolKind,
-                members: Vec<PoolMember>,
-                interval: Option<u32>,
-                tolerance: Option<u32>,
-                strategy: Option<&str>| TransportPool {
+    use PoolMember::{AllExceptRole, AllProfiles, Direct, Pool, Role};
+    let automatic_pool = |id: &str,
+                          kind: PoolKind,
+                          members: Vec<PoolMember>,
+                          timeout_ms: u32,
+                          tolerance_ms: Option<u32>,
+                          priority: i32| TransportPool {
         id: id.to_string(),
         display_name: id.to_string(),
         kind,
         enabled: true,
         members,
-        test_url: interval.map(|_| "https://www.gstatic.com/generate_204".to_string()),
-        interval_seconds: interval,
-        timeout_ms: interval.map(|_| 5_000),
-        tolerance_ms: tolerance,
-        max_failures: interval.map(|_| 5),
+        test_url: Some("https://www.gstatic.com/generate_204".to_string()),
+        interval_seconds: Some(60),
+        timeout_ms: Some(timeout_ms),
+        tolerance_ms,
+        max_failures: Some(5),
+        lazy: false,
+        minimum_healthy_count: None,
+        fallback_pool: None,
+        priority,
+        strategy: None,
+    };
+    let manual = TransportPool {
+        id: "MANUAL".to_string(),
+        display_name: "MANUAL".to_string(),
+        kind: PoolKind::Select,
+        enabled: true,
+        members: vec![
+            Pool("SMART-AUTO".to_string()),
+            Pool("FAST-AUTO".to_string()),
+            Pool("REST-AUTO".to_string()),
+            AllProfiles,
+            Direct,
+        ],
+        test_url: None,
+        interval_seconds: None,
+        timeout_ms: None,
+        tolerance_ms: None,
+        max_failures: None,
         lazy: true,
         minimum_healthy_count: None,
         fallback_pool: None,
-        priority: 100,
-        strategy: strategy.map(str::to_string),
-    };
-    let disabled = |mut pool: TransportPool| {
-        pool.enabled = false;
-        pool
+        priority: 130,
+        strategy: None,
     };
     ClientPolicy {
         pools: vec![
-            disabled(pool(
-                "STEALTH-TCP",
-                PoolKind::Select,
-                [
-                    "vless-reality-tcp",
-                    "vless-shadowtls-v3",
-                    "vless-restls",
-                    "vless-jls",
-                    "anytls-shadowtls-v3",
-                    "anytls-restls",
-                    "anytls-jls",
-                    "trojan-shadowtls-v3",
-                    "trojan-restls",
-                    "trojan-jls",
-                    "trojan-reality",
-                    "snell-v5-shadowtls-v3",
-                    "snell-v5-restls",
-                    "snell-v5-jls",
-                ]
-                .into_iter()
-                .map(|id| Capability(id.to_string()))
-                .collect(),
-                None,
-                None,
-                None,
-            )),
-            disabled(pool(
-                "HTTPS-LIKE",
-                PoolKind::Select,
-                [
-                    "trusttunnel-h2",
-                    "vless-jls",
-                    "anytls-jls",
-                    "trojan-jls",
-                    "snell-v5-jls",
-                    "sudoku-httpmask",
-                ]
-                .into_iter()
-                .map(|id| Capability(id.to_string()))
-                .collect(),
-                None,
-                None,
-                None,
-            )),
-            disabled(pool(
-                "FAST-UDP",
-                PoolKind::Select,
-                ["hysteria2", "tuic", "shadowquic"]
-                    .into_iter()
-                    .map(|id| Capability(id.to_string()))
-                    .collect(),
-                None,
-                None,
-                None,
-            )),
-            pool(
-                "AUTO-SAFE",
+            automatic_pool(
+                "FAST-AUTO",
                 PoolKind::UrlTest,
-                vec![
-                    Role(ProxyRole::AutoSafe),
-                    Role(ProxyRole::Compatibility),
-                    AllProfiles,
-                ],
-                Some(300),
+                vec![Role(ProxyRole::Speed)],
+                500,
                 Some(50),
-                None,
+                100,
             ),
-            pool(
-                "FAILOVER",
+            automatic_pool(
+                "REST-AUTO",
+                PoolKind::UrlTest,
+                vec![AllExceptRole(ProxyRole::Speed)],
+                3_000,
+                Some(50),
+                110,
+            ),
+            automatic_pool(
+                "SMART-AUTO",
                 PoolKind::Fallback,
-                vec![Pool("AUTO-SAFE".to_string())],
-                Some(120),
+                vec![Pool("FAST-AUTO".to_string()), Pool("REST-AUTO".to_string())],
+                3_000,
                 None,
-                None,
+                120,
             ),
-            pool(
-                "BALANCE",
-                PoolKind::LoadBalance,
-                vec![Pool("AUTO-SAFE".to_string())],
-                Some(180),
-                None,
-                Some("round-robin"),
-            ),
-            pool(
-                "SPEED",
-                PoolKind::Select,
-                vec![
-                    Role(ProxyRole::Speed),
-                    Pool("AUTO-SAFE".to_string()),
-                    Direct,
-                ],
-                None,
-                None,
-                None,
-            ),
-            pool(
-                "RU-ACCESS",
-                PoolKind::Select,
-                vec![
-                    Role(ProxyRole::RuAccess),
-                    Pool("AUTO-SAFE".to_string()),
-                    Direct,
-                ],
-                None,
-                None,
-                None,
-            ),
-            pool(
-                "MANUAL",
-                PoolKind::Select,
-                vec![
-                    Pool("AUTO-SAFE".to_string()),
-                    Pool("FAILOVER".to_string()),
-                    Pool("BALANCE".to_string()),
-                    Pool("SPEED".to_string()),
-                    Pool("RU-ACCESS".to_string()),
-                    AllProfiles,
-                    Direct,
-                ],
-                None,
-                None,
-                None,
-            ),
+            manual,
         ],
-        rules: vec![
-            RoutingPolicyRule {
-                id: "geoip-ru".to_string(),
-                display_name: "Russian IP ranges".to_string(),
+        rules: DEFAULT_DIRECT_GEOSITE_CATEGORIES
+            .iter()
+            .enumerate()
+            .map(|(position, category)| RoutingPolicyRule {
+                id: format!("direct-geosite-{category}"),
+                display_name: format!("Direct geosite {category}"),
                 enabled: true,
-                priority: 100,
-                condition: "GEOIP,RU".to_string(),
+                priority: 100 + i32::try_from(position).expect("built-in priority fits"),
+                condition: format!("GEOSITE,{category}"),
                 target: "DIRECT".to_string(),
-            },
-            RoutingPolicyRule {
-                id: "private-10".to_string(),
-                display_name: "Private 10/8".to_string(),
-                enabled: true,
-                priority: 110,
-                condition: "IP-CIDR,10.0.0.0/8,no-resolve".to_string(),
-                target: "DIRECT".to_string(),
-            },
-            RoutingPolicyRule {
-                id: "private-172".to_string(),
-                display_name: "Private 172.16/12".to_string(),
-                enabled: true,
-                priority: 120,
-                condition: "IP-CIDR,172.16.0.0/12,no-resolve".to_string(),
-                target: "DIRECT".to_string(),
-            },
-            RoutingPolicyRule {
-                id: "private-192".to_string(),
-                display_name: "Private 192.168/16".to_string(),
-                enabled: true,
-                priority: 130,
-                condition: "IP-CIDR,192.168.0.0/16,no-resolve".to_string(),
-                target: "DIRECT".to_string(),
-            },
-            RoutingPolicyRule {
-                id: "catch-all".to_string(),
-                display_name: "Default route".to_string(),
-                enabled: true,
-                priority: 1000,
-                condition: "MATCH".to_string(),
-                target: "MANUAL".to_string(),
-            },
-        ],
+            })
+            .chain([
+                RoutingPolicyRule {
+                    id: "private-10".to_string(),
+                    display_name: "Private 10/8".to_string(),
+                    enabled: true,
+                    priority: 200,
+                    condition: "IP-CIDR,10.0.0.0/8,no-resolve".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RoutingPolicyRule {
+                    id: "private-172".to_string(),
+                    display_name: "Private 172.16/12".to_string(),
+                    enabled: true,
+                    priority: 210,
+                    condition: "IP-CIDR,172.16.0.0/12,no-resolve".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RoutingPolicyRule {
+                    id: "private-192".to_string(),
+                    display_name: "Private 192.168/16".to_string(),
+                    enabled: true,
+                    priority: 220,
+                    condition: "IP-CIDR,192.168.0.0/16,no-resolve".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RoutingPolicyRule {
+                    id: "geoip-ru".to_string(),
+                    display_name: "Russian IP ranges".to_string(),
+                    enabled: true,
+                    priority: 300,
+                    condition: "GEOIP,RU,no-resolve".to_string(),
+                    target: "DIRECT".to_string(),
+                },
+                RoutingPolicyRule {
+                    id: "catch-all".to_string(),
+                    display_name: "Default route".to_string(),
+                    enabled: true,
+                    priority: 1000,
+                    condition: "MATCH".to_string(),
+                    target: "SMART-AUTO".to_string(),
+                },
+            ])
+            .collect(),
     }
 }
 
@@ -631,22 +599,74 @@ mod tests {
     }
 
     #[test]
-    fn default_policy_resolves_dynamic_profiles_without_duplicate_members() {
+    fn default_policy_partitions_enabled_profiles_and_prefers_fast_fallback() {
+        let mut disabled_fast = profile("DISABLED-FAST", ProxyRole::Speed);
+        disabled_fast.enabled = false;
+        let mut disabled_rest = profile("DISABLED-REST", ProxyRole::Compatibility);
+        disabled_rest.enabled = false;
         let profiles = [
-            profile("SAFE", ProxyRole::AutoSafe),
-            profile("FAST", ProxyRole::Speed),
+            profile("FAST-ONE", ProxyRole::Speed),
+            profile("FAST-TWO", ProxyRole::Speed),
+            profile("REST-ONE", ProxyRole::Compatibility),
+            profile("REST-TWO", ProxyRole::Manual),
+            disabled_fast,
+            disabled_rest,
         ];
         let pools = default_client_policy().resolved_pools(&profiles).unwrap();
-        let auto_safe = pools
+        let fast = pools
             .iter()
-            .find(|(pool, _)| pool.id == "AUTO-SAFE")
+            .find(|(pool, _)| pool.id == "FAST-AUTO")
             .unwrap();
-        assert_eq!(auto_safe.1, vec!["SAFE", "FAST"]);
+        assert_eq!(fast.1, vec!["FAST-ONE", "FAST-TWO"]);
+        assert_eq!(fast.0.timeout_ms, Some(500));
+        assert_eq!(fast.0.interval_seconds, Some(60));
+        assert!(!fast.0.lazy);
+        let rest = pools
+            .iter()
+            .find(|(pool, _)| pool.id == "REST-AUTO")
+            .unwrap();
+        assert_eq!(rest.1, vec!["REST-ONE", "REST-TWO"]);
+        assert_eq!(rest.0.timeout_ms, Some(3_000));
+        let smart = pools
+            .iter()
+            .find(|(pool, _)| pool.id == "SMART-AUTO")
+            .unwrap();
+        assert_eq!(smart.1, vec!["FAST-AUTO", "REST-AUTO"]);
         let manual = pools.iter().find(|(pool, _)| pool.id == "MANUAL").unwrap();
-        assert_eq!(
-            manual.1.iter().filter(|member| *member == "SAFE").count(),
-            1
-        );
+        assert_eq!(&manual.1[..3], ["SMART-AUTO", "FAST-AUTO", "REST-AUTO"]);
+        for profile in profiles.iter().filter(|profile| profile.enabled) {
+            assert_eq!(
+                fast.1
+                    .iter()
+                    .chain(&rest.1)
+                    .filter(|member| *member == &profile.name)
+                    .count(),
+                1
+            );
+            assert!(manual.1.contains(&profile.name));
+        }
+        assert!(manual.1.contains(&"DIRECT".to_string()));
+        assert!(!fast
+            .1
+            .iter()
+            .chain(&rest.1)
+            .any(|member| member.starts_with("DISABLED")));
+
+        let rules = default_client_policy().rules;
+        let geoip = rules.iter().position(|rule| rule.id == "geoip-ru").unwrap();
+        let fallback = rules
+            .iter()
+            .position(|rule| rule.id == "catch-all")
+            .unwrap();
+        assert!(rules[..geoip]
+            .iter()
+            .any(|rule| rule.condition == "GEOSITE,category-ru-whitelist"));
+        assert!(geoip < fallback);
+        assert_eq!(rules[fallback].condition, "MATCH");
+        assert_eq!(rules[fallback].target, "SMART-AUTO");
+        assert!(rules
+            .iter()
+            .all(|rule| rule.condition != "DOMAIN-SUFFIX,ru"));
     }
 
     #[test]
@@ -655,7 +675,7 @@ mod tests {
         policy
             .pools
             .iter_mut()
-            .find(|pool| pool.id == "AUTO-SAFE")
+            .find(|pool| pool.id == "FAST-AUTO")
             .unwrap()
             .members = vec![PoolMember::Pool("MISSING".to_string())];
         assert!(policy
@@ -666,9 +686,9 @@ mod tests {
         policy
             .pools
             .iter_mut()
-            .find(|pool| pool.id == "AUTO-SAFE")
+            .find(|pool| pool.id == "FAST-AUTO")
             .unwrap()
-            .members = vec![PoolMember::Pool("FAILOVER".to_string())];
+            .members = vec![PoolMember::Pool("SMART-AUTO".to_string())];
         assert!(policy
             .validate(&[profile("SAFE", ProxyRole::AutoSafe)])
             .is_err());

@@ -1474,35 +1474,35 @@ pub async fn ensure_default_settings(pool: &SqlitePool) -> Result<()> {
 }
 
 pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
-    if bootstrap_complete(pool, "client-routing").await? {
-        return Ok(());
+    if !bootstrap_complete(pool, "client-routing").await? {
+        for rule_set in default_routing_rule_sets() {
+            let enabled = get_setting(pool, &routing_setting_key(&rule_set.slug, "enabled"))
+                .await?
+                .map_or(rule_set.enabled, |value| parse_bool_setting(&value.value));
+            let target = get_setting(pool, &routing_setting_key(&rule_set.slug, "target"))
+                .await?
+                .map_or(rule_set.target, |value| value.value);
+            let payload = get_setting(pool, &routing_setting_key(&rule_set.slug, "payload"))
+                .await?
+                .map_or(rule_set.payload, |value| value.value);
+            sqlx::query(
+                "INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug) DO NOTHING",
+            )
+            .bind(rule_set.slug)
+            .bind(rule_set.title)
+            .bind(rule_set.effect)
+            .bind(target)
+            .bind(enabled)
+            .bind(payload)
+            .bind(Utc::now())
+            .execute(pool)
+            .await?;
+        }
+        ensure_default_client_policy(pool).await?;
+        ensure_default_dns_policy(pool).await?;
+        mark_bootstrap_complete(pool, "client-routing").await?;
     }
-    for rule_set in default_routing_rule_sets() {
-        let enabled = get_setting(pool, &routing_setting_key(&rule_set.slug, "enabled"))
-            .await?
-            .map_or(rule_set.enabled, |value| parse_bool_setting(&value.value));
-        let target = get_setting(pool, &routing_setting_key(&rule_set.slug, "target"))
-            .await?
-            .map_or(rule_set.target, |value| value.value);
-        let payload = get_setting(pool, &routing_setting_key(&rule_set.slug, "payload"))
-            .await?
-            .map_or(rule_set.payload, |value| value.value);
-        sqlx::query(
-            "INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug) DO NOTHING",
-        )
-        .bind(rule_set.slug)
-        .bind(rule_set.title)
-        .bind(rule_set.effect)
-        .bind(target)
-        .bind(enabled)
-        .bind(payload)
-        .bind(Utc::now())
-        .execute(pool)
-        .await?;
-    }
-    ensure_default_client_policy(pool).await?;
-    ensure_default_dns_policy(pool).await?;
-    mark_bootstrap_complete(pool, "client-routing").await?;
+    ensure_smart_auto_client_policy(pool).await?;
     Ok(())
 }
 
@@ -3631,6 +3631,125 @@ async fn ensure_default_client_policy(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_smart_auto_client_policy(pool: &SqlitePool) -> Result<()> {
+    const BOOTSTRAP_KEY: &str = "smart-auto-client-routing-v1";
+    const REPLACED_POOLS: &[&str] = &[
+        "STEALTH-TCP",
+        "HTTPS-LIKE",
+        "FAST-UDP",
+        "AUTO-SAFE",
+        "FAILOVER",
+        "BALANCE",
+        "SPEED",
+        "RU-ACCESS",
+        "FAST-AUTO",
+        "REST-AUTO",
+        "SMART-AUTO",
+        "MANUAL",
+    ];
+    const LEGACY_RULES: &[&str] = &[
+        "geoip-ru",
+        "private-10",
+        "private-172",
+        "private-192",
+        "catch-all",
+    ];
+
+    if bootstrap_complete(pool, BOOTSTRAP_KEY).await? {
+        return Ok(());
+    }
+
+    let policy = default_client_policy();
+    let mut transaction = pool.begin().await?;
+    for legacy in [
+        "STEALTH-TCP",
+        "HTTPS-LIKE",
+        "FAST-UDP",
+        "AUTO-SAFE",
+        "FAILOVER",
+        "BALANCE",
+        "SPEED",
+        "RU-ACCESS",
+    ] {
+        sqlx::query(
+            "UPDATE client_transport_pool_members SET member_value='SMART-AUTO' WHERE member_kind='pool' AND member_value=?",
+        )
+        .bind(legacy)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE client_transport_pools SET fallback_pool='SMART-AUTO' WHERE fallback_pool=?",
+        )
+        .bind(legacy)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("UPDATE client_routing_rules SET target='SMART-AUTO' WHERE target=?")
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE routing_rule_sets SET target='SMART-AUTO',updated_at=? WHERE target=?")
+            .bind(Utc::now())
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+    }
+
+    for id in REPLACED_POOLS {
+        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM client_transport_pools WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    for id in LEGACY_RULES
+        .iter()
+        .copied()
+        .chain(policy.rules.iter().map(|rule| rule.id.as_str()))
+    {
+        sqlx::query("DELETE FROM client_routing_rules WHERE id=?")
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?;
+    }
+
+    for (position, value) in policy.pools.iter().enumerate() {
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,test_url,interval_seconds,timeout_ms,tolerance_ms,max_failures,lazy,minimum_healthy_count,fallback_pool,priority,strategy,position) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&value.id).bind(&value.display_name).bind(pool_kind_name(value.kind)).bind(value.enabled)
+            .bind(&value.test_url).bind(value.interval_seconds.map(i64::from))
+            .bind(value.timeout_ms.map(i64::from)).bind(value.tolerance_ms.map(i64::from))
+            .bind(value.max_failures.map(i64::from)).bind(value.lazy)
+            .bind(value.minimum_healthy_count.map(i64::from)).bind(&value.fallback_pool)
+            .bind(value.priority).bind(&value.strategy).bind(i64::try_from(position)?)
+            .execute(&mut *transaction).await?;
+        for (member_position, member) in value.members.iter().enumerate() {
+            let (kind, member_value) = encode_pool_member(member);
+            sqlx::query("INSERT INTO client_transport_pool_members (pool_id,position,member_kind,member_value) VALUES (?,?,?,?)")
+                .bind(&value.id).bind(i64::try_from(member_position)?).bind(kind).bind(member_value)
+                .execute(&mut *transaction).await?;
+        }
+    }
+    for rule in &policy.rules {
+        sqlx::query("INSERT INTO client_routing_rules (id,display_name,enabled,priority,condition,target) VALUES (?,?,?,?,?,?)")
+            .bind(&rule.id).bind(&rule.display_name).bind(rule.enabled).bind(rule.priority)
+            .bind(&rule.condition).bind(&rule.target).execute(&mut *transaction).await?;
+    }
+    for rule_set in default_routing_rule_sets() {
+        sqlx::query("UPDATE routing_rule_sets SET title=?,effect=?,target=?,payload=?,updated_at=? WHERE slug=?")
+            .bind(rule_set.title).bind(rule_set.effect).bind(rule_set.target).bind(rule_set.payload)
+            .bind(Utc::now()).bind(rule_set.slug).execute(&mut *transaction).await?;
+    }
+    sqlx::query("INSERT INTO bootstrap_state (key,completed_at) VALUES (?,?)")
+        .bind(BOOTSTRAP_KEY)
+        .bind(Utc::now())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
 pub async fn load_client_policy(pool: &SqlitePool) -> Result<ClientPolicy> {
     let pool_rows = sqlx::query("SELECT id,display_name,kind,enabled,test_url,interval_seconds,timeout_ms,tolerance_ms,max_failures,lazy,minimum_healthy_count,fallback_pool,priority,strategy FROM client_transport_pools ORDER BY priority,position,id")
         .fetch_all(pool).await?;
@@ -4029,6 +4148,9 @@ fn encode_pool_member(member: &PoolMember) -> (&'static str, Option<String>) {
         PoolMember::Profile(value) => ("profile", Some(value.clone())),
         PoolMember::Capability(value) => ("capability", Some(value.clone())),
         PoolMember::Role(value) => ("role", Some(role_name(*value).to_string())),
+        PoolMember::AllExceptRole(value) => {
+            ("all-except-role", Some(role_name(*value).to_string()))
+        }
         PoolMember::Pool(value) => ("pool", Some(value.clone())),
         PoolMember::AllProfiles => ("all-profiles", None),
         PoolMember::Direct => ("direct", None),
@@ -4053,6 +4175,11 @@ fn decode_pool_member(kind: String, value: Option<String>) -> Result<PoolMember>
                 || anyhow::anyhow!("role member has no value"),
             )?)?))
         }
+        "all-except-role" => Ok(PoolMember::AllExceptRole(parse_role(
+            value
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("excluded role member has no value"))?,
+        )?)),
         "pool" => {
             Ok(PoolMember::Pool(value.ok_or_else(|| {
                 anyhow::anyhow!("pool member has no value")
@@ -5806,8 +5933,8 @@ mod tests {
 
         ensure_default_routing_rule_sets(&pool).await?;
         let policy = load_client_policy(&pool).await?;
-        assert_eq!(policy.pools.len(), 9);
-        assert_eq!(policy.rules.len(), 5);
+        assert_eq!(policy.pools.len(), 4);
+        assert_eq!(policy.rules.len(), 29);
         policy.validate(&crate::adapters::default_profiles())?;
         let mut dns = load_dns_policy(&pool).await?;
         assert_eq!(dns.enhanced_mode, "redir-host");
@@ -5817,7 +5944,7 @@ mod tests {
         dns.remote_resolvers = vec!["file:///etc/passwd".to_string()];
         assert!(update_dns_policy(&pool, &dns).await.is_err());
 
-        sqlx::query("UPDATE client_transport_pools SET interval_seconds=777 WHERE id='AUTO-SAFE'")
+        sqlx::query("UPDATE client_transport_pools SET interval_seconds=777 WHERE id='FAST-AUTO'")
             .execute(&pool)
             .await?;
         ensure_default_routing_rule_sets(&pool).await?;
@@ -5826,7 +5953,7 @@ mod tests {
             policy
                 .pools
                 .iter()
-                .find(|pool| pool.id == "AUTO-SAFE")
+                .find(|pool| pool.id == "FAST-AUTO")
                 .and_then(|pool| pool.interval_seconds),
             Some(777)
         );
@@ -5837,10 +5964,10 @@ mod tests {
         sqlx::query("DELETE FROM routing_rule_sets WHERE slug='streaming'")
             .execute(&pool)
             .await?;
-        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id='HTTPS-LIKE'")
+        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id='REST-AUTO'")
             .execute(&pool)
             .await?;
-        sqlx::query("DELETE FROM client_transport_pools WHERE id='HTTPS-LIKE'")
+        sqlx::query("DELETE FROM client_transport_pools WHERE id='REST-AUTO'")
             .execute(&pool)
             .await?;
         ensure_default_routing_rule_sets(&pool).await?;
@@ -5852,14 +5979,14 @@ mod tests {
             .await?
             .pools
             .iter()
-            .any(|pool| pool.id == "HTTPS-LIKE"));
+            .any(|pool| pool.id == "REST-AUTO"));
 
         update_routing_rule_set(
             &pool,
             UpdateRoutingRuleSet {
                 slug: "proxy-ai".to_string(),
                 enabled: true,
-                target: "AUTO-SAFE".to_string(),
+                target: "SMART-AUTO".to_string(),
                 payload: "DOMAIN-SUFFIX,openai.com\nDOMAIN-SUFFIX,perplexity.ai".to_string(),
             },
         )
@@ -5877,7 +6004,7 @@ mod tests {
             UpdateRoutingRuleSet {
                 slug: "proxy-ai".to_string(),
                 enabled: true,
-                target: "AUTO-SAFE".to_string(),
+                target: "SMART-AUTO".to_string(),
                 payload: "RULE-SET,other,DIRECT".to_string(),
             },
         )
@@ -5906,6 +6033,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn smart_auto_upgrade_replaces_built_ins_without_advancing_generation() -> Result<()> {
+        let (pool, path) = test_pool().await?;
+        ensure_default_routing_rule_sets(&pool).await?;
+        sqlx::query(
+            "UPDATE reconcile_state SET desired_generation=23,applied_generation=23 WHERE singleton=1",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM bootstrap_state WHERE key='smart-auto-client-routing-v1'")
+            .execute(&pool)
+            .await?;
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,lazy,priority,position) VALUES ('AUTO-SAFE','Legacy','select',1,1,500,500)")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,lazy,fallback_pool,priority,position) VALUES ('CUSTOM','Custom','fallback',1,1,'FAILOVER',600,600)")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO client_transport_pool_members (pool_id,position,member_kind,member_value) VALUES ('CUSTOM',0,'pool','AUTO-SAFE')")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO client_routing_rules (id,display_name,enabled,priority,condition,target) VALUES ('custom-rule','Custom',1,50,'DOMAIN,custom.example','AUTO-SAFE')")
+            .execute(&pool).await?;
+        sqlx::query("UPDATE routing_rule_sets SET target='AUTO-SAFE' WHERE slug='proxy-ai'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE routing_rule_sets SET payload='DOMAIN-SUFFIX,ru' WHERE slug='direct-local'",
+        )
+        .execute(&pool)
+        .await?;
+
+        ensure_default_routing_rule_sets(&pool).await?;
+        let state = get_reconcile_state(&pool).await?;
+        assert_eq!(state.desired_generation, 23);
+        assert_eq!(state.applied_generation, 23);
+        let policy = load_client_policy(&pool).await?;
+        for expected in ["FAST-AUTO", "REST-AUTO", "SMART-AUTO", "MANUAL", "CUSTOM"] {
+            assert!(policy.pools.iter().any(|pool| pool.id == expected));
+        }
+        assert!(!policy.pools.iter().any(|pool| pool.id == "AUTO-SAFE"));
+        assert_eq!(
+            policy
+                .pools
+                .iter()
+                .find(|pool| pool.id == "CUSTOM")
+                .map(|pool| pool.members.as_slice()),
+            Some(&[PoolMember::Pool("SMART-AUTO".to_string())][..])
+        );
+        assert_eq!(
+            policy
+                .pools
+                .iter()
+                .find(|pool| pool.id == "CUSTOM")
+                .and_then(|pool| pool.fallback_pool.as_deref()),
+            Some("SMART-AUTO")
+        );
+        assert_eq!(
+            policy
+                .rules
+                .iter()
+                .find(|rule| rule.id == "custom-rule")
+                .map(|rule| rule.target.as_str()),
+            Some("SMART-AUTO")
+        );
+        let rule_sets = load_routing_rule_sets(&pool).await?;
+        assert_eq!(
+            rule_sets
+                .iter()
+                .find(|rule_set| rule_set.slug == "proxy-ai")
+                .map(|rule_set| rule_set.target.as_str()),
+            Some("SMART-AUTO")
+        );
+        assert!(!rule_sets
+            .iter()
+            .find(|rule_set| rule_set.slug == "direct-local")
+            .expect("direct-local rule set")
+            .payload
+            .contains("DOMAIN-SUFFIX,ru"));
+
+        sqlx::query("UPDATE client_transport_pools SET interval_seconds=777 WHERE id='FAST-AUTO'")
+            .execute(&pool)
+            .await?;
+        ensure_default_routing_rule_sets(&pool).await?;
+        assert_eq!(
+            load_client_policy(&pool)
+                .await?
+                .pools
+                .iter()
+                .find(|pool| pool.id == "FAST-AUTO")
+                .and_then(|pool| pool.interval_seconds),
+            Some(777)
+        );
+
+        close_and_remove(pool, &path).await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn transport_pool_and_routing_policy_crud_preserve_references() -> Result<()> {
         let (pool, path) = test_pool().await?;
         ensure_default_routing_rule_sets(&pool).await?;
@@ -5915,7 +6137,7 @@ mod tests {
             display_name: "Custom transport".to_string(),
             kind: PoolKind::Fallback,
             enabled: true,
-            members: vec![PoolMember::Pool("AUTO-SAFE".to_string())],
+            members: vec![PoolMember::Pool("SMART-AUTO".to_string())],
             test_url: Some("https://www.gstatic.com/generate_204".to_string()),
             interval_seconds: Some(120),
             timeout_ms: Some(3_000),
@@ -5989,7 +6211,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        delete_transport_pool(&pool, "CUSTOM-RENAMED", Some("AUTO-SAFE"), &profiles).await?;
+        delete_transport_pool(&pool, "CUSTOM-RENAMED", Some("SMART-AUTO"), &profiles).await?;
         assert_eq!(
             load_client_policy(&pool)
                 .await?
@@ -5997,7 +6219,7 @@ mod tests {
                 .iter()
                 .find(|rule| rule.id == "custom-domain")
                 .map(|rule| rule.target.as_str()),
-            Some("AUTO-SAFE")
+            Some("SMART-AUTO")
         );
         assert_eq!(
             load_routing_rule_sets(&pool)
@@ -6005,7 +6227,7 @@ mod tests {
                 .iter()
                 .find(|rule_set| rule_set.slug == "proxy-ai")
                 .map(|rule_set| rule_set.target.as_str()),
-            Some("AUTO-SAFE")
+            Some("SMART-AUTO")
         );
         delete_routing_policy(&pool, "custom-domain").await?;
 

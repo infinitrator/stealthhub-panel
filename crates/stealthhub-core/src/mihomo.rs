@@ -16,6 +16,14 @@ use crate::{
     rules::{classical_rule_with_target, RoutingRuleSet},
 };
 
+// GrimbirdUsers/ru-routing-dat recommends its jsDelivr mirror. Mihomo stores the
+// downloaded geodata below its own home and keeps the last usable copy across updates.
+const RU_GEOSITE_URL: &str =
+    "https://cdn.jsdelivr.net/gh/GrimbirdUsers/ru-routing-dat@main/geosite.dat";
+const RU_GEOIP_URL: &str =
+    "https://cdn.jsdelivr.net/gh/GrimbirdUsers/ru-routing-dat@main/geoip.dat";
+const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
+
 /// Generates a Mihomo document with the trusted built-in adapter registry.
 pub fn generate_mihomo_yaml(
     settings: &PanelSettings,
@@ -141,6 +149,14 @@ pub fn generate_mihomo_yaml_detailed(
         "ipv6": false,
         "external-controller": "127.0.0.1:9090",
         "secret": user.subscription_token,
+        "geodata-mode": true,
+        "geodata-loader": "memconservative",
+        "geo-auto-update": true,
+        "geo-update-interval": 24,
+        "geox-url": {
+            "geosite": RU_GEOSITE_URL,
+            "geoip": RU_GEOIP_URL,
+        },
         "dns": dns_config(dns_policy, &active_rule_sets),
         "rule-providers": rule_provider_map(settings, &active_rule_sets),
         "proxies": proxies,
@@ -205,6 +221,14 @@ fn proxy_groups(pools: &[(crate::policy::TransportPool, Vec<String>)]) -> Vec<se
                 group.insert("max-failed-times".to_string(), json!(max_failures));
             }
             group.insert("lazy".to_string(), json!(pool.lazy));
+            if pool.test_url.as_deref() == Some(HEALTH_CHECK_URL) {
+                group.insert("expected-status".to_string(), json!(204));
+            }
+            if pool.kind == crate::policy::PoolKind::Select {
+                if let Some(first) = members.first() {
+                    group.insert("default-selected".to_string(), json!(first));
+                }
+            }
             if let Some(strategy) = &pool.strategy {
                 group.insert("strategy".to_string(), json!(strategy));
             }
@@ -375,11 +399,25 @@ mod tests {
         }
     }
 
+    fn fixture_profiles() -> Vec<ProtocolProfile> {
+        let rest = fixture_profile();
+        let mut fast = rest.clone();
+        fast.name = "VLESS-XHTTP-FAST".to_string();
+        fast.display_name = "VLESS XHTTP Fast".to_string();
+        fast.role = ProxyRole::Speed;
+        fast.port = 8444;
+        let mut disabled = rest.clone();
+        disabled.name = "VLESS-XHTTP-DISABLED".to_string();
+        disabled.display_name = "VLESS XHTTP Disabled".to_string();
+        disabled.enabled = false;
+        vec![rest, fast, disabled]
+    }
+
     #[test]
     fn generated_yaml_uses_profiles_and_configured_secrets() {
         let settings = fixture_settings();
         let user = fixture_user();
-        let profiles = vec![fixture_profile()];
+        let profiles = fixture_profiles();
 
         let mut secrets = std::collections::HashMap::new();
         secrets.insert(
@@ -399,8 +437,9 @@ mod tests {
         assert!(yaml.contains("public-key-value"));
         assert!(!yaml.contains("xray.reality.short_id"));
         assert!(!yaml.contains("REPLACE_WITH_"));
-        assert!(yaml.contains("AUTO-SAFE"));
-        assert!(yaml.contains("RULE-SET,proxy-ai,AUTO-SAFE"));
+        assert!(!yaml.contains("VLESS-XHTTP-DISABLED"));
+        assert!(yaml.contains("SMART-AUTO"));
+        assert!(yaml.contains("RULE-SET,proxy-ai,SMART-AUTO"));
         assert_eq!(
             parsed["proxies"][0]["xhttp-opts"]["host"],
             "www.microsoft.com"
@@ -422,12 +461,73 @@ mod tests {
             .filter_map(serde_norway::Value::as_str)
             .collect::<Vec<_>>();
         assert!(generated_rules.ends_with(&[
-            "GEOIP,RU,DIRECT",
             "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
             "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
             "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
-            "MATCH,MANUAL",
+            "GEOIP,RU,DIRECT,no-resolve",
+            "MATCH,SMART-AUTO",
         ]));
+        let generated_groups = parsed["proxy-groups"]
+            .as_sequence()
+            .expect("generated groups must be a sequence");
+        let group = |name: &str| {
+            generated_groups
+                .iter()
+                .find(|group| group["name"] == name)
+                .expect("generated group is absent")
+        };
+        let group_members = |name: &str| {
+            group(name)["proxies"]
+                .as_sequence()
+                .expect("group members must be a sequence")
+                .iter()
+                .map(|member| member.as_str().expect("group member must be a string"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(group_members("FAST-AUTO"), ["VLESS-XHTTP-FAST"]);
+        assert_eq!(group("FAST-AUTO")["timeout"], 500);
+        assert_eq!(group("FAST-AUTO")["interval"], 60);
+        assert_eq!(group("FAST-AUTO")["lazy"], false);
+        assert_eq!(group("FAST-AUTO")["expected-status"], 204);
+        assert_eq!(group_members("REST-AUTO"), ["VLESS-XHTTP-SAFE"]);
+        assert_eq!(group("REST-AUTO")["timeout"], 3_000);
+        assert_eq!(group_members("SMART-AUTO"), ["FAST-AUTO", "REST-AUTO"]);
+        assert_eq!(
+            group_members("MANUAL"),
+            [
+                "SMART-AUTO",
+                "FAST-AUTO",
+                "REST-AUTO",
+                "VLESS-XHTTP-SAFE",
+                "VLESS-XHTTP-FAST",
+                "DIRECT"
+            ]
+        );
+        assert_eq!(group("MANUAL")["default-selected"], "SMART-AUTO");
+        assert_eq!(parsed["geodata-mode"], true);
+        assert_eq!(parsed["geo-auto-update"], true);
+        assert_eq!(parsed["geo-update-interval"], 24);
+        assert_eq!(parsed["geox-url"]["geosite"], RU_GEOSITE_URL);
+        assert_eq!(parsed["geox-url"]["geoip"], RU_GEOIP_URL);
+        for obsolete in ["AUTO-SAFE", "SPEED", "RU-ACCESS", "BALANCE"] {
+            assert!(!generated_rules.iter().any(|rule| rule.contains(obsolete)));
+        }
+        let category_position = generated_rules
+            .iter()
+            .position(|rule| *rule == "GEOSITE,category-ru-whitelist,DIRECT")
+            .expect("RU geosite rule is absent");
+        let geoip_position = generated_rules
+            .iter()
+            .position(|rule| *rule == "GEOIP,RU,DIRECT,no-resolve")
+            .expect("RU GeoIP rule is absent");
+        let fallback_position = generated_rules
+            .iter()
+            .position(|rule| *rule == "MATCH,SMART-AUTO")
+            .expect("SMART-AUTO fallback is absent");
+        assert!(category_position < geoip_position && geoip_position < fallback_position);
+        assert!(!generated_rules
+            .iter()
+            .any(|rule| rule.starts_with("DOMAIN-SUFFIX,ru,")));
     }
 
     #[test]
@@ -437,7 +537,7 @@ mod tests {
         };
         let settings = fixture_settings();
         let user = fixture_user();
-        let profiles = vec![fixture_profile()];
+        let profiles = fixture_profiles();
         let secrets = HashMap::from([
             (
                 "xray.reality.public_key".to_string(),
@@ -457,19 +557,87 @@ mod tests {
         fs::create_dir_all(&validation_home)?;
         let candidate = directory.join("subscription.yaml");
         fs::write(&candidate, yaml)?;
-        let output = Command::new(binary)
-            .arg("-d")
-            .arg(&validation_home)
-            .args(["-t", "-f"])
-            .arg(&candidate)
-            .output()?;
-        fs::remove_dir_all(directory)?;
-        if !output.status.success() {
+        let validate = || {
+            Command::new(&binary)
+                .arg("-d")
+                .arg(&validation_home)
+                .args(["-t", "-f"])
+                .arg(&candidate)
+                .output()
+        };
+        let first = validate()?;
+        if !first.status.success() {
             bail!(
-                "Mihomo v1.19.30 rejected generated subscription routing: {}",
-                String::from_utf8_lossy(&output.stderr)
+                "Mihomo v1.19.30 rejected generated subscription routing:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr),
             );
         }
+        let cached = validate()?;
+        fs::remove_dir_all(directory)?;
+        if !cached.status.success()
+            || String::from_utf8_lossy(&cached.stdout).contains("start download")
+        {
+            bail!(
+                "Mihomo v1.19.30 did not reuse cached geodata:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&cached.stdout),
+                String::from_utf8_lossy(&cached.stderr),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_routing_is_stable_and_isolated_for_multiple_users() -> Result<()> {
+        let settings = fixture_settings();
+        let profiles = fixture_profiles();
+        let secrets = HashMap::from([
+            (
+                "xray.reality.public_key".to_string(),
+                "public-key-value".to_string(),
+            ),
+            (
+                "xray.reality.short_id".to_string(),
+                "0123456789abcdef".to_string(),
+            ),
+            (
+                "xray.reality.private_key".to_string(),
+                "server-private-key-must-not-leak".to_string(),
+            ),
+        ]);
+        let alice = fixture_user();
+        let bob = SubscriptionUser {
+            username: "bob".to_string(),
+            uuid: "22222222-2222-4222-8222-222222222222".to_string(),
+            subscription_token: "bob-subscription-token".to_string(),
+        };
+        let alice_yaml = generate_mihomo_yaml(
+            &settings,
+            &alice,
+            &profiles,
+            &secrets,
+            &default_routing_rule_sets(),
+        )?;
+        let bob_yaml = generate_mihomo_yaml(
+            &settings,
+            &bob,
+            &profiles,
+            &secrets,
+            &default_routing_rule_sets(),
+        )?;
+        assert!(alice_yaml.contains(&alice.subscription_token));
+        assert!(!alice_yaml.contains(&bob.subscription_token));
+        assert!(!alice_yaml.contains(&bob.uuid));
+        assert!(bob_yaml.contains(&bob.subscription_token));
+        assert!(!bob_yaml.contains(&alice.subscription_token));
+        assert!(!bob_yaml.contains(&alice.uuid));
+        assert!(!alice_yaml.contains("server-private-key-must-not-leak"));
+        assert!(!bob_yaml.contains("server-private-key-must-not-leak"));
+
+        let alice_doc: serde_norway::Value = serde_norway::from_str(&alice_yaml)?;
+        let bob_doc: serde_norway::Value = serde_norway::from_str(&bob_yaml)?;
+        assert_eq!(alice_doc["proxy-groups"], bob_doc["proxy-groups"]);
+        assert_eq!(alice_doc["rules"], bob_doc["rules"]);
         Ok(())
     }
 
@@ -477,7 +645,7 @@ mod tests {
     fn generation_rejects_missing_secrets_and_empty_profiles() {
         let settings = fixture_settings();
         let user = fixture_user();
-        let profiles = vec![fixture_profile()];
+        let profiles = fixture_profiles();
 
         let error = generate_mihomo_yaml(
             &settings,
@@ -506,7 +674,7 @@ mod tests {
     fn disabled_rule_sets_are_not_reintroduced() {
         let settings = fixture_settings();
         let user = fixture_user();
-        let profiles = vec![fixture_profile()];
+        let profiles = fixture_profiles();
         let secrets = std::collections::HashMap::from([
             ("xray.reality.public_key".to_string(), "key".to_string()),
             ("xray.reality.short_id".to_string(), "id".to_string()),
@@ -548,11 +716,16 @@ mod tests {
             config: json!({}),
         };
 
+        let mut fast = profile.clone();
+        fast.name = "EXTERNAL-FAST".to_string();
+        fast.display_name = "External Fast".to_string();
+        fast.role = ProxyRole::Speed;
+        let profiles = [profile, fast];
         let yaml = generate_mihomo_yaml_with_registry(
             MihomoGenerationInput {
                 settings: &fixture_settings(),
                 user: &fixture_user(),
-                profiles: &[profile],
+                profiles: &profiles,
                 secrets: &HashMap::new(),
                 routing_rule_sets: &[],
                 policy: &default_client_policy(),
@@ -573,7 +746,8 @@ mod tests {
         let mut historical = fixture_profile();
         historical.name = "HISTORICAL".to_string();
         historical.protocol_id = "removed-adapter".to_string();
-        let profiles = vec![fixture_profile(), historical];
+        let mut profiles = fixture_profiles();
+        profiles.push(historical);
         let secrets = HashMap::from([
             (
                 "xray.reality.public_key".to_string(),

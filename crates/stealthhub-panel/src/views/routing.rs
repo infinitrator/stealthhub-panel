@@ -167,7 +167,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
 
                     section {
                         h2 { "Transport pools" }
-                        p { "Members use one selector per line: profile:NAME, capability:PROTOCOL, role:ROLE, pool:ID, all-profiles, DIRECT, or REJECT." }
+                        p { "Members use one selector per line: profile:NAME, capability:PROTOCOL, role:ROLE, all-except-role:ROLE, pool:ID, all-profiles, DIRECT, or REJECT." }
                         div class="config-list" {
                             @for pool in &policy.pools {
                                 (transport_pool_editor(pool, auth, &policy.pools))
@@ -496,6 +496,9 @@ fn pool_member_lines(members: &[PoolMember]) -> String {
             PoolMember::Profile(value) => format!("profile:{value}"),
             PoolMember::Capability(value) => format!("capability:{value}"),
             PoolMember::Role(value) => format!("role:{}", role_name(*value)),
+            PoolMember::AllExceptRole(value) => {
+                format!("all-except-role:{}", role_name(*value))
+            }
             PoolMember::Pool(value) => format!("pool:{value}"),
             PoolMember::AllProfiles => "all-profiles".to_string(),
             PoolMember::Direct => "DIRECT".to_string(),

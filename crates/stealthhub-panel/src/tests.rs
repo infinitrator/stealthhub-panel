@@ -18,6 +18,7 @@ use stealthhub_core::{
         AdapterInventory, AdapterInventoryEntry, AdapterInventoryState, RuntimeInventoryEntry,
         RuntimeInventoryState,
     },
+    models::ProxyRole,
     storage::{
         AdminRecord, AuditEventRecord, ProtocolProfileRecord, ReconcileStateRecord, UserRecord,
     },
@@ -697,6 +698,10 @@ fn transport_pool_member_input_is_typed_and_rejects_ambiguous_values() {
     assert_eq!(
         parse_pool_member("capability:hysteria2").unwrap(),
         PoolMember::Capability("hysteria2".to_string())
+    );
+    assert_eq!(
+        parse_pool_member("all-except-role:speed").unwrap(),
+        PoolMember::AllExceptRole(ProxyRole::Speed)
     );
     assert_eq!(
         parse_pool_member("pool:AUTO").unwrap(),
