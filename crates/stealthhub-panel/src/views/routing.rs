@@ -5,10 +5,16 @@ use axum::response::{Html, IntoResponse, Response};
 use maud::{html, Markup};
 use std::collections::BTreeMap;
 use stealthhub_core::{
+    mihomo::{RU_GEOIP_URL, RU_GEOSITE_URL},
     models::ProtocolProfile,
-    policy::{role_name, ClientPolicy, DnsPolicy, PoolMember, RoutingPolicyRule, TransportPool},
+    policy::{
+        role_name, ClientPolicy, DnsPolicy, PoolMember, RoutingPolicyRule, TransportPool,
+        DEFAULT_DIRECT_GEOSITE_CATEGORIES,
+    },
     routing_topology::{InspectionOutcome, RouteInspection, RoutingTopology, TopologyPath},
-    rules::{RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource, RuleSourceFormat},
+    rules::{
+        RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource, RuleSourceFormat, CUSTOM_DIRECT_SLUG,
+    },
 };
 
 pub(crate) struct RoutingPageData<'a> {
@@ -39,6 +45,9 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
         topology,
         inspection,
     } = data;
+    let custom_direct = rule_sets
+        .iter()
+        .find(|rule_set| rule_set.slug == CUSTOM_DIRECT_SLUG);
     let targets = ["DIRECT".to_string(), "REJECT".to_string()]
         .into_iter()
         .chain(
@@ -76,6 +85,33 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                         div class="metric" {
                             span { "Transport pools" }
                             strong { (policy.pools.iter().filter(|pool| pool.enabled).count()) }
+                        }
+                    }
+
+                    section aria-labelledby="russian-direct-heading" {
+                        h2 id="russian-direct-heading" { "Russian direct routing" }
+                        p { "Manual DIRECT exceptions are evaluated first, followed by the managed Russian database, private networks, RU GeoIP, and finally SMART-AUTO." }
+                        div class="table-wrap" { table {
+                            tbody {
+                                tr { th { "External database" } td { a href="https://github.com/GrimbirdUsers/ru-routing-dat" rel="noreferrer" { "GrimbirdUsers/ru-routing-dat" } } }
+                                tr { th { "Geosite" } td { code { (RU_GEOSITE_URL) } } }
+                                tr { th { "GeoIP" } td { code { (RU_GEOIP_URL) } } }
+                                tr { th { "Auto update" } td { "Every 24 hours" } }
+                                tr { th { "Managed categories" } td { code { (DEFAULT_DIRECT_GEOSITE_CATEGORIES.join(", ")) } } }
+                            }
+                        } }
+                        @if let Some(rule_set) = custom_direct {
+                            form method="post" action="/admin/routing" class="config-form wide" {
+                                (csrf_field(&auth.csrf_token))
+                                input type="hidden" name="slug" value=(CUSTOM_DIRECT_SLUG);
+                                input type="hidden" name="target" value="DIRECT";
+                                label class="full-span" {
+                                    span { "Manual DIRECT exceptions" }
+                                    textarea name="payload" rows="8" spellcheck="false" placeholder="DOMAIN,example.ru\nDOMAIN-SUFFIX,example.ru\nIP-CIDR,203.0.113.0/24,no-resolve" { (&rule_set.payload) }
+                                    small { "One targetless classical Mihomo condition per line. DIRECT is fixed by the application. Clear the field to disable manual exceptions." }
+                                }
+                                button type="submit" { "Save DIRECT exceptions" }
+                            }
                         }
                     }
 
@@ -166,7 +202,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                     }
 
                     section {
-                        h2 { "Transport pools" }
+                        h2 { "Advanced transport diagnostics" }
                         p { "Members use one selector per line: profile:NAME, capability:PROTOCOL, role:ROLE, all-except-role:ROLE, pool:ID, all-profiles, DIRECT, or REJECT." }
                         div class="config-list" {
                             @for pool in &policy.pools {
@@ -177,7 +213,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                     }
 
                     section {
-                        h2 { "Inline routing policies" }
+                        h2 { "Advanced managed routing rules" }
                         p { "Targets may be DIRECT, REJECT, a pool ID, an exact profile name, or capability:PROTOCOL." }
                         datalist id="routing-targets" {
                             option value="DIRECT" {}
@@ -207,7 +243,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                                     }
                                 }
                                 tbody {
-                                    @for rule_set in rule_sets {
+                                    @for rule_set in rule_sets.iter().filter(|rule_set| rule_set.slug != CUSTOM_DIRECT_SLUG) {
                                         tr {
                                             td { strong { (&rule_set.title) } br; code { (&rule_set.slug) } }
                                             td { code { (&rule_set.target) } }
@@ -230,7 +266,7 @@ pub(crate) fn render(auth: &AuthenticatedAdmin, data: RoutingPageData<'_>) -> Re
                     section {
                         h2 { "Rule parameters" }
                         div class="config-list" {
-                            @for rule_set in rule_sets {
+                            @for rule_set in rule_sets.iter().filter(|rule_set| rule_set.slug != CUSTOM_DIRECT_SLUG) {
                                 (routing_rule_editor(
                                     rule_set,
                                     auth,

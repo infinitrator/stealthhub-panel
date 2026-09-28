@@ -18,9 +18,9 @@ use crate::{
 
 // GrimbirdUsers/ru-routing-dat recommends its jsDelivr mirror. Mihomo stores the
 // downloaded geodata below its own home and keeps the last usable copy across updates.
-const RU_GEOSITE_URL: &str =
+pub const RU_GEOSITE_URL: &str =
     "https://cdn.jsdelivr.net/gh/GrimbirdUsers/ru-routing-dat@main/geosite.dat";
-const RU_GEOIP_URL: &str =
+pub const RU_GEOIP_URL: &str =
     "https://cdn.jsdelivr.net/gh/GrimbirdUsers/ru-routing-dat@main/geoip.dat";
 const HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
 
@@ -413,6 +413,17 @@ mod tests {
         vec![rest, fast, disabled]
     }
 
+    fn fixture_rule_sets() -> Vec<RoutingRuleSet> {
+        let mut rule_sets = default_routing_rule_sets();
+        let custom_direct = rule_sets
+            .iter_mut()
+            .find(|rule_set| rule_set.slug == "custom-direct")
+            .expect("custom-direct fixture");
+        custom_direct.enabled = true;
+        custom_direct.payload = "DOMAIN,manual-direct.example".to_string();
+        rule_sets
+    }
+
     #[test]
     fn generated_yaml_uses_profiles_and_configured_secrets() {
         let settings = fixture_settings();
@@ -429,7 +440,7 @@ mod tests {
             "0123456789abcdef".to_string(),
         );
 
-        let rules = default_routing_rule_sets();
+        let rules = fixture_rule_sets();
         let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &rules).unwrap();
         let parsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
 
@@ -439,7 +450,10 @@ mod tests {
         assert!(!yaml.contains("REPLACE_WITH_"));
         assert!(!yaml.contains("VLESS-XHTTP-DISABLED"));
         assert!(yaml.contains("SMART-AUTO"));
-        assert!(yaml.contains("RULE-SET,proxy-ai,SMART-AUTO"));
+        assert!(yaml.contains("RULE-SET,custom-direct,DIRECT"));
+        for legacy in ["banking-direct", "direct-local", "proxy-ai", "streaming"] {
+            assert!(!yaml.contains(legacy));
+        }
         assert_eq!(
             parsed["proxies"][0]["xhttp-opts"]["host"],
             "www.microsoft.com"
@@ -448,18 +462,16 @@ mod tests {
         assert_eq!(parsed["dns"]["respect-rules"], true);
         assert!(parsed["dns"]["proxy-server-nameserver"].is_sequence());
         assert_eq!(
-            parsed["dns"]["nameserver-policy"]["rule-set:banking-direct"][0],
+            parsed["dns"]["nameserver-policy"]["rule-set:custom-direct"][0],
             "system"
         );
-        assert!(parsed["dns"]["nameserver-policy"]["rule-set:proxy-ai"][0]
-            .as_str()
-            .is_some_and(|resolver| resolver.starts_with("https://")));
         let generated_rules = parsed["rules"]
             .as_sequence()
             .expect("generated rules must be a sequence")
             .iter()
             .filter_map(serde_norway::Value::as_str)
             .collect::<Vec<_>>();
+        assert_eq!(generated_rules[0], "RULE-SET,custom-direct,DIRECT");
         assert!(generated_rules.ends_with(&[
             "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
             "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
@@ -504,6 +516,11 @@ mod tests {
             ]
         );
         assert_eq!(group("MANUAL")["default-selected"], "SMART-AUTO");
+        for obsolete in ["AUTO-SAFE", "SPEED", "RU-ACCESS", "BALANCE", "FAILOVER"] {
+            assert!(generated_groups
+                .iter()
+                .all(|group| group["name"] != obsolete));
+        }
         assert_eq!(parsed["geodata-mode"], true);
         assert_eq!(parsed["geo-auto-update"], true);
         assert_eq!(parsed["geo-update-interval"], 24);
@@ -524,6 +541,13 @@ mod tests {
             .iter()
             .position(|rule| *rule == "MATCH,SMART-AUTO")
             .expect("SMART-AUTO fallback is absent");
+        assert_eq!(
+            generated_rules
+                .iter()
+                .filter(|rule| rule.starts_with("MATCH,"))
+                .count(),
+            1
+        );
         assert!(category_position < geoip_position && geoip_position < fallback_position);
         assert!(!generated_rules
             .iter()
@@ -548,7 +572,8 @@ mod tests {
                 "0123456789abcdef".to_string(),
             ),
         ]);
-        let yaml = generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &[])?;
+        let yaml =
+            generate_mihomo_yaml(&settings, &user, &profiles, &secrets, &fixture_rule_sets())?;
         let directory = std::env::temp_dir().join(format!(
             "infiproxy-mihomo-subscription-routing-{}",
             uuid::Uuid::new_v4()
@@ -611,20 +636,10 @@ mod tests {
             uuid: "22222222-2222-4222-8222-222222222222".to_string(),
             subscription_token: "bob-subscription-token".to_string(),
         };
-        let alice_yaml = generate_mihomo_yaml(
-            &settings,
-            &alice,
-            &profiles,
-            &secrets,
-            &default_routing_rule_sets(),
-        )?;
-        let bob_yaml = generate_mihomo_yaml(
-            &settings,
-            &bob,
-            &profiles,
-            &secrets,
-            &default_routing_rule_sets(),
-        )?;
+        let alice_yaml =
+            generate_mihomo_yaml(&settings, &alice, &profiles, &secrets, &fixture_rule_sets())?;
+        let bob_yaml =
+            generate_mihomo_yaml(&settings, &bob, &profiles, &secrets, &fixture_rule_sets())?;
         assert!(alice_yaml.contains(&alice.subscription_token));
         assert!(!alice_yaml.contains(&bob.subscription_token));
         assert!(!alice_yaml.contains(&bob.uuid));

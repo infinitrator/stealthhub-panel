@@ -78,10 +78,10 @@ Daily-use bootstrap policy содержит четыре группы:
   `DIRECT`; первым/default выбором остается `SMART-AUTO`.
 
 Проверки используют `https://www.gstatic.com/generate_204` и ожидают HTTP 204.
-Disabled profiles ни в одну группу не попадают. Одноразовая миграция заменяет
-старые встроенные `AUTO-SAFE`/`SPEED`/`BALANCE` группы, перенаправляет ссылки на
-`SMART-AUTO`, сохраняет пользовательские pools/rules и не изменяет reconcile
-generation.
+Disabled profiles ни в одну группу не попадают. Одноразовая миграция удаляет
+из product policy старые `AUTO-SAFE`/`SPEED`/`RU-ACCESS`/`BALANCE`/`FAILOVER`
+группы, перенаправляет пользовательские ссылки на `SMART-AUTO`, сохраняет
+неизвестные operator-owned pools/rules и не изменяет reconcile generation.
 
 В блоке **Inline routing policies** доступны create, edit, enable/disable,
 rename и delete. Числовой `priority` задает порядок без drag-and-drop. Condition
@@ -104,6 +104,14 @@ advanced classical payload. В текущем UI можно:
 
 Provider-level target применяется ко всем строкам одного set, поэтому правила с
 разными желаемыми targets следует хранить раздельно.
+
+Product-owned set `custom-direct` показан наверху страницы как **Manual DIRECT
+exceptions**. Его target зафиксирован приложением на `DIRECT`; payload не может
+содержать собственный target, `MATCH`, `RULE-SET` или `SUB-RULE`. Пустой payload
+выключает provider. Повторный bootstrap не перезаписывает сохраненный оператором
+список. Старые product sets `banking-direct`, `direct-local`, `proxy-ai` и
+`streaming` удаляются идемпотентной cleanup-миграцией; произвольные operator-owned
+sets остаются доступны в advanced UI.
 
 ### Нормализованные entries
 
@@ -187,8 +195,7 @@ Generator сначала добавляет enabled rule sets в стабиль�
 enabled inline policies по priority:
 
 ```text
-RULE-SET,<slug>,<target>
-...
+RULE-SET,custom-direct,DIRECT
 GEOSITE,private,DIRECT
 GEOSITE,category-ru-whitelist,DIRECT
 GEOSITE,category-gov-ru,DIRECT
@@ -270,7 +277,7 @@ DIRECT rule sets. Это снижает риск отправить явно pro
 Команды быстрой проверки:
 
 ```bash
-curl -fsS https://panel.example.com/rules/proxy-ai.yaml
+curl -fsS https://panel.example.com/rules/custom-direct.yaml
 curl -fsS https://panel.example.com/sub/TOKEN/mihomo.yaml -o /tmp/infiproxy.yaml
 rg -n 'dns:|proxy-groups:|rule-providers:|RULE-SET|MATCH' /tmp/infiproxy.yaml
 ```

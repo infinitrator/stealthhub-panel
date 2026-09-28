@@ -258,81 +258,29 @@ pub struct DefaultRoutingRuleSet {
     pub title: &'static str,
     pub effect: &'static str,
     pub target: &'static str,
+    pub enabled: bool,
     pub payload: &'static [&'static str],
 }
+
+pub const CUSTOM_DIRECT_SLUG: &str = "custom-direct";
 
 pub const ROUTING_TARGETS: &[&str] = &[
     "DIRECT",
     "SMART-AUTO",
     "FAST-AUTO",
     "REST-AUTO",
-    "AUTO-SAFE",
-    "SPEED",
-    "RU-ACCESS",
     "MANUAL",
     "REJECT",
 ];
 
-const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[
-    DefaultRoutingRuleSet {
-        slug: "banking-direct",
-        title: "Banking and government",
-        effect: "Send matching domains directly without proxy.",
-        target: "DIRECT",
-        payload: &[
-            "DOMAIN-SUFFIX,sberbank.ru",
-            "DOMAIN-SUFFIX,online.sberbank.ru",
-            "DOMAIN-SUFFIX,sberbank.com",
-            "DOMAIN-SUFFIX,gazprombank.ru",
-            "DOMAIN-SUFFIX,tbank.ru",
-            "DOMAIN-SUFFIX,tinkoff.ru",
-            "DOMAIN-SUFFIX,vtb.ru",
-            "DOMAIN-SUFFIX,alfabank.ru",
-            "DOMAIN-SUFFIX,gosuslugi.ru",
-            "DOMAIN-SUFFIX,nalog.gov.ru",
-        ],
-    },
-    DefaultRoutingRuleSet {
-        slug: "direct-local",
-        title: "Local and RU",
-        effect: "Keep private networks and RU domains on direct routing.",
-        target: "DIRECT",
-        payload: &[
-            "DOMAIN-SUFFIX,local",
-            "DOMAIN-SUFFIX,lan",
-            "IP-CIDR,10.0.0.0/8,no-resolve",
-            "IP-CIDR,172.16.0.0/12,no-resolve",
-            "IP-CIDR,192.168.0.0/16,no-resolve",
-        ],
-    },
-    DefaultRoutingRuleSet {
-        slug: "proxy-ai",
-        title: "AI and development",
-        effect: "Route selected AI/development domains through SMART-AUTO.",
-        target: "SMART-AUTO",
-        payload: &[
-            "DOMAIN-SUFFIX,openai.com",
-            "DOMAIN-SUFFIX,chatgpt.com",
-            "DOMAIN-SUFFIX,anthropic.com",
-            "DOMAIN-SUFFIX,claude.ai",
-            "DOMAIN-SUFFIX,github.com",
-            "DOMAIN-SUFFIX,githubusercontent.com",
-        ],
-    },
-    DefaultRoutingRuleSet {
-        slug: "streaming",
-        title: "Streaming",
-        effect: "Route high-bandwidth media domains through SMART-AUTO.",
-        target: "SMART-AUTO",
-        payload: &[
-            "DOMAIN-SUFFIX,youtube.com",
-            "DOMAIN-SUFFIX,googlevideo.com",
-            "DOMAIN-SUFFIX,ytimg.com",
-            "DOMAIN-SUFFIX,netflix.com",
-            "DOMAIN-SUFFIX,spotify.com",
-        ],
-    },
-];
+const DEFAULT_RULE_SETS: &[DefaultRoutingRuleSet] = &[DefaultRoutingRuleSet {
+    slug: CUSTOM_DIRECT_SLUG,
+    title: "Manual DIRECT exceptions",
+    effect: "Operator-managed exceptions evaluated before Russian geodata.",
+    target: "DIRECT",
+    enabled: false,
+    payload: &[],
+}];
 
 #[must_use]
 pub fn default_routing_rule_sets() -> Vec<RoutingRuleSet> {
@@ -343,7 +291,7 @@ pub fn default_routing_rule_sets() -> Vec<RoutingRuleSet> {
             title: rule_set.title.to_string(),
             effect: rule_set.effect.to_string(),
             target: rule_set.target.to_string(),
-            enabled: true,
+            enabled: rule_set.enabled,
             payload: rule_set.payload.join("\n"),
         })
         .collect()
@@ -398,16 +346,15 @@ pub fn validate_classical_rule_payload(payload: &str) -> Result<Vec<String>> {
                 index + 1
             );
         }
-        if rest
-            .split(',')
-            .skip(1)
-            .map(str::trim)
-            .any(|value| ROUTING_TARGETS.contains(&value))
+        let fields = line.split(',').map(str::trim).collect::<Vec<_>>();
+        if fields.len() == 3
+            && fields[2].eq_ignore_ascii_case("no-resolve")
+            && NO_RESOLVE_CONDITION_TYPES.contains(&kind)
         {
-            bail!(
-                "line {} must not override the rule-set routing target",
-                index + 1
-            );
+            // The only supported third field in a targetless payload is the
+            // Mihomo no-resolve modifier. The rule-set owns the policy target.
+        } else if fields.len() != 2 {
+            bail!("line {} must not specify a routing target", index + 1);
         }
 
         rules.push(line.to_string());
@@ -493,6 +440,7 @@ mod tests {
             .contains("cannot reference another rule set"));
         assert!(validate_classical_rule_payload("UNKNOWN,value").is_err());
         assert!(validate_classical_rule_payload("DOMAIN,example.com,REJECT").is_err());
+        assert!(validate_classical_rule_payload("DOMAIN,example.com,CUSTOM-POOL").is_err());
         assert!(validate_classical_rule_payload("AND,((DOMAIN,a),(DOMAIN,b))").is_err());
     }
 

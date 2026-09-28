@@ -423,25 +423,34 @@ body_excludes 'tuic.password'
 
 request 400 /admin/routing --request POST \
     --data-urlencode csrf_token="$CSRF_TOKEN" \
-    --data-urlencode slug=proxy-ai \
+    --data-urlencode slug=custom-direct \
     --data-urlencode enabled=on \
-    --data-urlencode target=AUTO-SAFE \
+    --data-urlencode target=DIRECT \
     --data-urlencode payload=MATCH
+request 400 /admin/routing --request POST \
+    --data-urlencode csrf_token="$CSRF_TOKEN" \
+    --data-urlencode slug=custom-direct \
+    --data-urlencode target=DIRECT \
+    --data-urlencode payload=DOMAIN,example.test,SMART-AUTO
 request 303 /admin/routing --request POST \
     --data-urlencode csrf_token="$CSRF_TOKEN" \
-    --data-urlencode slug=proxy-ai \
+    --data-urlencode slug=custom-direct \
     --data-urlencode enabled=on \
-    --data-urlencode target=AUTO-SAFE \
-    --data-urlencode payload=DOMAIN-SUFFIX,openai.com
-request 200 /rules/proxy-ai.yaml
-body_contains 'DOMAIN-SUFFIX,openai.com'
+    --data-urlencode target=DIRECT \
+    --data-urlencode payload=DOMAIN-SUFFIX,example.ru
+request 200 /rules/custom-direct.yaml
+body_contains 'DOMAIN-SUFFIX,example.ru'
 RULE_ETAG="$(sed -nE 's/^[Ee][Tt][Aa][Gg]:[[:space:]]*(.*)\r$/\1/p' "$HEADER_FILE")"
 [[ -n "$RULE_ETAG" ]] || fail "routing provider ETag is missing"
-request 304 /rules/proxy-ai.yaml --header "If-None-Match: ${RULE_ETAG}"
+request 304 /rules/custom-direct.yaml --header "If-None-Match: ${RULE_ETAG}"
 [[ ! -s "$BODY_FILE" ]] || fail "304 routing provider response contains a body"
-request 200 '/admin/routing?domain=api.openai.com'
-body_contains 'Runtime-dependent result'
-body_contains 'api.openai.com'
+request 200 '/admin/routing?domain=example.ru'
+body_contains 'Russian direct routing'
+body_contains 'GrimbirdUsers/ru-routing-dat'
+body_contains 'Manual DIRECT exceptions'
+body_contains 'example.ru'
+body_excludes 'banking-direct'
+body_excludes 'proxy-ai'
 
 mkdir -p "${TMP_DIR}/module-requests"
 printf 'module-victim-preserved\n' >"${TMP_DIR}/module-request-victim"

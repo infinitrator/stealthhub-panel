@@ -70,7 +70,7 @@ use stealthhub_core::{
     routing_topology::{RoutingTopology, RuntimeResolution, TopologyAvailability},
     rules::{
         routing_rule_payload_yaml, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
-        RuleSourceFormat,
+        RuleSourceFormat, CUSTOM_DIRECT_SLUG,
     },
     storage::{
         admin_count, append_audit_event, audit_event_count, bulk_add_rule_entries_audited,
@@ -2284,20 +2284,39 @@ async fn update_routing_rule_action(
     if !is_owner_admin(&auth) {
         return owner_only_response();
     }
-    if let Err(error) = routing_rule_payload_yaml(&form.payload) {
+    if !form.payload.trim().is_empty() {
+        if let Err(error) = routing_rule_payload_yaml(&form.payload) {
+            return html_error_response_with_back(
+                StatusCode::BAD_REQUEST,
+                "Routing update failed",
+                error.to_string(),
+                "/admin/routing",
+                "Back to Routing",
+            );
+        }
+    } else if form.slug != CUSTOM_DIRECT_SLUG {
         return html_error_response_with_back(
             StatusCode::BAD_REQUEST,
             "Routing update failed",
-            error.to_string(),
+            "rule payload must contain at least one rule",
             "/admin/routing",
             "Back to Routing",
         );
     }
 
+    let custom_direct = form.slug == CUSTOM_DIRECT_SLUG;
     let input = UpdateRoutingRuleSet {
         slug: form.slug,
-        enabled: checkbox_enabled(&form.enabled),
-        target: form.target,
+        enabled: if custom_direct {
+            !form.payload.trim().is_empty()
+        } else {
+            checkbox_enabled(&form.enabled)
+        },
+        target: if custom_direct {
+            "DIRECT".to_string()
+        } else {
+            form.target
+        },
         payload: form.payload,
     };
     let event = audit_event(

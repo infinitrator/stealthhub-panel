@@ -33,7 +33,7 @@ use crate::{
     rules::{
         compile_rule_set_payload, default_routing_rule_sets, is_valid_routing_target,
         validate_classical_rule_payload, RoutingRuleSet, RuleEntry, RuleKind, RuleSetSource,
-        RuleSourceFormat,
+        RuleSourceFormat, CUSTOM_DIRECT_SLUG,
     },
     telemetry::RuntimeTelemetryObservation,
 };
@@ -1503,6 +1503,7 @@ pub async fn ensure_default_routing_rule_sets(pool: &SqlitePool) -> Result<()> {
         mark_bootstrap_complete(pool, "client-routing").await?;
     }
     ensure_smart_auto_client_policy(pool).await?;
+    ensure_daily_routing_cleanup(pool).await?;
     Ok(())
 }
 
@@ -2858,6 +2859,7 @@ async fn update_routing_rule_set_inner(
 ) -> Result<()> {
     let slug = input.slug.trim();
     let target = input.target.trim();
+    validate_managed_rule_set_target(slug, target)?;
     let policy = load_client_policy(pool).await?;
     if !is_valid_routing_target(target)
         && !policy
@@ -2868,8 +2870,14 @@ async fn update_routing_rule_set_inner(
         return Err(anyhow::anyhow!("unsupported routing target"));
     }
 
-    let rules = validate_classical_rule_payload(&input.payload)?;
-    let payload = rules.join("\n");
+    let payload = if input.payload.trim().is_empty() && slug == CUSTOM_DIRECT_SLUG {
+        String::new()
+    } else {
+        validate_classical_rule_payload(&input.payload)?.join("\n")
+    };
+    if slug == CUSTOM_DIRECT_SLUG && input.enabled && payload.is_empty() {
+        bail!("custom-direct cannot be enabled without a rule");
+    }
 
     let mut transaction = pool.begin().await?;
     let result = sqlx::query(
@@ -2994,6 +3002,9 @@ async fn delete_routing_rule_set_inner(
     slug: &str,
     event: Option<&NewAuditEvent>,
 ) -> Result<()> {
+    if slug.trim() == CUSTOM_DIRECT_SLUG {
+        bail!("custom-direct is product-owned and cannot be deleted");
+    }
     let mut transaction = pool.begin().await?;
     let result = sqlx::query("DELETE FROM routing_rule_sets WHERE slug=?")
         .bind(slug.trim())
@@ -3077,6 +3088,7 @@ async fn validate_rule_set_metadata(pool: &SqlitePool, value: &RoutingRuleSet) -
     {
         bail!("invalid rule-set metadata");
     }
+    validate_managed_rule_set_target(value.slug.trim(), value.target.trim())?;
     let policy = load_client_policy(pool).await?;
     if !is_valid_routing_target(value.target.trim())
         && !policy
@@ -3085,6 +3097,13 @@ async fn validate_rule_set_metadata(pool: &SqlitePool, value: &RoutingRuleSet) -
             .any(|candidate| candidate.enabled && candidate.id == value.target.trim())
     {
         bail!("unsupported routing target");
+    }
+    Ok(())
+}
+
+fn validate_managed_rule_set_target(slug: &str, target: &str) -> Result<()> {
+    if slug == CUSTOM_DIRECT_SLUG && target != "DIRECT" {
+        bail!("custom-direct target is fixed to DIRECT");
     }
     Ok(())
 }
@@ -3736,11 +3755,96 @@ async fn ensure_smart_auto_client_policy(pool: &SqlitePool) -> Result<()> {
             .bind(&rule.id).bind(&rule.display_name).bind(rule.enabled).bind(rule.priority)
             .bind(&rule.condition).bind(&rule.target).execute(&mut *transaction).await?;
     }
-    for rule_set in default_routing_rule_sets() {
-        sqlx::query("UPDATE routing_rule_sets SET title=?,effect=?,target=?,payload=?,updated_at=? WHERE slug=?")
-            .bind(rule_set.title).bind(rule_set.effect).bind(rule_set.target).bind(rule_set.payload)
-            .bind(Utc::now()).bind(rule_set.slug).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO bootstrap_state (key,completed_at) VALUES (?,?)")
+        .bind(BOOTSTRAP_KEY)
+        .bind(Utc::now())
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+async fn ensure_daily_routing_cleanup(pool: &SqlitePool) -> Result<()> {
+    const BOOTSTRAP_KEY: &str = "daily-client-routing-v2";
+    const LEGACY_RULE_SETS: &[&str] = &["banking-direct", "direct-local", "proxy-ai", "streaming"];
+    const LEGACY_POOLS: &[&str] = &[
+        "STEALTH-TCP",
+        "HTTPS-LIKE",
+        "FAST-UDP",
+        "AUTO-SAFE",
+        "FAILOVER",
+        "BALANCE",
+        "SPEED",
+        "RU-ACCESS",
+    ];
+
+    if bootstrap_complete(pool, BOOTSTRAP_KEY).await? {
+        return Ok(());
     }
+
+    let custom_direct = default_routing_rule_sets()
+        .into_iter()
+        .find(|rule_set| rule_set.slug == CUSTOM_DIRECT_SLUG)
+        .expect("custom-direct is a built-in rule set");
+    let mut transaction = pool.begin().await?;
+
+    for legacy in LEGACY_POOLS {
+        sqlx::query(
+            "UPDATE client_transport_pool_members SET member_value='SMART-AUTO' WHERE member_kind='pool' AND member_value=?",
+        )
+        .bind(legacy)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE client_transport_pools SET fallback_pool='SMART-AUTO' WHERE fallback_pool=?",
+        )
+        .bind(legacy)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("UPDATE client_routing_rules SET target='SMART-AUTO' WHERE target=?")
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE routing_rule_sets SET target='SMART-AUTO',updated_at=? WHERE target=?")
+            .bind(Utc::now())
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id=?")
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM client_transport_pools WHERE id=?")
+            .bind(legacy)
+            .execute(&mut *transaction)
+            .await?;
+    }
+
+    for slug in LEGACY_RULE_SETS {
+        sqlx::query("DELETE FROM routing_rule_sets WHERE slug=?")
+            .bind(slug)
+            .execute(&mut *transaction)
+            .await?;
+        for field in ["enabled", "target", "payload"] {
+            sqlx::query("DELETE FROM settings WHERE key=?")
+                .bind(routing_setting_key(slug, field))
+                .execute(&mut *transaction)
+                .await?;
+        }
+    }
+
+    sqlx::query(
+        "INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(slug) DO UPDATE SET target='DIRECT',updated_at=excluded.updated_at",
+    )
+    .bind(&custom_direct.slug)
+    .bind(&custom_direct.title)
+    .bind(&custom_direct.effect)
+    .bind(&custom_direct.target)
+    .bind(custom_direct.enabled)
+    .bind(&custom_direct.payload)
+    .bind(Utc::now())
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query("INSERT INTO bootstrap_state (key,completed_at) VALUES (?,?)")
         .bind(BOOTSTRAP_KEY)
         .bind(Utc::now())
@@ -5958,12 +6062,12 @@ mod tests {
             Some(777)
         );
         let rule_sets = load_routing_rule_sets(&pool).await?;
-        assert_eq!(rule_sets.len(), 4);
-        assert!(rule_sets.iter().all(|rule_set| rule_set.enabled));
+        assert_eq!(rule_sets.len(), 1);
+        assert_eq!(rule_sets[0].slug, CUSTOM_DIRECT_SLUG);
+        assert_eq!(rule_sets[0].target, "DIRECT");
+        assert!(!rule_sets[0].enabled);
+        assert!(rule_sets[0].payload.is_empty());
 
-        sqlx::query("DELETE FROM routing_rule_sets WHERE slug='streaming'")
-            .execute(&pool)
-            .await?;
         sqlx::query("DELETE FROM client_transport_pool_members WHERE pool_id='REST-AUTO'")
             .execute(&pool)
             .await?;
@@ -5971,10 +6075,6 @@ mod tests {
             .execute(&pool)
             .await?;
         ensure_default_routing_rule_sets(&pool).await?;
-        assert!(!load_routing_rule_sets(&pool)
-            .await?
-            .iter()
-            .any(|rule_set| rule_set.slug == "streaming"));
         assert!(!load_client_policy(&pool)
             .await?
             .pools
@@ -5984,27 +6084,27 @@ mod tests {
         update_routing_rule_set(
             &pool,
             UpdateRoutingRuleSet {
-                slug: "proxy-ai".to_string(),
+                slug: CUSTOM_DIRECT_SLUG.to_string(),
                 enabled: true,
-                target: "SMART-AUTO".to_string(),
-                payload: "DOMAIN-SUFFIX,openai.com\nDOMAIN-SUFFIX,perplexity.ai".to_string(),
+                target: "DIRECT".to_string(),
+                payload: "DOMAIN-SUFFIX,example.ru\nIP-CIDR,203.0.113.0/24,no-resolve".to_string(),
             },
         )
         .await?;
 
         let rule_sets = load_routing_rule_sets(&pool).await?;
-        let proxy_ai = rule_sets
+        let custom_direct = rule_sets
             .iter()
-            .find(|rule_set| rule_set.slug == "proxy-ai")
-            .expect("proxy-ai rule set should exist");
-        assert!(proxy_ai.payload.contains("perplexity.ai"));
+            .find(|rule_set| rule_set.slug == CUSTOM_DIRECT_SLUG)
+            .expect("custom-direct rule set should exist");
+        assert!(custom_direct.payload.contains("example.ru"));
 
         let err = update_routing_rule_set(
             &pool,
             UpdateRoutingRuleSet {
-                slug: "proxy-ai".to_string(),
+                slug: CUSTOM_DIRECT_SLUG.to_string(),
                 enabled: true,
-                target: "SMART-AUTO".to_string(),
+                target: "DIRECT".to_string(),
                 payload: "RULE-SET,other,DIRECT".to_string(),
             },
         )
@@ -6017,15 +6117,22 @@ mod tests {
         let err = update_routing_rule_set(
             &pool,
             UpdateRoutingRuleSet {
-                slug: "proxy-ai".to_string(),
+                slug: CUSTOM_DIRECT_SLUG.to_string(),
                 enabled: true,
-                target: "INVALID".to_string(),
+                target: "SMART-AUTO".to_string(),
                 payload: "DOMAIN-SUFFIX,openai.com".to_string(),
             },
         )
         .await
         .unwrap_err();
-        assert!(err.to_string().contains("unsupported routing target"));
+        assert!(err.to_string().contains("fixed to DIRECT"));
+
+        ensure_default_routing_rule_sets(&pool).await?;
+        let preserved = load_routing_rule_sets(&pool).await?;
+        assert!(preserved
+            .iter()
+            .find(|rule_set| rule_set.slug == CUSTOM_DIRECT_SLUG)
+            .is_some_and(|rule_set| rule_set.payload == custom_direct.payload));
 
         close_and_remove(pool, &path).await;
 
@@ -6033,7 +6140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smart_auto_upgrade_replaces_built_ins_without_advancing_generation() -> Result<()> {
+    async fn daily_routing_upgrade_is_idempotent_and_preserves_operator_data() -> Result<()> {
         let (pool, path) = test_pool().await?;
         ensure_default_routing_rule_sets(&pool).await?;
         sqlx::query(
@@ -6044,6 +6151,9 @@ mod tests {
         sqlx::query("DELETE FROM bootstrap_state WHERE key='smart-auto-client-routing-v1'")
             .execute(&pool)
             .await?;
+        sqlx::query("DELETE FROM bootstrap_state WHERE key='daily-client-routing-v2'")
+            .execute(&pool)
+            .await?;
         sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,lazy,priority,position) VALUES ('AUTO-SAFE','Legacy','select',1,1,500,500)")
             .execute(&pool).await?;
         sqlx::query("INSERT INTO client_transport_pools (id,display_name,kind,enabled,lazy,fallback_pool,priority,position) VALUES ('CUSTOM','Custom','fallback',1,1,'FAILOVER',600,600)")
@@ -6052,14 +6162,15 @@ mod tests {
             .execute(&pool).await?;
         sqlx::query("INSERT INTO client_routing_rules (id,display_name,enabled,priority,condition,target) VALUES ('custom-rule','Custom',1,50,'DOMAIN,custom.example','AUTO-SAFE')")
             .execute(&pool).await?;
-        sqlx::query("UPDATE routing_rule_sets SET target='AUTO-SAFE' WHERE slug='proxy-ai'")
-            .execute(&pool)
-            .await?;
-        sqlx::query(
-            "UPDATE routing_rule_sets SET payload='DOMAIN-SUFFIX,ru' WHERE slug='direct-local'",
-        )
-        .execute(&pool)
-        .await?;
+        for slug in ["banking-direct", "direct-local", "proxy-ai", "streaming"] {
+            sqlx::query("INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES (?,?,?,?,1,'DOMAIN-SUFFIX,legacy.example',?)")
+                .bind(slug).bind("Legacy").bind("Legacy").bind(if slug == "proxy-ai" { "AUTO-SAFE" } else { "DIRECT" })
+                .bind(Utc::now()).execute(&pool).await?;
+        }
+        sqlx::query("UPDATE routing_rule_sets SET enabled=1,payload='DOMAIN,keep.example' WHERE slug='custom-direct'")
+            .execute(&pool).await?;
+        sqlx::query("INSERT INTO routing_rule_sets (slug,title,effect,target,enabled,payload,updated_at) VALUES ('operator-owned','Operator','Keep','AUTO-SAFE',1,'DOMAIN,operator.example',?)")
+            .bind(Utc::now()).execute(&pool).await?;
 
         ensure_default_routing_rule_sets(&pool).await?;
         let state = get_reconcile_state(&pool).await?;
@@ -6095,19 +6206,20 @@ mod tests {
             Some("SMART-AUTO")
         );
         let rule_sets = load_routing_rule_sets(&pool).await?;
-        assert_eq!(
-            rule_sets
-                .iter()
-                .find(|rule_set| rule_set.slug == "proxy-ai")
-                .map(|rule_set| rule_set.target.as_str()),
-            Some("SMART-AUTO")
-        );
-        assert!(!rule_sets
-            .iter()
-            .find(|rule_set| rule_set.slug == "direct-local")
-            .expect("direct-local rule set")
-            .payload
-            .contains("DOMAIN-SUFFIX,ru"));
+        assert!(rule_sets.iter().all(|rule_set| !matches!(
+            rule_set.slug.as_str(),
+            "banking-direct" | "direct-local" | "proxy-ai" | "streaming"
+        )));
+        assert!(rule_sets.iter().any(|rule_set| {
+            rule_set.slug == CUSTOM_DIRECT_SLUG
+                && rule_set.payload == "DOMAIN,keep.example"
+                && rule_set.target == "DIRECT"
+        }));
+        assert!(rule_sets.iter().any(|rule_set| {
+            rule_set.slug == "operator-owned"
+                && rule_set.payload == "DOMAIN,operator.example"
+                && rule_set.target == "SMART-AUTO"
+        }));
 
         sqlx::query("UPDATE client_transport_pools SET interval_seconds=777 WHERE id='FAST-AUTO'")
             .execute(&pool)
@@ -6122,6 +6234,9 @@ mod tests {
                 .and_then(|pool| pool.interval_seconds),
             Some(777)
         );
+        assert!(load_routing_rule_sets(&pool).await?.iter().any(|rule_set| {
+            rule_set.slug == CUSTOM_DIRECT_SLUG && rule_set.payload == "DOMAIN,keep.example"
+        }));
 
         close_and_remove(pool, &path).await;
         Ok(())
@@ -6155,10 +6270,22 @@ mod tests {
             .pools
             .iter()
             .any(|entry| entry.id == "CUSTOM"));
+        create_routing_rule_set(
+            &pool,
+            &RoutingRuleSet {
+                slug: "operator-routing".to_string(),
+                title: "Operator routing".to_string(),
+                effect: "Reference preservation".to_string(),
+                target: "SMART-AUTO".to_string(),
+                enabled: true,
+                payload: "DOMAIN,example.test".to_string(),
+            },
+        )
+        .await?;
         update_routing_rule_set(
             &pool,
             UpdateRoutingRuleSet {
-                slug: "proxy-ai".to_string(),
+                slug: "operator-routing".to_string(),
                 enabled: true,
                 target: "CUSTOM".to_string(),
                 payload: "DOMAIN,example.test".to_string(),
@@ -6202,7 +6329,7 @@ mod tests {
             load_routing_rule_sets(&pool)
                 .await?
                 .iter()
-                .find(|rule_set| rule_set.slug == "proxy-ai")
+                .find(|rule_set| rule_set.slug == "operator-routing")
                 .map(|rule_set| rule_set.target.as_str()),
             Some("CUSTOM-RENAMED")
         );
@@ -6225,7 +6352,7 @@ mod tests {
             load_routing_rule_sets(&pool)
                 .await?
                 .iter()
-                .find(|rule_set| rule_set.slug == "proxy-ai")
+                .find(|rule_set| rule_set.slug == "operator-routing")
                 .map(|rule_set| rule_set.target.as_str()),
             Some("SMART-AUTO")
         );
