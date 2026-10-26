@@ -241,6 +241,8 @@ required_deploy_files=(
     deploy/lib/manager-operations.sh
     deploy/lib/install-state.sh
     deploy/lib/runtime-tls.sh
+    deploy/letsencrypt/infiproxy-core-tls.sh
+    deploy/letsencrypt/infiproxy-nginx-reload.sh
     deploy/panel-update.sh
     deploy/build-control-plane.sh
     deploy/control-plane-artifacts
@@ -462,6 +464,25 @@ install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/mihomo"
 install -d -o root -g "$RUNTIME_GROUP" -m 0750 "$CORE_CONFIG_DIR/tls"
 normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/fullchain.pem" "$RUNTIME_GROUP"
 normalize_runtime_tls_file "$CORE_CONFIG_DIR/tls/privkey.pem" "$RUNTIME_GROUP"
+
+# Install renewal hooks on every fresh install and update. A missing root-owned
+# core-tls-domain leaves the core hook inert until the operator configures it.
+# Existing server-specific Certbot hook configuration is not overwritten blindly:
+# script upgrades are opt-in when a customized hook is already present.
+CERTBOT_DEPLOY_DIR="${INFIPROXY_CERTBOT_DEPLOY_DIR:-/etc/letsencrypt/renewal-hooks/deploy}"
+install -d -o root -g root -m 0755 "$CERTBOT_DEPLOY_DIR"
+for hook in infiproxy-core-tls.sh infiproxy-nginx-reload.sh; do
+    hook_src="${ROOT_DIR}/deploy/letsencrypt/$hook"
+    hook_dst="$CERTBOT_DEPLOY_DIR/$hook"
+    if [[ ! -e "$hook_dst" && ! -L "$hook_dst" ]]; then
+        install -m 0750 -o root -g root "$hook_src" "$hook_dst"
+    elif cmp -s "$hook_src" "$hook_dst"; then
+        chown root:root "$hook_dst"
+        chmod 0750 "$hook_dst"
+    else
+        echo "Preserving customized Certbot hook: $hook_dst (review and migrate manually)" >&2
+    fi
+done
 "$RECONCILE_HELPER" --publish-tls-readiness
 
 if [[ ! -f "$CORE_CONFIG_DIR/xray/config.json" ]]; then
